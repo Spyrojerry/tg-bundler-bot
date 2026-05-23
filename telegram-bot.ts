@@ -79,7 +79,7 @@ export class TelegramBot {
           await this.sendMessage(chatIdString, reply);
         }
       } catch (err) {
-        log.warn('Telegram polling error', err);
+        log.warn('Telegram polling error', this.describeError(err));
         await new Promise((resolve) => setTimeout(resolve, 2_000));
       }
     }
@@ -101,11 +101,30 @@ export class TelegramBot {
       body: JSON.stringify(body),
     });
 
-    const json = await resp.json() as { ok: boolean; result?: T; description?: string };
+    const json = await resp.json() as {
+      ok: boolean;
+      result?: T;
+      description?: string;
+      error_code?: number;
+    };
     if (!json.ok) {
-      throw new Error(json.description ?? `Telegram ${method} failed`);
+      throw new Error(
+        `Telegram ${method} failed (${json.error_code ?? resp.status}): ` +
+        `${json.description ?? 'unknown error'}`
+      );
     }
     return json.result as T;
+  }
+
+  private describeError(err: unknown): Record<string, unknown> {
+    if (err instanceof Error) {
+      return {
+        name: err.name,
+        message: err.message,
+        stack: err.stack?.split('\n').slice(0, 2).join('\n'),
+      };
+    }
+    return { error: String(err) };
   }
 
   private formatSampleCard(event: MonitorSampleEvent): string {
