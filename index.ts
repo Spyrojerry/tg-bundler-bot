@@ -112,30 +112,35 @@ async function main(): Promise<void> {
 
   async function handleTelegramCommand(_chatId: string, text: string): Promise<string> {
     const [command, arg] = text.split(/\s+/, 2);
+    const html = (value: string): string =>
+      value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 
     try {
       if (command === '/start' || command === '/help') {
         return [
           'GMGN wallet monitor',
           '',
-          '/addwallet <address>',
-          '/removewallet <address>',
+          '/addwallet &lt;address&gt;',
+          '/removewallet &lt;address&gt;',
           '/wallets',
           '/status',
         ].join('\n');
       }
       if (command === '/addwallet') {
-        if (!arg) return 'Usage: /addwallet <solana_wallet_address>';
+        if (!arg) return 'Usage: /addwallet &lt;solana_wallet_address&gt;';
         return await startWallet(arg);
       }
       if (command === '/removewallet') {
-        if (!arg) return 'Usage: /removewallet <solana_wallet_address>';
+        if (!arg) return 'Usage: /removewallet &lt;solana_wallet_address&gt;';
         return stopWallet(arg);
       }
       if (command === '/wallets') {
         const wallets = [...walletMonitors.keys()];
         return wallets.length
-          ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w) => `- ${w}`).join('\n')}`
+          ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w) => `- <code>${html(w)}</code>`).join('\n')}`
           : 'No wallets are being monitored.';
       }
       if (command === '/status') {
@@ -148,7 +153,7 @@ async function main(): Promise<void> {
       }
       return 'Unknown command. Send /help.';
     } catch (err) {
-      return err instanceof Error ? err.message : String(err);
+      return html(err instanceof Error ? err.message : String(err));
     }
   }
 

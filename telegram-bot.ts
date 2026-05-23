@@ -33,7 +33,7 @@ export class TelegramBot {
     if (this.running) return;
     this.running = true;
     log.info('Telegram bot polling started');
-    void this.pollLoop();
+    void this.bootstrapAndPoll();
   }
 
   stop(): void {
@@ -52,6 +52,15 @@ export class TelegramBot {
   async sendDefault(text: string): Promise<void> {
     if (!this.defaultChatId) return;
     await this.sendMessage(this.defaultChatId, text);
+  }
+
+  private async bootstrapAndPoll(): Promise<void> {
+    try {
+      await this.api('deleteWebhook', { drop_pending_updates: false });
+    } catch (err) {
+      log.warn('Telegram deleteWebhook failed', this.describeError(err));
+    }
+    await this.pollLoop();
   }
 
   private async pollLoop(): Promise<void> {
@@ -131,8 +140,8 @@ export class TelegramBot {
     const metrics = event.metrics;
     return [
       '<b>GMGN Sample</b>',
-      `Wallet: <code>${this.short(event.walletAddress)}</code>`,
-      `Token: <code>${metrics.mint}</code>`,
+      `Wallet: <code>${this.escapeHtml(this.short(event.walletAddress))}</code>`,
+      `Token: <code>${this.escapeHtml(metrics.mint)}</code>`,
       `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,
       `Bundlers: <b>${this.fmt(metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(metrics.bundlersCount)}</b>`,
@@ -144,8 +153,8 @@ export class TelegramBot {
     const windowSec = Math.round(summary.windowMs / 1_000);
     return [
       '<b>Monitoring Summary</b>',
-      `Wallet: <code>${this.short(summary.walletAddress)}</code>`,
-      `Token: <code>${summary.mint}</code>`,
+      `Wallet: <code>${this.escapeHtml(this.short(summary.walletAddress))}</code>`,
+      `Token: <code>${this.escapeHtml(summary.mint)}</code>`,
       `Window: ${windowSec}s`,
       `Samples: ${summary.totalSamples}`,
       `Period: ${summary.firstSeen} -> ${summary.lastSeen}`,
@@ -166,5 +175,12 @@ export class TelegramBot {
 
   private short(value: string): string {
     return `${value.slice(0, 4)}...${value.slice(-4)}`;
+  }
+
+  escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
   }
 }
