@@ -29,6 +29,7 @@ import {
 const log = createLogger('SCHED');
 
 const SCHEDULER_TICK_MS = 500; // internal resolution — half the min interval
+const BUNDLERS_PERCENT_STOP_THRESHOLD = 5;
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
@@ -341,6 +342,17 @@ export class Scheduler extends EventEmitter {
           sampleNumber,
         };
         this.emit('sample', sampleEvent);
+
+        if (
+          metrics.bundlersPercent !== null &&
+          metrics.bundlersPercent < BUNDLERS_PERCENT_STOP_THRESHOLD
+        ) {
+          log.info(
+            `Bundlers below ${BUNDLERS_PERCENT_STOP_THRESHOLD}% for ${mint}; ` +
+            'closing monitoring window early'
+          );
+          await this.expireToken(entry);
+        }
       } else {
         log.warn(`Fetch failed for ${mint}: ${result.error}`);
 

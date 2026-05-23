@@ -328,6 +328,22 @@ export class MonitorDatabase {
     return rows[0]?.cnt ?? 0;
   }
 
+  tokenCountForWallet(walletAddress: string): number {
+    const rows = this.query<{ cnt: number }>(
+      `SELECT COUNT(*) AS cnt FROM tokens WHERE wallet_address = ?`,
+      [walletAddress]
+    );
+    return rows[0]?.cnt ?? 0;
+  }
+
+  sampleCountForWallet(walletAddress: string): number {
+    const rows = this.query<{ cnt: number }>(
+      `SELECT COUNT(*) AS cnt FROM bundler_metrics WHERE wallet_address = ?`,
+      [walletAddress]
+    );
+    return rows[0]?.cnt ?? 0;
+  }
+
   close(): void {
     this.persist();
     this.db.close();

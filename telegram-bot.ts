@@ -3,13 +3,34 @@ import { MonitorSampleEvent, ServiceConfig, TokenSummary } from './types';
 
 const log = createLogger('TG');
 
-type CommandHandler = (chatId: string, text: string) => Promise<string>;
+export interface TelegramReply {
+  text: string;
+  replyMarkup?: InlineKeyboardMarkup;
+}
+
+export interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
+}
+
+interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+
+type CommandHandler = (chatId: string, text: string) => Promise<string | TelegramReply>;
 
 interface TelegramUpdate {
   update_id: number;
   message?: {
     chat: { id: number | string };
     text?: string;
+  };
+  callback_query?: {
+    id: string;
+    data?: string;
+    message?: {
+      chat: { id: number | string };
+    };
   };
 }
 
@@ -69,11 +90,29 @@ export class TelegramBot {
         const updates = await this.api<TelegramUpdate[]>('getUpdates', {
           offset: this.offset,
           timeout: 25,
-          allowed_updates: ['message'],
+          allowed_updates: ['message', 'callback_query'],
         });
 
         for (const update of updates) {
           this.offset = update.update_id + 1;
+          const callbackQuery = update.callback_query;
+          if (callbackQuery) {
+            const chatId = callbackQuery.message?.chat.id;
+            const data = callbackQuery.data?.trim();
+            if (!data || chatId === undefined) continue;
+
+            const chatIdString = String(chatId);
+            if (this.defaultChatId && chatIdString !== this.defaultChatId) {
+              await this.answerCallbackQuery(callbackQuery.id, 'Unauthorized chat.');
+              continue;
+            }
+
+            const reply = await this.commandHandler(chatIdString, `/callback ${data}`);
+            await this.answerCallbackQuery(callbackQuery.id);
+            await this.sendReply(chatIdString, reply);
+            continue;
+          }
+
           const text = update.message?.text?.trim();
           const chatId = update.message?.chat.id;
           if (!text || chatId === undefined) continue;
@@ -85,7 +124,7 @@ export class TelegramBot {
           }
 
           const reply = await this.commandHandler(chatIdString, text);
-          await this.sendMessage(chatIdString, reply);
+          await this.sendReply(chatIdString, reply);
         }
       } catch (err) {
         log.warn('Telegram polling error', this.describeError(err));
@@ -94,12 +133,32 @@ export class TelegramBot {
     }
   }
 
-  private async sendMessage(chatId: string, text: string): Promise<void> {
+  private async sendReply(chatId: string, reply: string | TelegramReply): Promise<void> {
+    if (typeof reply === 'string') {
+      await this.sendMessage(chatId, reply);
+      return;
+    }
+    await this.sendMessage(chatId, reply.text, reply.replyMarkup);
+  }
+
+  private async sendMessage(
+    chatId: string,
+    text: string,
+    replyMarkup?: InlineKeyboardMarkup
+  ): Promise<void> {
     await this.api('sendMessage', {
       chat_id: chatId,
       text,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    });
+  }
+
+  private async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    await this.api('answerCallbackQuery', {
+      callback_query_id: callbackQueryId,
+      ...(text ? { text } : {}),
     });
   }
 
@@ -139,7 +198,7 @@ export class TelegramBot {
   private formatSampleCard(event: MonitorSampleEvent): string {
     const metrics = event.metrics;
     return [
-      '<b>GMGN Sample</b>',
+      `<b>${this.escapeHtml(this.short(event.walletAddress))} / ${this.escapeHtml(this.short(metrics.mint))}</b>`,
       `Wallet: <code>${this.escapeHtml(this.short(event.walletAddress))}</code>`,
       `Token: <code>${this.escapeHtml(metrics.mint)}</code>`,
       `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,

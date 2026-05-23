@@ -19,7 +19,7 @@ import { RateLimiter } from './rate-limiter';
 import { GmgnClient } from './gmgn-client';
 import { Scheduler } from './scheduler';
 import { WalletMonitor } from './wallet-monitor';
-import { TelegramBot } from './telegram-bot';
+import { TelegramBot, TelegramReply } from './telegram-bot';
 import { startHealthServer } from './health-server';
 import { MonitorSampleEvent, NewTokenEvent, TokenSummary } from './types';
 import { PublicKey } from '@solana/web3.js';
@@ -59,6 +59,7 @@ async function main(): Promise<void> {
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
+  const pendingTelegramActions = new Map<string, 'addwallet' | 'removewallet'>();
 
   function wireWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
@@ -110,47 +111,141 @@ async function main(): Promise<void> {
     return `Stopped monitoring ${normalized}`;
   }
 
-  async function handleTelegramCommand(_chatId: string, text: string): Promise<string> {
-    const [command, arg] = text.split(/\s+/, 2);
-    const html = (value: string): string =>
-      value
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+  const html = (value: string): string =>
+    value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+  function walletSummaryReply(address: string): TelegramReply {
+    const normalized = new PublicKey(address).toBase58();
+    const isMonitoring = walletMonitors.has(normalized);
+    const action = isMonitoring ? 'remove' : 'add';
+    const buttonText = isMonitoring ? 'Remove wallet' : 'Add wallet';
+
+    return {
+      text: [
+        '<b>Wallet</b>',
+        `<code>${html(normalized)}</code>`,
+        '',
+        `Status: <b>${isMonitoring ? 'Monitoring' : 'Not monitoring'}</b>`,
+        `Tokens seen: ${db.tokenCountForWallet(normalized)}`,
+        `Samples stored: ${db.sampleCountForWallet(normalized)}`,
+      ].join('\n'),
+      replyMarkup: {
+        inline_keyboard: [[
+          {
+            text: buttonText,
+            callback_data: `wallet:${action}:${normalized}`,
+          },
+        ]],
+      },
+    };
+  }
+
+  function homeReply(): TelegramReply {
+    return {
+      text: [
+        '<b>GMGN Bundler Monitor</b>',
+        '',
+        `Wallets monitored: <b>${walletMonitors.size}</b>`,
+        `Active token windows: <b>${scheduler.activeCount}</b>`,
+        `Monitor window: ${Math.round(config.monitoringWindowMs / 1_000)}s`,
+        `Poll interval: ${config.monitorInterval}ms`,
+        '',
+        'Send any Solana wallet address to preview it, then add or remove it with one tap.',
+      ].join('\n'),
+      replyMarkup: {
+        inline_keyboard: [
+          [
+            { text: 'Add wallet', callback_data: 'menu:addwallet' },
+            { text: 'Remove wallet', callback_data: 'menu:removewallet' },
+          ],
+          [
+            { text: 'Wallets', callback_data: 'menu:wallets' },
+            { text: 'Status', callback_data: 'menu:status' },
+          ],
+        ],
+      },
+    };
+  }
+
+  function walletsReply(): string {
+    const wallets = [...walletMonitors.keys()];
+    return wallets.length
+      ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w) => `- <code>${html(w)}</code>`).join('\n')}`
+      : 'No wallets are being monitored.';
+  }
+
+  function statusReply(): string {
+    return [
+      `Wallets: ${walletMonitors.size}`,
+      `Active tokens: ${scheduler.activeCount}`,
+      `Window: ${Math.round(config.monitoringWindowMs / 1_000)}s`,
+      `Interval: ${config.monitorInterval}ms`,
+    ].join('\n');
+  }
+
+  async function handleTelegramCommand(_chatId: string, text: string): Promise<string | TelegramReply> {
+    const chatId = _chatId;
+    const [command] = text.split(/\s+/, 1);
 
     try {
+      if (command === '/callback') {
+        const [, data] = text.split(/\s+/, 2);
+        if (data === 'menu:addwallet') {
+          pendingTelegramActions.set(chatId, 'addwallet');
+          return 'Send the Solana wallet address to add.';
+        }
+        if (data === 'menu:removewallet') {
+          pendingTelegramActions.set(chatId, 'removewallet');
+          return 'Send the Solana wallet address to remove.';
+        }
+        if (data === 'menu:wallets') return walletsReply();
+        if (data === 'menu:status') return statusReply();
+
+        const [kind, action, address] = data?.split(':') ?? [];
+        if (kind !== 'wallet' || !address) return 'Invalid button action.';
+        if (action === 'add') return html(await startWallet(address));
+        if (action === 'remove') return html(stopWallet(address));
+        return 'Invalid button action.';
+      }
+
+      const pendingAction = pendingTelegramActions.get(chatId);
+      if (pendingAction && !text.startsWith('/')) {
+        pendingTelegramActions.delete(chatId);
+        if (pendingAction === 'addwallet') {
+          return html(await startWallet(text));
+        }
+        return html(stopWallet(text));
+      }
+
+      if (command === '/cancel') {
+        pendingTelegramActions.delete(chatId);
+        return 'Cancelled.';
+      }
       if (command === '/start' || command === '/help') {
-        return [
-          'GMGN wallet monitor',
-          '',
-          '/addwallet &lt;address&gt;',
-          '/removewallet &lt;address&gt;',
-          '/wallets',
-          '/status',
-        ].join('\n');
+        return homeReply();
       }
       if (command === '/addwallet') {
-        if (!arg) return 'Usage: /addwallet &lt;solana_wallet_address&gt;';
-        return await startWallet(arg);
+        pendingTelegramActions.set(chatId, 'addwallet');
+        return 'Send the Solana wallet address to add.';
       }
       if (command === '/removewallet') {
-        if (!arg) return 'Usage: /removewallet &lt;solana_wallet_address&gt;';
-        return stopWallet(arg);
+        pendingTelegramActions.set(chatId, 'removewallet');
+        return 'Send the Solana wallet address to remove.';
       }
       if (command === '/wallets') {
-        const wallets = [...walletMonitors.keys()];
-        return wallets.length
-          ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w) => `- <code>${html(w)}</code>`).join('\n')}`
-          : 'No wallets are being monitored.';
+        return walletsReply();
       }
       if (command === '/status') {
-        return [
-          `Wallets: ${walletMonitors.size}`,
-          `Active tokens: ${scheduler.activeCount}`,
-          `Window: ${Math.round(config.monitoringWindowMs / 1_000)}s`,
-          `Interval: ${config.monitorInterval}ms`,
-        ].join('\n');
+        return statusReply();
       }
+
+      if (!text.startsWith('/')) {
+        return walletSummaryReply(text);
+      }
+
       return 'Unknown command. Send /help.';
     } catch (err) {
       return html(err instanceof Error ? err.message : String(err));

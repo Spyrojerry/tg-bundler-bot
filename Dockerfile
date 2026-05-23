@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY package*.json ./
 RUN npm ci
+RUN npm install -g gmgn-cli
 
 COPY . .
 RUN npm run build

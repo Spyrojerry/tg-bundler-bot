@@ -17,8 +17,8 @@
 
 import { createLogger } from './logger';
 import { RateLimiter } from './rate-limiter';
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import { execFile } from 'child_process';
+import * as path from 'path';
 import {
   BundlerMetrics,
   FetchResult,
@@ -39,8 +39,6 @@ const BLOCKED_RETRY_MS = 60_000;
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
-
-const execAsync = promisify(exec);
 
 function getSpawnEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -71,7 +69,55 @@ export class GmgnClient {
   // ── Public: fetch bundler metrics for one token ───────────────────────────
 
   async fetchBundlerMetrics(mint: string): Promise<FetchResult> {
-    return this.fetchWithCli(mint);
+    if (this.fetchMode === 'direct') {
+      return this.fetchDirect(mint);
+    }
+
+    if (this.fetchMode === 'cli') {
+      return this.fetchWithCli(mint);
+    }
+
+    const direct = await this.fetchDirect(mint);
+    if (direct.success && this.hasBundlerData(direct.metrics)) {
+      return direct;
+    }
+
+    const cli = await this.fetchWithCli(mint);
+    if (cli.success) return cli;
+
+    if (direct.success) return direct;
+
+    return {
+      success: false,
+      error: `direct failed: ${direct.error}; cli failed: ${cli.error}`,
+      retryAfterMs: direct.retryAfterMs ?? cli.retryAfterMs,
+      nonRetryable: direct.nonRetryable && cli.nonRetryable,
+    };
+  }
+
+  private async fetchDirect(mint: string): Promise<FetchResult> {
+    const endpoints = ['v1/token/security', 'v1/token/info'];
+    let firstSuccess: FetchResult | null = null;
+    let lastError = '';
+
+    for (const endpoint of endpoints) {
+      const result = await this.fetchWithRetry(endpoint, mint);
+
+      if (result.success) {
+        firstSuccess ??= result;
+        if (this.hasBundlerData(result.metrics)) return result;
+        continue;
+      }
+
+      lastError = result.error;
+
+      if (result.retryAfterMs !== undefined || result.nonRetryable) {
+        return result;
+      }
+    }
+
+    if (firstSuccess?.success) return firstSuccess;
+    return { success: false, error: lastError || 'GMGN direct endpoints failed' };
   }
 
   // ── Internal: fetch with retry ────────────────────────────────────────────
@@ -188,7 +234,7 @@ export class GmgnClient {
   }
 
   private async fetchWithCli(mint: string): Promise<FetchResult> {
-    const commands = ['security', 'info'];
+    const commands = ['info'];
     let firstSuccess: FetchResult | null = null;
     let lastError = '';
 
@@ -223,15 +269,16 @@ export class GmgnClient {
     log.debug(`gmgn-cli token ${command} ${mint}`);
 
     try {
-      const cmd =
-        `npx --yes gmgn-cli token ${command} ` +
-        `--chain ${this.chain} --address ${mint} --raw`;
+      const stdout = await this.execGmgnCli([
+        'token',
+        command,
+        '--chain',
+        this.chain,
+        '--address',
+        mint,
+        '--raw',
+      ]);
 
-      const { stdout } = await execAsync(cmd, {
-        timeout: REQUEST_TIMEOUT,
-        maxBuffer: 1024 * 1024,
-        env: getSpawnEnv(),
-      });
       const jsonStart = stdout.indexOf('{');
       if (jsonStart === -1) {
         return { success: false, error: `gmgn-cli ${command} returned no JSON` };
@@ -243,6 +290,29 @@ export class GmgnClient {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: `gmgn-cli ${command} failed: ${message}` };
     }
+  }
+
+  private execGmgnCli(args: string[]): Promise<string> {
+    const env = getSpawnEnv();
+    const localBin = `${process.cwd()}/node_modules/.bin`;
+    const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'PATH';
+    env[pathKey] = env[pathKey] ? `${localBin}${path.delimiter}${env[pathKey]}` : localBin;
+
+    return new Promise((resolve, reject) => {
+      execFile('gmgn-cli', args, {
+        timeout: REQUEST_TIMEOUT,
+        maxBuffer: 1024 * 1024,
+        env,
+        windowsHide: true,
+      }, (err, stdout, stderr) => {
+        if (err) {
+          const detail = stderr.trim() || err.message;
+          reject(new Error(detail));
+          return;
+        }
+        resolve(stdout);
+      });
+    });
   }
 
   private getRetryDelayMs(resp: Response): number | undefined {
