@@ -1,0 +1,320 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  gmgn-client.ts  —  GMGN OpenAPI REST client
+//
+//  Bundler data comes from two endpoints:
+//    1.  GET /v1/token/security?chain=sol&address=<mint>
+//        Fields: bundler_trader_amount_rate, bundle_num / bundler_count
+//
+//    2.  GET /v1/token/info?chain=sol&address=<mint>   (fallback)
+//        Some GMGN plan tiers surface bundler fields here instead.
+//
+//  Authentication: GMGN_API_KEY sent as  X-API-KEY  header.
+//  (Ed25519 signing is only required for swap/order endpoints.)
+//
+//  Rate limits: Not published. Community observation ~2 req/s.
+//  We rely on RateLimiter for all throttling — this module just fires requests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { createLogger } from './logger';
+import { RateLimiter } from './rate-limiter';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import {
+  BundlerMetrics,
+  FetchResult,
+  GmgnSecurityResponse,
+  ServiceConfig,
+} from './types';
+
+const log = createLogger('GMGN');
+
+// ── Retry config ──────────────────────────────────────────────────────────────
+
+const MAX_RETRIES      = 3;
+const BASE_RETRY_MS    = 1_000;
+const REQUEST_TIMEOUT  = 15_000;  // ms
+const BLOCKED_RETRY_MS = 60_000;
+
+// ── Helper: sleep ─────────────────────────────────────────────────────────────
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((r) => setTimeout(r, ms));
+
+const execAsync = promisify(exec);
+
+function getSpawnEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+// ── GmgnClient ────────────────────────────────────────────────────────────────
+
+export class GmgnClient {
+  private readonly baseUrl: string;
+  private readonly apiKey:  string;
+  private readonly fetchMode: ServiceConfig['gmgnFetchMode'];
+  private readonly chain  = 'sol';
+  private readonly limiter: RateLimiter;
+  private readonly baselineMinTime: number;
+
+  constructor(config: ServiceConfig, limiter: RateLimiter) {
+    this.baseUrl          = config.gmgnApiBaseUrl.replace(/\/$/, '');
+    this.apiKey           = config.gmgnApiKey;
+    this.fetchMode        = config.gmgnFetchMode;
+    this.limiter          = limiter;
+    this.baselineMinTime  = config.rateLimitMinTime;
+  }
+
+  // ── Public: fetch bundler metrics for one token ───────────────────────────
+
+  async fetchBundlerMetrics(mint: string): Promise<FetchResult> {
+    return this.fetchWithCli(mint);
+  }
+
+  // ── Internal: fetch with retry ────────────────────────────────────────────
+
+  private async fetchWithRetry(
+    endpoint: string,
+    mint: string
+  ): Promise<FetchResult> {
+    let lastError = '';
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const delay = BASE_RETRY_MS * 2 ** (attempt - 1);
+        log.debug(`Retry ${attempt}/${MAX_RETRIES} for ${mint} in ${delay}ms`);
+        await sleep(delay);
+      }
+
+      const result = await this.limiter.schedule(() =>
+        this.doRequest(endpoint, mint)
+      );
+
+      if (result.success) {
+        this.limiter.onSuccess(this.baselineMinTime);
+        return result;
+      }
+
+      lastError = result.error;
+
+      // 429 / blocked → activate backoff but don't retry here.
+      if (result.retryAfterMs !== undefined) {
+        this.limiter.onRateLimited(result.retryAfterMs);
+        return result;
+      }
+
+      if (result.nonRetryable) return result;
+    }
+
+    return { success: false, error: lastError };
+  }
+
+  // ── Internal: single HTTP request ─────────────────────────────────────────
+
+  private async doRequest(
+    endpoint: string,
+    mint: string
+  ): Promise<FetchResult> {
+    const url = `${this.baseUrl}/${endpoint}?chain=${this.chain}&address=${mint}`;
+
+    log.debug(`GET ${url}`);
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'X-API-KEY': this.apiKey,
+          Accept: 'application/json',
+          'User-Agent': 'gmgn-monitor/1.0',
+        },
+        signal: controller.signal,
+      });
+
+      clearTimeout(timer);
+
+      // ── 429 Too Many Requests ─────────────────────────────────────────────
+      if (resp.status === 429) {
+        const retryMs = this.getRetryDelayMs(resp) ?? BLOCKED_RETRY_MS;
+        return {
+          success: false,
+          error: 'Rate limited (429)',
+          retryAfterMs: retryMs,
+        };
+      }
+
+      // ── Other HTTP errors ─────────────────────────────────────────────────
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => '');
+        const isHtml = body.trimStart().startsWith('<');
+        const error = isHtml
+          ? `HTTP ${resp.status}: non-JSON response from GMGN host`
+          : `HTTP ${resp.status}`;
+        log.warn(`${error} from ${endpoint}`, { body: body.slice(0, 200) });
+
+        return {
+          success: false,
+          error,
+          retryAfterMs: resp.status === 403 ? BLOCKED_RETRY_MS : undefined,
+          nonRetryable: resp.status >= 400 && resp.status < 500,
+        };
+      }
+
+      // ── Parse JSON ────────────────────────────────────────────────────────
+      const json = (await resp.json()) as GmgnSecurityResponse;
+
+      if (json.code !== undefined && json.code !== 0) {
+        return { success: false, error: `GMGN error: ${json.msg}` };
+      }
+
+      const data = this.unwrapResponseData(json);
+      if (!data) {
+        return { success: false, error: 'Empty data payload' };
+      }
+
+      return { success: true, metrics: this.parseMetrics(mint, data) };
+
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        return { success: false, error: `Request timeout after ${REQUEST_TIMEOUT}ms` };
+      }
+      return { success: false, error: String(err) };
+    }
+  }
+
+  private async fetchWithCli(mint: string): Promise<FetchResult> {
+    const commands = ['security', 'info'];
+    let firstSuccess: FetchResult | null = null;
+    let lastError = '';
+
+    for (const command of commands) {
+      const result = await this.limiter.schedule(() =>
+        this.doCliRequest(command, mint)
+      );
+
+      if (result.success) {
+        this.limiter.onSuccess(this.baselineMinTime);
+        firstSuccess ??= result;
+        if (this.hasBundlerData(result.metrics)) return result;
+        continue;
+      }
+
+      lastError = result.error;
+    }
+
+    if (firstSuccess?.success) return firstSuccess;
+    return { success: false, error: lastError || 'GMGN CLI endpoints failed' };
+  }
+
+  private hasBundlerData(metrics: BundlerMetrics): boolean {
+    return metrics.bundlersPercent !== null || metrics.bundlersCount !== null;
+  }
+
+  private async doCliRequest(command: string, mint: string): Promise<FetchResult> {
+    if (!/^[1-9A-HJ-NP-Za-km-z]+$/.test(mint)) {
+      return { success: false, error: `Invalid mint for gmgn-cli: ${mint}` };
+    }
+
+    log.debug(`gmgn-cli token ${command} ${mint}`);
+
+    try {
+      const cmd =
+        `npx --yes gmgn-cli token ${command} ` +
+        `--chain ${this.chain} --address ${mint} --raw`;
+
+      const { stdout } = await execAsync(cmd, {
+        timeout: REQUEST_TIMEOUT,
+        maxBuffer: 1024 * 1024,
+        env: getSpawnEnv(),
+      });
+      const jsonStart = stdout.indexOf('{');
+      if (jsonStart === -1) {
+        return { success: false, error: `gmgn-cli ${command} returned no JSON` };
+      }
+
+      const data = JSON.parse(stdout.slice(jsonStart)) as Record<string, unknown>;
+      return { success: true, metrics: this.parseMetrics(mint, data) };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { success: false, error: `gmgn-cli ${command} failed: ${message}` };
+    }
+  }
+
+  private getRetryDelayMs(resp: Response): number | undefined {
+    const retryAfter = resp.headers.get('Retry-After');
+    if (retryAfter) {
+      const seconds = parseInt(retryAfter, 10);
+      if (!Number.isNaN(seconds) && seconds > 0) return seconds * 1_000;
+    }
+
+    const reset = resp.headers.get('X-RateLimit-Reset');
+    if (reset) {
+      const resetSeconds = parseInt(reset, 10);
+      if (!Number.isNaN(resetSeconds) && resetSeconds > 0) {
+        return Math.max(resetSeconds * 1_000 - Date.now(), 1_000);
+      }
+    }
+
+    return undefined;
+  }
+
+  // ── Internal: extract bundler fields from raw API response ────────────────
+
+  private unwrapResponseData(json: GmgnSecurityResponse): Record<string, unknown> {
+    return (json.data ?? json) as Record<string, unknown>;
+  }
+
+  private parseMetrics(
+    mint: string,
+    d: Record<string, unknown>
+  ): BundlerMetrics {
+    const stat = this.asRecord(d.stat);
+    const walletTagsStat = this.asRecord(d.wallet_tags_stat);
+
+    // GMGN token info exposes this as a 0-1 fraction under stat.
+    const rawRate = this.parseNullableNumber(
+      stat.top_bundler_trader_percentage ??
+      d.top_bundler_trader_percentage ??
+      d.bundler_trader_amount_rate ??
+      d.bundled_amount_rate
+    );
+    const bundlersPercent =
+      rawRate !== null ? parseFloat((rawRate * 100).toFixed(4)) : null;
+
+    const bundlersCount = this.parseNullableNumber(
+      walletTagsStat.bundler_wallets ??
+      d.bundler_wallets ??
+      d.bundle_num ??
+      d.bundler_count
+    );
+
+    return {
+      mint,
+      timestamp: new Date().toISOString(),
+      bundlersPercent,
+      bundlersCount: bundlersCount !== null ? Math.round(bundlersCount) : null,
+      bundledAmountRate: rawRate,
+      rawData: JSON.stringify(d),
+    };
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object'
+      ? value as Record<string, unknown>
+      : {};
+  }
+
+  private parseNullableNumber(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '') {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  }
+}

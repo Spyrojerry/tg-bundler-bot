@@ -1,0 +1,28 @@
+app = "gmgn-monitor"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DB_PATH = "/data/monitor.db"
+  PORT = "8080"
+  GMGN_FETCH_MODE = "cli"
+  LOG_LEVEL = "info"
+
+[mounts]
+  source = "gmgn_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "2s"
+    method = "GET"
+    path = "/health"
