@@ -61,7 +61,7 @@ async function main(): Promise<void> {
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
   const pendingTelegramActions = new Map<string, 'addwallet' | 'removewallet'>();
-  let monitoringPaused = false;
+  const pausedWallets = new Set<string>();
 
   function wireWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
@@ -94,13 +94,10 @@ async function main(): Promise<void> {
     db.addWallet(normalized);
     const monitor = new WalletMonitor(config, normalized);
     wireWalletMonitor(monitor);
-    if (!monitoringPaused) {
-      await monitor.start();
-    }
+    pausedWallets.delete(normalized);
+    await monitor.start();
     walletMonitors.set(normalized, monitor);
-    return monitoringPaused
-      ? `Added wallet <code>${normalized}</code>; monitoring is paused`
-      : `Monitoring wallet <code>${normalized}</code>`;
+    return `Monitoring wallet <code>${normalized}</code>`;
   }
 
   function stopWallet(address: string): string {
@@ -113,26 +110,29 @@ async function main(): Promise<void> {
 
     monitor.stop();
     walletMonitors.delete(normalized);
+    pausedWallets.delete(normalized);
     db.removeWallet(normalized);
     return `Stopped monitoring <code>${normalized}</code>`;
   }
 
-  async function pauseMonitoring(): Promise<string> {
-    if (monitoringPaused) return 'Monitoring is already paused.';
-    monitoringPaused = true;
-    for (const monitor of walletMonitors.values()) {
-      monitor.stop();
-    }
-    return `Paused monitoring for ${walletMonitors.size} wallet(s).`;
+  function pauseWallet(address: string): string {
+    const normalized = new PublicKey(address).toBase58();
+    const monitor = walletMonitors.get(normalized);
+    if (!monitor) return `Wallet is not monitored: <code>${normalized}</code>`;
+    if (pausedWallets.has(normalized)) return `Wallet is already paused: <code>${normalized}</code>`;
+    monitor.stop();
+    pausedWallets.add(normalized);
+    return `Paused monitoring <code>${normalized}</code>`;
   }
 
-  async function resumeMonitoring(): Promise<string> {
-    if (!monitoringPaused) return 'Monitoring is already running.';
-    monitoringPaused = false;
-    for (const monitor of walletMonitors.values()) {
-      await monitor.start();
-    }
-    return `Continued monitoring for ${walletMonitors.size} wallet(s).`;
+  async function resumeWallet(address: string): Promise<string> {
+    const normalized = new PublicKey(address).toBase58();
+    const monitor = walletMonitors.get(normalized);
+    if (!monitor) return `Wallet is not monitored: <code>${normalized}</code>`;
+    if (!pausedWallets.has(normalized)) return `Wallet is already running: <code>${normalized}</code>`;
+    pausedWallets.delete(normalized);
+    await monitor.start();
+    return `Continued monitoring <code>${normalized}</code>`;
   }
 
   const html = (value: string): string =>
@@ -141,44 +141,57 @@ async function main(): Promise<void> {
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
 
-  function walletSummaryReply(address: string): TelegramReply {
+  function walletSummaryReply(address: string, editCurrent = false): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
     const isMonitoring = walletMonitors.has(normalized);
-    const action = isMonitoring ? 'remove' : 'add';
-    const buttonText = isMonitoring ? 'Remove wallet' : 'Add wallet';
+    const isPaused = pausedWallets.has(normalized);
+    const status = !isMonitoring ? 'Not monitoring' : isPaused ? 'Paused' : 'Monitoring';
+    const actionButton = !isMonitoring
+      ? { text: 'Add wallet', callback_data: `wallet:add:${normalized}` }
+      : { text: 'Remove wallet', callback_data: `wallet:remove:${normalized}` };
+    const pauseButton = isPaused
+      ? { text: 'Continue monitoring', callback_data: `wallet:resume:${normalized}` }
+      : { text: 'Pause monitoring', callback_data: `wallet:pause:${normalized}` };
 
     return {
       text: [
         '<b>Wallet</b>',
         `<code>${html(normalized)}</code>`,
         '',
-        `Status: <b>${isMonitoring ? 'Monitoring' : 'Not monitoring'}</b>`,
+        `Status: <b>${status}</b>`,
         `Tokens seen: ${db.tokenCountForWallet(normalized)}`,
         `Samples stored: ${db.sampleCountForWallet(normalized)}`,
       ].join('\n'),
       replyMarkup: {
-        inline_keyboard: [[
-          {
-            text: buttonText,
-            callback_data: `wallet:${action}:${normalized}`,
-          },
-        ]],
+        inline_keyboard: isMonitoring
+          ? [
+              [actionButton],
+              [pauseButton],
+              [{ text: 'Refresh', callback_data: `wallet:refresh:${normalized}` }],
+            ]
+          : [
+              [actionButton],
+              [{ text: 'Refresh', callback_data: `wallet:refresh:${normalized}` }],
+            ],
       },
+      editCurrent,
     };
   }
 
-  function homeReply(): TelegramReply {
+  function homeReply(editCurrent = false): TelegramReply {
     const wallets = [...walletMonitors.keys()];
     const walletLines = wallets.length
       ? wallets.map((wallet, index) => `${index + 1}. <code>${html(wallet)}</code>`)
       : ['No wallets are currently monitored.'];
+    const runningWallets = wallets.length - pausedWallets.size;
 
     return {
       text: [
         '<b>GMGN Bundler Monitor</b>',
         '',
         `Wallets monitored: <b>${walletMonitors.size}</b>`,
-        `Monitoring: <b>${monitoringPaused ? 'Paused' : 'Running'}</b>`,
+        `Running wallets: <b>${runningWallets}</b>`,
+        `Paused wallets: <b>${pausedWallets.size}</b>`,
         `Active token windows: <b>${scheduler.activeCount}</b>`,
         `Monitor window: ${Math.round(config.monitoringWindowMs / 1_000)}s`,
         `Poll interval: ${config.monitorInterval}ms`,
@@ -196,15 +209,15 @@ async function main(): Promise<void> {
             { text: 'Remove wallet', callback_data: 'menu:removewallet' },
           ],
           [
-            monitoringPaused
-              ? { text: 'Continue monitoring', callback_data: 'menu:resume' }
-              : { text: 'Pause monitoring', callback_data: 'menu:pause' },
+            { text: 'Wallets', callback_data: 'menu:wallets' },
+            { text: 'Status', callback_data: 'menu:status' },
           ],
           [
             { text: 'Refresh', callback_data: 'menu:refresh' },
           ],
         ],
       },
+      editCurrent,
     };
   }
 
@@ -239,16 +252,29 @@ async function main(): Promise<void> {
           pendingTelegramActions.set(chatId, 'removewallet');
           return 'Send the Solana wallet address to remove.';
         }
-        if (data === 'menu:pause') return await pauseMonitoring();
-        if (data === 'menu:resume') return await resumeMonitoring();
-        if (data === 'menu:refresh') return homeReply();
+        if (data === 'menu:refresh') return homeReply(true);
         if (data === 'menu:wallets') return walletsReply();
         if (data === 'menu:status') return statusReply();
 
         const [kind, action, address] = data?.split(':') ?? [];
         if (kind !== 'wallet' || !address) return 'Invalid button action.';
-        if (action === 'add') return await startWallet(address);
-        if (action === 'remove') return stopWallet(address);
+        if (action === 'add') {
+          await startWallet(address);
+          return walletSummaryReply(address, true);
+        }
+        if (action === 'remove') {
+          stopWallet(address);
+          return walletSummaryReply(address, true);
+        }
+        if (action === 'pause') {
+          pauseWallet(address);
+          return walletSummaryReply(address, true);
+        }
+        if (action === 'resume') {
+          await resumeWallet(address);
+          return walletSummaryReply(address, true);
+        }
+        if (action === 'refresh') return walletSummaryReply(address, true);
         return 'Invalid button action.';
       }
 

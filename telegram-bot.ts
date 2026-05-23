@@ -6,6 +6,7 @@ const log = createLogger('TG');
 export interface TelegramReply {
   text: string;
   replyMarkup?: InlineKeyboardMarkup;
+  editCurrent?: boolean;
 }
 
 export interface InlineKeyboardMarkup {
@@ -29,6 +30,7 @@ interface TelegramUpdate {
     id: string;
     data?: string;
     message?: {
+      message_id: number;
       chat: { id: number | string };
     };
   };
@@ -109,7 +111,7 @@ export class TelegramBot {
 
             const reply = await this.commandHandler(chatIdString, `/callback ${data}`);
             await this.answerCallbackQuery(callbackQuery.id);
-            await this.sendReply(chatIdString, reply);
+            await this.sendReply(chatIdString, reply, callbackQuery.message?.message_id);
             continue;
           }
 
@@ -133,9 +135,17 @@ export class TelegramBot {
     }
   }
 
-  private async sendReply(chatId: string, reply: string | TelegramReply): Promise<void> {
+  private async sendReply(
+    chatId: string,
+    reply: string | TelegramReply,
+    messageId?: number
+  ): Promise<void> {
     if (typeof reply === 'string') {
       await this.sendMessage(chatId, reply);
+      return;
+    }
+    if (reply.editCurrent && messageId !== undefined) {
+      await this.editMessage(chatId, messageId, reply.text, reply.replyMarkup);
       return;
     }
     await this.sendMessage(chatId, reply.text, reply.replyMarkup);
@@ -159,6 +169,22 @@ export class TelegramBot {
     await this.api('answerCallbackQuery', {
       callback_query_id: callbackQueryId,
       ...(text ? { text } : {}),
+    });
+  }
+
+  private async editMessage(
+    chatId: string,
+    messageId: number,
+    text: string,
+    replyMarkup?: InlineKeyboardMarkup
+  ): Promise<void> {
+    await this.api('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
   }
 
