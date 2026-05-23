@@ -86,7 +86,7 @@ async function main(): Promise<void> {
   async function startWallet(address: string): Promise<string> {
     const normalized = new PublicKey(address).toBase58();
     if (walletMonitors.has(normalized)) {
-      return `Already monitoring ${normalized}`;
+      return `Already monitoring <code>${normalized}</code>`;
     }
 
     db.addWallet(normalized);
@@ -94,7 +94,7 @@ async function main(): Promise<void> {
     wireWalletMonitor(monitor);
     await monitor.start();
     walletMonitors.set(normalized, monitor);
-    return `Monitoring wallet ${normalized}`;
+    return `Monitoring wallet <code>${normalized}</code>`;
   }
 
   function stopWallet(address: string): string {
@@ -102,13 +102,13 @@ async function main(): Promise<void> {
     const monitor = walletMonitors.get(normalized);
     if (!monitor) {
       db.removeWallet(normalized);
-      return `Wallet was not running: ${normalized}`;
+      return `Wallet was not running: <code>${normalized}</code>`;
     }
 
     monitor.stop();
     walletMonitors.delete(normalized);
     db.removeWallet(normalized);
-    return `Stopped monitoring ${normalized}`;
+    return `Stopped monitoring <code>${normalized}</code>`;
   }
 
   const html = (value: string): string =>
@@ -144,6 +144,11 @@ async function main(): Promise<void> {
   }
 
   function homeReply(): TelegramReply {
+    const wallets = [...walletMonitors.keys()];
+    const walletLines = wallets.length
+      ? wallets.map((wallet, index) => `${index + 1}. <code>${html(wallet)}</code>`)
+      : ['No wallets are currently monitored.'];
+
     return {
       text: [
         '<b>GMGN Bundler Monitor</b>',
@@ -152,6 +157,9 @@ async function main(): Promise<void> {
         `Active token windows: <b>${scheduler.activeCount}</b>`,
         `Monitor window: ${Math.round(config.monitoringWindowMs / 1_000)}s`,
         `Poll interval: ${config.monitorInterval}ms`,
+        '',
+        '<b>Monitored Wallets</b>',
+        ...walletLines,
         '',
         'Send any Solana wallet address to preview it, then add or remove it with one tap.',
       ].join('\n'),
@@ -206,8 +214,8 @@ async function main(): Promise<void> {
 
         const [kind, action, address] = data?.split(':') ?? [];
         if (kind !== 'wallet' || !address) return 'Invalid button action.';
-        if (action === 'add') return html(await startWallet(address));
-        if (action === 'remove') return html(stopWallet(address));
+        if (action === 'add') return await startWallet(address);
+        if (action === 'remove') return stopWallet(address);
         return 'Invalid button action.';
       }
 
@@ -215,9 +223,9 @@ async function main(): Promise<void> {
       if (pendingAction && !text.startsWith('/')) {
         pendingTelegramActions.delete(chatId);
         if (pendingAction === 'addwallet') {
-          return html(await startWallet(text));
+          return await startWallet(text);
         }
-        return html(stopWallet(text));
+        return stopWallet(text);
       }
 
       if (command === '/cancel') {
