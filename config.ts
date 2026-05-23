@@ -36,6 +36,16 @@ function optionalInt(key: string, defaultVal: number): number {
   return n;
 }
 
+function optionalNumber(key: string, defaultVal: number): number {
+  const raw = process.env[key]?.trim();
+  if (!raw) return defaultVal;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`${key} must be a non-negative number, got: ${raw}`);
+  }
+  return n;
+}
+
 function optionalNullable(key: string): string | null {
   const val = process.env[key]?.trim();
   return val ? val : null;
@@ -62,6 +72,7 @@ export function loadConfig(): ServiceConfig {
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
 
   const walletPollInterval     = optionalInt('WALLET_POLL_INTERVAL', 5_000);
+  const minBuySol              = optionalNumber('MIN_BUY_SOL', 8);
   const monitorInterval        = optionalInt('MONITOR_INTERVAL', 2_000);
   const monitoringWindowMs     = optionalInt('MONITOR_WINDOW_MS', 60_000);
   const rateLimitMinTime       = optionalInt('RATE_LIMIT_MIN_TIME', 500);
@@ -91,6 +102,7 @@ export function loadConfig(): ServiceConfig {
     solanaRpcUrl,
     solanaWsUrl,
     walletPollInterval,
+    minBuySol,
     gmgnApiKey,
     gmgnApiBaseUrl,
     gmgnFetchMode,

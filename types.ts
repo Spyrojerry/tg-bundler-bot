@@ -88,6 +88,7 @@ export interface ServiceConfig {
   solanaRpcUrl: string;
   solanaWsUrl: string;
   walletPollInterval: number;
+  minBuySol: number;
   gmgnApiKey: string;
   gmgnApiBaseUrl: string;
   gmgnFetchMode: 'auto' | 'direct' | 'cli';
@@ -107,6 +108,7 @@ export interface NewTokenEvent {
   walletAddress: string;
   mint: string;
   detectedAt: number;
+  buySol: number | null;
 }
 
 export interface MonitorSampleEvent {

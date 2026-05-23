@@ -10,6 +10,7 @@
 
 import {
   Connection,
+  LAMPORTS_PER_SOL,
   PublicKey,
   ParsedAccountData,
   TokenAccountBalancePair,
@@ -31,6 +32,7 @@ export class WalletMonitor extends EventEmitter {
   private readonly connection: Connection;
   private readonly walletPubkey: PublicKey;
   private readonly pollInterval: number;
+  private readonly minBuySol: number;
   private readonly wsEndpoint: string;
 
   /** Mints present at startup — we ignore these */
@@ -67,6 +69,7 @@ export class WalletMonitor extends EventEmitter {
     }
 
     this.pollInterval = config.walletPollInterval;
+    this.minBuySol = config.minBuySol;
     this.wsEndpoint = config.solanaWsUrl;
   }
 
@@ -163,7 +166,7 @@ export class WalletMonitor extends EventEmitter {
           continue;
         }
 
-        this.emitNewToken(holding.mint, now, holding.uiAmount ?? holding.amount, 'account-poll');
+        this.emitNewToken(holding.mint, now, holding.uiAmount ?? holding.amount, 'account-poll', null);
       }
     } catch (err) {
       log.error('Failed to poll wallet holdings', err);
@@ -213,20 +216,22 @@ export class WalletMonitor extends EventEmitter {
       const boughtMints = await this.fetchBoughtMintsFromSignature(signature);
       if (!boughtMints) return;
 
-      if (boughtMints.size === 0) {
+      if (boughtMints.length === 0) {
         log.debug(`[WS TX] ${signature} parsed: no wallet token balance increase`);
       }
 
-      for (const mint of boughtMints) {
-        log.info(`[WS BUY] ${signature} -> ${mint}`);
-        this.emitNewToken(mint, Date.now(), 'tx-detected', source);
+      for (const buy of boughtMints) {
+        log.info(`[WS BUY] ${signature} -> ${buy.mint}`, { buySol: buy.buySol });
+        this.emitNewToken(buy.mint, Date.now(), 'tx-detected', source, buy.buySol);
       }
     } finally {
       this.pendingSignatures.delete(signature);
     }
   }
 
-  private async fetchBoughtMintsFromSignature(signature: string): Promise<Set<string> | null> {
+  private async fetchBoughtMintsFromSignature(
+    signature: string
+  ): Promise<Array<{ mint: string; buySol: number | null }> | null> {
     const tx = await this.connection.getParsedTransaction(signature, {
       commitment: 'confirmed',
       maxSupportedTransactionVersion: 0,
@@ -240,6 +245,11 @@ export class WalletMonitor extends EventEmitter {
     const boughtMints = new Set<string>();
     const preBalances = tx.meta?.preTokenBalances ?? [];
     const postBalances = tx.meta?.postTokenBalances ?? [];
+    const accountKeys = tx.transaction.message.accountKeys;
+    const walletIndex = accountKeys.findIndex((key) =>
+      key.pubkey.equals(this.walletPubkey)
+    );
+    const buySol = this.estimateSolSpent(tx.meta?.preBalances, tx.meta?.postBalances, walletIndex);
 
     for (const post of postBalances) {
       if (post.owner !== this.walletPubkey.toBase58()) continue;
@@ -255,24 +265,60 @@ export class WalletMonitor extends EventEmitter {
       }
     }
 
-    return boughtMints;
+    return [...boughtMints].map((mint) => ({ mint, buySol }));
+  }
+
+  private estimateSolSpent(
+    preBalances: number[] | undefined,
+    postBalances: number[] | undefined,
+    walletIndex: number
+  ): number | null {
+    if (!preBalances || !postBalances || walletIndex < 0) return null;
+    const pre = preBalances[walletIndex];
+    const post = postBalances[walletIndex];
+    if (!Number.isFinite(pre) || !Number.isFinite(post)) return null;
+    const spentLamports = pre - post;
+    return spentLamports > 0
+      ? parseFloat((spentLamports / LAMPORTS_PER_SOL).toFixed(6))
+      : 0;
   }
 
   private emitNewToken(
     mint: string,
     detectedAt: number,
     amount: string | number,
-    source: string
+    source: string,
+    buySol: number | null
   ): void {
     if (this.knownMints.has(mint)) return;
 
+    if (this.minBuySol > 0) {
+      if (buySol === null) {
+        log.info(
+          `[SKIP TOKEN] Mint: ${mint}  Source: ${source}  ` +
+          `Reason: buy SOL unknown, min ${this.minBuySol} SOL required`
+        );
+        this.knownMints.add(mint);
+        return;
+      }
+      if (buySol < this.minBuySol) {
+        log.info(
+          `[SKIP TOKEN] Mint: ${mint}  Buy: ${buySol} SOL  ` +
+          `Min: ${this.minBuySol} SOL  Source: ${source}`
+        );
+        this.knownMints.add(mint);
+        return;
+      }
+    }
+
     this.knownMints.add(mint);
-    log.info(`[NEW TOKEN] Mint: ${mint}  Amount: ${amount}  Source: ${source}`);
+    log.info(`[NEW TOKEN] Mint: ${mint}  Amount: ${amount}  Source: ${source}  BuySOL: ${buySol ?? 'unknown'}`);
 
     const event: NewTokenEvent = {
       walletAddress: this.walletPubkey.toBase58(),
       mint,
       detectedAt,
+      buySol,
     };
     this.emit('newToken', event);
   }

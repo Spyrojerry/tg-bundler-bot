@@ -38,6 +38,7 @@ async function main(): Promise<void> {
     wallet:          config.walletAddress,
     rpc:             config.solanaRpcUrl,
     ws:              config.solanaWsUrl,
+    minBuySol:       config.minBuySol,
     gmgnFetchMode:   config.gmgnFetchMode,
     monitorInterval: config.monitorInterval,
     rateLimitMinTime: config.rateLimitMinTime,
@@ -60,6 +61,7 @@ async function main(): Promise<void> {
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
   const pendingTelegramActions = new Map<string, 'addwallet' | 'removewallet'>();
+  let monitoringPaused = false;
 
   function wireWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
@@ -92,9 +94,13 @@ async function main(): Promise<void> {
     db.addWallet(normalized);
     const monitor = new WalletMonitor(config, normalized);
     wireWalletMonitor(monitor);
-    await monitor.start();
+    if (!monitoringPaused) {
+      await monitor.start();
+    }
     walletMonitors.set(normalized, monitor);
-    return `Monitoring wallet <code>${normalized}</code>`;
+    return monitoringPaused
+      ? `Added wallet <code>${normalized}</code>; monitoring is paused`
+      : `Monitoring wallet <code>${normalized}</code>`;
   }
 
   function stopWallet(address: string): string {
@@ -109,6 +115,24 @@ async function main(): Promise<void> {
     walletMonitors.delete(normalized);
     db.removeWallet(normalized);
     return `Stopped monitoring <code>${normalized}</code>`;
+  }
+
+  async function pauseMonitoring(): Promise<string> {
+    if (monitoringPaused) return 'Monitoring is already paused.';
+    monitoringPaused = true;
+    for (const monitor of walletMonitors.values()) {
+      monitor.stop();
+    }
+    return `Paused monitoring for ${walletMonitors.size} wallet(s).`;
+  }
+
+  async function resumeMonitoring(): Promise<string> {
+    if (!monitoringPaused) return 'Monitoring is already running.';
+    monitoringPaused = false;
+    for (const monitor of walletMonitors.values()) {
+      await monitor.start();
+    }
+    return `Continued monitoring for ${walletMonitors.size} wallet(s).`;
   }
 
   const html = (value: string): string =>
@@ -154,9 +178,11 @@ async function main(): Promise<void> {
         '<b>GMGN Bundler Monitor</b>',
         '',
         `Wallets monitored: <b>${walletMonitors.size}</b>`,
+        `Monitoring: <b>${monitoringPaused ? 'Paused' : 'Running'}</b>`,
         `Active token windows: <b>${scheduler.activeCount}</b>`,
         `Monitor window: ${Math.round(config.monitoringWindowMs / 1_000)}s`,
         `Poll interval: ${config.monitorInterval}ms`,
+        `Min buy: ${config.minBuySol} SOL`,
         '',
         '<b>Monitored Wallets</b>',
         ...walletLines,
@@ -170,8 +196,12 @@ async function main(): Promise<void> {
             { text: 'Remove wallet', callback_data: 'menu:removewallet' },
           ],
           [
-            { text: 'Wallets', callback_data: 'menu:wallets' },
-            { text: 'Status', callback_data: 'menu:status' },
+            monitoringPaused
+              ? { text: 'Continue monitoring', callback_data: 'menu:resume' }
+              : { text: 'Pause monitoring', callback_data: 'menu:pause' },
+          ],
+          [
+            { text: 'Refresh', callback_data: 'menu:refresh' },
           ],
         ],
       },
@@ -209,6 +239,9 @@ async function main(): Promise<void> {
           pendingTelegramActions.set(chatId, 'removewallet');
           return 'Send the Solana wallet address to remove.';
         }
+        if (data === 'menu:pause') return await pauseMonitoring();
+        if (data === 'menu:resume') return await resumeMonitoring();
+        if (data === 'menu:refresh') return homeReply();
         if (data === 'menu:wallets') return walletsReply();
         if (data === 'menu:status') return statusReply();
 
