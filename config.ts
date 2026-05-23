@@ -50,7 +50,7 @@ function isValidGmgnFetchMode(s: string): s is ServiceConfig['gmgnFetchMode'] {
 }
 
 export function loadConfig(): ServiceConfig {
-  const walletAddress    = required('WALLET_ADDRESS');
+  const walletAddress    = optionalNullable('WALLET_ADDRESS');
   const gmgnApiKey       = required('GMGN_API_KEY');
   const solanaRpcUrl     = optional('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com');
   const solanaWsUrl      = optional('SOLANA_WS_URL', deriveWsUrl(solanaRpcUrl));

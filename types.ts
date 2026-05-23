@@ -84,7 +84,7 @@ export interface TokenSummary {
 
 /** Config pulled from environment variables (all validated at startup) */
 export interface ServiceConfig {
-  walletAddress: string;
+  walletAddress: string | null;
   solanaRpcUrl: string;
   solanaWsUrl: string;
   walletPollInterval: number;

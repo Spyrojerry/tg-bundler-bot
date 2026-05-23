@@ -48,8 +48,12 @@ export class WalletMonitor extends EventEmitter {
   private pollTimer: NodeJS.Timeout | null = null;
   private running = false;
 
-  constructor(config: ServiceConfig, walletAddress = config.walletAddress) {
+  constructor(config: ServiceConfig, walletAddress?: string) {
     super();
+
+    if (!walletAddress) {
+      throw new Error('WalletMonitor requires a wallet address');
+    }
 
     this.connection = new Connection(config.solanaRpcUrl, {
       commitment: 'confirmed',
