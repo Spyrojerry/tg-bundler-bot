@@ -324,9 +324,11 @@ async function main(): Promise<void> {
       replyMarkup: {
         inline_keyboard: isMonitoring
           ? [
+              [
+                { text: 'Settings', callback_data: `wallet:settings:${normalized}` },
+                pauseButton,
+              ],
               [actionButton],
-              [pauseButton],
-              [{ text: 'Settings', callback_data: `wallet:settings:${normalized}` }],
               [
                 { text: 'Back', callback_data: 'menu:refresh' },
                 { text: 'Refresh', callback_data: `wallet:refresh:${normalized}` },
@@ -398,12 +400,20 @@ async function main(): Promise<void> {
         { text: `${enabledMark(settings[mode].sellIfNoTeenOrTwentyPct)} ${profileTitle[mode]} 10s/20s`, callback_data: `togglep:${shortMode(mode)}:teen20:${normalized}` },
       ],
     ];
-    const modeButtons = [
-      [{ text: `${enabledMark(settings.maxBundlersPercentIncrease !== null)} Massive % Increase`, callback_data: `set:maxInc:${normalized}` }],
-      [{ text: `${enabledMark(settings.minBundlersPercentIncrease !== null)} Minimal % Increase`, callback_data: `set:minInc:${normalized}` }],
+    const modeButton = (mode: Exclude<ProfileMode, 'global'>) => [
+      {
+        text: mode === 'massive'
+          ? `${enabledMark(settings.maxBundlersPercentIncrease !== null)} Massive % Increase`
+          : `${enabledMark(settings.minBundlersPercentIncrease !== null)} Minimal % Increase`,
+        callback_data: mode === 'massive'
+          ? `set:maxInc:${normalized}`
+          : `set:minInc:${normalized}`,
+      },
     ];
-    const detailButtons = [
+    const groupedModeButtons = [
+      modeButton('massive'),
       ...(settings.maxBundlersPercentIncrease !== null ? profileButtons('massive') : []),
+      modeButton('minimal'),
       ...(settings.minBundlersPercentIncrease !== null ? profileButtons('minimal') : []),
     ];
 
@@ -425,8 +435,7 @@ async function main(): Promise<void> {
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
-          ...modeButtons,
-          ...detailButtons,
+          ...groupedModeButtons,
           [
             { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
             { text: 'Refresh', callback_data: `settings:refresh:${normalized}` },
@@ -443,6 +452,16 @@ async function main(): Promise<void> {
       ? wallets.map((wallet, index) => `${index + 1}. <code>${html(wallet)}</code>`)
       : ['No wallets are currently monitored.'];
     const runningWallets = wallets.length - pausedWallets.size;
+    const walletButtons = wallets.map((wallet, index) => [
+      {
+        text: `Settings ${index + 1}`,
+        callback_data: `wallet:settings:${wallet}`,
+      },
+      {
+        text: `Open ${index + 1}`,
+        callback_data: `wallet:refresh:${wallet}`,
+      },
+    ]);
 
     return {
       text: [
@@ -474,17 +493,34 @@ async function main(): Promise<void> {
           [
             { text: 'Refresh', callback_data: 'menu:refresh' },
           ],
+          ...walletButtons,
         ],
       },
       editCurrent,
     };
   }
 
-  function walletsReply(): string {
+  function walletsReply(): TelegramReply {
     const wallets = [...walletMonitors.keys()];
-    return wallets.length
-      ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w) => `- <code>${html(w)}</code>`).join('\n')}`
-      : 'No wallets are being monitored.';
+    return {
+      text: wallets.length
+        ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w, i) => `${i + 1}. <code>${html(w)}</code>`).join('\n')}`
+        : 'No wallets are being monitored.',
+      replyMarkup: {
+        inline_keyboard: wallets.length
+          ? wallets.map((wallet, index) => [
+              {
+                text: `Settings ${index + 1}`,
+                callback_data: `wallet:settings:${wallet}`,
+              },
+              {
+                text: `Open ${index + 1}`,
+                callback_data: `wallet:refresh:${wallet}`,
+              },
+            ])
+          : [[{ text: 'Add wallet', callback_data: 'menu:addwallet' }]],
+      },
+    };
   }
 
   function statusReply(): string {
