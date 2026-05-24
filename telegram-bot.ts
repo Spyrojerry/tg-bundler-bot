@@ -1,5 +1,10 @@
 import { createLogger } from './logger';
-import { MonitorSampleEvent, ServiceConfig, TokenSummary } from './types';
+import {
+  FilterFailEvent,
+  MonitorSampleEvent,
+  ServiceConfig,
+  TokenSummary,
+} from './types';
 
 const log = createLogger('TG');
 
@@ -74,6 +79,10 @@ export class TelegramBot {
 
   async sendSummaryCard(summary: TokenSummary): Promise<void> {
     await this.sendDefault(this.formatSummaryCard(summary), { pin: true });
+  }
+
+  async sendFilterFailCard(event: FilterFailEvent): Promise<void> {
+    await this.sendDefault(this.formatFilterFailCard(event), { pin: true });
   }
 
   async sendDefault(text: string, options: { pin?: boolean } = {}): Promise<void> {
@@ -268,6 +277,22 @@ export class TelegramBot {
       '<b>Bundler Wallets</b>',
       `First: ${this.fmt(summary.bundlersCount.first)} | Last: ${this.fmt(summary.bundlersCount.last)}`,
       `Min: ${this.fmt(summary.bundlersCount.min)} | Max: ${this.fmt(summary.bundlersCount.max)}`,
+    ].join('\n');
+  }
+
+  private formatFilterFailCard(event: FilterFailEvent): string {
+    return [
+      '<b>Filter Failed</b>',
+      `Wallet: <code>${this.escapeHtml(this.short(event.walletAddress))}</code>`,
+      `Token: <code>${this.escapeHtml(event.mint)}</code>`,
+      `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,
+      `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
+      `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
+      '',
+      '<b>Reasons</b>',
+      ...event.reasons.map((reason) => `- ${this.escapeHtml(reason)}`),
+      '',
+      'Sell execution requires confirmation before any swap is submitted.',
     ].join('\n');
   }
 

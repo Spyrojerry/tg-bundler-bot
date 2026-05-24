@@ -58,6 +58,22 @@ export interface SchedulerEntry {
   pendingRequest: boolean;     // guard against duplicate in-flight requests
   priority: number;            // lower = higher priority (ms since detection)
   monitoringStartedAt: number; // ms timestamp when this token was added
+  filterAlerted: boolean;
+}
+
+export interface WalletFilterSettings {
+  applyAtSample: number;
+  minBundlersPercent: number | null;
+  maxBundlersPercent: number | null;
+  minBundlersCount: number | null;
+  maxBundlersCount: number | null;
+  maxBundlersPercentIncrease: number | null;
+  maxPctAboveValue: number | null;
+  maxPctAboveOccurrences: number | null;
+  maxPctBelowValue: number | null;
+  maxPctBelowOccurrences: number | null;
+  sellIfFirstThreePctZero: boolean;
+  sellIfNoTeenOrTwentyPct: boolean;
 }
 
 /** Summary emitted after a token's monitoring window expires */
@@ -117,6 +133,16 @@ export interface MonitorSampleEvent {
   elapsedSec: number;
   metrics: BundlerMetrics;
   sampleNumber: number;
+}
+
+export interface FilterFailEvent {
+  walletAddress: string;
+  mint: string;
+  sampleNumber: number;
+  elapsedSec: number;
+  reasons: string[];
+  settings: WalletFilterSettings;
+  metrics: BundlerMetrics;
 }
 
 /** Result of a single GMGN fetch attempt */

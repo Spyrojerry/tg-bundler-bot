@@ -10,10 +10,30 @@
 import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import * as fs from 'fs';
 import * as path from 'path';
-import { BundlerMetrics, MonitoringStatus, TrackedToken } from './types';
+import {
+  BundlerMetrics,
+  MonitoringStatus,
+  TrackedToken,
+  WalletFilterSettings,
+} from './types';
 import { createLogger } from './logger';
 
 const log = createLogger('DB');
+
+export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
+  applyAtSample: 20,
+  minBundlersPercent: null,
+  maxBundlersPercent: null,
+  minBundlersCount: null,
+  maxBundlersCount: null,
+  maxBundlersPercentIncrease: null,
+  maxPctAboveValue: 60,
+  maxPctAboveOccurrences: 5,
+  maxPctBelowValue: null,
+  maxPctBelowOccurrences: null,
+  sellIfFirstThreePctZero: false,
+  sellIfNoTeenOrTwentyPct: false,
+};
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -31,6 +51,11 @@ CREATE TABLE IF NOT EXISTS monitored_wallets (
   address     TEXT PRIMARY KEY NOT NULL,
   added_at    TEXT NOT NULL,
   status      TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS wallet_settings (
+  wallet_address   TEXT PRIMARY KEY NOT NULL,
+  filter_settings  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS bundler_metrics (
@@ -342,6 +367,30 @@ export class MonitorDatabase {
       [walletAddress]
     );
     return rows[0]?.cnt ?? 0;
+  }
+
+  getWalletSettings(walletAddress: string): WalletFilterSettings {
+    const rows = this.query<{ filter_settings: string }>(
+      `SELECT filter_settings FROM wallet_settings WHERE wallet_address = ?`,
+      [walletAddress]
+    );
+    if (rows.length === 0) return { ...DEFAULT_WALLET_FILTER_SETTINGS };
+
+    try {
+      const parsed = JSON.parse(rows[0].filter_settings) as Partial<WalletFilterSettings>;
+      return { ...DEFAULT_WALLET_FILTER_SETTINGS, ...parsed };
+    } catch {
+      return { ...DEFAULT_WALLET_FILTER_SETTINGS };
+    }
+  }
+
+  updateWalletSettings(walletAddress: string, settings: WalletFilterSettings): void {
+    this.run(
+      `INSERT INTO wallet_settings (wallet_address, filter_settings)
+       VALUES (?, ?)
+       ON CONFLICT(wallet_address) DO UPDATE SET filter_settings = excluded.filter_settings`,
+      [walletAddress, JSON.stringify(settings)]
+    );
   }
 
   close(): void {

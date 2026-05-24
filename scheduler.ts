@@ -19,6 +19,7 @@ import { MonitorDatabase } from './database';
 import { RateLimiter } from './rate-limiter';
 import {
   BundlerMetrics,
+  FilterFailEvent,
   MonitorSampleEvent,
   NewTokenEvent,
   SchedulerEntry,
@@ -91,6 +92,7 @@ export class Scheduler extends EventEmitter {
       pendingRequest:      false,
       priority:            event.detectedAt,
       monitoringStartedAt: now,
+      filterAlerted:       false,
     };
 
     this.entries.set(key, entry);
@@ -342,6 +344,7 @@ export class Scheduler extends EventEmitter {
         };
         this.emit('sample', sampleEvent);
 
+        this.evaluateFilters(entry, elapsed, metrics, sampleNumber);
       } else {
         log.warn(`Fetch failed for ${mint}: ${result.error}`);
 
@@ -352,5 +355,111 @@ export class Scheduler extends EventEmitter {
     } finally {
       entry.pendingRequest = false;
     }
+  }
+
+  private evaluateFilters(
+    entry: SchedulerEntry,
+    elapsedSec: number,
+    metrics: BundlerMetrics,
+    sampleNumber: number
+  ): void {
+    if (entry.filterAlerted) return;
+
+    const settings = this.db.getWalletSettings(entry.walletAddress);
+    if (sampleNumber < settings.applyAtSample) return;
+
+    const samples = this.db
+      .getLatestMetricsForWallet(entry.walletAddress, entry.mint, 10_000)
+      .reverse();
+    const validPercentSamples = samples.filter(
+      (sample) => sample.bundlersPercent !== null && sample.bundlersPercent >= 1
+    );
+    const validPercents = validPercentSamples.map((sample) => sample.bundlersPercent as number);
+    const counts = samples
+      .map((sample) => sample.bundlersCount)
+      .filter((value): value is number => value !== null);
+
+    const reasons: string[] = [];
+    const latestValidPercent = [...validPercentSamples].at(-1)?.bundlersPercent ?? null;
+    const latestCount = counts.at(-1) ?? null;
+
+    if (
+      latestValidPercent !== null &&
+      settings.minBundlersPercent !== null &&
+      latestValidPercent < settings.minBundlersPercent
+    ) {
+      reasons.push(`bundlers % ${latestValidPercent} below min ${settings.minBundlersPercent}`);
+    }
+    if (
+      latestValidPercent !== null &&
+      settings.maxBundlersPercent !== null &&
+      latestValidPercent > settings.maxBundlersPercent
+    ) {
+      reasons.push(`bundlers % ${latestValidPercent} above max ${settings.maxBundlersPercent}`);
+    }
+    if (
+      latestCount !== null &&
+      settings.minBundlersCount !== null &&
+      latestCount < settings.minBundlersCount
+    ) {
+      reasons.push(`bundlers count ${latestCount} below min ${settings.minBundlersCount}`);
+    }
+    if (
+      latestCount !== null &&
+      settings.maxBundlersCount !== null &&
+      latestCount > settings.maxBundlersCount
+    ) {
+      reasons.push(`bundlers count ${latestCount} above max ${settings.maxBundlersCount}`);
+    }
+    if (settings.maxBundlersPercentIncrease !== null && validPercents.length >= 2) {
+      const increase = Math.max(...validPercents) - validPercents[0];
+      if (increase > settings.maxBundlersPercentIncrease) {
+        reasons.push(
+          `bundlers % increased by ${parseFloat(increase.toFixed(4))}, max allowed ${settings.maxBundlersPercentIncrease}`
+        );
+      }
+    }
+    if (settings.maxPctAboveValue !== null && settings.maxPctAboveOccurrences !== null) {
+      const occurrences = validPercents.filter((value) => value > settings.maxPctAboveValue!).length;
+      if (occurrences > settings.maxPctAboveOccurrences) {
+        reasons.push(
+          `${occurrences} valid samples above ${settings.maxPctAboveValue}%, max allowed ${settings.maxPctAboveOccurrences}`
+        );
+      }
+    }
+    if (settings.maxPctBelowValue !== null && settings.maxPctBelowOccurrences !== null) {
+      const occurrences = validPercents.filter((value) => value < settings.maxPctBelowValue!).length;
+      if (occurrences > settings.maxPctBelowOccurrences) {
+        reasons.push(
+          `${occurrences} valid samples below ${settings.maxPctBelowValue}%, max allowed ${settings.maxPctBelowOccurrences}`
+        );
+      }
+    }
+    if (settings.sellIfFirstThreePctZero) {
+      const firstThree = samples.slice(0, 3).map((sample) => sample.bundlersPercent);
+      if (firstThree.length === 3 && firstThree.every((value) => value === 0)) {
+        reasons.push('first three bundlers % samples are 0%');
+      }
+    }
+    if (settings.sellIfNoTeenOrTwentyPct) {
+      const hasTeenOrTwenty = validPercents.some((value) => value >= 10 && value < 30);
+      if (!hasTeenOrTwenty) {
+        reasons.push('no valid bundlers % sample in the 10%-29.99% range');
+      }
+    }
+
+    if (reasons.length === 0) return;
+
+    entry.filterAlerted = true;
+    const event: FilterFailEvent = {
+      walletAddress: entry.walletAddress,
+      mint: entry.mint,
+      sampleNumber,
+      elapsedSec,
+      reasons,
+      settings,
+      metrics,
+    };
+    this.emit('filterFail', event);
   }
 }
