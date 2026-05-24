@@ -80,6 +80,7 @@ async function main(): Promise<void> {
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
   const pausedWallets = new Set<string>();
+  const walletAliasesByChat = new Map<string, string[]>();
 
   type ProfileMode = 'global' | 'massive' | 'minimal';
   type SettingField = keyof Pick<
@@ -324,11 +325,8 @@ async function main(): Promise<void> {
       replyMarkup: {
         inline_keyboard: isMonitoring
           ? [
-              [
-                { text: 'Settings', callback_data: `wallet:settings:${normalized}` },
-                pauseButton,
-              ],
-              [actionButton],
+              [{ text: 'Settings', callback_data: `wallet:settings:${normalized}` }],
+              [pauseButton, actionButton],
               [
                 { text: 'Back', callback_data: 'menu:refresh' },
                 { text: 'Refresh', callback_data: `wallet:refresh:${normalized}` },
@@ -448,20 +446,11 @@ async function main(): Promise<void> {
 
   function homeReply(editCurrent = false): TelegramReply {
     const wallets = [...walletMonitors.keys()];
+    walletAliasesByChat.set('__default__', wallets);
     const walletLines = wallets.length
-      ? wallets.map((wallet, index) => `${index + 1}. <code>${html(wallet)}</code>`)
+      ? wallets.map((wallet, index) => `✅ /w_${index} <code>${html(wallet)}</code>`)
       : ['No wallets are currently monitored.'];
     const runningWallets = wallets.length - pausedWallets.size;
-    const walletButtons = wallets.map((wallet, index) => [
-      {
-        text: `Settings ${index + 1}`,
-        callback_data: `wallet:settings:${wallet}`,
-      },
-      {
-        text: `Open ${index + 1}`,
-        callback_data: `wallet:refresh:${wallet}`,
-      },
-    ]);
 
     return {
       text: [
@@ -493,31 +482,22 @@ async function main(): Promise<void> {
           [
             { text: 'Refresh', callback_data: 'menu:refresh' },
           ],
-          ...walletButtons,
         ],
       },
       editCurrent,
     };
   }
 
-  function walletsReply(): TelegramReply {
+  function walletsReply(chatId: string): TelegramReply {
     const wallets = [...walletMonitors.keys()];
+    walletAliasesByChat.set(chatId, wallets);
     return {
       text: wallets.length
-        ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w, i) => `${i + 1}. <code>${html(w)}</code>`).join('\n')}`
+        ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w, i) => `✅ /w_${i} <code>${html(w)}</code>`).join('\n')}`
         : 'No wallets are being monitored.',
       replyMarkup: {
         inline_keyboard: wallets.length
-          ? wallets.map((wallet, index) => [
-              {
-                text: `Settings ${index + 1}`,
-                callback_data: `wallet:settings:${wallet}`,
-              },
-              {
-                text: `Open ${index + 1}`,
-                callback_data: `wallet:refresh:${wallet}`,
-              },
-            ])
+          ? [[{ text: 'Back', callback_data: 'menu:refresh' }]]
           : [[{ text: 'Add wallet', callback_data: 'menu:addwallet' }]],
       },
     };
@@ -655,7 +635,7 @@ async function main(): Promise<void> {
           return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
         }
         if (data === 'menu:refresh') return homeReply(true);
-        if (data === 'menu:wallets') return walletsReply();
+        if (data === 'menu:wallets') return walletsReply(chatId);
         if (data === 'menu:status') return statusReply();
 
         if (callbackKind === 'sell' && callbackAction && callbackAddress) {
@@ -822,7 +802,14 @@ async function main(): Promise<void> {
         return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
       }
       if (command === '/wallets') {
-        return walletsReply();
+        return walletsReply(chatId);
+      }
+      const walletAlias = command.match(/^\/w_(\d+)$/);
+      if (walletAlias) {
+        const wallets = walletAliasesByChat.get(chatId) ?? walletAliasesByChat.get('__default__') ?? [...walletMonitors.keys()];
+        const wallet = wallets[Number(walletAlias[1])];
+        if (!wallet) return 'Wallet shortcut not found. Send /wallets to refresh the list.';
+        return settingsReply(wallet);
       }
       if (command === '/status') {
         return statusReply();
