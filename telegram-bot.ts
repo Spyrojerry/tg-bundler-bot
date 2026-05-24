@@ -1,6 +1,7 @@
 import { createLogger } from './logger';
 import {
   FilterFailEvent,
+  FilterPassEvent,
   MonitorSampleEvent,
   ServiceConfig,
   TokenSummary,
@@ -91,6 +92,10 @@ export class TelegramBot {
       pin: true,
       replyMarkup,
     });
+  }
+
+  async sendFilterPassCard(event: FilterPassEvent): Promise<void> {
+    await this.sendDefault(this.formatFilterPassCard(event), { pin: true });
   }
 
   async sendDefault(
@@ -328,11 +333,26 @@ export class TelegramBot {
       `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,
       `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
+      `Matched wallets: <b>${event.matchingWallets.length}</b>`,
       '',
       '<b>Reasons</b>',
       ...event.reasons.map((reason) => `- ${this.escapeHtml(reason)}`),
       '',
       'Confirm below before any sell is submitted.',
+    ].join('\n');
+  }
+
+  private formatFilterPassCard(event: FilterPassEvent): string {
+    return [
+      '<b>Filter Passed</b>',
+      `Wallet: <code>${this.escapeHtml(this.short(event.walletAddress))}</code>`,
+      `Token: <code>${this.escapeHtml(event.mint)}</code>`,
+      `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,
+      `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
+      `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
+      `Matched wallets: <b>${event.matchingWallets.length}</b>`,
+      '',
+      'Decision: position left open.',
     ].join('\n');
   }
 

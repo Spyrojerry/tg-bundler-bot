@@ -14,26 +14,33 @@ import {
   BundlerMetrics,
   MonitoringStatus,
   TrackedToken,
+  WalletFilterProfileSettings,
   WalletFilterSettings,
 } from './types';
 import { createLogger } from './logger';
 
 const log = createLogger('DB');
 
-export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
+export const DEFAULT_WALLET_FILTER_PROFILE_SETTINGS: WalletFilterProfileSettings = {
   applyAtSample: 20,
   minBundlersPercent: null,
   maxBundlersPercent: null,
   minBundlersCount: null,
   maxBundlersCount: null,
-  minBundlersPercentIncrease: null,
-  maxBundlersPercentIncrease: null,
   maxPctAboveValue: 60,
   maxPctAboveOccurrences: 5,
   maxPctBelowValue: null,
   maxPctBelowOccurrences: null,
   sellIfFirstThreePctZero: false,
   sellIfNoTeenOrTwentyPct: false,
+};
+
+export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
+  ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS,
+  minBundlersPercentIncrease: null,
+  maxBundlersPercentIncrease: null,
+  massive: { ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS },
+  minimal: { ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS },
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -402,14 +409,44 @@ export class MonitorDatabase {
       `SELECT filter_settings FROM wallet_settings WHERE wallet_address = ?`,
       [walletAddress]
     );
-    if (rows.length === 0) return { ...DEFAULT_WALLET_FILTER_SETTINGS };
+    if (rows.length === 0) return this.normalizeWalletSettings({});
 
     try {
       const parsed = JSON.parse(rows[0].filter_settings) as Partial<WalletFilterSettings>;
-      return { ...DEFAULT_WALLET_FILTER_SETTINGS, ...parsed };
+      return this.normalizeWalletSettings(parsed);
     } catch {
-      return { ...DEFAULT_WALLET_FILTER_SETTINGS };
+      return this.normalizeWalletSettings({});
     }
+  }
+
+  private normalizeWalletSettings(parsed: Partial<WalletFilterSettings>): WalletFilterSettings {
+    const legacyProfile: WalletFilterProfileSettings = {
+      ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS,
+      applyAtSample: parsed.applyAtSample ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.applyAtSample,
+      minBundlersPercent: parsed.minBundlersPercent ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.minBundlersPercent,
+      maxBundlersPercent: parsed.maxBundlersPercent ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxBundlersPercent,
+      minBundlersCount: parsed.minBundlersCount ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.minBundlersCount,
+      maxBundlersCount: parsed.maxBundlersCount ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxBundlersCount,
+      maxPctAboveValue: parsed.maxPctAboveValue ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctAboveValue,
+      maxPctAboveOccurrences: parsed.maxPctAboveOccurrences ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctAboveOccurrences,
+      maxPctBelowValue: parsed.maxPctBelowValue ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctBelowValue,
+      maxPctBelowOccurrences: parsed.maxPctBelowOccurrences ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctBelowOccurrences,
+      sellIfFirstThreePctZero: parsed.sellIfFirstThreePctZero ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfFirstThreePctZero,
+      sellIfNoTeenOrTwentyPct: parsed.sellIfNoTeenOrTwentyPct ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoTeenOrTwentyPct,
+    };
+    return {
+      ...legacyProfile,
+      minBundlersPercentIncrease: parsed.minBundlersPercentIncrease ?? null,
+      maxBundlersPercentIncrease: parsed.maxBundlersPercentIncrease ?? null,
+      massive: {
+        ...legacyProfile,
+        ...(parsed.massive ?? {}),
+      },
+      minimal: {
+        ...legacyProfile,
+        ...(parsed.minimal ?? {}),
+      },
+    };
   }
 
   updateWalletSettings(walletAddress: string, settings: WalletFilterSettings): void {

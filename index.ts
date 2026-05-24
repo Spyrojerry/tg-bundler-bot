@@ -23,6 +23,7 @@ import { InlineKeyboardMarkup, TelegramBot, TelegramReply } from './telegram-bot
 import { startHealthServer } from './health-server';
 import {
   FilterFailEvent,
+  FilterPassEvent,
   MonitorSampleEvent,
   NewTokenEvent,
   SellResult,
@@ -44,6 +45,7 @@ async function main(): Promise<void> {
   log.info('═══════════════════════════════════════');
   log.info('Config', {
     wallet:          config.walletAddress,
+    tradingWallet:   config.tradingWalletAddress,
     rpc:             config.solanaRpcUrl,
     ws:              config.solanaWsUrl,
     minBuySol:       config.minBuySol,
@@ -68,13 +70,18 @@ async function main(): Promise<void> {
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
+  let tradingWalletMonitor: WalletMonitor | null = null;
+  const pendingTradingBuys = new Map<string, NewTokenEvent>();
+  const recentWatchedBuys = new Map<string, Set<string>>();
+  const activeTradingMints = new Set<string>();
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
-    | { type: 'setting'; walletAddress: string; field: SettingField };
+    | { type: 'setting'; walletAddress: string; field: SettingField; mode: ProfileMode };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
   const pausedWallets = new Set<string>();
 
+  type ProfileMode = 'global' | 'massive' | 'minimal';
   type SettingField = keyof Pick<
     WalletFilterSettings,
     | 'applyAtSample'
@@ -115,28 +122,73 @@ async function main(): Promise<void> {
     maxPctBelowValue: 'Below-% threshold',
     maxPctBelowOccurrences: 'Max below-% occurrences',
   };
+  const profileTitle: Record<Exclude<ProfileMode, 'global'>, string> = {
+    massive: 'Massive % Increase',
+    minimal: 'Minimal % Increase',
+  };
 
-  function wireWalletMonitor(walletMonitor: WalletMonitor): void {
+  function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
-    const { mint, detectedAt } = event;
+      pendingTradingBuys.set(event.mint, event);
+      const matchedWallets = [...(recentWatchedBuys.get(event.mint) ?? new Set<string>())];
 
-    log.info(`[NEW TOKEN] Wallet: ${event.walletAddress} Mint: ${mint}`);
+      log.info(`[TRADING BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+      telegramBot?.sendDefault([
+        '<b>Trading Wallet Buy Detected</b>',
+        `Wallet: <code>${html(event.walletAddress)}</code>`,
+        `Token: <code>${html(event.mint)}</code>`,
+        `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
+        matchedWallets.length
+          ? `Already matched by watched wallet(s): <b>${matchedWallets.length}</b>`
+          : 'Waiting for a watched wallet to buy this token before filters start.',
+      ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
 
-    // Persist to DB if not already there
-    if (!db.tokenExists(event.walletAddress, mint)) {
+      if (matchedWallets.length > 0) {
+        activateTradingToken(event.mint, matchedWallets);
+      }
+    });
+  }
+
+  function wireWatchedWalletMonitor(walletMonitor: WalletMonitor): void {
+    walletMonitor.on('newToken', (event: NewTokenEvent) => {
+      log.info(`[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+      const wallets = recentWatchedBuys.get(event.mint) ?? new Set<string>();
+      wallets.add(event.walletAddress);
+      recentWatchedBuys.set(event.mint, wallets);
+
+      if (pendingTradingBuys.has(event.mint)) {
+        activateTradingToken(event.mint, [...wallets]);
+      }
+    });
+  }
+
+  function activateTradingToken(mint: string, matchingWallets: string[]): void {
+    if (activeTradingMints.has(mint)) return;
+    const tradingBuy = pendingTradingBuys.get(mint);
+    if (!tradingBuy) return;
+    activeTradingMints.add(mint);
+
+    if (!db.tokenExists(tradingBuy.walletAddress, mint)) {
       db.insertToken({
-        walletAddress: event.walletAddress,
+        walletAddress: tradingBuy.walletAddress,
         mint,
         firstSeen: new Date().toISOString(),
         monitoringStatus: 'active',
-        detectedAt,
-        buySol: event.buySol,
+        detectedAt: tradingBuy.detectedAt,
+        buySol: tradingBuy.buySol,
       });
     }
 
-    // Add to scheduler
-    scheduler.addToken(event);
-    });
+    scheduler.addToken({ ...tradingBuy, matchingWallets });
+    telegramBot?.sendDefault([
+      '<b>Watched Wallet Match Found</b>',
+      `Trading wallet token: <code>${html(mint)}</code>`,
+      `Matched watched wallets: <b>${matchingWallets.length}</b>`,
+      ...matchingWallets.slice(0, 5).map((wallet) => `- <code>${html(wallet)}</code>`),
+      matchingWallets.length > 5 ? `...and ${matchingWallets.length - 5} more` : '',
+      '',
+      'Filters are now running on your trading-wallet position.',
+    ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram match alert failed', err));
   }
 
   async function startWallet(address: string): Promise<string> {
@@ -147,7 +199,7 @@ async function main(): Promise<void> {
 
     db.addWallet(normalized);
     const monitor = new WalletMonitor(config, normalized);
-    wireWalletMonitor(monitor);
+    wireWatchedWalletMonitor(monitor);
     pausedWallets.delete(normalized);
     await monitor.start();
     walletMonitors.set(normalized, monitor);
@@ -202,17 +254,20 @@ async function main(): Promise<void> {
   function updateSetting(
     walletAddress: string,
     field: SettingField,
+    mode: ProfileMode,
     rawValue: string
   ): string {
     const normalized = new PublicKey(walletAddress).toBase58();
     const trimmed = rawValue.trim().toLowerCase();
     const settings = db.getWalletSettings(normalized);
+    const target = mode === 'global' ? settings : settings[mode];
+    const targetRecord = target as unknown as Record<string, number | boolean | null>;
 
     if (trimmed === 'off' || trimmed === 'any' || trimmed === 'none') {
       if (field === 'applyAtSample') {
         return 'Apply sample cannot be disabled. Send a positive whole number.';
       }
-      settings[field] = null as never;
+      targetRecord[field] = null;
     } else {
       const value = Number(trimmed);
       if (!Number.isFinite(value) || value < 0) {
@@ -221,14 +276,15 @@ async function main(): Promise<void> {
       if (field === 'applyAtSample') {
         const n = Math.trunc(value);
         if (n <= 0) return 'Apply sample must be at least 1.';
-        settings[field] = n as never;
+        targetRecord[field] = n;
       } else {
-        settings[field] = value as never;
+        targetRecord[field] = value;
       }
     }
 
     db.updateWalletSettings(normalized, settings);
-    return `Updated ${settingLabel[field]} for <code>${html(normalized)}</code>.`;
+    const scope = mode === 'global' ? '' : ` (${profileTitle[mode]})`;
+    return `Updated ${settingLabel[field]}${scope} for <code>${html(normalized)}</code>.`;
   }
 
   function walletSummaryReply(address: string, editCurrent = false): TelegramReply {
@@ -280,69 +336,82 @@ async function main(): Promise<void> {
     const settings = db.getWalletSettings(normalized);
     const range = (min: number | null, max: number | null, suffix = ''): string =>
       `${fmtSetting(min)}${suffix} - ${fmtSetting(max)}${suffix}`;
-    const increaseLines = [
-      settings.maxBundlersPercentIncrease !== null
-        ? `${enabledMark(true)} Massive % increase: sell if rise is over <b>${settings.maxBundlersPercentIncrease}%</b>`
-        : null,
-      settings.minBundlersPercentIncrease !== null
-        ? `${enabledMark(true)} Minimal % increase: sell if rise is under <b>${settings.minBundlersPercentIncrease}%</b>`
-        : null,
-    ].filter((line): line is string => line !== null);
+    const profileText = (mode: Exclude<ProfileMode, 'global'>): string[] => {
+      const profile = settings[mode];
+      const threshold = mode === 'massive'
+        ? settings.maxBundlersPercentIncrease
+        : settings.minBundlersPercentIncrease;
+      if (threshold === null) return [];
+      const rule = mode === 'massive'
+        ? `Core rule: fail if increase is over <b>${threshold}%</b>.`
+        : `Core rule: fail if increase is under <b>${threshold}%</b>.`;
+      return [
+        '',
+        `<b>${profileTitle[mode]} Settings</b>`,
+        rule,
+        `Apply filters at sample: <b>#${profile.applyAtSample}</b>`,
+        `Latest bundlers % min/max: <b>${range(profile.minBundlersPercent, profile.maxBundlersPercent, '%')}</b>`,
+        `Latest bundler wallet count min/max: <b>${range(profile.minBundlersCount, profile.maxBundlersCount)}</b>`,
+        `No more than <b>${fmtSetting(profile.maxPctAboveOccurrences)}</b> sample(s) above <b>${fmtSetting(profile.maxPctAboveValue)}%</b>`,
+        `No more than <b>${fmtSetting(profile.maxPctBelowOccurrences)}</b> sample(s) below <b>${fmtSetting(profile.maxPctBelowValue)}%</b>`,
+        `${enabledMark(profile.sellIfFirstThreePctZero)} First 3 bundlers % samples are all 0%`,
+        `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} No valid sample appears in the 10%-29.99% range`,
+      ];
+    };
+    const profileButtons = (mode: Exclude<ProfileMode, 'global'>) => [
+      [{ text: `${profileTitle[mode]} Apply #`, callback_data: `setp:${mode}:apply:${normalized}` }],
+      [
+        { text: `${profileTitle[mode]} Min %`, callback_data: `setp:${mode}:minPct:${normalized}` },
+        { text: `${profileTitle[mode]} Max %`, callback_data: `setp:${mode}:maxPct:${normalized}` },
+      ],
+      [
+        { text: `${profileTitle[mode]} Min Count`, callback_data: `setp:${mode}:minCnt:${normalized}` },
+        { text: `${profileTitle[mode]} Max Count`, callback_data: `setp:${mode}:maxCnt:${normalized}` },
+      ],
+      [
+        { text: `${profileTitle[mode]} Above %`, callback_data: `setp:${mode}:hiPct:${normalized}` },
+        { text: `${profileTitle[mode]} Above Times`, callback_data: `setp:${mode}:hiOcc:${normalized}` },
+      ],
+      [
+        { text: `${profileTitle[mode]} Below %`, callback_data: `setp:${mode}:loPct:${normalized}` },
+        { text: `${profileTitle[mode]} Below Times`, callback_data: `setp:${mode}:loOcc:${normalized}` },
+      ],
+      [
+        { text: `${enabledMark(settings[mode].sellIfFirstThreePctZero)} ${profileTitle[mode]} First 3=0`, callback_data: `togglep:${mode}:first0:${normalized}` },
+      ],
+      [
+        { text: `${enabledMark(settings[mode].sellIfNoTeenOrTwentyPct)} ${profileTitle[mode]} 10s/20s`, callback_data: `togglep:${mode}:teen20:${normalized}` },
+      ],
+    ];
+    const modeButtons = [
+      [{ text: `${enabledMark(settings.maxBundlersPercentIncrease !== null)} Massive % Increase`, callback_data: `set:maxInc:${normalized}` }],
+      [{ text: `${enabledMark(settings.minBundlersPercentIncrease !== null)} Minimal % Increase`, callback_data: `set:minInc:${normalized}` }],
+    ];
+    const detailButtons = [
+      ...(settings.maxBundlersPercentIncrease !== null ? profileButtons('massive') : []),
+      ...(settings.minBundlersPercentIncrease !== null ? profileButtons('minimal') : []),
+    ];
 
     return {
       text: [
         '<b>Filter Settings</b>',
         `<code>${html(normalized)}</code>`,
         '',
-        '<b>When To Check</b>',
-        `Apply filters at sample: <b>#${settings.applyAtSample}</b>`,
-        '',
-        '<b>Allowed Latest Sample Ranges</b>',
-        `Latest bundlers % min/max: <b>${range(settings.minBundlersPercent, settings.maxBundlersPercent, '%')}</b>`,
-        `Latest bundler wallet count min/max: <b>${range(settings.minBundlersCount, settings.maxBundlersCount)}</b>`,
-        ...(increaseLines.length ? ['', '<b>Bundlers % Increase Filters</b>', ...increaseLines] : []),
-        '',
-        '<b>Occurrence Limits</b>',
-        `No more than <b>${fmtSetting(settings.maxPctAboveOccurrences)}</b> sample(s) above <b>${fmtSetting(settings.maxPctAboveValue)}%</b>`,
-        `No more than <b>${fmtSetting(settings.maxPctBelowOccurrences)}</b> sample(s) below <b>${fmtSetting(settings.maxPctBelowValue)}%</b>`,
-        '',
-        '<b>Pattern Checks</b>',
-        `${enabledMark(settings.sellIfFirstThreePctZero)} First 3 bundlers % samples are all 0%`,
-        `${enabledMark(settings.sellIfNoTeenOrTwentyPct)} No valid sample appears in the 10%-29.99% range`,
+        '<b>Core Modes</b>',
+        `${enabledMark(settings.maxBundlersPercentIncrease !== null)} Massive % Increase: required for the Massive settings below to run.`,
+        `${enabledMark(settings.minBundlersPercentIncrease !== null)} Minimal % Increase: required for the Minimal settings below to run.`,
+        'At least one core mode must be set before any other filter can pass or fail a token.',
+        'Increase is measured as highest valid bundlers % minus the first valid bundlers %.',
+        'Valid bundlers % samples are 1% or higher.',
+        ...profileText('massive'),
+        ...profileText('minimal'),
         '',
         '<i>Any = disabled. Normal % filters ignore samples below 1%.</i>',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
-          [
-            { text: 'Apply #', callback_data: `set:apply:${normalized}` },
-            { text: 'Min Bundlers %', callback_data: `set:minPct:${normalized}` },
-            { text: 'Max Bundlers %', callback_data: `set:maxPct:${normalized}` },
-          ],
-          [
-            { text: 'Min Wallet Count', callback_data: `set:minCnt:${normalized}` },
-            { text: 'Max Wallet Count', callback_data: `set:maxCnt:${normalized}` },
-          ],
-          [
-            { text: `${enabledMark(settings.maxBundlersPercentIncrease !== null)} Massive % Increase`, callback_data: `set:maxInc:${normalized}` },
-          ],
-          [
-            { text: `${enabledMark(settings.minBundlersPercentIncrease !== null)} Minimal % Increase`, callback_data: `set:minInc:${normalized}` },
-          ],
-          [
-            { text: 'Above % Limit', callback_data: `set:hiPct:${normalized}` },
-            { text: 'Above Max Times', callback_data: `set:hiOcc:${normalized}` },
-          ],
-          [
-            { text: 'Below % Limit', callback_data: `set:loPct:${normalized}` },
-            { text: 'Below Max Times', callback_data: `set:loOcc:${normalized}` },
-          ],
-          [
-            { text: `${enabledMark(settings.sellIfFirstThreePctZero)} First 3 = 0%`, callback_data: `toggle:first0:${normalized}` },
-          ],
-          [
-            { text: `${enabledMark(settings.sellIfNoTeenOrTwentyPct)} Require 10s/20s`, callback_data: `toggle:teen20:${normalized}` },
-          ],
+          ...modeButtons,
+          ...detailButtons,
           [
             { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
             { text: 'Refresh', callback_data: `settings:refresh:${normalized}` },
@@ -456,6 +525,7 @@ async function main(): Promise<void> {
       `Token: <code>${html(event.mint)}</code>`,
       `Status: <b>${html(result.status)}</b>`,
       `Sold: <b>${result.soldPercent}%</b>`,
+      `Matched watched wallets: <b>${event.matchingWallets.length}</b>`,
       `Token amount sold: <code>${html(result.filledInputAmount ?? 'pending')}</code>`,
       `Received: <b>${fmtSol(receivedSol)}</b>`,
       `Cost basis sold: ${fmtSol(costBasis)}`,
@@ -473,6 +543,7 @@ async function main(): Promise<void> {
       '<b>Sell Failed</b>',
       `Wallet: <code>${html(event.walletAddress)}</code>`,
       `Token: <code>${html(event.mint)}</code>`,
+      `Matched watched wallets: <b>${event.matchingWallets.length}</b>`,
       `Error: ${html(err instanceof Error ? err.message : String(err))}`,
       '',
       '<b>Why sell was requested</b>',
@@ -521,7 +592,8 @@ async function main(): Promise<void> {
     try {
       if (command === '/callback') {
         const [, data] = text.split(/\s+/, 2);
-        const [callbackKind, callbackAction, callbackAddress] = data?.split(':') ?? [];
+        const parts = data?.split(':') ?? [];
+        const [callbackKind, callbackAction, callbackAddress] = parts;
 
         if (data === 'menu:addwallet') {
           pendingTelegramActions.set(chatId, { type: 'addwallet' });
@@ -570,10 +642,33 @@ async function main(): Promise<void> {
             type: 'setting',
             walletAddress: normalized,
             field,
+            mode: 'global',
           });
           return {
             text: [
               `Send a value for <b>${settingLabel[field]}</b>.`,
+              field === 'applyAtSample' ? 'Use a positive whole number.' : 'Use a number, or send <code>off</code> to disable.',
+            ].join('\n'),
+            trackPrompt: true,
+          };
+        }
+        if (callbackKind === 'setp' && parts.length >= 4) {
+          const [, rawMode, rawField, rawAddress] = parts;
+          if (rawMode !== 'massive' && rawMode !== 'minimal') return 'Invalid setting group.';
+          const field = settingFieldByCode[rawField];
+          if (!field || field === 'minBundlersPercentIncrease' || field === 'maxBundlersPercentIncrease') {
+            return 'Invalid setting.';
+          }
+          const normalized = new PublicKey(rawAddress).toBase58();
+          pendingTelegramActions.set(chatId, {
+            type: 'setting',
+            walletAddress: normalized,
+            field,
+            mode: rawMode,
+          });
+          return {
+            text: [
+              `Send a value for <b>${profileTitle[rawMode]} ${settingLabel[field]}</b>.`,
               field === 'applyAtSample' ? 'Use a positive whole number.' : 'Use a number, or send <code>off</code> to disable.',
             ].join('\n'),
             trackPrompt: true,
@@ -586,6 +681,22 @@ async function main(): Promise<void> {
             settings.sellIfFirstThreePctZero = !settings.sellIfFirstThreePctZero;
           } else if (callbackAction === 'teen20') {
             settings.sellIfNoTeenOrTwentyPct = !settings.sellIfNoTeenOrTwentyPct;
+          } else {
+            return 'Invalid setting.';
+          }
+          db.updateWalletSettings(normalized, settings);
+          return settingsReply(normalized, true);
+        }
+        if (callbackKind === 'togglep' && parts.length >= 4) {
+          const [, rawMode, rawAction, rawAddress] = parts;
+          if (rawMode !== 'massive' && rawMode !== 'minimal') return 'Invalid setting group.';
+          const normalized = new PublicKey(rawAddress).toBase58();
+          const settings = db.getWalletSettings(normalized);
+          const profile = settings[rawMode];
+          if (rawAction === 'first0') {
+            profile.sellIfFirstThreePctZero = !profile.sellIfFirstThreePctZero;
+          } else if (rawAction === 'teen20') {
+            profile.sellIfNoTeenOrTwentyPct = !profile.sellIfNoTeenOrTwentyPct;
           } else {
             return 'Invalid setting.';
           }
@@ -634,6 +745,7 @@ async function main(): Promise<void> {
           const message = updateSetting(
             pendingAction.walletAddress,
             pendingAction.field,
+            pendingAction.mode,
             text
           );
           if (!message.startsWith('Updated ')) return message;
@@ -702,15 +814,25 @@ async function main(): Promise<void> {
         log.warn('Telegram filter alert send failed', err)
       );
     });
+    scheduler.on('filterPass', (event: FilterPassEvent) => {
+      telegramBot.sendFilterPassCard(event).catch((err) =>
+        log.warn('Telegram filter pass send failed', err)
+      );
+    });
     telegramBot.start();
   }
 
   // ── 6. Start everything ───────────────────────────────────────────────────
-  if (config.walletAddress) {
-    db.addWallet(config.walletAddress);
+  if (config.tradingWalletAddress) {
+    tradingWalletMonitor = new WalletMonitor(config, config.tradingWalletAddress);
+    wireTradingWalletMonitor(tradingWalletMonitor);
+    await tradingWalletMonitor.start();
+  } else {
+    log.warn('No TRADING_WALLET_ADDRESS or WALLET_ADDRESS configured; sell flow cannot detect your buys.');
   }
   const wallets = db.getActiveWallets();
   for (const wallet of wallets) {
+    if (wallet === config.tradingWalletAddress) continue;
     await startWallet(wallet);
   }
   scheduler.start();
@@ -730,6 +852,7 @@ async function main(): Promise<void> {
     for (const monitor of walletMonitors.values()) {
       monitor.stop();
     }
+    tradingWalletMonitor?.stop();
     telegramBot?.stop();
     scheduler.stop();
     healthServer.close();

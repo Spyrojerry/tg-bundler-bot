@@ -20,11 +20,13 @@ import { RateLimiter } from './rate-limiter';
 import {
   BundlerMetrics,
   FilterFailEvent,
+  FilterPassEvent,
   MonitorSampleEvent,
   NewTokenEvent,
   SchedulerEntry,
   ServiceConfig,
   TokenSummary,
+  WalletFilterProfileSettings,
 } from './types';
 
 const log = createLogger('SCHED');
@@ -93,7 +95,9 @@ export class Scheduler extends EventEmitter {
       priority:            event.detectedAt,
       monitoringStartedAt: now,
       filterAlerted:       false,
+      filterPassed:        false,
       buySol:              event.buySol,
+      matchingWallets:     event.matchingWallets ?? [],
     };
 
     this.entries.set(key, entry);
@@ -364,10 +368,30 @@ export class Scheduler extends EventEmitter {
     metrics: BundlerMetrics,
     sampleNumber: number
   ): void {
-    if (entry.filterAlerted) return;
+    if (entry.filterAlerted || entry.filterPassed) return;
 
     const settings = this.db.getWalletSettings(entry.walletAddress);
-    if (sampleNumber < settings.applyAtSample) return;
+    const activeProfiles: Array<{
+      name: 'Massive' | 'Minimal';
+      profile: WalletFilterProfileSettings;
+      threshold: number;
+    }> = [];
+    if (settings.maxBundlersPercentIncrease !== null) {
+      activeProfiles.push({
+        name: 'Massive',
+        profile: settings.massive,
+        threshold: settings.maxBundlersPercentIncrease,
+      });
+    }
+    if (settings.minBundlersPercentIncrease !== null) {
+      activeProfiles.push({
+        name: 'Minimal',
+        profile: settings.minimal,
+        threshold: settings.minBundlersPercentIncrease,
+      });
+    }
+    if (activeProfiles.length === 0) return;
+    if (sampleNumber < Math.max(...activeProfiles.map((p) => p.profile.applyAtSample))) return;
 
     const samples = this.db
       .getLatestMetricsForWallet(entry.walletAddress, entry.mint, 10_000)
@@ -383,88 +407,48 @@ export class Scheduler extends EventEmitter {
     const reasons: string[] = [];
     const latestValidPercent = [...validPercentSamples].at(-1)?.bundlersPercent ?? null;
     const latestCount = counts.at(-1) ?? null;
+    const increase = validPercents.length >= 2
+      ? Math.max(...validPercents) - validPercents[0]
+      : null;
 
-    if (
-      latestValidPercent !== null &&
-      settings.minBundlersPercent !== null &&
-      latestValidPercent < settings.minBundlersPercent
-    ) {
-      reasons.push(`bundlers % ${latestValidPercent} below min ${settings.minBundlersPercent}`);
-    }
-    if (
-      latestValidPercent !== null &&
-      settings.maxBundlersPercent !== null &&
-      latestValidPercent > settings.maxBundlersPercent
-    ) {
-      reasons.push(`bundlers % ${latestValidPercent} above max ${settings.maxBundlersPercent}`);
-    }
-    if (
-      latestCount !== null &&
-      settings.minBundlersCount !== null &&
-      latestCount < settings.minBundlersCount
-    ) {
-      reasons.push(`bundlers count ${latestCount} below min ${settings.minBundlersCount}`);
-    }
-    if (
-      latestCount !== null &&
-      settings.maxBundlersCount !== null &&
-      latestCount > settings.maxBundlersCount
-    ) {
-      reasons.push(`bundlers count ${latestCount} above max ${settings.maxBundlersCount}`);
-    }
-    if (
-      (settings.minBundlersPercentIncrease !== null ||
-       settings.maxBundlersPercentIncrease !== null) &&
-      validPercents.length >= 2
-    ) {
-      const increase = Math.max(...validPercents) - validPercents[0];
-      if (
-        settings.minBundlersPercentIncrease !== null &&
-        increase < settings.minBundlersPercentIncrease
-      ) {
+    for (const active of activeProfiles) {
+      const prefix = `[${active.name}]`;
+      if (increase === null) continue;
+      if (active.name === 'Massive' && increase > active.threshold) {
         reasons.push(
-          `bundlers % increased by ${parseFloat(increase.toFixed(4))}, below required ${settings.minBundlersPercentIncrease}`
+          `${prefix} bundlers % increased by ${parseFloat(increase.toFixed(4))}, max allowed ${active.threshold}`
         );
       }
-      if (
-        settings.maxBundlersPercentIncrease !== null &&
-        increase > settings.maxBundlersPercentIncrease
-      ) {
+      if (active.name === 'Minimal' && increase < active.threshold) {
         reasons.push(
-          `bundlers % increased by ${parseFloat(increase.toFixed(4))}, max allowed ${settings.maxBundlersPercentIncrease}`
+          `${prefix} bundlers % increased by ${parseFloat(increase.toFixed(4))}, below required ${active.threshold}`
         );
       }
-    }
-    if (settings.maxPctAboveValue !== null && settings.maxPctAboveOccurrences !== null) {
-      const occurrences = validPercents.filter((value) => value > settings.maxPctAboveValue!).length;
-      if (occurrences > settings.maxPctAboveOccurrences) {
-        reasons.push(
-          `${occurrences} valid samples above ${settings.maxPctAboveValue}%, max allowed ${settings.maxPctAboveOccurrences}`
-        );
-      }
-    }
-    if (settings.maxPctBelowValue !== null && settings.maxPctBelowOccurrences !== null) {
-      const occurrences = validPercents.filter((value) => value < settings.maxPctBelowValue!).length;
-      if (occurrences > settings.maxPctBelowOccurrences) {
-        reasons.push(
-          `${occurrences} valid samples below ${settings.maxPctBelowValue}%, max allowed ${settings.maxPctBelowOccurrences}`
-        );
-      }
-    }
-    if (settings.sellIfFirstThreePctZero) {
-      const firstThree = samples.slice(0, 3).map((sample) => sample.bundlersPercent);
-      if (firstThree.length === 3 && firstThree.every((value) => value === 0)) {
-        reasons.push('first three bundlers % samples are 0%');
-      }
-    }
-    if (settings.sellIfNoTeenOrTwentyPct) {
-      const hasTeenOrTwenty = validPercents.some((value) => value >= 10 && value < 30);
-      if (!hasTeenOrTwenty) {
-        reasons.push('no valid bundlers % sample in the 10%-29.99% range');
-      }
+      reasons.push(...this.evaluateProfileFilters(
+        prefix,
+        active.profile,
+        latestValidPercent,
+        latestCount,
+        validPercents,
+        samples
+      ));
     }
 
-    if (reasons.length === 0) return;
+    if (reasons.length === 0) {
+      entry.filterPassed = true;
+      const event: FilterPassEvent = {
+        walletAddress: entry.walletAddress,
+        mint: entry.mint,
+        sampleNumber,
+        elapsedSec,
+        settings,
+        metrics,
+        buySol: entry.buySol,
+        matchingWallets: entry.matchingWallets,
+      };
+      this.emit('filterPass', event);
+      return;
+    }
 
     entry.filterAlerted = true;
     const event: FilterFailEvent = {
@@ -476,7 +460,76 @@ export class Scheduler extends EventEmitter {
       settings,
       metrics,
       buySol: entry.buySol,
+      matchingWallets: entry.matchingWallets,
     };
     this.emit('filterFail', event);
+  }
+
+  private evaluateProfileFilters(
+    prefix: string,
+    settings: WalletFilterProfileSettings,
+    latestValidPercent: number | null,
+    latestCount: number | null,
+    validPercents: number[],
+    samples: BundlerMetrics[]
+  ): string[] {
+    const reasons: string[] = [];
+    if (
+      latestValidPercent !== null &&
+      settings.minBundlersPercent !== null &&
+      latestValidPercent < settings.minBundlersPercent
+    ) {
+      reasons.push(`${prefix} bundlers % ${latestValidPercent} below min ${settings.minBundlersPercent}`);
+    }
+    if (
+      latestValidPercent !== null &&
+      settings.maxBundlersPercent !== null &&
+      latestValidPercent > settings.maxBundlersPercent
+    ) {
+      reasons.push(`${prefix} bundlers % ${latestValidPercent} above max ${settings.maxBundlersPercent}`);
+    }
+    if (
+      latestCount !== null &&
+      settings.minBundlersCount !== null &&
+      latestCount < settings.minBundlersCount
+    ) {
+      reasons.push(`${prefix} bundlers count ${latestCount} below min ${settings.minBundlersCount}`);
+    }
+    if (
+      latestCount !== null &&
+      settings.maxBundlersCount !== null &&
+      latestCount > settings.maxBundlersCount
+    ) {
+      reasons.push(`${prefix} bundlers count ${latestCount} above max ${settings.maxBundlersCount}`);
+    }
+    if (settings.maxPctAboveValue !== null && settings.maxPctAboveOccurrences !== null) {
+      const occurrences = validPercents.filter((value) => value > settings.maxPctAboveValue!).length;
+      if (occurrences > settings.maxPctAboveOccurrences) {
+        reasons.push(
+          `${prefix} ${occurrences} valid samples above ${settings.maxPctAboveValue}%, max allowed ${settings.maxPctAboveOccurrences}`
+        );
+      }
+    }
+    if (settings.maxPctBelowValue !== null && settings.maxPctBelowOccurrences !== null) {
+      const occurrences = validPercents.filter((value) => value < settings.maxPctBelowValue!).length;
+      if (occurrences > settings.maxPctBelowOccurrences) {
+        reasons.push(
+          `${prefix} ${occurrences} valid samples below ${settings.maxPctBelowValue}%, max allowed ${settings.maxPctBelowOccurrences}`
+        );
+      }
+    }
+    if (settings.sellIfFirstThreePctZero) {
+      const firstThree = samples.slice(0, 3).map((sample) => sample.bundlersPercent);
+      if (firstThree.length === 3 && firstThree.every((value) => value === 0)) {
+        reasons.push(`${prefix} first three bundlers % samples are 0%`);
+      }
+    }
+    if (settings.sellIfNoTeenOrTwentyPct) {
+      const hasTeenOrTwenty = validPercents.some((value) => value >= 10 && value < 30);
+      if (!hasTeenOrTwenty) {
+        reasons.push(`${prefix} no valid bundlers % sample in the 10%-29.99% range`);
+      }
+    }
+    return reasons;
   }
 }

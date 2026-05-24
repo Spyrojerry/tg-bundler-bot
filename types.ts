@@ -60,23 +60,30 @@ export interface SchedulerEntry {
   priority: number;            // lower = higher priority (ms since detection)
   monitoringStartedAt: number; // ms timestamp when this token was added
   filterAlerted: boolean;
+  filterPassed: boolean;
   buySol: number | null;
+  matchingWallets: string[];
 }
 
-export interface WalletFilterSettings {
+export interface WalletFilterProfileSettings {
   applyAtSample: number;
   minBundlersPercent: number | null;
   maxBundlersPercent: number | null;
   minBundlersCount: number | null;
   maxBundlersCount: number | null;
-  minBundlersPercentIncrease: number | null;
-  maxBundlersPercentIncrease: number | null;
   maxPctAboveValue: number | null;
   maxPctAboveOccurrences: number | null;
   maxPctBelowValue: number | null;
   maxPctBelowOccurrences: number | null;
   sellIfFirstThreePctZero: boolean;
   sellIfNoTeenOrTwentyPct: boolean;
+}
+
+export interface WalletFilterSettings extends WalletFilterProfileSettings {
+  minBundlersPercentIncrease: number | null;
+  maxBundlersPercentIncrease: number | null;
+  massive: WalletFilterProfileSettings;
+  minimal: WalletFilterProfileSettings;
 }
 
 /** Summary emitted after a token's monitoring window expires */
@@ -104,6 +111,7 @@ export interface TokenSummary {
 /** Config pulled from environment variables (all validated at startup) */
 export interface ServiceConfig {
   walletAddress: string | null;
+  tradingWalletAddress: string | null;
   solanaRpcUrl: string;
   solanaWsUrl: string;
   walletPollInterval: number;
@@ -133,6 +141,7 @@ export interface NewTokenEvent {
   mint: string;
   detectedAt: number;
   buySol: number | null;
+  matchingWallets?: string[];
 }
 
 export interface MonitorSampleEvent {
@@ -152,6 +161,18 @@ export interface FilterFailEvent {
   settings: WalletFilterSettings;
   metrics: BundlerMetrics;
   buySol: number | null;
+  matchingWallets: string[];
+}
+
+export interface FilterPassEvent {
+  walletAddress: string;
+  mint: string;
+  sampleNumber: number;
+  elapsedSec: number;
+  settings: WalletFilterSettings;
+  metrics: BundlerMetrics;
+  buySol: number | null;
+  matchingWallets: string[];
 }
 
 export interface SellOptions {
