@@ -50,7 +50,11 @@ export class WalletMonitor extends EventEmitter {
   private pollTimer: NodeJS.Timeout | null = null;
   private running = false;
 
-  constructor(config: ServiceConfig, walletAddress?: string) {
+  constructor(
+    config: ServiceConfig,
+    walletAddress?: string,
+    options: { enforceMinBuySol?: boolean } = {}
+  ) {
     super();
 
     if (!walletAddress) {
@@ -69,7 +73,7 @@ export class WalletMonitor extends EventEmitter {
     }
 
     this.pollInterval = config.walletPollInterval;
-    this.minBuySol = config.minBuySol;
+    this.minBuySol = options.enforceMinBuySol === false ? 0 : config.minBuySol;
     this.wsEndpoint = config.solanaWsUrl;
   }
 

@@ -34,6 +34,7 @@ import { PublicKey } from '@solana/web3.js';
 import { randomBytes } from 'crypto';
 
 const log = createLogger('MAIN');
+const TRADING_LINK_WINDOW_MS = 5 * 60 * 1000;
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -72,6 +73,7 @@ async function main(): Promise<void> {
   const walletMonitors = new Map<string, WalletMonitor>();
   let tradingWalletMonitor: WalletMonitor | null = null;
   const pendingTradingBuys = new Map<string, NewTokenEvent>();
+  const pendingTradingBuyTimers = new Map<string, NodeJS.Timeout>();
   const recentWatchedBuys = new Map<string, Set<string>>();
   const activeTradingMints = new Set<string>();
   type PendingTelegramAction =
@@ -147,7 +149,22 @@ async function main(): Promise<void> {
 
   function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
+      const existingTimer = pendingTradingBuyTimers.get(event.mint);
+      if (existingTimer) clearTimeout(existingTimer);
       pendingTradingBuys.set(event.mint, event);
+      const expireTimer = setTimeout(() => {
+        pendingTradingBuyTimers.delete(event.mint);
+        if (activeTradingMints.has(event.mint)) return;
+        pendingTradingBuys.delete(event.mint);
+        log.info(`[TRADING BUY EXPIRED] No watched-wallet match within 5 minutes for ${event.mint}`);
+        telegramBot?.sendDefault([
+          '<b>Trading Wallet Buy Expired</b>',
+          `Token: <code>${html(event.mint)}</code>`,
+          'No watched wallet matched this token within 5 minutes.',
+        ].join('\n')).catch((err) => log.warn('Telegram trading buy expiry alert failed', err));
+      }, TRADING_LINK_WINDOW_MS);
+      pendingTradingBuyTimers.set(event.mint, expireTimer);
+
       const matchedWallets = eligibleWatchedWallets(recentWatchedBuys.get(event.mint) ?? []);
 
       log.info(`[TRADING BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
@@ -193,6 +210,10 @@ async function main(): Promise<void> {
     matchingWallets = eligibleWatchedWallets(new Set(matchingWallets));
     if (matchingWallets.length === 0) return;
     activeTradingMints.add(mint);
+    const pendingTimer = pendingTradingBuyTimers.get(mint);
+    if (pendingTimer) clearTimeout(pendingTimer);
+    pendingTradingBuyTimers.delete(mint);
+    pendingTradingBuys.delete(mint);
 
     if (!db.tokenExists(tradingBuy.walletAddress, mint)) {
       db.insertToken({
@@ -224,7 +245,7 @@ async function main(): Promise<void> {
     }
 
     db.addWallet(normalized);
-    const monitor = new WalletMonitor(config, normalized);
+    const monitor = new WalletMonitor(config, normalized, { enforceMinBuySol: true });
     wireWatchedWalletMonitor(monitor);
     pausedWallets.delete(normalized);
     await monitor.start();
@@ -903,7 +924,7 @@ async function main(): Promise<void> {
 
   // ── 6. Start everything ───────────────────────────────────────────────────
   if (config.tradingWalletAddress) {
-    tradingWalletMonitor = new WalletMonitor(config, config.tradingWalletAddress);
+    tradingWalletMonitor = new WalletMonitor(config, config.tradingWalletAddress, { enforceMinBuySol: false });
     wireTradingWalletMonitor(tradingWalletMonitor);
     await tradingWalletMonitor.start();
   } else {
@@ -931,6 +952,10 @@ async function main(): Promise<void> {
     for (const monitor of walletMonitors.values()) {
       monitor.stop();
     }
+    for (const timer of pendingTradingBuyTimers.values()) {
+      clearTimeout(timer);
+    }
+    pendingTradingBuyTimers.clear();
     tradingWalletMonitor?.stop();
     telegramBot?.stop();
     scheduler.stop();
