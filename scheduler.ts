@@ -230,7 +230,8 @@ export class Scheduler extends EventEmitter {
   ): TokenSummary {
     const percents = samples
       .map((s) => s.bundlersPercent)
-      .filter((v): v is number => v !== null && v >= 1);
+      .filter((v): v is number => v !== null);
+    const validPercents = percents.filter((v) => v >= 1);
 
     const counts = samples
       .map((s) => s.bundlersCount)
@@ -246,8 +247,8 @@ export class Scheduler extends EventEmitter {
       bundlersPercent: {
         first: percents.at(0)  ?? null,
         last:  percents.at(-1) ?? null,
-        min:   percents.length ? Math.min(...percents) : null,
-        max:   percents.length ? Math.max(...percents) : null,
+        min:   validPercents.length ? Math.min(...validPercents) : null,
+        max:   validPercents.length ? Math.max(...validPercents) : null,
       },
       bundlersCount: {
         first: counts.at(0)  ?? null,

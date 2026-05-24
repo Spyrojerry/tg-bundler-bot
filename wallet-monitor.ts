@@ -20,6 +20,7 @@ import { createLogger } from './logger';
 import { NewTokenEvent, ServiceConfig, TokenHolding } from './types';
 
 const log = createLogger('WALLET');
+const WALLET_COMMITMENT = 'processed';
 
 const TOKEN_PROGRAM_IDS = [
   new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
@@ -46,6 +47,7 @@ export class WalletMonitor extends EventEmitter {
 
   /** Signatures currently being parsed from websocket notifications. */
   private pendingSignatures: Set<string> = new Set();
+  private minBuyUnknownLogged: Set<string> = new Set();
 
   private pollTimer: NodeJS.Timeout | null = null;
   private running = false;
@@ -62,7 +64,7 @@ export class WalletMonitor extends EventEmitter {
     }
 
     this.connection = new Connection(config.solanaRpcUrl, {
-      commitment: 'confirmed',
+      commitment: WALLET_COMMITMENT,
       wsEndpoint: config.solanaWsUrl,
     });
 
@@ -151,7 +153,7 @@ export class WalletMonitor extends EventEmitter {
           log.error(`Failed to process logs signature ${logInfo.signature}`, err)
         );
       },
-      'confirmed'
+      WALLET_COMMITMENT
     );
 
     log.info(`WS logsSubscribe active (id=${this.logsSubscriptionId})`);
@@ -188,7 +190,7 @@ export class WalletMonitor extends EventEmitter {
       const resp = await this.connection.getParsedTokenAccountsByOwner(
         this.walletPubkey,
         { programId },
-        'confirmed'
+        WALLET_COMMITMENT
       );
 
       for (const { account } of resp.value) {
@@ -236,13 +238,18 @@ export class WalletMonitor extends EventEmitter {
   private async fetchBoughtMintsFromSignature(
     signature: string
   ): Promise<Array<{ mint: string; buySol: number | null }> | null> {
-    const tx = await this.connection.getParsedTransaction(signature, {
-      commitment: 'confirmed',
-      maxSupportedTransactionVersion: 0,
-    });
+    let tx = null;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      tx = await this.connection.getParsedTransaction(signature, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0,
+      });
+      if (tx) break;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+    }
 
     if (!tx) {
-      log.debug(`Transaction ${signature} is not parsed yet; retrying later`);
+      log.debug(`Transaction ${signature} was not parsed after retries`);
       return null;
     }
 
@@ -298,11 +305,13 @@ export class WalletMonitor extends EventEmitter {
 
     if (this.minBuySol > 0) {
       if (buySol === null) {
-        log.info(
-          `[SKIP TOKEN] Mint: ${mint}  Source: ${source}  ` +
-          `Reason: buy SOL unknown, min ${this.minBuySol} SOL required`
-        );
-        this.knownMints.add(mint);
+        if (!this.minBuyUnknownLogged.has(mint)) {
+          log.info(
+            `[WAIT TOKEN] Mint: ${mint}  Source: ${source}  ` +
+            `Reason: buy SOL unknown, waiting for tx parse to check min ${this.minBuySol} SOL`
+          );
+          this.minBuyUnknownLogged.add(mint);
+        }
         return;
       }
       if (buySol < this.minBuySol) {
