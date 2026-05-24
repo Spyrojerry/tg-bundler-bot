@@ -282,6 +282,19 @@ async function main(): Promise<void> {
       }
     }
 
+    if (field === 'maxBundlersPercentIncrease') {
+      settings.massive = {
+        ...settings.massive,
+        applyAtSample: settings.massive.applyAtSample || settings.applyAtSample,
+      };
+    }
+    if (field === 'minBundlersPercentIncrease') {
+      settings.minimal = {
+        ...settings.minimal,
+        applyAtSample: settings.minimal.applyAtSample || settings.applyAtSample,
+      };
+    }
+
     db.updateWalletSettings(normalized, settings);
     const scope = mode === 'global' ? '' : ` (${profileTitle[mode]})`;
     return `Updated ${settingLabel[field]}${scope} for <code>${html(normalized)}</code>.`;
@@ -358,29 +371,31 @@ async function main(): Promise<void> {
         `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} No valid sample appears in the 10%-29.99% range`,
       ];
     };
+    const shortMode = (mode: Exclude<ProfileMode, 'global'>): 'm' | 'n' =>
+      mode === 'massive' ? 'm' : 'n';
     const profileButtons = (mode: Exclude<ProfileMode, 'global'>) => [
-      [{ text: `${profileTitle[mode]} Apply #`, callback_data: `setp:${mode}:apply:${normalized}` }],
+      [{ text: `${profileTitle[mode]} Apply #`, callback_data: `setp:${shortMode(mode)}:apply:${normalized}` }],
       [
-        { text: `${profileTitle[mode]} Min %`, callback_data: `setp:${mode}:minPct:${normalized}` },
-        { text: `${profileTitle[mode]} Max %`, callback_data: `setp:${mode}:maxPct:${normalized}` },
+        { text: `${profileTitle[mode]} Min %`, callback_data: `setp:${shortMode(mode)}:minPct:${normalized}` },
+        { text: `${profileTitle[mode]} Max %`, callback_data: `setp:${shortMode(mode)}:maxPct:${normalized}` },
       ],
       [
-        { text: `${profileTitle[mode]} Min Count`, callback_data: `setp:${mode}:minCnt:${normalized}` },
-        { text: `${profileTitle[mode]} Max Count`, callback_data: `setp:${mode}:maxCnt:${normalized}` },
+        { text: `${profileTitle[mode]} Min Count`, callback_data: `setp:${shortMode(mode)}:minCnt:${normalized}` },
+        { text: `${profileTitle[mode]} Max Count`, callback_data: `setp:${shortMode(mode)}:maxCnt:${normalized}` },
       ],
       [
-        { text: `${profileTitle[mode]} Above %`, callback_data: `setp:${mode}:hiPct:${normalized}` },
-        { text: `${profileTitle[mode]} Above Times`, callback_data: `setp:${mode}:hiOcc:${normalized}` },
+        { text: `${profileTitle[mode]} Above %`, callback_data: `setp:${shortMode(mode)}:hiPct:${normalized}` },
+        { text: `${profileTitle[mode]} Above Times`, callback_data: `setp:${shortMode(mode)}:hiOcc:${normalized}` },
       ],
       [
-        { text: `${profileTitle[mode]} Below %`, callback_data: `setp:${mode}:loPct:${normalized}` },
-        { text: `${profileTitle[mode]} Below Times`, callback_data: `setp:${mode}:loOcc:${normalized}` },
+        { text: `${profileTitle[mode]} Below %`, callback_data: `setp:${shortMode(mode)}:loPct:${normalized}` },
+        { text: `${profileTitle[mode]} Below Times`, callback_data: `setp:${shortMode(mode)}:loOcc:${normalized}` },
       ],
       [
-        { text: `${enabledMark(settings[mode].sellIfFirstThreePctZero)} ${profileTitle[mode]} First 3=0`, callback_data: `togglep:${mode}:first0:${normalized}` },
+        { text: `${enabledMark(settings[mode].sellIfFirstThreePctZero)} ${profileTitle[mode]} First 3=0`, callback_data: `togglep:${shortMode(mode)}:first0:${normalized}` },
       ],
       [
-        { text: `${enabledMark(settings[mode].sellIfNoTeenOrTwentyPct)} ${profileTitle[mode]} 10s/20s`, callback_data: `togglep:${mode}:teen20:${normalized}` },
+        { text: `${enabledMark(settings[mode].sellIfNoTeenOrTwentyPct)} ${profileTitle[mode]} 10s/20s`, callback_data: `togglep:${shortMode(mode)}:teen20:${normalized}` },
       ],
     ];
     const modeButtons = [
@@ -654,7 +669,8 @@ async function main(): Promise<void> {
         }
         if (callbackKind === 'setp' && parts.length >= 4) {
           const [, rawMode, rawField, rawAddress] = parts;
-          if (rawMode !== 'massive' && rawMode !== 'minimal') return 'Invalid setting group.';
+          const mode = rawMode === 'm' ? 'massive' : rawMode === 'n' ? 'minimal' : rawMode;
+          if (mode !== 'massive' && mode !== 'minimal') return 'Invalid setting group.';
           const field = settingFieldByCode[rawField];
           if (!field || field === 'minBundlersPercentIncrease' || field === 'maxBundlersPercentIncrease') {
             return 'Invalid setting.';
@@ -664,11 +680,11 @@ async function main(): Promise<void> {
             type: 'setting',
             walletAddress: normalized,
             field,
-            mode: rawMode,
+            mode,
           });
           return {
             text: [
-              `Send a value for <b>${profileTitle[rawMode]} ${settingLabel[field]}</b>.`,
+              `Send a value for <b>${profileTitle[mode]} ${settingLabel[field]}</b>.`,
               field === 'applyAtSample' ? 'Use a positive whole number.' : 'Use a number, or send <code>off</code> to disable.',
             ].join('\n'),
             trackPrompt: true,
@@ -689,10 +705,11 @@ async function main(): Promise<void> {
         }
         if (callbackKind === 'togglep' && parts.length >= 4) {
           const [, rawMode, rawAction, rawAddress] = parts;
-          if (rawMode !== 'massive' && rawMode !== 'minimal') return 'Invalid setting group.';
+          const mode = rawMode === 'm' ? 'massive' : rawMode === 'n' ? 'minimal' : rawMode;
+          if (mode !== 'massive' && mode !== 'minimal') return 'Invalid setting group.';
           const normalized = new PublicKey(rawAddress).toBase58();
           const settings = db.getWalletSettings(normalized);
-          const profile = settings[rawMode];
+          const profile = settings[mode];
           if (rawAction === 'first0') {
             profile.sellIfFirstThreePctZero = !profile.sellIfFirstThreePctZero;
           } else if (rawAction === 'teen20') {
