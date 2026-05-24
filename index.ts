@@ -809,7 +809,7 @@ async function main(): Promise<void> {
         const wallets = walletAliasesByChat.get(chatId) ?? walletAliasesByChat.get('__default__') ?? [...walletMonitors.keys()];
         const wallet = wallets[Number(walletAlias[1])];
         if (!wallet) return 'Wallet shortcut not found. Send /wallets to refresh the list.';
-        return settingsReply(wallet);
+        return walletSummaryReply(wallet);
       }
       if (command === '/status') {
         return statusReply();
