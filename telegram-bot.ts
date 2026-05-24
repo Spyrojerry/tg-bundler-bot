@@ -195,10 +195,11 @@ export class TelegramBot {
       return;
     }
     if (reply.editCurrent && messageId !== undefined) {
-      await this.editMessage(chatId, messageId, reply.text, reply.replyMarkup);
+      const edited = await this.editMessage(chatId, messageId, reply.text, reply.replyMarkup);
       if (reply.trackPrompt) {
         this.promptMessagesByChat.set(chatId, messageId);
       }
+      if (!edited) return;
       return;
     }
     const sent = await this.sendMessage(chatId, reply.text, reply.replyMarkup);
@@ -233,15 +234,24 @@ export class TelegramBot {
     messageId: number,
     text: string,
     replyMarkup?: InlineKeyboardMarkup
-  ): Promise<void> {
-    await this.api('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-    });
+  ): Promise<boolean> {
+    try {
+      await this.api('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      });
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('message is not modified')) {
+        return false;
+      }
+      throw err;
+    }
   }
 
   private async pinMessage(chatId: string, messageId: number): Promise<void> {
@@ -322,6 +332,8 @@ export class TelegramBot {
       '<b>Bundler Wallets</b>',
       `First: ${this.fmt(summary.bundlersCount.first)} | Last: ${this.fmt(summary.bundlersCount.last)}`,
       `Min: ${this.fmt(summary.bundlersCount.min)} | Max: ${this.fmt(summary.bundlersCount.max)}`,
+      '',
+      '<i>Filter note: normal % filters ignore samples below 1%.</i>',
     ].join('\n');
   }
 
@@ -334,6 +346,7 @@ export class TelegramBot {
       `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
       `Matched wallets: <b>${event.matchingWallets.length}</b>`,
+      '<i>Normal % filters ignore samples below 1%.</i>',
       '',
       '<b>Reasons</b>',
       ...event.reasons.map((reason) => `- ${this.escapeHtml(reason)}`),
@@ -351,6 +364,7 @@ export class TelegramBot {
       `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
       `Matched wallets: <b>${event.matchingWallets.length}</b>`,
+      '<i>Normal % filters ignore samples below 1%.</i>',
       '',
       'Decision: position left open.',
     ].join('\n');

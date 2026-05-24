@@ -123,6 +123,14 @@ async function main(): Promise<void> {
     maxPctBelowValue: 'Below-% threshold',
     maxPctBelowOccurrences: 'Max below-% occurrences',
   };
+  const settingHint = (field: SettingField): string => {
+    if (field === 'applyAtSample') return 'Use a positive whole number.';
+    if (field === 'maxPctAboveValue') return 'Use a number, or send <code>off</code> to disable. Above-% also needs Above Times set.';
+    if (field === 'maxPctAboveOccurrences') return 'Use a number, or send <code>off</code> to disable. Above Times also needs Above % set.';
+    if (field === 'maxPctBelowValue') return 'Use a number, or send <code>off</code> to disable. Below-% also needs Below Times set.';
+    if (field === 'maxPctBelowOccurrences') return 'Use a number, or send <code>off</code> to disable. Below Times also needs Below % set.';
+    return 'Use a number, or send <code>off</code> to disable.';
+  };
   const profileTitle: Record<Exclude<ProfileMode, 'global'>, string> = {
     massive: 'Massive Count Change',
     minimal: 'Minimal Count Change',
@@ -366,6 +374,16 @@ async function main(): Promise<void> {
     const settings = db.getWalletSettings(normalized);
     const range = (min: number | null, max: number | null, suffix = ''): string =>
       `${fmtSetting(min)}${suffix} - ${fmtSetting(max)}${suffix}`;
+    const pairLine = (
+      occurrences: number | null,
+      value: number | null,
+      label: 'above' | 'below'
+    ): string => {
+      const disabled = occurrences === null || value === null
+        ? ' <i>(disabled until both values are set)</i>'
+        : '';
+      return `No more than <b>${fmtSetting(occurrences)}</b> sample(s) ${label} <b>${fmtSetting(value)}%</b>${disabled}`;
+    };
     const profileText = (mode: Exclude<ProfileMode, 'global'>): string[] => {
       const profile = settings[mode];
       const threshold = mode === 'massive'
@@ -382,8 +400,8 @@ async function main(): Promise<void> {
         `Apply filters at sample: <b>#${profile.applyAtSample}</b>`,
         `Observed bundlers % min/max: <b>${range(profile.minBundlersPercent, profile.maxBundlersPercent, '%')}</b>`,
         `Observed bundler wallet count min/max: <b>${range(profile.minBundlersCount, profile.maxBundlersCount)}</b>`,
-        `No more than <b>${fmtSetting(profile.maxPctAboveOccurrences)}</b> sample(s) above <b>${fmtSetting(profile.maxPctAboveValue)}%</b>`,
-        `No more than <b>${fmtSetting(profile.maxPctBelowOccurrences)}</b> sample(s) below <b>${fmtSetting(profile.maxPctBelowValue)}%</b>`,
+        pairLine(profile.maxPctAboveOccurrences, profile.maxPctAboveValue, 'above'),
+        pairLine(profile.maxPctBelowOccurrences, profile.maxPctBelowValue, 'below'),
         `${enabledMark(profile.sellIfFirstThreePctZero)} First 3 bundlers % samples are all 0%`,
         `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} No valid sample appears in the 10%-29.99% range`,
       ];
@@ -450,7 +468,7 @@ async function main(): Promise<void> {
         ...profileText('massive'),
         ...profileText('minimal'),
         '',
-        '<i>Any = disabled. Normal % filters ignore samples below 1%.</i>',
+        '<i>For min/max filters, Any disables only that side of the range. Above/below sample rules need both values. Normal % filters ignore samples below 1%.</i>',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
@@ -699,7 +717,7 @@ async function main(): Promise<void> {
           return {
             text: [
               `Send a value for <b>${settingLabel[field]}</b>.`,
-              field === 'applyAtSample' ? 'Use a positive whole number.' : 'Use a number, or send <code>off</code> to disable.',
+              settingHint(field),
             ].join('\n'),
             trackPrompt: true,
           };
@@ -722,7 +740,7 @@ async function main(): Promise<void> {
           return {
             text: [
               `Send a value for <b>${profileTitle[mode]} ${settingLabel[field]}</b>.`,
-              field === 'applyAtSample' ? 'Use a positive whole number.' : 'Use a number, or send <code>off</code> to disable.',
+              settingHint(field),
             ].join('\n'),
             trackPrompt: true,
           };
