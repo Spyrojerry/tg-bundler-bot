@@ -27,8 +27,8 @@ export const DEFAULT_WALLET_FILTER_PROFILE_SETTINGS: WalletFilterProfileSettings
   maxBundlersPercent: null,
   minBundlersCount: null,
   maxBundlersCount: null,
-  maxPctAboveValue: 60,
-  maxPctAboveOccurrences: 5,
+  maxPctAboveValue: null,
+  maxPctAboveOccurrences: null,
   maxPctBelowValue: null,
   maxPctBelowOccurrences: null,
   sellIfFirstThreePctZero: false,
@@ -434,18 +434,23 @@ export class MonitorDatabase {
       sellIfFirstThreePctZero: parsed.sellIfFirstThreePctZero ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfFirstThreePctZero,
       sellIfNoTeenOrTwentyPct: parsed.sellIfNoTeenOrTwentyPct ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoTeenOrTwentyPct,
     };
+    const normalizeProfile = (profile?: Partial<WalletFilterProfileSettings>): WalletFilterProfileSettings => {
+      const normalized = {
+        ...legacyProfile,
+        ...(profile ?? {}),
+      };
+      if (normalized.maxPctAboveValue === 60 && normalized.maxPctAboveOccurrences === 5) {
+        normalized.maxPctAboveValue = null;
+        normalized.maxPctAboveOccurrences = null;
+      }
+      return normalized;
+    };
     return {
       ...legacyProfile,
       minBundlersCountChange: parsed.minBundlersCountChange ?? (parsed as { minBundlersPercentIncrease?: number | null }).minBundlersPercentIncrease ?? null,
       maxBundlersCountChange: parsed.maxBundlersCountChange ?? (parsed as { maxBundlersPercentIncrease?: number | null }).maxBundlersPercentIncrease ?? null,
-      massive: {
-        ...legacyProfile,
-        ...(parsed.massive ?? {}),
-      },
-      minimal: {
-        ...legacyProfile,
-        ...(parsed.minimal ?? {}),
-      },
+      massive: normalizeProfile(parsed.massive),
+      minimal: normalizeProfile(parsed.minimal),
     };
   }
 

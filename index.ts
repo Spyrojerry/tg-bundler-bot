@@ -380,8 +380,8 @@ async function main(): Promise<void> {
         `<b>${profileTitle[mode]} Settings</b>`,
         rule,
         `Apply filters at sample: <b>#${profile.applyAtSample}</b>`,
-        `Latest bundlers % min/max: <b>${range(profile.minBundlersPercent, profile.maxBundlersPercent, '%')}</b>`,
-        `Latest bundler wallet count min/max: <b>${range(profile.minBundlersCount, profile.maxBundlersCount)}</b>`,
+        `Observed bundlers % min/max: <b>${range(profile.minBundlersPercent, profile.maxBundlersPercent, '%')}</b>`,
+        `Observed bundler wallet count min/max: <b>${range(profile.minBundlersCount, profile.maxBundlersCount)}</b>`,
         `No more than <b>${fmtSetting(profile.maxPctAboveOccurrences)}</b> sample(s) above <b>${fmtSetting(profile.maxPctAboveValue)}%</b>`,
         `No more than <b>${fmtSetting(profile.maxPctBelowOccurrences)}</b> sample(s) below <b>${fmtSetting(profile.maxPctBelowValue)}%</b>`,
         `${enabledMark(profile.sellIfFirstThreePctZero)} First 3 bundlers % samples are all 0%`,
@@ -390,36 +390,40 @@ async function main(): Promise<void> {
     };
     const shortMode = (mode: Exclude<ProfileMode, 'global'>): 'm' | 'n' =>
       mode === 'massive' ? 'm' : 'n';
-    const profileButtons = (mode: Exclude<ProfileMode, 'global'>) => [
-      [{ text: `${profileTitle[mode]} Apply #`, callback_data: `setp:${shortMode(mode)}:apply:${normalized}` }],
-      [
-        { text: `${profileTitle[mode]} Min %`, callback_data: `setp:${shortMode(mode)}:minPct:${normalized}` },
-        { text: `${profileTitle[mode]} Max %`, callback_data: `setp:${shortMode(mode)}:maxPct:${normalized}` },
-      ],
-      [
-        { text: `${profileTitle[mode]} Min Count`, callback_data: `setp:${shortMode(mode)}:minCnt:${normalized}` },
-        { text: `${profileTitle[mode]} Max Count`, callback_data: `setp:${shortMode(mode)}:maxCnt:${normalized}` },
-      ],
-      [
-        { text: `${profileTitle[mode]} Above %`, callback_data: `setp:${shortMode(mode)}:hiPct:${normalized}` },
-        { text: `${profileTitle[mode]} Above Times`, callback_data: `setp:${shortMode(mode)}:hiOcc:${normalized}` },
-      ],
-      [
-        { text: `${profileTitle[mode]} Below %`, callback_data: `setp:${shortMode(mode)}:loPct:${normalized}` },
-        { text: `${profileTitle[mode]} Below Times`, callback_data: `setp:${shortMode(mode)}:loOcc:${normalized}` },
-      ],
-      [
-        { text: `${enabledMark(settings[mode].sellIfFirstThreePctZero)} ${profileTitle[mode]} First 3=0`, callback_data: `togglep:${shortMode(mode)}:first0:${normalized}` },
-      ],
-      [
-        { text: `${enabledMark(settings[mode].sellIfNoTeenOrTwentyPct)} ${profileTitle[mode]} 10s/20s`, callback_data: `togglep:${shortMode(mode)}:teen20:${normalized}` },
-      ],
-    ];
+    const profileButtons = (mode: Exclude<ProfileMode, 'global'>) => {
+      const profile = settings[mode];
+      const title = profileTitle[mode];
+      return [
+        [{ text: `${title} Apply #: ${profile.applyAtSample}`, callback_data: `setp:${shortMode(mode)}:apply:${normalized}` }],
+        [
+          { text: `${title} Min %: ${fmtSetting(profile.minBundlersPercent)}`, callback_data: `setp:${shortMode(mode)}:minPct:${normalized}` },
+          { text: `${title} Max %: ${fmtSetting(profile.maxBundlersPercent)}`, callback_data: `setp:${shortMode(mode)}:maxPct:${normalized}` },
+        ],
+        [
+          { text: `${title} Min Count: ${fmtSetting(profile.minBundlersCount)}`, callback_data: `setp:${shortMode(mode)}:minCnt:${normalized}` },
+          { text: `${title} Max Count: ${fmtSetting(profile.maxBundlersCount)}`, callback_data: `setp:${shortMode(mode)}:maxCnt:${normalized}` },
+        ],
+        [
+          { text: `${title} Above %: ${fmtSetting(profile.maxPctAboveValue)}`, callback_data: `setp:${shortMode(mode)}:hiPct:${normalized}` },
+          { text: `${title} Above Times: ${fmtSetting(profile.maxPctAboveOccurrences)}`, callback_data: `setp:${shortMode(mode)}:hiOcc:${normalized}` },
+        ],
+        [
+          { text: `${title} Below %: ${fmtSetting(profile.maxPctBelowValue)}`, callback_data: `setp:${shortMode(mode)}:loPct:${normalized}` },
+          { text: `${title} Below Times: ${fmtSetting(profile.maxPctBelowOccurrences)}`, callback_data: `setp:${shortMode(mode)}:loOcc:${normalized}` },
+        ],
+        [
+          { text: `${enabledMark(profile.sellIfFirstThreePctZero)} ${title} First 3=0`, callback_data: `togglep:${shortMode(mode)}:first0:${normalized}` },
+        ],
+        [
+          { text: `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} ${title} 10s/20s`, callback_data: `togglep:${shortMode(mode)}:teen20:${normalized}` },
+        ],
+      ];
+    };
     const modeButton = (mode: Exclude<ProfileMode, 'global'>) => [
       {
         text: mode === 'massive'
-          ? `${enabledMark(settings.maxBundlersCountChange !== null)} Massive Count Change`
-          : `${enabledMark(settings.minBundlersCountChange !== null)} Minimal Count Change`,
+          ? `${enabledMark(settings.maxBundlersCountChange !== null)} Massive Count Change: ${fmtSetting(settings.maxBundlersCountChange)}`
+          : `${enabledMark(settings.minBundlersCountChange !== null)} Minimal Count Change: ${fmtSetting(settings.minBundlersCountChange)}`,
         callback_data: mode === 'massive'
           ? `set:maxInc:${normalized}`
           : `set:minInc:${normalized}`,

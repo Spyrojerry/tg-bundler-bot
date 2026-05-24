@@ -414,8 +414,6 @@ export class Scheduler extends EventEmitter {
       .filter((value): value is number => value !== null);
 
     const reasons: string[] = [];
-    const latestValidPercent = [...validPercentSamples].at(-1)?.bundlersPercent ?? null;
-    const latestCount = counts.at(-1) ?? null;
     const countChange = counts.length >= 2
       ? Math.max(...counts) - Math.min(...counts)
       : null;
@@ -436,9 +434,8 @@ export class Scheduler extends EventEmitter {
       reasons.push(...this.evaluateProfileFilters(
         prefix,
         active.profile,
-        latestValidPercent,
-        latestCount,
         validPercents,
+        counts,
         samples
       ));
     }
@@ -477,39 +474,42 @@ export class Scheduler extends EventEmitter {
   private evaluateProfileFilters(
     prefix: string,
     settings: WalletFilterProfileSettings,
-    latestValidPercent: number | null,
-    latestCount: number | null,
     validPercents: number[],
+    counts: number[],
     samples: BundlerMetrics[]
   ): string[] {
     const reasons: string[] = [];
+    const minValidPercent = validPercents.length ? Math.min(...validPercents) : null;
+    const maxValidPercent = validPercents.length ? Math.max(...validPercents) : null;
+    const minCount = counts.length ? Math.min(...counts) : null;
+    const maxCount = counts.length ? Math.max(...counts) : null;
     if (
-      latestValidPercent !== null &&
+      minValidPercent !== null &&
       settings.minBundlersPercent !== null &&
-      latestValidPercent < settings.minBundlersPercent
+      minValidPercent < settings.minBundlersPercent
     ) {
-      reasons.push(`${prefix} bundlers % ${latestValidPercent} below min ${settings.minBundlersPercent}`);
+      reasons.push(`${prefix} lowest bundlers % ${minValidPercent} below min ${settings.minBundlersPercent}`);
     }
     if (
-      latestValidPercent !== null &&
+      maxValidPercent !== null &&
       settings.maxBundlersPercent !== null &&
-      latestValidPercent > settings.maxBundlersPercent
+      maxValidPercent > settings.maxBundlersPercent
     ) {
-      reasons.push(`${prefix} bundlers % ${latestValidPercent} above max ${settings.maxBundlersPercent}`);
+      reasons.push(`${prefix} highest bundlers % ${maxValidPercent} above max ${settings.maxBundlersPercent}`);
     }
     if (
-      latestCount !== null &&
+      minCount !== null &&
       settings.minBundlersCount !== null &&
-      latestCount < settings.minBundlersCount
+      minCount < settings.minBundlersCount
     ) {
-      reasons.push(`${prefix} bundlers count ${latestCount} below min ${settings.minBundlersCount}`);
+      reasons.push(`${prefix} lowest bundlers count ${minCount} below min ${settings.minBundlersCount}`);
     }
     if (
-      latestCount !== null &&
+      maxCount !== null &&
       settings.maxBundlersCount !== null &&
-      latestCount > settings.maxBundlersCount
+      maxCount > settings.maxBundlersCount
     ) {
-      reasons.push(`${prefix} bundlers count ${latestCount} above max ${settings.maxBundlersCount}`);
+      reasons.push(`${prefix} highest bundlers count ${maxCount} above max ${settings.maxBundlersCount}`);
     }
     if (settings.maxPctAboveValue !== null && settings.maxPctAboveOccurrences !== null) {
       const occurrences = validPercents.filter((value) => value > settings.maxPctAboveValue!).length;
