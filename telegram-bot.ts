@@ -12,6 +12,7 @@ export interface TelegramReply {
   text: string;
   replyMarkup?: InlineKeyboardMarkup;
   editCurrent?: boolean;
+  trackPrompt?: boolean;
 }
 
 export interface InlineKeyboardMarkup {
@@ -49,6 +50,7 @@ export class TelegramBot {
   private readonly token: string;
   private readonly defaultChatId: string | null;
   private readonly commandHandler: CommandHandler;
+  private readonly promptMessagesByChat = new Map<string, number>();
   private offset = 0;
   private running = false;
 
@@ -81,18 +83,35 @@ export class TelegramBot {
     await this.sendDefault(this.formatSummaryCard(summary), { pin: true });
   }
 
-  async sendFilterFailCard(event: FilterFailEvent): Promise<void> {
-    await this.sendDefault(this.formatFilterFailCard(event), { pin: true });
+  async sendFilterFailCard(
+    event: FilterFailEvent,
+    replyMarkup?: InlineKeyboardMarkup
+  ): Promise<void> {
+    await this.sendDefault(this.formatFilterFailCard(event), {
+      pin: true,
+      replyMarkup,
+    });
   }
 
-  async sendDefault(text: string, options: { pin?: boolean } = {}): Promise<void> {
+  async sendDefault(
+    text: string,
+    options: { pin?: boolean; replyMarkup?: InlineKeyboardMarkup } = {}
+  ): Promise<void> {
     if (!this.defaultChatId) return;
-    const message = await this.sendMessage(this.defaultChatId, text);
+    const message = await this.sendMessage(this.defaultChatId, text, options.replyMarkup);
     if (options.pin) {
       await this.pinMessage(this.defaultChatId, message.message_id).catch((err) =>
         log.warn('Telegram summary pin failed', this.describeError(err))
       );
     }
+  }
+
+  async sendChat(
+    chatId: string,
+    text: string,
+    replyMarkup?: InlineKeyboardMarkup
+  ): Promise<void> {
+    await this.sendMessage(chatId, text, replyMarkup);
   }
 
   private async bootstrapAndPoll(): Promise<void> {
@@ -143,6 +162,14 @@ export class TelegramBot {
             continue;
           }
 
+          const promptMessageId = this.promptMessagesByChat.get(chatIdString);
+          if (promptMessageId !== undefined) {
+            this.promptMessagesByChat.delete(chatIdString);
+            await this.deleteMessage(chatIdString, promptMessageId).catch((err) =>
+              log.debug('Telegram prompt delete failed', this.describeError(err))
+            );
+          }
+
           const reply = await this.commandHandler(chatIdString, text);
           await this.sendReply(chatIdString, reply);
         }
@@ -164,9 +191,15 @@ export class TelegramBot {
     }
     if (reply.editCurrent && messageId !== undefined) {
       await this.editMessage(chatId, messageId, reply.text, reply.replyMarkup);
+      if (reply.trackPrompt) {
+        this.promptMessagesByChat.set(chatId, messageId);
+      }
       return;
     }
-    await this.sendMessage(chatId, reply.text, reply.replyMarkup);
+    const sent = await this.sendMessage(chatId, reply.text, reply.replyMarkup);
+    if (reply.trackPrompt) {
+      this.promptMessagesByChat.set(chatId, sent.message_id);
+    }
   }
 
   private async sendMessage(
@@ -211,6 +244,13 @@ export class TelegramBot {
       chat_id: chatId,
       message_id: messageId,
       disable_notification: true,
+    });
+  }
+
+  private async deleteMessage(chatId: string, messageId: number): Promise<void> {
+    await this.api('deleteMessage', {
+      chat_id: chatId,
+      message_id: messageId,
     });
   }
 
@@ -292,7 +332,7 @@ export class TelegramBot {
       '<b>Reasons</b>',
       ...event.reasons.map((reason) => `- ${this.escapeHtml(reason)}`),
       '',
-      'Sell execution requires confirmation before any swap is submitted.',
+      'Confirm below before any sell is submitted.',
     ].join('\n');
   }
 

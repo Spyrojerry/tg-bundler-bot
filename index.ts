@@ -19,16 +19,18 @@ import { RateLimiter } from './rate-limiter';
 import { GmgnClient } from './gmgn-client';
 import { Scheduler } from './scheduler';
 import { WalletMonitor } from './wallet-monitor';
-import { TelegramBot, TelegramReply } from './telegram-bot';
+import { InlineKeyboardMarkup, TelegramBot, TelegramReply } from './telegram-bot';
 import { startHealthServer } from './health-server';
 import {
   FilterFailEvent,
   MonitorSampleEvent,
   NewTokenEvent,
+  SellResult,
   TokenSummary,
   WalletFilterSettings,
 } from './types';
 import { PublicKey } from '@solana/web3.js';
+import { randomBytes } from 'crypto';
 
 const log = createLogger('MAIN');
 
@@ -70,6 +72,7 @@ async function main(): Promise<void> {
     | { type: 'addwallet' | 'removewallet' }
     | { type: 'setting'; walletAddress: string; field: SettingField };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
+  const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
   const pausedWallets = new Set<string>();
 
   type SettingField = keyof Pick<
@@ -79,6 +82,7 @@ async function main(): Promise<void> {
     | 'maxBundlersPercent'
     | 'minBundlersCount'
     | 'maxBundlersCount'
+    | 'minBundlersPercentIncrease'
     | 'maxBundlersPercentIncrease'
     | 'maxPctAboveValue'
     | 'maxPctAboveOccurrences'
@@ -91,7 +95,8 @@ async function main(): Promise<void> {
     maxPct: 'maxBundlersPercent',
     minCnt: 'minBundlersCount',
     maxCnt: 'maxBundlersCount',
-    pctInc: 'maxBundlersPercentIncrease',
+    minInc: 'minBundlersPercentIncrease',
+    maxInc: 'maxBundlersPercentIncrease',
     hiPct: 'maxPctAboveValue',
     hiOcc: 'maxPctAboveOccurrences',
     loPct: 'maxPctBelowValue',
@@ -103,7 +108,8 @@ async function main(): Promise<void> {
     maxBundlersPercent: 'Max bundlers %',
     minBundlersCount: 'Min bundlers count',
     maxBundlersCount: 'Max bundlers count',
-    maxBundlersPercentIncrease: 'Max % increase',
+    minBundlersPercentIncrease: 'Minimal bundlers % increase',
+    maxBundlersPercentIncrease: 'Massive bundlers % increase',
     maxPctAboveValue: 'Above-% threshold',
     maxPctAboveOccurrences: 'Max above-% occurrences',
     maxPctBelowValue: 'Below-% threshold',
@@ -124,6 +130,7 @@ async function main(): Promise<void> {
         firstSeen: new Date().toISOString(),
         monitoringStatus: 'active',
         detectedAt,
+        buySol: event.buySol,
       });
     }
 
@@ -190,6 +197,7 @@ async function main(): Promise<void> {
 
   const fmtSetting = (value: number | null): string =>
     value === null ? 'Any' : String(value);
+  const enabledMark = (enabled: boolean): string => enabled ? '✅' : '❌';
 
   function updateSetting(
     walletAddress: string,
@@ -270,9 +278,16 @@ async function main(): Promise<void> {
   function settingsReply(address: string, editCurrent = false): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
     const settings = db.getWalletSettings(normalized);
-    const mark = (enabled: boolean): string => enabled ? '✅' : '❌';
     const range = (min: number | null, max: number | null, suffix = ''): string =>
       `${fmtSetting(min)}${suffix} - ${fmtSetting(max)}${suffix}`;
+    const increaseLines = [
+      settings.maxBundlersPercentIncrease !== null
+        ? `${enabledMark(true)} Massive % increase: sell if rise is over <b>${settings.maxBundlersPercentIncrease}%</b>`
+        : null,
+      settings.minBundlersPercentIncrease !== null
+        ? `${enabledMark(true)} Minimal % increase: sell if rise is under <b>${settings.minBundlersPercentIncrease}%</b>`
+        : null,
+    ].filter((line): line is string => line !== null);
 
     return {
       text: [
@@ -282,18 +297,18 @@ async function main(): Promise<void> {
         '<b>When To Check</b>',
         `Apply filters at sample: <b>#${settings.applyAtSample}</b>`,
         '',
-        '<b>Allowed Ranges</b>',
-        `Bundlers %: <b>${range(settings.minBundlersPercent, settings.maxBundlersPercent, '%')}</b>`,
-        `Bundler wallets: <b>${range(settings.minBundlersCount, settings.maxBundlersCount)}</b>`,
-        `Max bundlers % increase: <b>${fmtSetting(settings.maxBundlersPercentIncrease)}%</b>`,
+        '<b>Allowed Latest Sample Ranges</b>',
+        `Latest bundlers % min/max: <b>${range(settings.minBundlersPercent, settings.maxBundlersPercent, '%')}</b>`,
+        `Latest bundler wallet count min/max: <b>${range(settings.minBundlersCount, settings.maxBundlersCount)}</b>`,
+        ...(increaseLines.length ? ['', '<b>Bundlers % Increase Filters</b>', ...increaseLines] : []),
         '',
         '<b>Occurrence Limits</b>',
         `No more than <b>${fmtSetting(settings.maxPctAboveOccurrences)}</b> sample(s) above <b>${fmtSetting(settings.maxPctAboveValue)}%</b>`,
         `No more than <b>${fmtSetting(settings.maxPctBelowOccurrences)}</b> sample(s) below <b>${fmtSetting(settings.maxPctBelowValue)}%</b>`,
         '',
         '<b>Pattern Checks</b>',
-        `${mark(settings.sellIfFirstThreePctZero)} First 3 bundlers % samples are all 0%`,
-        `${mark(settings.sellIfNoTeenOrTwentyPct)} No valid sample appears in the 10%-29.99% range`,
+        `${enabledMark(settings.sellIfFirstThreePctZero)} First 3 bundlers % samples are all 0%`,
+        `${enabledMark(settings.sellIfNoTeenOrTwentyPct)} No valid sample appears in the 10%-29.99% range`,
         '',
         '<i>Any = disabled. Normal % filters ignore samples below 1%.</i>',
       ].join('\n'),
@@ -301,15 +316,18 @@ async function main(): Promise<void> {
         inline_keyboard: [
           [
             { text: 'Apply #', callback_data: `set:apply:${normalized}` },
-            { text: 'Min %', callback_data: `set:minPct:${normalized}` },
-            { text: 'Max %', callback_data: `set:maxPct:${normalized}` },
+            { text: 'Min Bundlers %', callback_data: `set:minPct:${normalized}` },
+            { text: 'Max Bundlers %', callback_data: `set:maxPct:${normalized}` },
           ],
           [
-            { text: 'Min Count', callback_data: `set:minCnt:${normalized}` },
-            { text: 'Max Count', callback_data: `set:maxCnt:${normalized}` },
+            { text: 'Min Wallet Count', callback_data: `set:minCnt:${normalized}` },
+            { text: 'Max Wallet Count', callback_data: `set:maxCnt:${normalized}` },
           ],
           [
-            { text: 'Max % Increase', callback_data: `set:pctInc:${normalized}` },
+            { text: `${enabledMark(settings.maxBundlersPercentIncrease !== null)} Massive % Increase`, callback_data: `set:maxInc:${normalized}` },
+          ],
+          [
+            { text: `${enabledMark(settings.minBundlersPercentIncrease !== null)} Minimal % Increase`, callback_data: `set:minInc:${normalized}` },
           ],
           [
             { text: 'Above % Limit', callback_data: `set:hiPct:${normalized}` },
@@ -320,10 +338,10 @@ async function main(): Promise<void> {
             { text: 'Below Max Times', callback_data: `set:loOcc:${normalized}` },
           ],
           [
-            { text: `${mark(settings.sellIfFirstThreePctZero)} First 3 = 0%`, callback_data: `toggle:first0:${normalized}` },
+            { text: `${enabledMark(settings.sellIfFirstThreePctZero)} First 3 = 0%`, callback_data: `toggle:first0:${normalized}` },
           ],
           [
-            { text: `${mark(settings.sellIfNoTeenOrTwentyPct)} Require 10s/20s`, callback_data: `toggle:teen20:${normalized}` },
+            { text: `${enabledMark(settings.sellIfNoTeenOrTwentyPct)} Require 10s/20s`, callback_data: `toggle:teen20:${normalized}` },
           ],
           [
             { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
@@ -394,6 +412,108 @@ async function main(): Promise<void> {
     ].join('\n');
   }
 
+  function sellAlertMarkup(sellId: string): InlineKeyboardMarkup {
+    return {
+      inline_keyboard: [
+        [
+          {
+            text: `Sell ${config.sellPercent}% for SOL`,
+            callback_data: `sell:confirm:${sellId}`,
+          },
+        ],
+        [
+          { text: 'Ignore', callback_data: `sell:ignore:${sellId}` },
+        ],
+      ],
+    };
+  }
+
+  function lamportsToSol(raw: string | null): number | null {
+    if (!raw || !/^\d+$/.test(raw)) return null;
+    return Number(BigInt(raw)) / 1_000_000_000;
+  }
+
+  function sellReceipt(event: FilterFailEvent, result: SellResult): string {
+    const receivedSol = lamportsToSol(result.filledOutputAmount);
+    const costBasis = event.buySol !== null
+      ? event.buySol * (result.soldPercent / 100)
+      : null;
+    const pnl = receivedSol !== null && costBasis !== null
+      ? receivedSol - costBasis
+      : null;
+    const pnlPct = pnl !== null && costBasis !== null && costBasis > 0
+      ? (pnl / costBasis) * 100
+      : null;
+    const fmtSol = (value: number | null): string =>
+      value === null ? 'N/A' : `${parseFloat(value.toFixed(6))} SOL`;
+    const pnlLine = pnl === null
+      ? 'P/L: N/A (original buy SOL unknown)'
+      : `P/L: <b>${fmtSol(pnl)}</b> (${parseFloat((pnlPct ?? 0).toFixed(2))}%)`;
+
+    return [
+      result.status === 'confirmed' ? '<b>Sell Confirmed</b>' : '<b>Sell Submitted</b>',
+      `Wallet: <code>${html(event.walletAddress)}</code>`,
+      `Token: <code>${html(event.mint)}</code>`,
+      `Status: <b>${html(result.status)}</b>`,
+      `Sold: <b>${result.soldPercent}%</b>`,
+      `Token amount sold: <code>${html(result.filledInputAmount ?? 'pending')}</code>`,
+      `Received: <b>${fmtSol(receivedSol)}</b>`,
+      `Cost basis sold: ${fmtSol(costBasis)}`,
+      pnlLine,
+      result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
+      result.orderId ? `Order ID: <code>${html(result.orderId)}</code>` : '',
+      '',
+      '<b>Why it sold</b>',
+      ...event.reasons.map((reason) => `- ${html(reason)}`),
+    ].filter(Boolean).join('\n');
+  }
+
+  function sellFailedReply(event: FilterFailEvent, err: unknown): string {
+    return [
+      '<b>Sell Failed</b>',
+      `Wallet: <code>${html(event.walletAddress)}</code>`,
+      `Token: <code>${html(event.mint)}</code>`,
+      `Error: ${html(err instanceof Error ? err.message : String(err))}`,
+      '',
+      '<b>Why sell was requested</b>',
+      ...event.reasons.map((reason) => `- ${html(reason)}`),
+    ].join('\n');
+  }
+
+  async function executeSellAndNotify(
+    chatId: string,
+    sellId: string,
+    telegramBot: TelegramBot
+  ): Promise<void> {
+    const pending = pendingSells.get(sellId);
+    if (!pending) return;
+
+    try {
+      const result = await gmgnClient.sellTokenForSol(
+        pending.event.walletAddress,
+        pending.event.mint,
+        {
+          percent: config.sellPercent,
+          slippage: config.sellSlippage,
+          autoSlippage: config.sellAutoSlippage,
+          priorityFeeSol: config.sellPriorityFeeSol,
+          antiMev: config.sellAntiMev,
+        }
+      );
+      if (result.status === 'confirmed') {
+        scheduler.removeToken(pending.event.mint);
+        db.updateTokenStatus(pending.event.walletAddress, pending.event.mint, 'stopped');
+      }
+      await telegramBot.sendChat(chatId, sellReceipt(pending.event, result));
+    } catch (err) {
+      await telegramBot.sendChat(chatId, sellFailedReply(pending.event, err));
+    } finally {
+      pendingSells.delete(sellId);
+    }
+  }
+
+  let telegramBot: TelegramBot | null = null;
+
   async function handleTelegramCommand(_chatId: string, text: string): Promise<string | TelegramReply> {
     const chatId = _chatId;
     const [command] = text.split(/\s+/, 1);
@@ -405,15 +525,42 @@ async function main(): Promise<void> {
 
         if (data === 'menu:addwallet') {
           pendingTelegramActions.set(chatId, { type: 'addwallet' });
-          return 'Send the Solana wallet address to add.';
+          return { text: 'Send the Solana wallet address to add.', trackPrompt: true };
         }
         if (data === 'menu:removewallet') {
           pendingTelegramActions.set(chatId, { type: 'removewallet' });
-          return 'Send the Solana wallet address to remove.';
+          return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
         }
         if (data === 'menu:refresh') return homeReply(true);
         if (data === 'menu:wallets') return walletsReply();
         if (data === 'menu:status') return statusReply();
+
+        if (callbackKind === 'sell' && callbackAction && callbackAddress) {
+          const pending = pendingSells.get(callbackAddress);
+          if (!pending) return 'This sell request is no longer available.';
+          if (callbackAction === 'ignore') {
+            pendingSells.delete(callbackAddress);
+            return 'Sell ignored.';
+          }
+          if (callbackAction === 'confirm') {
+            if (pending.executing) return 'Sell is already being submitted.';
+            pending.executing = true;
+            if (telegramBot) {
+              void executeSellAndNotify(chatId, callbackAddress, telegramBot);
+            }
+            return [
+              '<b>Sell submission started</b>',
+              `Token: <code>${html(pending.event.mint)}</code>`,
+              `Selling: <b>${config.sellPercent}%</b> for SOL`,
+              `Slippage: <b>${config.sellAutoSlippage ? 'auto' : config.sellSlippage}</b>`,
+              `Priority fee: <b>${config.sellPriorityFeeSol} SOL</b>`,
+              `Anti-MEV: <b>${config.sellAntiMev ? 'on' : 'off'}</b>`,
+              '',
+              'I will send the receipt here when GMGN returns the order result.',
+            ].join('\n');
+          }
+          return 'Invalid sell action.';
+        }
 
         if (callbackKind === 'set' && callbackAction && callbackAddress) {
           const field = settingFieldByCode[callbackAction];
@@ -424,10 +571,13 @@ async function main(): Promise<void> {
             walletAddress: normalized,
             field,
           });
-          return [
-            `Send a value for <b>${settingLabel[field]}</b>.`,
-            field === 'applyAtSample' ? 'Use a positive whole number.' : 'Use a number, or send <code>off</code> to disable.',
-          ].join('\n');
+          return {
+            text: [
+              `Send a value for <b>${settingLabel[field]}</b>.`,
+              field === 'applyAtSample' ? 'Use a positive whole number.' : 'Use a number, or send <code>off</code> to disable.',
+            ].join('\n'),
+            trackPrompt: true,
+          };
         }
         if (callbackKind === 'toggle' && callbackAction && callbackAddress) {
           const normalized = new PublicKey(callbackAddress).toBase58();
@@ -473,10 +623,12 @@ async function main(): Promise<void> {
       if (pendingAction && !text.startsWith('/')) {
         pendingTelegramActions.delete(chatId);
         if (pendingAction.type === 'addwallet') {
-          return await startWallet(text);
+          await startWallet(text);
+          return walletSummaryReply(text);
         }
         if (pendingAction.type === 'removewallet') {
-          return stopWallet(text);
+          stopWallet(text);
+          return homeReply();
         }
         if (pendingAction.type === 'setting') {
           const message = updateSetting(
@@ -484,7 +636,8 @@ async function main(): Promise<void> {
             pendingAction.field,
             text
           );
-          return `${message}\n\nSend the wallet again or open Settings to review.`;
+          if (!message.startsWith('Updated ')) return message;
+          return settingsReply(pendingAction.walletAddress);
         }
       }
 
@@ -497,11 +650,11 @@ async function main(): Promise<void> {
       }
       if (command === '/addwallet') {
         pendingTelegramActions.set(chatId, { type: 'addwallet' });
-        return 'Send the Solana wallet address to add.';
+        return { text: 'Send the Solana wallet address to add.', trackPrompt: true };
       }
       if (command === '/removewallet') {
         pendingTelegramActions.set(chatId, { type: 'removewallet' });
-        return 'Send the Solana wallet address to remove.';
+        return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
       }
       if (command === '/wallets') {
         return walletsReply();
@@ -520,7 +673,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const telegramBot = config.telegramBotToken
+  telegramBot = config.telegramBotToken
     ? new TelegramBot(config, handleTelegramCommand)
     : null;
 
@@ -536,7 +689,16 @@ async function main(): Promise<void> {
       );
     });
     scheduler.on('filterFail', (event: FilterFailEvent) => {
-      telegramBot.sendFilterFailCard(event).catch((err) =>
+      const sellId = randomBytes(5).toString('hex');
+      pendingSells.set(sellId, {
+        event: {
+          ...event,
+          buySol: event.buySol ?? db.getToken(event.walletAddress, event.mint)?.buySol ?? null,
+        },
+        createdAt: Date.now(),
+        executing: false,
+      });
+      telegramBot.sendFilterFailCard(event, sellAlertMarkup(sellId)).catch((err) =>
         log.warn('Telegram filter alert send failed', err)
       );
     });

@@ -93,6 +93,7 @@ export class Scheduler extends EventEmitter {
       priority:            event.detectedAt,
       monitoringStartedAt: now,
       filterAlerted:       false,
+      buySol:              event.buySol,
     };
 
     this.entries.set(key, entry);
@@ -411,9 +412,24 @@ export class Scheduler extends EventEmitter {
     ) {
       reasons.push(`bundlers count ${latestCount} above max ${settings.maxBundlersCount}`);
     }
-    if (settings.maxBundlersPercentIncrease !== null && validPercents.length >= 2) {
+    if (
+      (settings.minBundlersPercentIncrease !== null ||
+       settings.maxBundlersPercentIncrease !== null) &&
+      validPercents.length >= 2
+    ) {
       const increase = Math.max(...validPercents) - validPercents[0];
-      if (increase > settings.maxBundlersPercentIncrease) {
+      if (
+        settings.minBundlersPercentIncrease !== null &&
+        increase < settings.minBundlersPercentIncrease
+      ) {
+        reasons.push(
+          `bundlers % increased by ${parseFloat(increase.toFixed(4))}, below required ${settings.minBundlersPercentIncrease}`
+        );
+      }
+      if (
+        settings.maxBundlersPercentIncrease !== null &&
+        increase > settings.maxBundlersPercentIncrease
+      ) {
         reasons.push(
           `bundlers % increased by ${parseFloat(increase.toFixed(4))}, max allowed ${settings.maxBundlersPercentIncrease}`
         );
@@ -459,6 +475,7 @@ export class Scheduler extends EventEmitter {
       reasons,
       settings,
       metrics,
+      buySol: entry.buySol,
     };
     this.emit('filterFail', event);
   }

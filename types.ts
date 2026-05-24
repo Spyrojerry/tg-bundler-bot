@@ -12,6 +12,7 @@ export interface TrackedToken {
   firstSeen: string;          // ISO-8601 UTC
   monitoringStatus: MonitoringStatus;
   detectedAt: number;         // performance.now() epoch for priority scoring
+  buySol: number | null;      // estimated original SOL spent, when known
 }
 
 /** One sample of GMGN bundler metrics */
@@ -59,6 +60,7 @@ export interface SchedulerEntry {
   priority: number;            // lower = higher priority (ms since detection)
   monitoringStartedAt: number; // ms timestamp when this token was added
   filterAlerted: boolean;
+  buySol: number | null;
 }
 
 export interface WalletFilterSettings {
@@ -67,6 +69,7 @@ export interface WalletFilterSettings {
   maxBundlersPercent: number | null;
   minBundlersCount: number | null;
   maxBundlersCount: number | null;
+  minBundlersPercentIncrease: number | null;
   maxBundlersPercentIncrease: number | null;
   maxPctAboveValue: number | null;
   maxPctAboveOccurrences: number | null;
@@ -116,6 +119,11 @@ export interface ServiceConfig {
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;
+  sellPercent: number;
+  sellSlippage: number;
+  sellAutoSlippage: boolean;
+  sellPriorityFeeSol: number;
+  sellAntiMev: boolean;
   port: number;
 }
 
@@ -143,6 +151,27 @@ export interface FilterFailEvent {
   reasons: string[];
   settings: WalletFilterSettings;
   metrics: BundlerMetrics;
+  buySol: number | null;
+}
+
+export interface SellOptions {
+  percent: number;
+  slippage: number;
+  autoSlippage: boolean;
+  priorityFeeSol: number;
+  antiMev: boolean;
+}
+
+export interface SellResult {
+  orderId: string | null;
+  hash: string | null;
+  status: string;
+  inputToken: string;
+  outputToken: string;
+  soldPercent: number;
+  filledInputAmount: string | null;
+  filledOutputAmount: string | null;
+  raw: Record<string, unknown>;
 }
 
 /** Result of a single GMGN fetch attempt */

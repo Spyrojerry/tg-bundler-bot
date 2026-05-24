@@ -46,6 +46,14 @@ function optionalNumber(key: string, defaultVal: number): number {
   return n;
 }
 
+function optionalBoolean(key: string, defaultVal: boolean): boolean {
+  const raw = process.env[key]?.trim().toLowerCase();
+  if (!raw) return defaultVal;
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
+  throw new Error(`${key} must be true or false, got: ${raw}`);
+}
+
 function optionalNullable(key: string): string | null {
   const val = process.env[key]?.trim();
   return val ? val : null;
@@ -70,6 +78,8 @@ export function loadConfig(): ServiceConfig {
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
+  const sellAutoSlippage = optionalBoolean('SELL_AUTO_SLIPPAGE', true);
+  const sellAntiMev      = optionalBoolean('SELL_ANTI_MEV', true);
 
   const walletPollInterval     = optionalInt('WALLET_POLL_INTERVAL', 5_000);
   const minBuySol              = optionalNumber('MIN_BUY_SOL', 8);
@@ -77,6 +87,9 @@ export function loadConfig(): ServiceConfig {
   const monitoringWindowMs     = optionalInt('MONITOR_WINDOW_MS', 60_000);
   const rateLimitMinTime       = optionalInt('RATE_LIMIT_MIN_TIME', 500);
   const rateLimitMaxConcurrent = optionalInt('RATE_LIMIT_MAX_CONCURRENT', 1);
+  const sellPercent            = optionalNumber('SELL_PERCENT', 100);
+  const sellSlippage           = optionalNumber('SELL_SLIPPAGE', 0.3);
+  const sellPriorityFeeSol     = optionalNumber('SELL_PRIORITY_FEE_SOL', 0.000012);
   const port                   = optionalInt('PORT', 8080);
 
   if (!isValidLogLevel(rawLogLevel)) {
@@ -96,6 +109,9 @@ export function loadConfig(): ServiceConfig {
   if (monitoringWindowMs < monitorInterval) {
     throw new Error('MONITOR_WINDOW_MS must be >= MONITOR_INTERVAL');
   }
+  if (sellPercent <= 0 || sellPercent > 100) {
+    throw new Error('SELL_PERCENT must be greater than 0 and at most 100');
+  }
 
   return {
     walletAddress,
@@ -114,6 +130,11 @@ export function loadConfig(): ServiceConfig {
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,
+    sellPercent,
+    sellSlippage,
+    sellAutoSlippage,
+    sellPriorityFeeSol,
+    sellAntiMev,
     port,
   };
 }

@@ -26,6 +26,7 @@ export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
   maxBundlersPercent: null,
   minBundlersCount: null,
   maxBundlersCount: null,
+  minBundlersPercentIncrease: null,
   maxBundlersPercentIncrease: null,
   maxPctAboveValue: 60,
   maxPctAboveOccurrences: 5,
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS tokens (
   first_seen         TEXT    NOT NULL,
   monitoring_status  TEXT    NOT NULL DEFAULT 'active',
   detected_at_ms     INTEGER NOT NULL,
+  buy_sol            REAL,
   PRIMARY KEY (wallet_address, mint)
 );
 
@@ -81,6 +83,7 @@ interface TokenRow {
   first_seen: string;
   monitoring_status: string;
   detected_at_ms: number;
+  buy_sol: number | null;
 }
 
 interface MetricRow {
@@ -139,6 +142,9 @@ export class MonitorDatabase {
     if (!tokenColumns.some((c) => c.name === 'wallet_address')) {
       this.db.run(`ALTER TABLE tokens ADD COLUMN wallet_address TEXT NOT NULL DEFAULT ''`);
     }
+    if (!tokenColumns.some((c) => c.name === 'buy_sol')) {
+      this.db.run(`ALTER TABLE tokens ADD COLUMN buy_sol REAL`);
+    }
     const metricColumns = this.query<{ name: string }>(`PRAGMA table_info(bundler_metrics)`);
     if (!metricColumns.some((c) => c.name === 'wallet_address')) {
       this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN wallet_address TEXT NOT NULL DEFAULT ''`);
@@ -161,17 +167,20 @@ export class MonitorDatabase {
           first_seen         TEXT    NOT NULL,
           monitoring_status  TEXT    NOT NULL DEFAULT 'active',
           detected_at_ms     INTEGER NOT NULL,
+          buy_sol            REAL,
           PRIMARY KEY (wallet_address, mint)
         )
       `);
 
       const hasWalletAddress = columns.some((c) => c.name === 'wallet_address');
       const selectWalletAddress = hasWalletAddress ? 'wallet_address' : "''";
+      const hasBuySol = columns.some((c) => c.name === 'buy_sol');
+      const selectBuySol = hasBuySol ? 'buy_sol' : 'NULL';
 
       this.db.run(`
         INSERT OR IGNORE INTO tokens_new
-          (wallet_address, mint, first_seen, monitoring_status, detected_at_ms)
-        SELECT ${selectWalletAddress}, mint, first_seen, monitoring_status, detected_at_ms
+          (wallet_address, mint, first_seen, monitoring_status, detected_at_ms, buy_sol)
+        SELECT ${selectWalletAddress}, mint, first_seen, monitoring_status, detected_at_ms, ${selectBuySol}
         FROM tokens
       `);
 
@@ -216,14 +225,15 @@ export class MonitorDatabase {
   insertToken(token: TrackedToken): void {
     this.run(
       `INSERT OR IGNORE INTO tokens
-         (mint, wallet_address, first_seen, monitoring_status, detected_at_ms)
-       VALUES (?, ?, ?, ?, ?)`,
+         (mint, wallet_address, first_seen, monitoring_status, detected_at_ms, buy_sol)
+       VALUES (?, ?, ?, ?, ?, ?)`,
       [
         token.mint,
         token.walletAddress,
         token.firstSeen,
         token.monitoringStatus,
         token.detectedAt,
+        token.buySol,
       ]
     );
   }
@@ -245,7 +255,25 @@ export class MonitorDatabase {
       firstSeen: r.first_seen,
       monitoringStatus: r.monitoring_status as MonitoringStatus,
       detectedAt: r.detected_at_ms,
+      buySol: r.buy_sol,
     }));
+  }
+
+  getToken(walletAddress: string, mint: string): TrackedToken | null {
+    const rows = this.query<TokenRow>(
+      `SELECT * FROM tokens WHERE wallet_address = ? AND mint = ?`,
+      [walletAddress, mint]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      mint: row.mint,
+      walletAddress: row.wallet_address,
+      firstSeen: row.first_seen,
+      monitoringStatus: row.monitoring_status as MonitoringStatus,
+      detectedAt: row.detected_at_ms,
+      buySol: row.buy_sol,
+    };
   }
 
   tokenExists(walletAddress: string, mint: string): boolean {

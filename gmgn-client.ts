@@ -23,6 +23,8 @@ import {
   BundlerMetrics,
   FetchResult,
   GmgnSecurityResponse,
+  SellOptions,
+  SellResult,
   ServiceConfig,
 } from './types';
 
@@ -34,6 +36,7 @@ const MAX_RETRIES      = 3;
 const BASE_RETRY_MS    = 1_000;
 const REQUEST_TIMEOUT  = 15_000;  // ms
 const BLOCKED_RETRY_MS = 60_000;
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 
@@ -43,6 +46,7 @@ const sleep = (ms: number): Promise<void> =>
 function getSpawnEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
+    if (key === 'GMGN_PRIVATE_KEY' && value?.trim() === '') continue;
     if (value !== undefined) env[key] = value;
   }
   return env;
@@ -93,6 +97,82 @@ export class GmgnClient {
       retryAfterMs: direct.retryAfterMs ?? cli.retryAfterMs,
       nonRetryable: direct.nonRetryable && cli.nonRetryable,
     };
+  }
+
+  async sellTokenForSol(
+    walletAddress: string,
+    mint: string,
+    options: SellOptions
+  ): Promise<SellResult> {
+    this.validateSolAddress(walletAddress, 'wallet address');
+    this.validateSolAddress(mint, 'token mint');
+
+    const args = [
+      'swap',
+      '--chain',
+      this.chain,
+      '--from',
+      walletAddress,
+      '--input-token',
+      mint,
+      '--output-token',
+      SOL_MINT,
+      '--percent',
+      String(options.percent),
+    ];
+    if (options.antiMev) {
+      args.push('--anti-mev');
+    }
+    if (options.priorityFeeSol > 0) {
+      args.push('--priority-fee', String(options.priorityFeeSol));
+    }
+
+    if (options.autoSlippage) {
+      args.push('--auto-slippage');
+    } else {
+      args.push('--slippage', String(options.slippage));
+    }
+    args.push('--raw');
+
+    log.warn(`Submitting confirmed sell via gmgn-cli`, {
+      wallet: walletAddress,
+      mint,
+      percent: options.percent,
+      outputToken: SOL_MINT,
+      slippage: options.autoSlippage ? 'auto' : options.slippage,
+      priorityFeeSol: options.priorityFeeSol,
+      antiMev: options.antiMev,
+    });
+
+    const raw = this.parseCliJson(await this.execGmgnCli(args));
+    let result = this.parseSellResult(raw, mint, options.percent);
+
+    if (!['confirmed', 'failed', 'expired'].includes(result.status) && result.orderId) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await sleep(5_000);
+        const orderId = result.orderId;
+        if (!orderId) break;
+        const orderRaw = this.parseCliJson(await this.execGmgnCli([
+          'order',
+          'get',
+          '--chain',
+          this.chain,
+          '--order-id',
+          orderId,
+          '--raw',
+        ]));
+        result = {
+          ...result,
+          ...this.parseSellResult(orderRaw, mint, options.percent),
+          orderId: this.asString(orderRaw.order_id) ?? result.orderId,
+          hash: this.asString(orderRaw.hash) ?? result.hash,
+          raw: orderRaw,
+        };
+        if (['confirmed', 'failed', 'expired'].includes(result.status)) break;
+      }
+    }
+
+    return result;
   }
 
   private async fetchDirect(mint: string): Promise<FetchResult> {
@@ -262,8 +342,10 @@ export class GmgnClient {
   }
 
   private async doCliRequest(command: string, mint: string): Promise<FetchResult> {
-    if (!/^[1-9A-HJ-NP-Za-km-z]+$/.test(mint)) {
-      return { success: false, error: `Invalid mint for gmgn-cli: ${mint}` };
+    try {
+      this.validateSolAddress(mint, 'mint');
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
     }
 
     log.debug(`gmgn-cli token ${command} ${mint}`);
@@ -279,17 +361,50 @@ export class GmgnClient {
         '--raw',
       ]);
 
-      const jsonStart = stdout.indexOf('{');
-      if (jsonStart === -1) {
-        return { success: false, error: `gmgn-cli ${command} returned no JSON` };
-      }
-
-      const data = JSON.parse(stdout.slice(jsonStart)) as Record<string, unknown>;
+      const data = this.parseCliJson(stdout);
       return { success: true, metrics: this.parseMetrics(mint, data) };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return { success: false, error: `gmgn-cli ${command} failed: ${message}` };
     }
+  }
+
+  private validateSolAddress(value: string, label: string): void {
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
+      throw new Error(`Invalid ${label} for gmgn-cli: ${value}`);
+    }
+  }
+
+  private parseCliJson(stdout: string): Record<string, unknown> {
+    const jsonStart = stdout.indexOf('{');
+    if (jsonStart === -1) {
+      throw new Error('gmgn-cli returned no JSON');
+    }
+    return JSON.parse(stdout.slice(jsonStart)) as Record<string, unknown>;
+  }
+
+  private parseSellResult(
+    raw: Record<string, unknown>,
+    mint: string,
+    soldPercent: number
+  ): SellResult {
+    return {
+      orderId: this.asString(raw.order_id),
+      hash: this.asString(raw.hash),
+      status: this.asString(raw.status) ?? 'unknown',
+      inputToken: this.asString(raw.input_token) ?? mint,
+      outputToken: this.asString(raw.output_token) ?? SOL_MINT,
+      soldPercent,
+      filledInputAmount: this.asString(raw.filled_input_amount),
+      filledOutputAmount: this.asString(raw.filled_output_amount),
+      raw,
+    };
+  }
+
+  private asString(value: unknown): string | null {
+    if (typeof value === 'string' && value.trim() !== '') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    return null;
   }
 
   private execGmgnCli(args: string[]): Promise<string> {
