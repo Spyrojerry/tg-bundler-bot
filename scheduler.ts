@@ -27,6 +27,7 @@ import {
   ServiceConfig,
   TokenSummary,
   WalletFilterProfileSettings,
+  WalletFilterSettings,
 } from './types';
 
 const log = createLogger('SCHED');
@@ -370,25 +371,33 @@ export class Scheduler extends EventEmitter {
   ): void {
     if (entry.filterAlerted || entry.filterPassed) return;
 
-    const settings = this.db.getWalletSettings(entry.walletAddress);
     const activeProfiles: Array<{
       name: 'Massive' | 'Minimal';
+      sourceWallet: string;
+      settings: WalletFilterSettings;
       profile: WalletFilterProfileSettings;
       threshold: number;
     }> = [];
-    if (settings.maxBundlersPercentIncrease !== null) {
-      activeProfiles.push({
-        name: 'Massive',
-        profile: settings.massive,
-        threshold: settings.maxBundlersPercentIncrease,
-      });
-    }
-    if (settings.minBundlersPercentIncrease !== null) {
-      activeProfiles.push({
-        name: 'Minimal',
-        profile: settings.minimal,
-        threshold: settings.minBundlersPercentIncrease,
-      });
+    for (const sourceWallet of entry.matchingWallets) {
+      const settings = this.db.getWalletSettings(sourceWallet);
+      if (settings.maxBundlersCountChange !== null) {
+        activeProfiles.push({
+          name: 'Massive',
+          sourceWallet,
+          settings,
+          profile: settings.massive,
+          threshold: settings.maxBundlersCountChange,
+        });
+      }
+      if (settings.minBundlersCountChange !== null) {
+        activeProfiles.push({
+          name: 'Minimal',
+          sourceWallet,
+          settings,
+          profile: settings.minimal,
+          threshold: settings.minBundlersCountChange,
+        });
+      }
     }
     if (activeProfiles.length === 0) return;
     if (sampleNumber < Math.max(...activeProfiles.map((p) => p.profile.applyAtSample))) return;
@@ -407,21 +416,21 @@ export class Scheduler extends EventEmitter {
     const reasons: string[] = [];
     const latestValidPercent = [...validPercentSamples].at(-1)?.bundlersPercent ?? null;
     const latestCount = counts.at(-1) ?? null;
-    const increase = validPercents.length >= 2
-      ? Math.max(...validPercents) - validPercents[0]
+    const countChange = counts.length >= 2
+      ? Math.max(...counts) - Math.min(...counts)
       : null;
+    if (countChange === null) return;
 
     for (const active of activeProfiles) {
-      const prefix = `[${active.name}]`;
-      if (increase === null) continue;
-      if (active.name === 'Massive' && increase > active.threshold) {
+      const prefix = `[${active.name} ${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)}]`;
+      if (active.name === 'Massive' && countChange >= active.threshold) {
         reasons.push(
-          `${prefix} bundlers % increased by ${parseFloat(increase.toFixed(4))}, max allowed ${active.threshold}`
+          `${prefix} bundler wallet count changed by ${countChange}, threshold ${active.threshold}`
         );
       }
-      if (active.name === 'Minimal' && increase < active.threshold) {
+      if (active.name === 'Minimal' && countChange < active.threshold) {
         reasons.push(
-          `${prefix} bundlers % increased by ${parseFloat(increase.toFixed(4))}, below required ${active.threshold}`
+          `${prefix} bundler wallet count changed by ${countChange}, below required ${active.threshold}`
         );
       }
       reasons.push(...this.evaluateProfileFilters(
@@ -441,7 +450,7 @@ export class Scheduler extends EventEmitter {
         mint: entry.mint,
         sampleNumber,
         elapsedSec,
-        settings,
+        settings: activeProfiles[0].settings,
         metrics,
         buySol: entry.buySol,
         matchingWallets: entry.matchingWallets,
@@ -457,7 +466,7 @@ export class Scheduler extends EventEmitter {
       sampleNumber,
       elapsedSec,
       reasons,
-      settings,
+      settings: activeProfiles[0].settings,
       metrics,
       buySol: entry.buySol,
       matchingWallets: entry.matchingWallets,

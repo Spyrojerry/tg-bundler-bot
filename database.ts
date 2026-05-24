@@ -37,8 +37,8 @@ export const DEFAULT_WALLET_FILTER_PROFILE_SETTINGS: WalletFilterProfileSettings
 
 export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
   ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS,
-  minBundlersPercentIncrease: null,
-  maxBundlersPercentIncrease: null,
+  minBundlersCountChange: null,
+  maxBundlersCountChange: null,
   massive: { ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS },
   minimal: { ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS },
 };
@@ -436,8 +436,8 @@ export class MonitorDatabase {
     };
     return {
       ...legacyProfile,
-      minBundlersPercentIncrease: parsed.minBundlersPercentIncrease ?? null,
-      maxBundlersPercentIncrease: parsed.maxBundlersPercentIncrease ?? null,
+      minBundlersCountChange: parsed.minBundlersCountChange ?? (parsed as { minBundlersPercentIncrease?: number | null }).minBundlersPercentIncrease ?? null,
+      maxBundlersCountChange: parsed.maxBundlersCountChange ?? (parsed as { maxBundlersPercentIncrease?: number | null }).maxBundlersPercentIncrease ?? null,
       massive: {
         ...legacyProfile,
         ...(parsed.massive ?? {}),

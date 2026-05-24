@@ -80,8 +80,8 @@ export interface WalletFilterProfileSettings {
 }
 
 export interface WalletFilterSettings extends WalletFilterProfileSettings {
-  minBundlersPercentIncrease: number | null;
-  maxBundlersPercentIncrease: number | null;
+  minBundlersCountChange: number | null;
+  maxBundlersCountChange: number | null;
   massive: WalletFilterProfileSettings;
   minimal: WalletFilterProfileSettings;
 }

@@ -90,8 +90,8 @@ async function main(): Promise<void> {
     | 'maxBundlersPercent'
     | 'minBundlersCount'
     | 'maxBundlersCount'
-    | 'minBundlersPercentIncrease'
-    | 'maxBundlersPercentIncrease'
+    | 'minBundlersCountChange'
+    | 'maxBundlersCountChange'
     | 'maxPctAboveValue'
     | 'maxPctAboveOccurrences'
     | 'maxPctBelowValue'
@@ -103,8 +103,8 @@ async function main(): Promise<void> {
     maxPct: 'maxBundlersPercent',
     minCnt: 'minBundlersCount',
     maxCnt: 'maxBundlersCount',
-    minInc: 'minBundlersPercentIncrease',
-    maxInc: 'maxBundlersPercentIncrease',
+    minInc: 'minBundlersCountChange',
+    maxInc: 'maxBundlersCountChange',
     hiPct: 'maxPctAboveValue',
     hiOcc: 'maxPctAboveOccurrences',
     loPct: 'maxPctBelowValue',
@@ -116,22 +116,31 @@ async function main(): Promise<void> {
     maxBundlersPercent: 'Max bundlers %',
     minBundlersCount: 'Min bundlers count',
     maxBundlersCount: 'Max bundlers count',
-    minBundlersPercentIncrease: 'Minimal bundlers % increase',
-    maxBundlersPercentIncrease: 'Massive bundlers % increase',
+    minBundlersCountChange: 'Minimal bundler wallet count change',
+    maxBundlersCountChange: 'Massive bundler wallet count change',
     maxPctAboveValue: 'Above-% threshold',
     maxPctAboveOccurrences: 'Max above-% occurrences',
     maxPctBelowValue: 'Below-% threshold',
     maxPctBelowOccurrences: 'Max below-% occurrences',
   };
   const profileTitle: Record<Exclude<ProfileMode, 'global'>, string> = {
-    massive: 'Massive % Increase',
-    minimal: 'Minimal % Increase',
+    massive: 'Massive Count Change',
+    minimal: 'Minimal Count Change',
   };
+
+  function walletHasCoreCountChangeMode(walletAddress: string): boolean {
+    const settings = db.getWalletSettings(walletAddress);
+    return settings.maxBundlersCountChange !== null || settings.minBundlersCountChange !== null;
+  }
+
+  function eligibleWatchedWallets(wallets: Iterable<string>): string[] {
+    return [...wallets].filter((wallet) => walletHasCoreCountChangeMode(wallet));
+  }
 
   function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       pendingTradingBuys.set(event.mint, event);
-      const matchedWallets = [...(recentWatchedBuys.get(event.mint) ?? new Set<string>())];
+      const matchedWallets = eligibleWatchedWallets(recentWatchedBuys.get(event.mint) ?? []);
 
       log.info(`[TRADING BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
       telegramBot?.sendDefault([
@@ -153,6 +162,12 @@ async function main(): Promise<void> {
   function wireWatchedWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       log.info(`[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+      if (!walletHasCoreCountChangeMode(event.walletAddress)) {
+        log.info(
+          `[WATCHED BUY IGNORED] Wallet ${event.walletAddress} has no massive/minimal bundler count change setting`
+        );
+        return;
+      }
       const wallets = recentWatchedBuys.get(event.mint) ?? new Set<string>();
       wallets.add(event.walletAddress);
       recentWatchedBuys.set(event.mint, wallets);
@@ -167,6 +182,8 @@ async function main(): Promise<void> {
     if (activeTradingMints.has(mint)) return;
     const tradingBuy = pendingTradingBuys.get(mint);
     if (!tradingBuy) return;
+    matchingWallets = eligibleWatchedWallets(new Set(matchingWallets));
+    if (matchingWallets.length === 0) return;
     activeTradingMints.add(mint);
 
     if (!db.tokenExists(tradingBuy.walletAddress, mint)) {
@@ -283,13 +300,13 @@ async function main(): Promise<void> {
       }
     }
 
-    if (field === 'maxBundlersPercentIncrease') {
+    if (field === 'maxBundlersCountChange') {
       settings.massive = {
         ...settings.massive,
         applyAtSample: settings.massive.applyAtSample || settings.applyAtSample,
       };
     }
-    if (field === 'minBundlersPercentIncrease') {
+    if (field === 'minBundlersCountChange') {
       settings.minimal = {
         ...settings.minimal,
         applyAtSample: settings.minimal.applyAtSample || settings.applyAtSample,
@@ -352,12 +369,12 @@ async function main(): Promise<void> {
     const profileText = (mode: Exclude<ProfileMode, 'global'>): string[] => {
       const profile = settings[mode];
       const threshold = mode === 'massive'
-        ? settings.maxBundlersPercentIncrease
-        : settings.minBundlersPercentIncrease;
+        ? settings.maxBundlersCountChange
+        : settings.minBundlersCountChange;
       if (threshold === null) return [];
       const rule = mode === 'massive'
-        ? `Core rule: fail if increase is over <b>${threshold}%</b>.`
-        : `Core rule: fail if increase is under <b>${threshold}%</b>.`;
+        ? `Core rule: fail if bundler wallet count change is at least <b>${threshold}</b>.`
+        : `Core rule: fail if bundler wallet count change is under <b>${threshold}</b>.`;
       return [
         '',
         `<b>${profileTitle[mode]} Settings</b>`,
@@ -401,8 +418,8 @@ async function main(): Promise<void> {
     const modeButton = (mode: Exclude<ProfileMode, 'global'>) => [
       {
         text: mode === 'massive'
-          ? `${enabledMark(settings.maxBundlersPercentIncrease !== null)} Massive % Increase`
-          : `${enabledMark(settings.minBundlersPercentIncrease !== null)} Minimal % Increase`,
+          ? `${enabledMark(settings.maxBundlersCountChange !== null)} Massive Count Change`
+          : `${enabledMark(settings.minBundlersCountChange !== null)} Minimal Count Change`,
         callback_data: mode === 'massive'
           ? `set:maxInc:${normalized}`
           : `set:minInc:${normalized}`,
@@ -410,9 +427,9 @@ async function main(): Promise<void> {
     ];
     const groupedModeButtons = [
       modeButton('massive'),
-      ...(settings.maxBundlersPercentIncrease !== null ? profileButtons('massive') : []),
+      ...(settings.maxBundlersCountChange !== null ? profileButtons('massive') : []),
       modeButton('minimal'),
-      ...(settings.minBundlersPercentIncrease !== null ? profileButtons('minimal') : []),
+      ...(settings.minBundlersCountChange !== null ? profileButtons('minimal') : []),
     ];
 
     return {
@@ -421,10 +438,10 @@ async function main(): Promise<void> {
         `<code>${html(normalized)}</code>`,
         '',
         '<b>Core Modes</b>',
-        `${enabledMark(settings.maxBundlersPercentIncrease !== null)} Massive % Increase: required for the Massive settings below to run.`,
-        `${enabledMark(settings.minBundlersPercentIncrease !== null)} Minimal % Increase: required for the Minimal settings below to run.`,
+        `${enabledMark(settings.maxBundlersCountChange !== null)} Massive Count Change: required for the Massive settings below to run.`,
+        `${enabledMark(settings.minBundlersCountChange !== null)} Minimal Count Change: required for the Minimal settings below to run.`,
         'At least one core mode must be set before any other filter can pass or fail a token.',
-        'Increase is measured as highest valid bundlers % minus the first valid bundlers %.',
+        'Count change is measured as highest bundler wallet count minus lowest bundler wallet count.',
         'Valid bundlers % samples are 1% or higher.',
         ...profileText('massive'),
         ...profileText('minimal'),
@@ -688,7 +705,7 @@ async function main(): Promise<void> {
           const mode = rawMode === 'm' ? 'massive' : rawMode === 'n' ? 'minimal' : rawMode;
           if (mode !== 'massive' && mode !== 'minimal') return 'Invalid setting group.';
           const field = settingFieldByCode[rawField];
-          if (!field || field === 'minBundlersPercentIncrease' || field === 'maxBundlersPercentIncrease') {
+          if (!field || field === 'minBundlersCountChange' || field === 'maxBundlersCountChange') {
             return 'Invalid setting.';
           }
           const normalized = new PublicKey(rawAddress).toBase58();
@@ -868,7 +885,7 @@ async function main(): Promise<void> {
     wireTradingWalletMonitor(tradingWalletMonitor);
     await tradingWalletMonitor.start();
   } else {
-    log.warn('No TRADING_WALLET_ADDRESS or WALLET_ADDRESS configured; sell flow cannot detect your buys.');
+    log.warn('No TRADING_WALLET_ADDRESS configured; sell flow cannot detect your buys.');
   }
   const wallets = db.getActiveWallets();
   for (const wallet of wallets) {

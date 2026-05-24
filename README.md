@@ -100,7 +100,7 @@ cp .env.example .env
 Edit `.env`:
 
 ```dotenv
-WALLET_ADDRESS=<your Solana wallet>
+TRADING_WALLET_ADDRESS=<your Solana trading wallet>
 GMGN_API_KEY=<your GMGN API key>
 
 # Optional — tune as needed
