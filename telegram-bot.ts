@@ -36,6 +36,10 @@ interface TelegramUpdate {
   };
 }
 
+interface TelegramMessageResponse {
+  message_id: number;
+}
+
 export class TelegramBot {
   private readonly token: string;
   private readonly defaultChatId: string | null;
@@ -69,12 +73,17 @@ export class TelegramBot {
   }
 
   async sendSummaryCard(summary: TokenSummary): Promise<void> {
-    await this.sendDefault(this.formatSummaryCard(summary));
+    await this.sendDefault(this.formatSummaryCard(summary), { pin: true });
   }
 
-  async sendDefault(text: string): Promise<void> {
+  async sendDefault(text: string, options: { pin?: boolean } = {}): Promise<void> {
     if (!this.defaultChatId) return;
-    await this.sendMessage(this.defaultChatId, text);
+    const message = await this.sendMessage(this.defaultChatId, text);
+    if (options.pin) {
+      await this.pinMessage(this.defaultChatId, message.message_id).catch((err) =>
+        log.warn('Telegram summary pin failed', this.describeError(err))
+      );
+    }
   }
 
   private async bootstrapAndPoll(): Promise<void> {
@@ -155,8 +164,8 @@ export class TelegramBot {
     chatId: string,
     text: string,
     replyMarkup?: InlineKeyboardMarkup
-  ): Promise<void> {
-    await this.api('sendMessage', {
+  ): Promise<TelegramMessageResponse> {
+    return await this.api<TelegramMessageResponse>('sendMessage', {
       chat_id: chatId,
       text,
       parse_mode: 'HTML',
@@ -185,6 +194,14 @@ export class TelegramBot {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    });
+  }
+
+  private async pinMessage(chatId: string, messageId: number): Promise<void> {
+    await this.api('pinChatMessage', {
+      chat_id: chatId,
+      message_id: messageId,
+      disable_notification: true,
     });
   }
 
