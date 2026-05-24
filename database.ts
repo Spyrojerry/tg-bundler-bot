@@ -33,6 +33,7 @@ export const DEFAULT_WALLET_FILTER_PROFILE_SETTINGS: WalletFilterProfileSettings
   maxPctBelowOccurrences: null,
   sellIfFirstThreePctZero: false,
   sellIfNoTeenOrTwentyPct: false,
+  sellIfNoPctAbove50: true,
 };
 
 export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
@@ -433,6 +434,7 @@ export class MonitorDatabase {
       maxPctBelowOccurrences: parsed.maxPctBelowOccurrences ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctBelowOccurrences,
       sellIfFirstThreePctZero: parsed.sellIfFirstThreePctZero ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfFirstThreePctZero,
       sellIfNoTeenOrTwentyPct: parsed.sellIfNoTeenOrTwentyPct ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoTeenOrTwentyPct,
+      sellIfNoPctAbove50: parsed.sellIfNoPctAbove50 ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoPctAbove50,
     };
     const normalizeProfile = (profile?: Partial<WalletFilterProfileSettings>): WalletFilterProfileSettings => ({
       ...legacyProfile,

@@ -77,6 +77,7 @@ export interface WalletFilterProfileSettings {
   maxPctBelowOccurrences: number | null;
   sellIfFirstThreePctZero: boolean;
   sellIfNoTeenOrTwentyPct: boolean;
+  sellIfNoPctAbove50: boolean;
 }
 
 export interface WalletFilterSettings extends WalletFilterProfileSettings {
@@ -86,7 +87,7 @@ export interface WalletFilterSettings extends WalletFilterProfileSettings {
   minimal: WalletFilterProfileSettings;
 }
 
-/** Summary emitted after a token's monitoring window expires */
+/** Summary emitted after a token reaches its apply-sample decision */
 export interface TokenSummary {
   walletAddress: string;
   mint: string;
@@ -120,7 +121,7 @@ export interface ServiceConfig {
   gmgnApiBaseUrl: string;
   gmgnFetchMode: 'auto' | 'direct' | 'cli';
   monitorInterval: number;
-  monitoringWindowMs: number;  // how long to monitor each token before summarising
+  monitoringWindowMs: number;  // legacy env setting; linked tokens use apply-sample decisions
   rateLimitMinTime: number;
   rateLimitMaxConcurrent: number;
   dbPath: string;
@@ -150,6 +151,26 @@ export interface MonitorSampleEvent {
   elapsedSec: number;
   metrics: BundlerMetrics;
   sampleNumber: number;
+  matchingWallets: string[];
+}
+
+export interface FilterProgressEvent {
+  walletAddress: string;
+  mint: string;
+  sampleNumber: number;
+  elapsedSec: number;
+  metrics: BundlerMetrics;
+  matchingWallets: string[];
+  status: 'waiting' | 'evaluating' | 'insufficient-counts';
+  requiredSample: number;
+  activeProfiles: string[];
+  countChange: number | null;
+  observed: {
+    minBundlersPercent: number | null;
+    maxBundlersPercent: number | null;
+    minBundlersCount: number | null;
+    maxBundlersCount: number | null;
+  };
 }
 
 export interface FilterFailEvent {

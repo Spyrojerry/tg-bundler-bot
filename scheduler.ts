@@ -1,15 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  scheduler.ts  —  Single-loop scheduler for GMGN metric fetches
 //
-//  Changes from v1:
-//    • Each token is monitored for exactly MONITOR_WINDOW_MS (default 60 s).
-//    • When the window expires the scheduler:
-//        1. Waits for any in-flight request to land (pendingRequest guard).
-//        2. Reads all samples for the token from the DB.
-//        3. Computes and logs a full summary (first/last/min/max/avg).
-//        4. Removes the token from the active set.
-//    • MONITOR_INTERVAL default changed to 2 s.
-//    • All other rate-limit / adaptive / priority / dedup logic unchanged.
+//  Linked trading-wallet tokens are monitored until their active profile
+//  reaches Apply filters at sample #N and produces a pass/fail decision.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createLogger } from './logger';
@@ -21,6 +14,7 @@ import {
   BundlerMetrics,
   FilterFailEvent,
   FilterPassEvent,
+  FilterProgressEvent,
   MonitorSampleEvent,
   NewTokenEvent,
   SchedulerEntry,
@@ -68,7 +62,7 @@ export class Scheduler extends EventEmitter {
     this.scheduleTick();
     log.info(
       `Scheduler started — interval ${this.config.monitorInterval}ms, ` +
-      `window ${this.config.monitoringWindowMs}ms per token`
+      `sample-count driven filter decisions`
     );
   }
 
@@ -103,9 +97,8 @@ export class Scheduler extends EventEmitter {
 
     this.entries.set(key, entry);
 
-    const windowSec = Math.round(this.config.monitoringWindowMs / 1_000);
     log.info(
-      `Scheduler: tracking ${event.mint} for ${windowSec}s ` +
+      `Scheduler: tracking ${event.mint} until apply-sample decision ` +
       `(${this.entries.size} active)`
     );
     this.logCapacityWarning();
@@ -162,17 +155,6 @@ export class Scheduler extends EventEmitter {
 
       const now = Date.now();
 
-      // ── 1. Expire tokens whose window has elapsed ─────────────────────────
-      for (const entry of this.entries.values()) {
-        const elapsed = now - entry.monitoringStartedAt;
-        if (elapsed >= this.config.monitoringWindowMs && !entry.pendingRequest) {
-          // Fire-and-forget the expiry so it doesn't block the tick loop
-          this.expireToken(entry).catch((err) =>
-            log.error(`Expiry error for ${entry.mint}`, err)
-          );
-        }
-      }
-
       // ── 2. Adaptive effective interval ────────────────────────────────────
       const activeEntries = [...this.entries.values()];
       const effectiveInterval = Math.max(
@@ -186,7 +168,6 @@ export class Scheduler extends EventEmitter {
         const elapsed = now - entry.monitoringStartedAt;
         if (
           !entry.pendingRequest &&
-          elapsed < this.config.monitoringWindowMs &&          // still in window
           now - entry.lastFetchedAt >= effectiveInterval
         ) {
           due.push(entry);
@@ -209,7 +190,7 @@ export class Scheduler extends EventEmitter {
     }
   }
 
-  // ── Window expiry + summary ───────────────────────────────────────────────
+  // ── Decision summary ──────────────────────────────────────────────────────
 
   private async expireToken(entry: SchedulerEntry): Promise<void> {
     const { mint } = entry;
@@ -220,7 +201,7 @@ export class Scheduler extends EventEmitter {
     // Update DB status
     this.db.updateTokenStatus(entry.walletAddress, mint, 'stopped');
 
-    // Fetch ALL samples recorded during the window
+    // Fetch ALL samples recorded before the apply-sample decision.
     const samples = this.db.getLatestMetricsForWallet(
       entry.walletAddress,
       mint,
@@ -229,17 +210,27 @@ export class Scheduler extends EventEmitter {
     // getLatestMetrics returns newest-first; reverse for chronological order
     samples.reverse();
 
-    const summary = this.buildSummary(entry.walletAddress, mint, samples);
+    const summary = this.buildSummary(
+      entry.walletAddress,
+      mint,
+      samples,
+      Math.max(0, Date.now() - entry.monitoringStartedAt)
+    );
     this.logSummary(summary);
     this.emit('summary', summary);
   }
 
   // ── Summary computation ───────────────────────────────────────────────────
 
-  private buildSummary(walletAddress: string, mint: string, samples: BundlerMetrics[]): TokenSummary {
+  private buildSummary(
+    walletAddress: string,
+    mint: string,
+    samples: BundlerMetrics[],
+    windowMs: number
+  ): TokenSummary {
     const percents = samples
       .map((s) => s.bundlersPercent)
-      .filter((v): v is number => v !== null);
+      .filter((v): v is number => v !== null && v >= 1);
 
     const counts = samples
       .map((s) => s.bundlersCount)
@@ -248,7 +239,7 @@ export class Scheduler extends EventEmitter {
     return {
       walletAddress,
       mint,
-      windowMs:     this.config.monitoringWindowMs,
+      windowMs,
       totalSamples: samples.length,
       firstSeen:    samples.at(0)?.timestamp  ?? new Date().toISOString(),
       lastSeen:     samples.at(-1)?.timestamp ?? new Date().toISOString(),
@@ -347,6 +338,7 @@ export class Scheduler extends EventEmitter {
           elapsedSec: elapsed,
           metrics,
           sampleNumber,
+          matchingWallets: entry.matchingWallets,
         };
         this.emit('sample', sampleEvent);
 
@@ -400,7 +392,7 @@ export class Scheduler extends EventEmitter {
       }
     }
     if (activeProfiles.length === 0) return;
-    if (sampleNumber < Math.max(...activeProfiles.map((p) => p.profile.applyAtSample))) return;
+    const requiredSample = Math.max(...activeProfiles.map((p) => p.profile.applyAtSample));
 
     const samples = this.db
       .getLatestMetricsForWallet(entry.walletAddress, entry.mint, 10_000)
@@ -412,13 +404,50 @@ export class Scheduler extends EventEmitter {
     const counts = samples
       .map((sample) => sample.bundlersCount)
       .filter((value): value is number => value !== null);
-
-    const reasons: string[] = [];
+    const observed = {
+      minBundlersPercent: validPercents.length ? Math.min(...validPercents) : null,
+      maxBundlersPercent: validPercents.length ? Math.max(...validPercents) : null,
+      minBundlersCount: counts.length ? Math.min(...counts) : null,
+      maxBundlersCount: counts.length ? Math.max(...counts) : null,
+    };
     const countChange = counts.length >= 2
       ? Math.max(...counts) - Math.min(...counts)
       : null;
-    if (countChange === null) return;
+    const progressBase = {
+      walletAddress: entry.walletAddress,
+      mint: entry.mint,
+      sampleNumber,
+      elapsedSec,
+      metrics,
+      matchingWallets: entry.matchingWallets,
+      requiredSample,
+      activeProfiles: activeProfiles.map(
+        (active) => `${active.name} ${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)} threshold ${active.threshold}`
+      ),
+      countChange,
+      observed,
+    };
+    if (sampleNumber < requiredSample) {
+      this.emit('filterProgress', {
+        ...progressBase,
+        status: 'waiting',
+      } satisfies FilterProgressEvent);
+      return;
+    }
+    if (countChange === null) {
+      this.emit('filterProgress', {
+        ...progressBase,
+        status: 'insufficient-counts',
+      } satisfies FilterProgressEvent);
+      return;
+    }
 
+    this.emit('filterProgress', {
+      ...progressBase,
+      status: 'evaluating',
+    } satisfies FilterProgressEvent);
+
+    const reasons: string[] = [];
     for (const active of activeProfiles) {
       const prefix = `[${active.name} ${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)}]`;
       if (active.name === 'Massive' && countChange >= active.threshold) {
@@ -453,6 +482,9 @@ export class Scheduler extends EventEmitter {
         matchingWallets: entry.matchingWallets,
       };
       this.emit('filterPass', event);
+      this.expireToken(entry).catch((err) =>
+        log.error(`Post-pass summary error for ${entry.mint}`, err)
+      );
       return;
     }
 
@@ -469,6 +501,9 @@ export class Scheduler extends EventEmitter {
       matchingWallets: entry.matchingWallets,
     };
     this.emit('filterFail', event);
+    this.expireToken(entry).catch((err) =>
+      log.error(`Post-fail summary error for ${entry.mint}`, err)
+    );
   }
 
   private evaluateProfileFilters(
@@ -525,6 +560,12 @@ export class Scheduler extends EventEmitter {
         reasons.push(
           `${prefix} ${occurrences} valid samples below ${settings.maxPctBelowValue}%, max allowed ${settings.maxPctBelowOccurrences}`
         );
+      }
+    }
+    if (settings.sellIfNoPctAbove50) {
+      const hasPctAbove50 = validPercents.some((value) => value > 50);
+      if (!hasPctAbove50) {
+        reasons.push(`${prefix} no valid bundlers % sample is above 50%`);
       }
     }
     if (settings.sellIfFirstThreePctZero) {

@@ -24,6 +24,7 @@ import { startHealthServer } from './health-server';
 import {
   FilterFailEvent,
   FilterPassEvent,
+  FilterProgressEvent,
   MonitorSampleEvent,
   NewTokenEvent,
   SellResult,
@@ -147,6 +148,22 @@ async function main(): Promise<void> {
     return [...wallets].filter((wallet) => walletHasCoreCountChangeMode(wallet));
   }
 
+  function linkedWalletModeLines(wallet: string): string[] {
+    const settings = db.getWalletSettings(wallet);
+    const lines = [`- <code>${html(wallet)}</code>`];
+    if (settings.maxBundlersCountChange !== null) {
+      lines.push(
+        `  Massive: count change >= <b>${settings.maxBundlersCountChange}</b>, apply #${settings.massive.applyAtSample}`
+      );
+    }
+    if (settings.minBundlersCountChange !== null) {
+      lines.push(
+        `  Minimal: count change &lt; <b>${settings.minBundlersCountChange}</b>, apply #${settings.minimal.applyAtSample}`
+      );
+    }
+    return lines;
+  }
+
   function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       const existingTimer = pendingTradingBuyTimers.get(event.mint);
@@ -231,10 +248,10 @@ async function main(): Promise<void> {
       '<b>Watched Wallet Match Found</b>',
       `Trading wallet token: <code>${html(mint)}</code>`,
       `Matched watched wallets: <b>${matchingWallets.length}</b>`,
-      ...matchingWallets.slice(0, 5).map((wallet) => `- <code>${html(wallet)}</code>`),
+      ...matchingWallets.slice(0, 5).flatMap((wallet) => linkedWalletModeLines(wallet)),
       matchingWallets.length > 5 ? `...and ${matchingWallets.length - 5} more` : '',
       '',
-      'Filters are now running on your trading-wallet position.',
+      'Filters are now running on your trading-wallet position. I will send sample and filter-progress updates until pass/fail/summary.',
     ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram match alert failed', err));
   }
 
@@ -423,6 +440,7 @@ async function main(): Promise<void> {
         `Observed bundler wallet count min/max: <b>${range(profile.minBundlersCount, profile.maxBundlersCount)}</b>`,
         pairLine(profile.maxPctAboveOccurrences, profile.maxPctAboveValue, 'above'),
         pairLine(profile.maxPctBelowOccurrences, profile.maxPctBelowValue, 'below'),
+        `${enabledMark(profile.sellIfNoPctAbove50)} At least one valid bundlers % sample is above 50%`,
         `${enabledMark(profile.sellIfFirstThreePctZero)} First 3 bundlers % samples are all 0%`,
         `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} No valid sample appears in the 10%-29.99% range`,
       ];
@@ -449,6 +467,9 @@ async function main(): Promise<void> {
         [
           { text: `${title} Below %: ${fmtSetting(profile.maxPctBelowValue)}`, callback_data: `setp:${shortMode(mode)}:loPct:${normalized}` },
           { text: `${title} Below Times: ${fmtSetting(profile.maxPctBelowOccurrences)}`, callback_data: `setp:${shortMode(mode)}:loOcc:${normalized}` },
+        ],
+        [
+          { text: `${enabledMark(profile.sellIfNoPctAbove50)} ${title} Any >50%`, callback_data: `togglep:${shortMode(mode)}:gt50:${normalized}` },
         ],
         [
           { text: `${enabledMark(profile.sellIfFirstThreePctZero)} ${title} First 3=0`, callback_data: `togglep:${shortMode(mode)}:first0:${normalized}` },
@@ -519,8 +540,8 @@ async function main(): Promise<void> {
         `Wallets monitored: <b>${walletMonitors.size}</b>`,
         `Running wallets: <b>${runningWallets}</b>`,
         `Paused wallets: <b>${pausedWallets.size}</b>`,
-        `Active token windows: <b>${scheduler.activeCount}</b>`,
-        `Monitor window: ${Math.round(config.monitoringWindowMs / 1_000)}s`,
+        `Active linked tokens: <b>${scheduler.activeCount}</b>`,
+        'Filter timing: apply-sample driven',
         `Poll interval: ${config.monitorInterval}ms`,
         `Min buy: ${config.minBuySol} SOL`,
         '',
@@ -567,7 +588,7 @@ async function main(): Promise<void> {
     return [
       `Wallets: ${walletMonitors.size}`,
       `Active tokens: ${scheduler.activeCount}`,
-      `Window: ${Math.round(config.monitoringWindowMs / 1_000)}s`,
+      'Filter timing: apply-sample driven',
       `Interval: ${config.monitorInterval}ms`,
     ].join('\n');
   }
@@ -786,7 +807,9 @@ async function main(): Promise<void> {
           const normalized = new PublicKey(rawAddress).toBase58();
           const settings = db.getWalletSettings(normalized);
           const profile = settings[mode];
-          if (rawAction === 'first0') {
+          if (rawAction === 'gt50') {
+            profile.sellIfNoPctAbove50 = !profile.sellIfNoPctAbove50;
+          } else if (rawAction === 'first0') {
             profile.sellIfFirstThreePctZero = !profile.sellIfFirstThreePctZero;
           } else if (rawAction === 'teen20') {
             profile.sellIfNoTeenOrTwentyPct = !profile.sellIfNoTeenOrTwentyPct;
@@ -893,6 +916,11 @@ async function main(): Promise<void> {
     scheduler.on('sample', (event: MonitorSampleEvent) => {
       telegramBot.sendSampleCard(event).catch((err) =>
         log.warn('Telegram sample send failed', err)
+      );
+    });
+    scheduler.on('filterProgress', (event: FilterProgressEvent) => {
+      telegramBot.sendFilterProgressCard(event).catch((err) =>
+        log.warn('Telegram filter progress send failed', err)
       );
     });
     scheduler.on('summary', (summary: TokenSummary) => {
