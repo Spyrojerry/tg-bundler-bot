@@ -434,17 +434,10 @@ export class MonitorDatabase {
       sellIfFirstThreePctZero: parsed.sellIfFirstThreePctZero ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfFirstThreePctZero,
       sellIfNoTeenOrTwentyPct: parsed.sellIfNoTeenOrTwentyPct ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoTeenOrTwentyPct,
     };
-    const normalizeProfile = (profile?: Partial<WalletFilterProfileSettings>): WalletFilterProfileSettings => {
-      const normalized = {
-        ...legacyProfile,
-        ...(profile ?? {}),
-      };
-      if (normalized.maxPctAboveValue === 60 && normalized.maxPctAboveOccurrences === 5) {
-        normalized.maxPctAboveValue = null;
-        normalized.maxPctAboveOccurrences = null;
-      }
-      return normalized;
-    };
+    const normalizeProfile = (profile?: Partial<WalletFilterProfileSettings>): WalletFilterProfileSettings => ({
+      ...legacyProfile,
+      ...(profile ?? {}),
+    });
     return {
       ...legacyProfile,
       minBundlersCountChange: parsed.minBundlersCountChange ?? (parsed as { minBundlersPercentIncrease?: number | null }).minBundlersPercentIncrease ?? null,
