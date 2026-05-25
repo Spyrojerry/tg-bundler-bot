@@ -209,11 +209,34 @@ async function main(): Promise<void> {
       const wallets = recentWatchedBuys.get(event.mint) ?? new Set<string>();
       wallets.add(event.walletAddress);
       recentWatchedBuys.set(event.mint, wallets);
+      startWatchedWalletSummary(event);
 
       if (pendingTradingBuys.has(event.mint)) {
         activateTradingToken(event.mint, [...wallets]);
       }
     });
+  }
+
+  function startWatchedWalletSummary(event: NewTokenEvent): void {
+    if (!db.tokenExists(event.walletAddress, event.mint)) {
+      db.insertToken({
+        walletAddress: event.walletAddress,
+        mint: event.mint,
+        firstSeen: new Date().toISOString(),
+        monitoringStatus: 'active',
+        detectedAt: event.detectedAt,
+        buySol: event.buySol,
+      });
+    }
+
+    scheduler.addToken({ ...event, matchingWallets: [] });
+    telegramBot?.sendDefault([
+      '<b>Watched Wallet Monitoring Started</b>',
+      `Wallet: <code>${html(event.walletAddress)}</code>`,
+      `Token: <code>${html(event.mint)}</code>`,
+      `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
+      'Mode: monitor-only summary at sample #20. Sell decisions are disabled for watched-wallet-only monitoring.',
+    ].join('\n')).catch((err) => log.warn('Telegram watched-wallet monitor alert failed', err));
   }
 
   function activateTradingToken(mint: string, matchingWallets: string[]): void {
