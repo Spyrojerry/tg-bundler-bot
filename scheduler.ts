@@ -429,7 +429,7 @@ export class Scheduler extends EventEmitter {
         ? activeProfiles.map(
             (active) => `${active.name} ${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)} threshold ${active.threshold}`
           )
-        : entry.matchingWallets.map((wallet) => `Monitor-only ${wallet.slice(0, 4)}...${wallet.slice(-4)} no Massive/Minimal Count Change`),
+        : entry.matchingWallets.map((wallet) => `Monitor-only ${wallet.slice(0, 4)}...${wallet.slice(-4)} sell decisions disabled`),
       countChange,
       observed,
     };

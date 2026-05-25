@@ -158,7 +158,7 @@ async function main(): Promise<void> {
       );
     }
     if (!walletHasCoreCountChangeMode(wallet)) {
-      lines.push('  Monitor-only: no Massive/Minimal Count Change set, so no sell filter can trigger.');
+      lines.push('  Monitor-only: no Massive/Minimal Count Change set, so sell decisions are disabled.');
     }
     return lines;
   }
@@ -247,7 +247,7 @@ async function main(): Promise<void> {
       ...matchingWallets.slice(0, 5).flatMap((wallet) => linkedWalletModeLines(wallet)),
       matchingWallets.length > 5 ? `...and ${matchingWallets.length - 5} more` : '',
       '',
-      'Filters are now running on your trading-wallet position. I will send sample and filter-progress updates until pass/fail/summary.',
+      'Monitoring is now running on your trading-wallet position. Sell decisions run only for linked wallets with Massive or Minimal Count Change enabled.',
     ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram match alert failed', err));
   }
 
@@ -498,9 +498,9 @@ async function main(): Promise<void> {
         `<code>${html(normalized)}</code>`,
         '',
         '<b>Core Modes</b>',
-        `${enabledMark(settings.maxBundlersCountChange !== null)} Massive Count Change: required for the Massive settings below to run.`,
-        `${enabledMark(settings.minBundlersCountChange !== null)} Minimal Count Change: required for the Minimal settings below to run.`,
-        'At least one core mode must be set before any other filter can pass or fail a token.',
+        `${enabledMark(settings.maxBundlersCountChange !== null)} Massive Count Change: enables Massive sell decisions.`,
+        `${enabledMark(settings.minBundlersCountChange !== null)} Minimal Count Change: enables Minimal sell decisions.`,
+        'If neither mode is enabled, linked tokens are monitor-only and still summarize at sample #20.',
         'Count change is measured as highest bundler wallet count minus lowest bundler wallet count.',
         'Valid bundlers % samples are 1% or higher.',
         ...profileText('massive'),
