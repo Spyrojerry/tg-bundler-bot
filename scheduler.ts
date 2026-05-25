@@ -27,6 +27,7 @@ import {
 const log = createLogger('SCHED');
 
 const SCHEDULER_TICK_MS = 500; // internal resolution — half the min interval
+const DEFAULT_APPLY_SAMPLE = 20;
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
@@ -392,8 +393,10 @@ export class Scheduler extends EventEmitter {
         });
       }
     }
-    if (activeProfiles.length === 0) return;
-    const requiredSample = Math.max(...activeProfiles.map((p) => p.profile.applyAtSample));
+    const linkedSettings = entry.matchingWallets.map((wallet) => this.db.getWalletSettings(wallet));
+    const requiredSample = activeProfiles.length > 0
+      ? Math.max(...activeProfiles.map((p) => p.profile.applyAtSample))
+      : Math.max(...linkedSettings.map((settings) => settings.applyAtSample), DEFAULT_APPLY_SAMPLE);
 
     const samples = this.db
       .getLatestMetricsForWallet(entry.walletAddress, entry.mint, 10_000)
@@ -422,9 +425,11 @@ export class Scheduler extends EventEmitter {
       metrics,
       matchingWallets: entry.matchingWallets,
       requiredSample,
-      activeProfiles: activeProfiles.map(
-        (active) => `${active.name} ${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)} threshold ${active.threshold}`
-      ),
+      activeProfiles: activeProfiles.length
+        ? activeProfiles.map(
+            (active) => `${active.name} ${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)} threshold ${active.threshold}`
+          )
+        : entry.matchingWallets.map((wallet) => `Monitor-only ${wallet.slice(0, 4)}...${wallet.slice(-4)} no Massive/Minimal Count Change`),
       countChange,
       observed,
     };
@@ -440,6 +445,17 @@ export class Scheduler extends EventEmitter {
         ...progressBase,
         status: 'insufficient-counts',
       } satisfies FilterProgressEvent);
+      return;
+    }
+
+    if (activeProfiles.length === 0) {
+      this.emit('filterProgress', {
+        ...progressBase,
+        status: 'evaluating',
+      } satisfies FilterProgressEvent);
+      this.expireToken(entry).catch((err) =>
+        log.error(`Monitor-only summary error for ${entry.mint}`, err)
+      );
       return;
     }
 

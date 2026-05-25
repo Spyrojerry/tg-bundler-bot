@@ -144,10 +144,6 @@ async function main(): Promise<void> {
     return settings.maxBundlersCountChange !== null || settings.minBundlersCountChange !== null;
   }
 
-  function eligibleWatchedWallets(wallets: Iterable<string>): string[] {
-    return [...wallets].filter((wallet) => walletHasCoreCountChangeMode(wallet));
-  }
-
   function linkedWalletModeLines(wallet: string): string[] {
     const settings = db.getWalletSettings(wallet);
     const lines = [`- <code>${html(wallet)}</code>`];
@@ -160,6 +156,9 @@ async function main(): Promise<void> {
       lines.push(
         `  Minimal: count change &lt; <b>${settings.minBundlersCountChange}</b>, apply #${settings.minimal.applyAtSample}`
       );
+    }
+    if (!walletHasCoreCountChangeMode(wallet)) {
+      lines.push('  Monitor-only: no Massive/Minimal Count Change set, so no sell filter can trigger.');
     }
     return lines;
   }
@@ -182,7 +181,7 @@ async function main(): Promise<void> {
       }, TRADING_LINK_WINDOW_MS);
       pendingTradingBuyTimers.set(event.mint, expireTimer);
 
-      const matchedWallets = eligibleWatchedWallets(recentWatchedBuys.get(event.mint) ?? []);
+      const matchedWallets = [...(recentWatchedBuys.get(event.mint) ?? new Set<string>())];
 
       log.info(`[TRADING BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
       telegramBot?.sendDefault([
@@ -205,10 +204,7 @@ async function main(): Promise<void> {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       log.info(`[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
       if (!walletHasCoreCountChangeMode(event.walletAddress)) {
-        log.info(
-          `[WATCHED BUY IGNORED] Wallet ${event.walletAddress} has no massive/minimal bundler count change setting`
-        );
-        return;
+        log.info(`[WATCHED BUY MONITOR-ONLY] Wallet ${event.walletAddress} has no massive/minimal bundler count change setting`);
       }
       const wallets = recentWatchedBuys.get(event.mint) ?? new Set<string>();
       wallets.add(event.walletAddress);
@@ -224,7 +220,7 @@ async function main(): Promise<void> {
     if (activeTradingMints.has(mint)) return;
     const tradingBuy = pendingTradingBuys.get(mint);
     if (!tradingBuy) return;
-    matchingWallets = eligibleWatchedWallets(new Set(matchingWallets));
+    matchingWallets = [...new Set(matchingWallets)];
     if (matchingWallets.length === 0) return;
     activeTradingMints.add(mint);
     const pendingTimer = pendingTradingBuyTimers.get(mint);
