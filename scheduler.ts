@@ -582,13 +582,13 @@ export class Scheduler extends EventEmitter {
     if (settings.sellIfNoPctAbove50) {
       const hasPctAbove50 = validPercents.some((value) => value > 50);
       if (!hasPctAbove50) {
-        reasons.push(`${prefix} no valid bundlers % sample is above 50%`);
+        reasons.push(`${prefix} no valid bundlers % sample above 50%`);
       }
     }
     if (settings.sellIfFirstThreePctZero) {
       const firstThree = samples.slice(0, 3).map((sample) => sample.bundlersPercent);
-      if (firstThree.length === 3 && firstThree.every((value) => value === 0)) {
-        reasons.push(`${prefix} first three bundlers % samples are 0%`);
+      if (firstThree.length === 3 && firstThree.some((value) => value === null || value <= 0)) {
+        reasons.push(`${prefix} one of the first three bundlers % samples is 0% or missing`);
       }
     }
     if (settings.sellIfNoTeenOrTwentyPct) {

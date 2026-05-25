@@ -459,9 +459,9 @@ async function main(): Promise<void> {
         `Observed bundler wallet count min/max: <b>${range(profile.minBundlersCount, profile.maxBundlersCount)}</b>`,
         pairLine(profile.maxPctAboveOccurrences, profile.maxPctAboveValue, 'above'),
         pairLine(profile.maxPctBelowOccurrences, profile.maxPctBelowValue, 'below'),
-        `${enabledMark(profile.sellIfNoPctAbove50)} At least one valid bundlers % sample is above 50%`,
-        `${enabledMark(profile.sellIfFirstThreePctZero)} First 3 bundlers % samples are all 0%`,
-        `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} No valid sample appears in the 10%-29.99% range`,
+        `${enabledMark(profile.sellIfNoPctAbove50)} Require at least one valid bundlers % sample above 50%`,
+        `${enabledMark(profile.sellIfFirstThreePctZero)} Require each of the first 3 bundlers % samples to be above 0%`,
+        `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} Require at least one valid bundlers % sample in the 10%-29.99% range`,
       ];
     };
     const shortMode = (mode: Exclude<ProfileMode, 'global'>): 'm' | 'n' =>
@@ -491,10 +491,10 @@ async function main(): Promise<void> {
           { text: `${enabledMark(profile.sellIfNoPctAbove50)} ${title} Any >50%`, callback_data: `togglep:${shortMode(mode)}:gt50:${normalized}` },
         ],
         [
-          { text: `${enabledMark(profile.sellIfFirstThreePctZero)} ${title} First 3=0`, callback_data: `togglep:${shortMode(mode)}:first0:${normalized}` },
+          { text: `${enabledMark(profile.sellIfFirstThreePctZero)} ${title} First 3 >0%`, callback_data: `togglep:${shortMode(mode)}:first0:${normalized}` },
         ],
         [
-          { text: `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} ${title} 10s/20s`, callback_data: `togglep:${shortMode(mode)}:teen20:${normalized}` },
+          { text: `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} ${title} Any 10%-29.99%`, callback_data: `togglep:${shortMode(mode)}:teen20:${normalized}` },
         ],
       ];
     };
