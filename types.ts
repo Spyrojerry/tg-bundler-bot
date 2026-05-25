@@ -23,6 +23,8 @@ export interface BundlerMetrics {
   timestamp: string;          // ISO-8601 UTC
   bundlersPercent: number | null;   // bundler_trader_amount_rate × 100
   bundlersCount: number | null;     // bundle_num / bundler_count
+  initialBaseReserve: number | null;
+  topWallets: number | null;
   bundledAmountRate: number | null; // raw rate (0-1) from API
   // Any extra fields the API returns — stored as JSON string in DB
   rawData?: string;
@@ -82,9 +84,6 @@ export interface WalletFilterProfileSettings {
 
 export interface WalletFilterSettings extends WalletFilterProfileSettings {
   minBundlersCountChange: number | null;
-  maxBundlersCountChange: number | null;
-  massive: WalletFilterProfileSettings;
-  minimal: WalletFilterProfileSettings;
 }
 
 /** Summary emitted after a token reaches its apply-sample decision */
@@ -106,6 +105,13 @@ export interface TokenSummary {
     last:    number | null;
     min:     number | null;
     max:     number | null;
+  };
+  initialBaseReserve: number | null;
+  topWallets: {
+    first: number | null;
+    last: number | null;
+    min: number | null;
+    max: number | null;
   };
 }
 
@@ -152,25 +158,6 @@ export interface MonitorSampleEvent {
   metrics: BundlerMetrics;
   sampleNumber: number;
   matchingWallets: string[];
-}
-
-export interface FilterProgressEvent {
-  walletAddress: string;
-  mint: string;
-  sampleNumber: number;
-  elapsedSec: number;
-  metrics: BundlerMetrics;
-  matchingWallets: string[];
-  status: 'waiting' | 'evaluating' | 'insufficient-counts';
-  requiredSample: number;
-  activeProfiles: string[];
-  countChange: number | null;
-  observed: {
-    minBundlersPercent: number | null;
-    maxBundlersPercent: number | null;
-    minBundlersCount: number | null;
-    maxBundlersCount: number | null;
-  };
 }
 
 export interface FilterFailEvent {

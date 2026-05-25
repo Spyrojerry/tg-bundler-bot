@@ -33,15 +33,12 @@ export const DEFAULT_WALLET_FILTER_PROFILE_SETTINGS: WalletFilterProfileSettings
   maxPctBelowOccurrences: null,
   sellIfFirstThreePctZero: false,
   sellIfNoTeenOrTwentyPct: false,
-  sellIfNoPctAbove50: true,
+  sellIfNoPctAbove50: false,
 };
 
 export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
   ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS,
-  minBundlersCountChange: null,
-  maxBundlersCountChange: null,
-  massive: { ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS },
-  minimal: { ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS },
+  minBundlersCountChange: 20,
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -75,6 +72,8 @@ CREATE TABLE IF NOT EXISTS bundler_metrics (
   timestamp            TEXT    NOT NULL,
   bundlers_percent     REAL,
   bundlers_count       INTEGER,
+  initial_base_reserve REAL,
+  top_wallets          INTEGER,
   bundled_amount_rate  REAL,
   raw_data             TEXT
 );
@@ -101,6 +100,8 @@ interface MetricRow {
   timestamp: string;
   bundlers_percent: number | null;
   bundlers_count: number | null;
+  initial_base_reserve: number | null;
+  top_wallets: number | null;
   bundled_amount_rate: number | null;
   raw_data: string | null;
 }
@@ -156,6 +157,12 @@ export class MonitorDatabase {
     const metricColumns = this.query<{ name: string }>(`PRAGMA table_info(bundler_metrics)`);
     if (!metricColumns.some((c) => c.name === 'wallet_address')) {
       this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN wallet_address TEXT NOT NULL DEFAULT ''`);
+    }
+    if (!metricColumns.some((c) => c.name === 'initial_base_reserve')) {
+      this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN initial_base_reserve REAL`);
+    }
+    if (!metricColumns.some((c) => c.name === 'top_wallets')) {
+      this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN top_wallets INTEGER`);
     }
   }
 
@@ -320,14 +327,16 @@ export class MonitorDatabase {
   insertMetrics(m: BundlerMetrics): void {
     this.run(
       `INSERT INTO bundler_metrics
-         (wallet_address, mint, timestamp, bundlers_percent, bundlers_count, bundled_amount_rate, raw_data)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+         (wallet_address, mint, timestamp, bundlers_percent, bundlers_count, initial_base_reserve, top_wallets, bundled_amount_rate, raw_data)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         m.walletAddress ?? '',
         m.mint,
         m.timestamp,
         m.bundlersPercent  ?? null,
         m.bundlersCount    ?? null,
+        m.initialBaseReserve ?? null,
+        m.topWallets ?? null,
         m.bundledAmountRate ?? null,
         m.rawData          ?? null,
       ]
@@ -350,6 +359,8 @@ export class MonitorDatabase {
       timestamp:        r.timestamp,
       bundlersPercent:  r.bundlers_percent,
       bundlersCount:    r.bundlers_count,
+      initialBaseReserve: r.initial_base_reserve,
+      topWallets: r.top_wallets,
       bundledAmountRate: r.bundled_amount_rate,
       rawData:          r.raw_data ?? undefined,
     }));
@@ -368,6 +379,8 @@ export class MonitorDatabase {
       timestamp:        r.timestamp,
       bundlersPercent:  r.bundlers_percent,
       bundlersCount:    r.bundlers_count,
+      initialBaseReserve: r.initial_base_reserve,
+      topWallets: r.top_wallets,
       bundledAmountRate: r.bundled_amount_rate,
       rawData:          r.raw_data ?? undefined,
     }));
@@ -442,10 +455,7 @@ export class MonitorDatabase {
     });
     return {
       ...legacyProfile,
-      minBundlersCountChange: parsed.minBundlersCountChange ?? (parsed as { minBundlersPercentIncrease?: number | null }).minBundlersPercentIncrease ?? null,
-      maxBundlersCountChange: parsed.maxBundlersCountChange ?? (parsed as { maxBundlersPercentIncrease?: number | null }).maxBundlersPercentIncrease ?? null,
-      massive: normalizeProfile(parsed.massive),
-      minimal: normalizeProfile(parsed.minimal),
+      minBundlersCountChange: parsed.minBundlersCountChange ?? (parsed as { minBundlersPercentIncrease?: number | null }).minBundlersPercentIncrease ?? DEFAULT_WALLET_FILTER_SETTINGS.minBundlersCountChange,
     };
   }
 

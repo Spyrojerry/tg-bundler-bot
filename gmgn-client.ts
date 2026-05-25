@@ -82,7 +82,7 @@ export class GmgnClient {
     }
 
     const direct = await this.fetchDirect(mint);
-    if (direct.success && this.hasBundlerData(direct.metrics)) {
+    if (direct.success && this.hasDecisionData(direct.metrics)) {
       return direct;
     }
 
@@ -326,7 +326,7 @@ export class GmgnClient {
       if (result.success) {
         this.limiter.onSuccess(this.baselineMinTime);
         firstSuccess ??= result;
-        if (this.hasBundlerData(result.metrics)) return result;
+        if (this.hasDecisionData(result.metrics)) return result;
         continue;
       }
 
@@ -339,6 +339,10 @@ export class GmgnClient {
 
   private hasBundlerData(metrics: BundlerMetrics): boolean {
     return metrics.bundlersPercent !== null || metrics.bundlersCount !== null;
+  }
+
+  private hasDecisionData(metrics: BundlerMetrics): boolean {
+    return this.hasBundlerData(metrics) && metrics.initialBaseReserve !== null;
   }
 
   private async doCliRequest(command: string, mint: string): Promise<FetchResult> {
@@ -460,6 +464,7 @@ export class GmgnClient {
   ): BundlerMetrics {
     const stat = this.asRecord(d.stat);
     const walletTagsStat = this.asRecord(d.wallet_tags_stat);
+    const pool = this.asRecord(d.pool);
 
     // GMGN token info exposes this as a 0-1 fraction under stat.
     const rawRate = this.parseNullableNumber(
@@ -477,12 +482,22 @@ export class GmgnClient {
       d.bundle_num ??
       d.bundler_count
     );
+    const initialBaseReserve = this.parseNullableNumber(
+      pool.initial_base_reserve ??
+      d.initial_base_reserve
+    );
+    const topWallets = this.parseNullableNumber(
+      walletTagsStat.top_wallets ??
+      d.top_wallets
+    );
 
     return {
       mint,
       timestamp: new Date().toISOString(),
       bundlersPercent,
       bundlersCount: bundlersCount !== null ? Math.round(bundlersCount) : null,
+      initialBaseReserve,
+      topWallets: topWallets !== null ? Math.round(topWallets) : null,
       bundledAmountRate: rawRate,
       rawData: JSON.stringify(d),
     };

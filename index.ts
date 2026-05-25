@@ -24,7 +24,6 @@ import { startHealthServer } from './health-server';
 import {
   FilterFailEvent,
   FilterPassEvent,
-  FilterProgressEvent,
   MonitorSampleEvent,
   NewTokenEvent,
   SellResult,
@@ -79,13 +78,12 @@ async function main(): Promise<void> {
   const activeTradingMints = new Set<string>();
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
-    | { type: 'setting'; walletAddress: string; field: SettingField; mode: ProfileMode };
+    | { type: 'setting'; walletAddress: string; field: SettingField };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
   const pausedWallets = new Set<string>();
   const walletAliasesByChat = new Map<string, string[]>();
 
-  type ProfileMode = 'global' | 'massive' | 'minimal';
   type SettingField = keyof Pick<
     WalletFilterSettings,
     | 'applyAtSample'
@@ -94,11 +92,6 @@ async function main(): Promise<void> {
     | 'minBundlersCount'
     | 'maxBundlersCount'
     | 'minBundlersCountChange'
-    | 'maxBundlersCountChange'
-    | 'maxPctAboveValue'
-    | 'maxPctAboveOccurrences'
-    | 'maxPctBelowValue'
-    | 'maxPctBelowOccurrences'
   >;
   const settingFieldByCode: Record<string, SettingField> = {
     apply: 'applyAtSample',
@@ -107,11 +100,6 @@ async function main(): Promise<void> {
     minCnt: 'minBundlersCount',
     maxCnt: 'maxBundlersCount',
     minInc: 'minBundlersCountChange',
-    maxInc: 'maxBundlersCountChange',
-    hiPct: 'maxPctAboveValue',
-    hiOcc: 'maxPctAboveOccurrences',
-    loPct: 'maxPctBelowValue',
-    loOcc: 'maxPctBelowOccurrences',
   };
   const settingLabel: Record<SettingField, string> = {
     applyAtSample: 'Apply at sample #',
@@ -119,48 +107,25 @@ async function main(): Promise<void> {
     maxBundlersPercent: 'Max bundlers %',
     minBundlersCount: 'Min bundlers count',
     maxBundlersCount: 'Max bundlers count',
-    minBundlersCountChange: 'Minimal bundler wallet count change',
-    maxBundlersCountChange: 'Massive bundler wallet count change',
-    maxPctAboveValue: 'Above-% threshold',
-    maxPctAboveOccurrences: 'Max above-% occurrences',
-    maxPctBelowValue: 'Below-% threshold',
-    maxPctBelowOccurrences: 'Max below-% occurrences',
+    minBundlersCountChange: 'Min count change to sell',
   };
   const settingHint = (field: SettingField): string => {
     if (field === 'applyAtSample') return 'Use a positive whole number.';
-    if (field === 'maxPctAboveValue') return 'Use a number, or send <code>off</code> to disable. Above-% also needs Above Times set.';
-    if (field === 'maxPctAboveOccurrences') return 'Use a number, or send <code>off</code> to disable. Above Times also needs Above % set.';
-    if (field === 'maxPctBelowValue') return 'Use a number, or send <code>off</code> to disable. Below-% also needs Below Times set.';
-    if (field === 'maxPctBelowOccurrences') return 'Use a number, or send <code>off</code> to disable. Below Times also needs Below % set.';
     return 'Use a number, or send <code>off</code> to disable.';
   };
-  const profileTitle: Record<Exclude<ProfileMode, 'global'>, string> = {
-    massive: 'Massive Count Change',
-    minimal: 'Minimal Count Change',
-  };
 
-  function walletHasCoreCountChangeMode(walletAddress: string): boolean {
+  function walletHasSellFilters(walletAddress: string): boolean {
     const settings = db.getWalletSettings(walletAddress);
-    return settings.maxBundlersCountChange !== null || settings.minBundlersCountChange !== null;
+    return settings.minBundlersCountChange !== null;
   }
 
   function linkedWalletModeLines(wallet: string): string[] {
     const settings = db.getWalletSettings(wallet);
-    const lines = [`- <code>${html(wallet)}</code>`];
-    if (settings.maxBundlersCountChange !== null) {
-      lines.push(
-        `  Massive: count change >= <b>${settings.maxBundlersCountChange}</b>, apply #${settings.massive.applyAtSample}`
-      );
-    }
-    if (settings.minBundlersCountChange !== null) {
-      lines.push(
-        `  Minimal: count change &lt; <b>${settings.minBundlersCountChange}</b>, apply #${settings.minimal.applyAtSample}`
-      );
-    }
-    if (!walletHasCoreCountChangeMode(wallet)) {
-      lines.push('  Monitor-only: no Massive/Minimal Count Change set, so sell decisions are disabled.');
-    }
-    return lines;
+    return [
+      `- <code>${html(wallet)}</code>`,
+      `  Initial reserve gate: <b>1B only</b>, apply #${settings.applyAtSample}`,
+      `  Sell count-change threshold: <b>${fmtSetting(settings.minBundlersCountChange)}</b>`,
+    ];
   }
 
   function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
@@ -203,8 +168,8 @@ async function main(): Promise<void> {
   function wireWatchedWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       log.info(`[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
-      if (!walletHasCoreCountChangeMode(event.walletAddress)) {
-        log.info(`[WATCHED BUY MONITOR-ONLY] Wallet ${event.walletAddress} has no massive/minimal bundler count change setting`);
+      if (!walletHasSellFilters(event.walletAddress)) {
+        log.info(`[WATCHED BUY MONITOR-ONLY] Wallet ${event.walletAddress} has no bundler count-change setting`);
       }
       const wallets = recentWatchedBuys.get(event.mint) ?? new Set<string>();
       wallets.add(event.walletAddress);
@@ -270,7 +235,7 @@ async function main(): Promise<void> {
       ...matchingWallets.slice(0, 5).flatMap((wallet) => linkedWalletModeLines(wallet)),
       matchingWallets.length > 5 ? `...and ${matchingWallets.length - 5} more` : '',
       '',
-      'Monitoring is now running on your trading-wallet position. Sell decisions run only for linked wallets with Massive or Minimal Count Change enabled.',
+      'Monitoring is now running on your trading-wallet position. Sell decisions use the linked wallet filter settings.',
     ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram match alert failed', err));
   }
 
@@ -337,14 +302,12 @@ async function main(): Promise<void> {
   function updateSetting(
     walletAddress: string,
     field: SettingField,
-    mode: ProfileMode,
     rawValue: string
   ): string {
     const normalized = new PublicKey(walletAddress).toBase58();
     const trimmed = rawValue.trim().toLowerCase();
     const settings = db.getWalletSettings(normalized);
-    const target = mode === 'global' ? settings : settings[mode];
-    const targetRecord = target as unknown as Record<string, number | boolean | null>;
+    const targetRecord = settings as unknown as Record<string, number | boolean | null>;
 
     if (trimmed === 'off' || trimmed === 'any' || trimmed === 'none') {
       if (field === 'applyAtSample') {
@@ -365,22 +328,8 @@ async function main(): Promise<void> {
       }
     }
 
-    if (field === 'maxBundlersCountChange') {
-      settings.massive = {
-        ...settings.massive,
-        applyAtSample: settings.massive.applyAtSample || settings.applyAtSample,
-      };
-    }
-    if (field === 'minBundlersCountChange') {
-      settings.minimal = {
-        ...settings.minimal,
-        applyAtSample: settings.minimal.applyAtSample || settings.applyAtSample,
-      };
-    }
-
     db.updateWalletSettings(normalized, settings);
-    const scope = mode === 'global' ? '' : ` (${profileTitle[mode]})`;
-    return `Updated ${settingLabel[field]}${scope} for <code>${html(normalized)}</code>.`;
+    return `Updated ${settingLabel[field]} for <code>${html(normalized)}</code>.`;
   }
 
   function walletSummaryReply(address: string, editCurrent = false): TelegramReply {
@@ -431,88 +380,17 @@ async function main(): Promise<void> {
     const settings = db.getWalletSettings(normalized);
     const range = (min: number | null, max: number | null, suffix = ''): string =>
       `${fmtSetting(min)}${suffix} - ${fmtSetting(max)}${suffix}`;
-    const pairLine = (
-      occurrences: number | null,
-      value: number | null,
-      label: 'above' | 'below'
-    ): string => {
-      const disabled = occurrences === null || value === null
-        ? ' <i>(disabled until both values are set)</i>'
-        : '';
-      return `No more than <b>${fmtSetting(occurrences)}</b> sample(s) ${label} <b>${fmtSetting(value)}%</b>${disabled}`;
-    };
-    const profileText = (mode: Exclude<ProfileMode, 'global'>): string[] => {
-      const profile = settings[mode];
-      const threshold = mode === 'massive'
-        ? settings.maxBundlersCountChange
-        : settings.minBundlersCountChange;
-      if (threshold === null) return [];
-      const rule = mode === 'massive'
-        ? `Core rule: fail if bundler wallet count change is at least <b>${threshold}</b>.`
-        : `Core rule: fail if bundler wallet count change is under <b>${threshold}</b>.`;
-      return [
-        '',
-        `<b>${profileTitle[mode]} Settings</b>`,
-        rule,
-        `Apply filters at sample: <b>#${profile.applyAtSample}</b>`,
-        `Observed bundlers % min/max: <b>${range(profile.minBundlersPercent, profile.maxBundlersPercent, '%')}</b>`,
-        `Observed bundler wallet count min/max: <b>${range(profile.minBundlersCount, profile.maxBundlersCount)}</b>`,
-        pairLine(profile.maxPctAboveOccurrences, profile.maxPctAboveValue, 'above'),
-        pairLine(profile.maxPctBelowOccurrences, profile.maxPctBelowValue, 'below'),
-        `${enabledMark(profile.sellIfNoPctAbove50)} Require at least one valid bundlers % sample above 50%`,
-        `${enabledMark(profile.sellIfFirstThreePctZero)} Require each of the first 3 bundlers % samples to be above 0%`,
-        `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} Require at least one valid bundlers % sample in the 10%-29.99% range`,
-      ];
-    };
-    const shortMode = (mode: Exclude<ProfileMode, 'global'>): 'm' | 'n' =>
-      mode === 'massive' ? 'm' : 'n';
-    const profileButtons = (mode: Exclude<ProfileMode, 'global'>) => {
-      const profile = settings[mode];
-      const title = profileTitle[mode];
-      return [
-        [{ text: `${title} Apply #: ${profile.applyAtSample}`, callback_data: `setp:${shortMode(mode)}:apply:${normalized}` }],
-        [
-          { text: `${title} Min %: ${fmtSetting(profile.minBundlersPercent)}`, callback_data: `setp:${shortMode(mode)}:minPct:${normalized}` },
-          { text: `${title} Max %: ${fmtSetting(profile.maxBundlersPercent)}`, callback_data: `setp:${shortMode(mode)}:maxPct:${normalized}` },
-        ],
-        [
-          { text: `${title} Min Count: ${fmtSetting(profile.minBundlersCount)}`, callback_data: `setp:${shortMode(mode)}:minCnt:${normalized}` },
-          { text: `${title} Max Count: ${fmtSetting(profile.maxBundlersCount)}`, callback_data: `setp:${shortMode(mode)}:maxCnt:${normalized}` },
-        ],
-        [
-          { text: `${title} Above %: ${fmtSetting(profile.maxPctAboveValue)}`, callback_data: `setp:${shortMode(mode)}:hiPct:${normalized}` },
-          { text: `${title} Above Times: ${fmtSetting(profile.maxPctAboveOccurrences)}`, callback_data: `setp:${shortMode(mode)}:hiOcc:${normalized}` },
-        ],
-        [
-          { text: `${title} Below %: ${fmtSetting(profile.maxPctBelowValue)}`, callback_data: `setp:${shortMode(mode)}:loPct:${normalized}` },
-          { text: `${title} Below Times: ${fmtSetting(profile.maxPctBelowOccurrences)}`, callback_data: `setp:${shortMode(mode)}:loOcc:${normalized}` },
-        ],
-        [
-          { text: `${enabledMark(profile.sellIfNoPctAbove50)} ${title} Any >50%`, callback_data: `togglep:${shortMode(mode)}:gt50:${normalized}` },
-        ],
-        [
-          { text: `${enabledMark(profile.sellIfFirstThreePctZero)} ${title} First 3 >0%`, callback_data: `togglep:${shortMode(mode)}:first0:${normalized}` },
-        ],
-        [
-          { text: `${enabledMark(profile.sellIfNoTeenOrTwentyPct)} ${title} Any 10%-29.99%`, callback_data: `togglep:${shortMode(mode)}:teen20:${normalized}` },
-        ],
-      ];
-    };
-    const modeButton = (mode: Exclude<ProfileMode, 'global'>) => [
-      {
-        text: mode === 'massive'
-          ? `${enabledMark(settings.maxBundlersCountChange !== null)} Massive Count Change: ${fmtSetting(settings.maxBundlersCountChange)}`
-          : `${enabledMark(settings.minBundlersCountChange !== null)} Minimal Count Change: ${fmtSetting(settings.minBundlersCountChange)}`,
-        callback_data: mode === 'massive'
-          ? `set:maxInc:${normalized}`
-          : `set:minInc:${normalized}`,
-      },
-    ];
-    const groupedModeButtons = [
-      modeButton('massive'),
-      ...(settings.maxBundlersCountChange !== null ? profileButtons('massive') : []),
-      modeButton('minimal'),
-      ...(settings.minBundlersCountChange !== null ? profileButtons('minimal') : []),
+    const buttons = [
+      [{ text: `Apply #: ${settings.applyAtSample}`, callback_data: `set:apply:${normalized}` }],
+      [
+        { text: `Min %: ${fmtSetting(settings.minBundlersPercent)}`, callback_data: `set:minPct:${normalized}` },
+        { text: `Max %: ${fmtSetting(settings.maxBundlersPercent)}`, callback_data: `set:maxPct:${normalized}` },
+      ],
+      [
+        { text: `Min Count: ${fmtSetting(settings.minBundlersCount)}`, callback_data: `set:minCnt:${normalized}` },
+        { text: `Max Count: ${fmtSetting(settings.maxBundlersCount)}`, callback_data: `set:maxCnt:${normalized}` },
+      ],
+      [{ text: `Count Change: ${fmtSetting(settings.minBundlersCountChange)}`, callback_data: `set:minInc:${normalized}` }],
     ];
 
     return {
@@ -520,20 +398,23 @@ async function main(): Promise<void> {
         '<b>Filter Settings</b>',
         `<code>${html(normalized)}</code>`,
         '',
-        '<b>Core Modes</b>',
-        `${enabledMark(settings.maxBundlersCountChange !== null)} Massive Count Change: enables Massive sell decisions.`,
-        `${enabledMark(settings.minBundlersCountChange !== null)} Minimal Count Change: enables Minimal sell decisions.`,
-        'If neither mode is enabled, linked tokens are monitor-only and still summarize at sample #20.',
-        'Count change is measured as highest bundler wallet count minus lowest bundler wallet count.',
-        'Valid bundlers % samples are 1% or higher.',
-        ...profileText('massive'),
-        ...profileText('minimal'),
+        '<b>Reserve Gate</b>',
+        'Sell filters only evaluate when initial base reserve is exactly <b>1B</b>. If it is 206.9M or anything else, the token is left open.',
         '',
-        '<i>For min/max filters, Any disables only that side of the range. Above/below sample rules need both values. Normal % filters ignore samples below 1%.</i>',
+        '<b>Sample Filters</b>',
+        `Apply filters at sample: <b>#${settings.applyAtSample}</b>`,
+        `Observed bundlers % min/max: <b>${range(settings.minBundlersPercent, settings.maxBundlersPercent, '%')}</b>`,
+        `Observed bundler wallet count min/max: <b>${range(settings.minBundlersCount, settings.maxBundlersCount)}</b>`,
+        `Sell if count change is at least: <b>${fmtSetting(settings.minBundlersCountChange)}</b>`,
+        '',
+        'Count change is highest bundler wallet count minus lowest bundler wallet count.',
+        'Valid bundlers % samples are 1% or higher.',
+        '',
+        '<i>For min/max filters, Any disables only that side of the range.</i>',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
-          ...groupedModeButtons,
+          ...buttons,
           [
             { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
             { text: 'Refresh', callback_data: `settings:refresh:${normalized}` },
@@ -773,34 +654,10 @@ async function main(): Promise<void> {
             type: 'setting',
             walletAddress: normalized,
             field,
-            mode: 'global',
           });
           return {
             text: [
               `Send a value for <b>${settingLabel[field]}</b>.`,
-              settingHint(field),
-            ].join('\n'),
-            trackPrompt: true,
-          };
-        }
-        if (callbackKind === 'setp' && parts.length >= 4) {
-          const [, rawMode, rawField, rawAddress] = parts;
-          const mode = rawMode === 'm' ? 'massive' : rawMode === 'n' ? 'minimal' : rawMode;
-          if (mode !== 'massive' && mode !== 'minimal') return 'Invalid setting group.';
-          const field = settingFieldByCode[rawField];
-          if (!field || field === 'minBundlersCountChange' || field === 'maxBundlersCountChange') {
-            return 'Invalid setting.';
-          }
-          const normalized = new PublicKey(rawAddress).toBase58();
-          pendingTelegramActions.set(chatId, {
-            type: 'setting',
-            walletAddress: normalized,
-            field,
-            mode,
-          });
-          return {
-            text: [
-              `Send a value for <b>${profileTitle[mode]} ${settingLabel[field]}</b>.`,
               settingHint(field),
             ].join('\n'),
             trackPrompt: true,
@@ -813,25 +670,6 @@ async function main(): Promise<void> {
             settings.sellIfFirstThreePctZero = !settings.sellIfFirstThreePctZero;
           } else if (callbackAction === 'teen20') {
             settings.sellIfNoTeenOrTwentyPct = !settings.sellIfNoTeenOrTwentyPct;
-          } else {
-            return 'Invalid setting.';
-          }
-          db.updateWalletSettings(normalized, settings);
-          return settingsReply(normalized, true);
-        }
-        if (callbackKind === 'togglep' && parts.length >= 4) {
-          const [, rawMode, rawAction, rawAddress] = parts;
-          const mode = rawMode === 'm' ? 'massive' : rawMode === 'n' ? 'minimal' : rawMode;
-          if (mode !== 'massive' && mode !== 'minimal') return 'Invalid setting group.';
-          const normalized = new PublicKey(rawAddress).toBase58();
-          const settings = db.getWalletSettings(normalized);
-          const profile = settings[mode];
-          if (rawAction === 'gt50') {
-            profile.sellIfNoPctAbove50 = !profile.sellIfNoPctAbove50;
-          } else if (rawAction === 'first0') {
-            profile.sellIfFirstThreePctZero = !profile.sellIfFirstThreePctZero;
-          } else if (rawAction === 'teen20') {
-            profile.sellIfNoTeenOrTwentyPct = !profile.sellIfNoTeenOrTwentyPct;
           } else {
             return 'Invalid setting.';
           }
@@ -880,7 +718,6 @@ async function main(): Promise<void> {
           const message = updateSetting(
             pendingAction.walletAddress,
             pendingAction.field,
-            pendingAction.mode,
             text
           );
           if (!message.startsWith('Updated ')) return message;
@@ -935,11 +772,6 @@ async function main(): Promise<void> {
     scheduler.on('sample', (event: MonitorSampleEvent) => {
       telegramBot.sendSampleCard(event).catch((err) =>
         log.warn('Telegram sample send failed', err)
-      );
-    });
-    scheduler.on('filterProgress', (event: FilterProgressEvent) => {
-      telegramBot.sendFilterProgressCard(event).catch((err) =>
-        log.warn('Telegram filter progress send failed', err)
       );
     });
     scheduler.on('summary', (summary: TokenSummary) => {

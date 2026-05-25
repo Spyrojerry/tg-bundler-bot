@@ -2,7 +2,6 @@ import { createLogger } from './logger';
 import {
   FilterFailEvent,
   FilterPassEvent,
-  FilterProgressEvent,
   MonitorSampleEvent,
   ServiceConfig,
   TokenSummary,
@@ -97,10 +96,6 @@ export class TelegramBot {
 
   async sendFilterPassCard(event: FilterPassEvent): Promise<void> {
     await this.sendDefault(this.formatFilterPassCard(event), { pin: true });
-  }
-
-  async sendFilterProgressCard(event: FilterProgressEvent): Promise<void> {
-    await this.sendDefault(this.formatFilterProgressCard(event));
   }
 
   async sendDefault(
@@ -316,34 +311,10 @@ export class TelegramBot {
       `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,
       `Bundlers: <b>${this.fmt(metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(metrics.bundlersCount)}</b>`,
+      `Initial base reserve: <b>${this.fmt(metrics.initialBaseReserve)}</b>`,
+      `Top wallets: <b>${this.fmt(metrics.topWallets)}</b>`,
       `Matched wallets: <b>${event.matchingWallets.length}</b>`,
       `Time: ${metrics.timestamp}`,
-    ].join('\n');
-  }
-
-  private formatFilterProgressCard(event: FilterProgressEvent): string {
-    const status = event.status === 'waiting'
-      ? `Waiting for sample #${event.requiredSample}`
-      : event.status === 'insufficient-counts'
-        ? 'Waiting for at least 2 bundler wallet count samples'
-        : 'Evaluating filters now';
-    return [
-      '<b>Filter Progress</b>',
-      `Wallet: <code>${this.escapeHtml(this.short(event.walletAddress))}</code>`,
-      `Token: <code>${this.escapeHtml(event.mint)}</code>`,
-      `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,
-      `Status: <b>${status}</b>`,
-      `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
-      `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
-      `Observed bundlers %: <b>${this.fmt(event.observed.minBundlersPercent, '%')} - ${this.fmt(event.observed.maxBundlersPercent, '%')}</b>`,
-      `Observed wallet count: <b>${this.fmt(event.observed.minBundlersCount)} - ${this.fmt(event.observed.maxBundlersCount)}</b>`,
-      `Count change: <b>${this.fmt(event.countChange)}</b>`,
-      `Matched wallets: <b>${event.matchingWallets.length}</b>`,
-      '',
-      '<b>Active linked modes</b>',
-      ...event.activeProfiles.map((profile) => `- ${this.escapeHtml(profile)}`),
-      '',
-      '<i>Normal % filters ignore samples below 1%.</i>',
     ].join('\n');
   }
 
@@ -365,6 +336,13 @@ export class TelegramBot {
       `First: ${this.fmt(summary.bundlersCount.first)} | Last: ${this.fmt(summary.bundlersCount.last)}`,
       `Min: ${this.fmt(summary.bundlersCount.min)} | Max: ${this.fmt(summary.bundlersCount.max)}`,
       '',
+      '<b>Initial Base Reserve</b>',
+      `${this.fmt(summary.initialBaseReserve)}`,
+      '',
+      '<b>Top Wallets</b>',
+      `First: ${this.fmt(summary.topWallets.first)} | Last: ${this.fmt(summary.topWallets.last)}`,
+      `Min: ${this.fmt(summary.topWallets.min)} | Max: ${this.fmt(summary.topWallets.max)}`,
+      '',
       '<i>Filter note: normal % filters ignore samples below 1%.</i>',
     ].join('\n');
   }
@@ -377,6 +355,8 @@ export class TelegramBot {
       `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,
       `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
+      `Initial base reserve: <b>${this.fmt(event.metrics.initialBaseReserve)}</b>`,
+      `Top wallets: <b>${this.fmt(event.metrics.topWallets)}</b>`,
       `Matched wallets: <b>${event.matchingWallets.length}</b>`,
       '<i>Normal % filters ignore samples below 1%.</i>',
       '',
@@ -395,6 +375,8 @@ export class TelegramBot {
       `Sample: #${event.sampleNumber} at +${event.elapsedSec}s`,
       `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
+      `Initial base reserve: <b>${this.fmt(event.metrics.initialBaseReserve)}</b>`,
+      `Top wallets: <b>${this.fmt(event.metrics.topWallets)}</b>`,
       `Matched wallets: <b>${event.matchingWallets.length}</b>`,
       '<i>Normal % filters ignore samples below 1%.</i>',
       '',

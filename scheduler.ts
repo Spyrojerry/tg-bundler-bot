@@ -14,7 +14,6 @@ import {
   BundlerMetrics,
   FilterFailEvent,
   FilterPassEvent,
-  FilterProgressEvent,
   MonitorSampleEvent,
   NewTokenEvent,
   SchedulerEntry,
@@ -28,6 +27,7 @@ const log = createLogger('SCHED');
 
 const SCHEDULER_TICK_MS = 500; // internal resolution — half the min interval
 const DEFAULT_APPLY_SAMPLE = 20;
+const TARGET_INITIAL_BASE_RESERVE = 1_000_000_000;
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
@@ -237,6 +237,9 @@ export class Scheduler extends EventEmitter {
     const counts = samples
       .map((s) => s.bundlersCount)
       .filter((v): v is number => v !== null);
+    const topWallets = samples
+      .map((s) => s.topWallets)
+      .filter((v): v is number => v !== null);
 
     return {
       walletAddress,
@@ -246,7 +249,7 @@ export class Scheduler extends EventEmitter {
       firstSeen:    samples.at(0)?.timestamp  ?? new Date().toISOString(),
       lastSeen:     samples.at(-1)?.timestamp ?? new Date().toISOString(),
       bundlersPercent: {
-        first: percents.at(0)  ?? null,
+        first: validPercents.at(0)  ?? null,
         last:  percents.at(-1) ?? null,
         min:   validPercents.length ? Math.min(...validPercents) : null,
         max:   validPercents.length ? Math.max(...validPercents) : null,
@@ -256,6 +259,13 @@ export class Scheduler extends EventEmitter {
         last:  counts.at(-1) ?? null,
         min:   counts.length ? Math.min(...counts) : null,
         max:   counts.length ? Math.max(...counts) : null,
+      },
+      initialBaseReserve: samples.find((sample) => sample.initialBaseReserve !== null)?.initialBaseReserve ?? null,
+      topWallets: {
+        first: topWallets.at(0) ?? null,
+        last: topWallets.at(-1) ?? null,
+        min: topWallets.length ? Math.min(...topWallets) : null,
+        max: topWallets.length ? Math.max(...topWallets) : null,
       },
     };
   }
@@ -283,6 +293,10 @@ export class Scheduler extends EventEmitter {
       `║  Bundlers Count`,
       `║    First : ${fmt(s.bundlersCount.first)}   Last : ${fmt(s.bundlersCount.last)}`,
       `║    Min   : ${fmt(s.bundlersCount.min)}   Max  : ${fmt(s.bundlersCount.max)}`,
+      `║  Initial Base Reserve : ${fmt(s.initialBaseReserve)}`,
+      `║  Top Wallets`,
+      `║    First : ${fmt(s.topWallets.first)}   Last : ${fmt(s.topWallets.last)}`,
+      `║    Min   : ${fmt(s.topWallets.min)}   Max  : ${fmt(s.topWallets.max)}`,
       `╚══════════════════════════════════════════════════════════╝`,
       ``,
     ];
@@ -316,12 +330,16 @@ export class Scheduler extends EventEmitter {
         log.info(
           `[MONITOR +${elapsed}s]  Mint: ${mint.slice(0, 8)}…  ` +
           `Bundlers%: ${metrics.bundlersPercent ?? 'N/A'}  ` +
-          `Count: ${metrics.bundlersCount ?? 'N/A'}`,
+          `Count: ${metrics.bundlersCount ?? 'N/A'}  ` +
+          `InitialBaseReserve: ${metrics.initialBaseReserve ?? 'N/A'}  ` +
+          `TopWallets: ${metrics.topWallets ?? 'N/A'}`,
           {
             mint,
             time:            metrics.timestamp,
             bundlersPercent: metrics.bundlersPercent,
             bundlersCount:   metrics.bundlersCount,
+            initialBaseReserve: metrics.initialBaseReserve,
+            topWallets: metrics.topWallets,
           }
         );
 
@@ -331,6 +349,8 @@ export class Scheduler extends EventEmitter {
             time:            metrics.timestamp,
             bundlersPercent: metrics.bundlersPercent,
             bundlersCount:   metrics.bundlersCount,
+            initialBaseReserve: metrics.initialBaseReserve,
+            topWallets: metrics.topWallets,
           }) + '\n'
         );
 
@@ -365,38 +385,13 @@ export class Scheduler extends EventEmitter {
   ): void {
     if (entry.filterAlerted || entry.filterPassed) return;
 
-    const activeProfiles: Array<{
-      name: 'Massive' | 'Minimal';
-      sourceWallet: string;
-      settings: WalletFilterSettings;
-      profile: WalletFilterProfileSettings;
-      threshold: number;
-    }> = [];
-    for (const sourceWallet of entry.matchingWallets) {
-      const settings = this.db.getWalletSettings(sourceWallet);
-      if (settings.maxBundlersCountChange !== null) {
-        activeProfiles.push({
-          name: 'Massive',
-          sourceWallet,
-          settings,
-          profile: settings.massive,
-          threshold: settings.maxBundlersCountChange,
-        });
-      }
-      if (settings.minBundlersCountChange !== null) {
-        activeProfiles.push({
-          name: 'Minimal',
-          sourceWallet,
-          settings,
-          profile: settings.minimal,
-          threshold: settings.minBundlersCountChange,
-        });
-      }
-    }
-    const linkedSettings = entry.matchingWallets.map((wallet) => this.db.getWalletSettings(wallet));
-    const requiredSample = activeProfiles.length > 0
-      ? Math.max(...activeProfiles.map((p) => p.profile.applyAtSample))
-      : Math.max(...linkedSettings.map((settings) => settings.applyAtSample), DEFAULT_APPLY_SAMPLE);
+    const activeSettings = entry.matchingWallets.map((sourceWallet) => ({
+      sourceWallet,
+      settings: this.db.getWalletSettings(sourceWallet),
+    }));
+    const requiredSample = activeSettings.length > 0
+      ? Math.max(...activeSettings.map((active) => active.settings.applyAtSample))
+      : DEFAULT_APPLY_SAMPLE;
 
     const samples = this.db
       .getLatestMetricsForWallet(entry.walletAddress, entry.mint, 10_000)
@@ -408,78 +403,46 @@ export class Scheduler extends EventEmitter {
     const counts = samples
       .map((sample) => sample.bundlersCount)
       .filter((value): value is number => value !== null);
-    const observed = {
-      minBundlersPercent: validPercents.length ? Math.min(...validPercents) : null,
-      maxBundlersPercent: validPercents.length ? Math.max(...validPercents) : null,
-      minBundlersCount: counts.length ? Math.min(...counts) : null,
-      maxBundlersCount: counts.length ? Math.max(...counts) : null,
-    };
     const countChange = counts.length >= 2
       ? Math.max(...counts) - Math.min(...counts)
       : null;
-    const progressBase = {
-      walletAddress: entry.walletAddress,
-      mint: entry.mint,
-      sampleNumber,
-      elapsedSec,
-      metrics,
-      matchingWallets: entry.matchingWallets,
-      requiredSample,
-      activeProfiles: activeProfiles.length
-        ? activeProfiles.map(
-            (active) => `${active.name} ${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)} threshold ${active.threshold}`
-          )
-        : entry.matchingWallets.map((wallet) => `Monitor-only ${wallet.slice(0, 4)}...${wallet.slice(-4)} sell decisions disabled`),
-      countChange,
-      observed,
-    };
     if (sampleNumber < requiredSample) {
-      this.emit('filterProgress', {
-        ...progressBase,
-        status: 'waiting',
-      } satisfies FilterProgressEvent);
       return;
     }
     if (countChange === null) {
-      this.emit('filterProgress', {
-        ...progressBase,
-        status: 'insufficient-counts',
-      } satisfies FilterProgressEvent);
       return;
     }
 
-    if (activeProfiles.length === 0) {
-      this.emit('filterProgress', {
-        ...progressBase,
-        status: 'evaluating',
-      } satisfies FilterProgressEvent);
+    if (activeSettings.length === 0) {
       this.expireToken(entry).catch((err) =>
         log.error(`Monitor-only summary error for ${entry.mint}`, err)
       );
       return;
     }
 
-    this.emit('filterProgress', {
-      ...progressBase,
-      status: 'evaluating',
-    } satisfies FilterProgressEvent);
+    const initialBaseReserve = samples.find((sample) => sample.initialBaseReserve !== null)?.initialBaseReserve ?? null;
+    if (initialBaseReserve !== TARGET_INITIAL_BASE_RESERVE) {
+      log.info(
+        `[FILTER PASS] ${entry.mint} initial base reserve ${initialBaseReserve ?? 'N/A'} is not ${TARGET_INITIAL_BASE_RESERVE}; leaving position open.`
+      );
+      this.expireToken(entry).catch((err) =>
+        log.error(`Post-reserve-pass summary error for ${entry.mint}`, err)
+      );
+      return;
+    }
 
     const reasons: string[] = [];
-    for (const active of activeProfiles) {
-      const prefix = `[${active.name} ${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)}]`;
-      if (active.name === 'Massive' && countChange >= active.threshold) {
+    for (const active of activeSettings) {
+      const prefix = `[${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)}]`;
+      const threshold = active.settings.minBundlersCountChange;
+      if (threshold !== null && countChange >= threshold) {
         reasons.push(
-          `${prefix} bundler wallet count changed by ${countChange}, threshold ${active.threshold}`
-        );
-      }
-      if (active.name === 'Minimal' && countChange < active.threshold) {
-        reasons.push(
-          `${prefix} bundler wallet count changed by ${countChange}, below required ${active.threshold}`
+          `${prefix} initial base reserve is 1B and bundler wallet count changed by ${countChange}, threshold ${threshold}`
         );
       }
       reasons.push(...this.evaluateProfileFilters(
         prefix,
-        active.profile,
+        active.settings,
         validPercents,
         counts,
         samples
@@ -493,7 +456,7 @@ export class Scheduler extends EventEmitter {
         mint: entry.mint,
         sampleNumber,
         elapsedSec,
-        settings: activeProfiles[0].settings,
+        settings: activeSettings[0].settings,
         metrics,
         buySol: entry.buySol,
         matchingWallets: entry.matchingWallets,
@@ -512,7 +475,7 @@ export class Scheduler extends EventEmitter {
       sampleNumber,
       elapsedSec,
       reasons,
-      settings: activeProfiles[0].settings,
+      settings: activeSettings[0].settings,
       metrics,
       buySol: entry.buySol,
       matchingWallets: entry.matchingWallets,
