@@ -1,8 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  scheduler.ts  —  Single-loop scheduler for GMGN metric fetches
 //
-//  Linked trading-wallet tokens are monitored until their active profile
-//  reaches Apply filters at sample #N and produces a pass/fail decision.
+//  Linked trading-wallet tokens are monitored through sample #20 and summarized.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createLogger } from './logger';
@@ -13,7 +12,6 @@ import { RateLimiter } from './rate-limiter';
 import {
   BundlerMetrics,
   FilterFailEvent,
-  FilterPassEvent,
   MonitorSampleEvent,
   NewTokenEvent,
   SchedulerEntry,
@@ -25,7 +23,6 @@ const log = createLogger('SCHED');
 
 const SCHEDULER_TICK_MS = 500; // internal resolution — half the min interval
 const DEFAULT_APPLY_SAMPLE = 20;
-const TARGET_INITIAL_BASE_RESERVE = 1_000_000_000;
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
@@ -61,7 +58,7 @@ export class Scheduler extends EventEmitter {
     this.scheduleTick();
     log.info(
       `Scheduler started — interval ${this.config.monitorInterval}ms, ` +
-      `sample-count driven filter decisions`
+      `sample-count driven summaries`
     );
   }
 
@@ -291,7 +288,6 @@ export class Scheduler extends EventEmitter {
       `║  Bundlers Count`,
       `║    First : ${fmt(s.bundlersCount.first)}   Last : ${fmt(s.bundlersCount.last)}`,
       `║    Min   : ${fmt(s.bundlersCount.min)}   Max  : ${fmt(s.bundlersCount.max)}`,
-      `║  Initial Base Reserve : ${fmt(s.initialBaseReserve)}`,
       `║  Top Wallets`,
       `║    First : ${fmt(s.topWallets.first)}   Last : ${fmt(s.topWallets.last)}`,
       `║    Min   : ${fmt(s.topWallets.min)}   Max  : ${fmt(s.topWallets.max)}`,
@@ -303,8 +299,18 @@ export class Scheduler extends EventEmitter {
       log.info(line);
     }
 
-    // Machine-readable JSON line for piping / log aggregation
-    process.stdout.write(JSON.stringify({ event: 'summary', ...s }) + '\n');
+    process.stdout.write(JSON.stringify({
+      event: 'summary',
+      walletAddress: s.walletAddress,
+      mint: s.mint,
+      windowMs: s.windowMs,
+      totalSamples: s.totalSamples,
+      firstSeen: s.firstSeen,
+      lastSeen: s.lastSeen,
+      bundlersPercent: s.bundlersPercent,
+      bundlersCount: s.bundlersCount,
+      topWallets: s.topWallets,
+    }) + '\n');
   }
 
   // ── Fetch + persist ────────────────────────────────────────────────────────
@@ -329,14 +335,12 @@ export class Scheduler extends EventEmitter {
           `[MONITOR +${elapsed}s]  Mint: ${mint.slice(0, 8)}…  ` +
           `Bundlers%: ${metrics.bundlersPercent ?? 'N/A'}  ` +
           `Count: ${metrics.bundlersCount ?? 'N/A'}  ` +
-          `InitialBaseReserve: ${metrics.initialBaseReserve ?? 'N/A'}  ` +
           `TopWallets: ${metrics.topWallets ?? 'N/A'}`,
           {
             mint,
             time:            metrics.timestamp,
             bundlersPercent: metrics.bundlersPercent,
             bundlersCount:   metrics.bundlersCount,
-            initialBaseReserve: metrics.initialBaseReserve,
             topWallets: metrics.topWallets,
           }
         );
@@ -347,7 +351,6 @@ export class Scheduler extends EventEmitter {
             time:            metrics.timestamp,
             bundlersPercent: metrics.bundlersPercent,
             bundlersCount:   metrics.bundlersCount,
-            initialBaseReserve: metrics.initialBaseReserve,
             topWallets: metrics.topWallets,
           }) + '\n'
         );
@@ -381,45 +384,37 @@ export class Scheduler extends EventEmitter {
     metrics: BundlerMetrics,
     sampleNumber: number
   ): void {
-    const activeSettings = entry.matchingWallets.map((sourceWallet) => ({
-      sourceWallet,
-      settings: this.db.getWalletSettings(sourceWallet),
-    }));
+    if (!entry.filterAlerted && entry.matchingWallets.length > 0 && (sampleNumber === 2 || sampleNumber === 3)) {
+      const samples = this.db
+        .getLatestMetricsForWallet(entry.walletAddress, entry.mint, 3)
+        .reverse();
+      const topWallets = samples.map((sample) => sample.topWallets);
+      const second = topWallets[1] ?? null;
+      const validSecond = second === 1 || second === 3;
+      const shouldSell = sampleNumber === 2
+        ? topWallets[0] !== 0 || !validSecond
+        : topWallets[0] !== 0 || !validSecond || topWallets[2] !== second;
 
-    if (sampleNumber === 1 && activeSettings.length > 0 && !entry.filterAlerted && !entry.filterPassed) {
-      const initialBaseReserve = metrics.initialBaseReserve;
-      if (initialBaseReserve === TARGET_INITIAL_BASE_RESERVE) {
+      if (shouldSell) {
         entry.filterAlerted = true;
+        const settings = this.db.getWalletSettings(entry.matchingWallets[0]);
+        const expected = sampleNumber === 2
+          ? '#1 must be 0 and #2 must be 1 or 3'
+          : '#1-#3 must be 0-1-1 or 0-3-3';
         const event: FilterFailEvent = {
           walletAddress: entry.walletAddress,
           mint: entry.mint,
           sampleNumber,
           elapsedSec,
           reasons: [
-            `Initial base reserve is 1B on sample #1 for linked wallet buy; sell triggered.`,
+            `Top wallets pattern failed by sample #${sampleNumber}: observed ${topWallets.map((value) => value ?? 'N/A').join(' -> ')}; expected ${expected}.`,
           ],
-          settings: activeSettings[0].settings,
+          settings,
           metrics,
           buySol: entry.buySol,
           matchingWallets: entry.matchingWallets,
         };
         this.emit('filterFail', event);
-      } else {
-        entry.filterPassed = true;
-        log.info(
-          `[FILTER PASS] ${entry.mint} sample #1 initial base reserve ${initialBaseReserve ?? 'N/A'} is not ${TARGET_INITIAL_BASE_RESERVE}; leaving position open.`
-        );
-        const event: FilterPassEvent = {
-          walletAddress: entry.walletAddress,
-          mint: entry.mint,
-          sampleNumber,
-          elapsedSec,
-          settings: activeSettings[0].settings,
-          metrics,
-          buySol: entry.buySol,
-          matchingWallets: entry.matchingWallets,
-        };
-        this.emit('filterPass', event);
       }
     }
 

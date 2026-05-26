@@ -121,7 +121,7 @@ async function main(): Promise<void> {
   function linkedWalletModeLines(wallet: string): string[] {
     return [
       `- <code>${html(wallet)}</code>`,
-      `  Sell trigger: sample #1 initial base reserve is <b>1B</b>`,
+      `  Sell filter: top wallets must be 0 -> 1 -> 1 or 0 -> 3 -> 3`,
       `  Monitoring continues through sample #${20}`,
     ];
   }
@@ -154,7 +154,7 @@ async function main(): Promise<void> {
         `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
         matchedWallets.length
           ? `Already matched by watched wallet(s): <b>${matchedWallets.length}</b>`
-          : 'Waiting for a watched wallet to buy this token before filters start.',
+          : 'Waiting for a watched wallet to buy this token before monitoring starts.',
       ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
 
       if (matchedWallets.length > 0) {
@@ -233,7 +233,7 @@ async function main(): Promise<void> {
       ...matchingWallets.slice(0, 5).flatMap((wallet) => linkedWalletModeLines(wallet)),
       matchingWallets.length > 5 ? `...and ${matchingWallets.length - 5} more` : '',
       '',
-      'Monitoring is now running on your trading-wallet position. Sell decisions use the linked wallet filter settings.',
+      'Monitoring is now running on your trading-wallet position. Sample cards and the sample #20 summary will continue.',
     ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram match alert failed', err));
   }
 
@@ -382,9 +382,10 @@ async function main(): Promise<void> {
         `<code>${html(normalized)}</code>`,
         '',
         '<b>Current Flow</b>',
-        'Linked trading-wallet tokens are checked from sample <b>#1</b>.',
-        'If initial base reserve is exactly <b>1B</b>, the configured sell submits automatically.',
-        'If initial base reserve is not <b>1B</b>, the token is left open.',
+        'Linked trading-wallet tokens are monitored from sample <b>#1</b>.',
+        'No reserve-based sell rule is active.',
+        'Top wallets must be <b>0 -> 1 -> 1</b> or <b>0 -> 3 -> 3</b> across the first 3 samples.',
+        'If sample #2 is not 1 or 3, it sells at sample #2. If sample #3 does not match sample #2, it sells at sample #3.',
         '',
         'Samples, logs, Telegram sample cards, and the summary continue through sample <b>#20</b> either way.',
       ].join('\n'),
@@ -768,11 +769,6 @@ async function main(): Promise<void> {
       } else {
         log.warn('Sell trigger created, but TELEGRAM_CHAT_ID is not configured so no sell receipt chat is available.');
       }
-    });
-    scheduler.on('filterPass', (event: FilterPassEvent) => {
-      telegramBot.sendFilterPassCard(event).catch((err) =>
-        log.warn('Telegram filter pass send failed', err)
-      );
     });
     telegramBot.start();
   }
