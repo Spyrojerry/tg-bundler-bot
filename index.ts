@@ -121,7 +121,7 @@ async function main(): Promise<void> {
   function linkedWalletModeLines(wallet: string): string[] {
     return [
       `- <code>${html(wallet)}</code>`,
-      `  Sell filter: top wallets must be 0 -> 1 -> 1 or 0 -> 3 -> 3`,
+      `  Sell filter: top wallets must start with 0 or 1, then 1 -> 1 or 3 -> 3`,
       `  Monitoring continues through sample #${20}`,
     ];
   }
@@ -384,7 +384,7 @@ async function main(): Promise<void> {
         '<b>Current Flow</b>',
         'Linked trading-wallet tokens are monitored from sample <b>#1</b>.',
         'No reserve-based sell rule is active.',
-        'Top wallets must be <b>0 -> 1 -> 1</b> or <b>0 -> 3 -> 3</b> across the first 3 samples.',
+        'Top wallets sample #1 must be <b>0</b> or <b>1</b>, then samples #2-#3 must be <b>1 -> 1</b> or <b>3 -> 3</b>.',
         'If sample #2 is not 1 or 3, it sells at sample #2. If sample #3 does not match sample #2, it sells at sample #3.',
         '',
         'Samples, logs, Telegram sample cards, and the summary continue through sample <b>#20</b> either way.',
@@ -540,9 +540,9 @@ async function main(): Promise<void> {
   }
 
   async function executeSellAndNotify(
-    chatId: string,
+    chatId: string | null,
     sellId: string,
-    telegramBot: TelegramBot
+    telegramBot: TelegramBot | null
   ): Promise<void> {
     const pending = pendingSells.get(sellId);
     if (!pending) return;
@@ -559,9 +559,23 @@ async function main(): Promise<void> {
           antiMev: config.sellAntiMev,
         }
       );
-      await telegramBot.sendChat(chatId, sellReceipt(pending.event, result));
+      const receipt = sellReceipt(pending.event, result);
+      if (chatId && telegramBot) {
+        await telegramBot.sendChat(chatId, receipt);
+      } else {
+        log.info('Sell completed without Telegram receipt chat', {
+          mint: pending.event.mint,
+          status: result.status,
+          hash: result.hash,
+          orderId: result.orderId,
+        });
+      }
     } catch (err) {
-      await telegramBot.sendChat(chatId, sellFailedReply(pending.event, err));
+      if (chatId && telegramBot) {
+        await telegramBot.sendChat(chatId, sellFailedReply(pending.event, err));
+      } else {
+        log.error('Sell failed without Telegram receipt chat', err);
+      }
     } finally {
       pendingSells.delete(sellId);
     }
@@ -751,27 +765,24 @@ async function main(): Promise<void> {
         log.warn('Telegram summary send failed', err)
       );
     });
-    scheduler.on('filterFail', (event: FilterFailEvent) => {
-      const sellId = randomBytes(5).toString('hex');
-      pendingSells.set(sellId, {
-        event: {
-          ...event,
-          buySol: event.buySol ?? db.getToken(event.walletAddress, event.mint)?.buySol ?? null,
-        },
-        createdAt: Date.now(),
-        executing: true,
-      });
-      telegramBot.sendFilterFailCard(event).catch((err) =>
-        log.warn('Telegram filter alert send failed', err)
-      );
-      if (config.telegramChatId) {
-        void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
-      } else {
-        log.warn('Sell trigger created, but TELEGRAM_CHAT_ID is not configured so no sell receipt chat is available.');
-      }
-    });
     telegramBot.start();
   }
+
+  scheduler.on('filterFail', (event: FilterFailEvent) => {
+    const sellId = randomBytes(5).toString('hex');
+    pendingSells.set(sellId, {
+      event: {
+        ...event,
+        buySol: event.buySol ?? db.getToken(event.walletAddress, event.mint)?.buySol ?? null,
+      },
+      createdAt: Date.now(),
+      executing: true,
+    });
+    telegramBot?.sendFilterFailCard(event).catch((err) =>
+      log.warn('Telegram filter alert send failed', err)
+    );
+    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+  });
 
   // ── 6. Start everything ───────────────────────────────────────────────────
   if (config.tradingWalletAddress) {

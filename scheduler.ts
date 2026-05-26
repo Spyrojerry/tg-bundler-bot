@@ -389,18 +389,20 @@ export class Scheduler extends EventEmitter {
         .getLatestMetricsForWallet(entry.walletAddress, entry.mint, 3)
         .reverse();
       const topWallets = samples.map((sample) => sample.topWallets);
+      const first = topWallets[0] ?? null;
       const second = topWallets[1] ?? null;
+      const validFirst = first === 0 || first === 1;
       const validSecond = second === 1 || second === 3;
       const shouldSell = sampleNumber === 2
-        ? topWallets[0] !== 0 || !validSecond
-        : topWallets[0] !== 0 || !validSecond || topWallets[2] !== second;
+        ? !validFirst || !validSecond
+        : !validFirst || !validSecond || topWallets[2] !== second;
 
       if (shouldSell) {
         entry.filterAlerted = true;
         const settings = this.db.getWalletSettings(entry.matchingWallets[0]);
         const expected = sampleNumber === 2
-          ? '#1 must be 0 and #2 must be 1 or 3'
-          : '#1-#3 must be 0-1-1 or 0-3-3';
+          ? '#1 must be 0 or 1, and #2 must be 1 or 3'
+          : '#1 must be 0 or 1, and #2-#3 must be 1-1 or 3-3';
         const event: FilterFailEvent = {
           walletAddress: entry.walletAddress,
           mint: entry.mint,
