@@ -19,8 +19,6 @@ import {
   SchedulerEntry,
   ServiceConfig,
   TokenSummary,
-  WalletFilterProfileSettings,
-  WalletFilterSettings,
 } from './types';
 
 const log = createLogger('SCHED');
@@ -383,183 +381,52 @@ export class Scheduler extends EventEmitter {
     metrics: BundlerMetrics,
     sampleNumber: number
   ): void {
-    if (entry.filterAlerted || entry.filterPassed) return;
-
     const activeSettings = entry.matchingWallets.map((sourceWallet) => ({
       sourceWallet,
       settings: this.db.getWalletSettings(sourceWallet),
     }));
-    const requiredSample = activeSettings.length > 0
-      ? Math.max(...activeSettings.map((active) => active.settings.applyAtSample))
-      : DEFAULT_APPLY_SAMPLE;
 
-    const samples = this.db
-      .getLatestMetricsForWallet(entry.walletAddress, entry.mint, 10_000)
-      .reverse();
-    const validPercentSamples = samples.filter(
-      (sample) => sample.bundlersPercent !== null && sample.bundlersPercent >= 1
-    );
-    const validPercents = validPercentSamples.map((sample) => sample.bundlersPercent as number);
-    const counts = samples
-      .map((sample) => sample.bundlersCount)
-      .filter((value): value is number => value !== null);
-    const countChange = counts.length >= 2
-      ? Math.max(...counts) - Math.min(...counts)
-      : null;
-    if (sampleNumber < requiredSample) {
-      return;
-    }
-    if (countChange === null) {
-      return;
-    }
-
-    if (activeSettings.length === 0) {
-      this.expireToken(entry).catch((err) =>
-        log.error(`Monitor-only summary error for ${entry.mint}`, err)
-      );
-      return;
-    }
-
-    const initialBaseReserve = samples.find((sample) => sample.initialBaseReserve !== null)?.initialBaseReserve ?? null;
-    if (initialBaseReserve !== TARGET_INITIAL_BASE_RESERVE) {
-      log.info(
-        `[FILTER PASS] ${entry.mint} initial base reserve ${initialBaseReserve ?? 'N/A'} is not ${TARGET_INITIAL_BASE_RESERVE}; leaving position open.`
-      );
-      this.expireToken(entry).catch((err) =>
-        log.error(`Post-reserve-pass summary error for ${entry.mint}`, err)
-      );
-      return;
-    }
-
-    const reasons: string[] = [];
-    for (const active of activeSettings) {
-      const prefix = `[${active.sourceWallet.slice(0, 4)}...${active.sourceWallet.slice(-4)}]`;
-      const threshold = active.settings.minBundlersCountChange;
-      if (threshold !== null && countChange >= threshold) {
-        reasons.push(
-          `${prefix} initial base reserve is 1B and bundler wallet count changed by ${countChange}, threshold ${threshold}`
+    if (sampleNumber === 1 && activeSettings.length > 0 && !entry.filterAlerted && !entry.filterPassed) {
+      const initialBaseReserve = metrics.initialBaseReserve;
+      if (initialBaseReserve === TARGET_INITIAL_BASE_RESERVE) {
+        entry.filterAlerted = true;
+        const event: FilterFailEvent = {
+          walletAddress: entry.walletAddress,
+          mint: entry.mint,
+          sampleNumber,
+          elapsedSec,
+          reasons: [
+            `Initial base reserve is 1B on sample #1 for linked wallet buy; sell triggered.`,
+          ],
+          settings: activeSettings[0].settings,
+          metrics,
+          buySol: entry.buySol,
+          matchingWallets: entry.matchingWallets,
+        };
+        this.emit('filterFail', event);
+      } else {
+        entry.filterPassed = true;
+        log.info(
+          `[FILTER PASS] ${entry.mint} sample #1 initial base reserve ${initialBaseReserve ?? 'N/A'} is not ${TARGET_INITIAL_BASE_RESERVE}; leaving position open.`
         );
+        const event: FilterPassEvent = {
+          walletAddress: entry.walletAddress,
+          mint: entry.mint,
+          sampleNumber,
+          elapsedSec,
+          settings: activeSettings[0].settings,
+          metrics,
+          buySol: entry.buySol,
+          matchingWallets: entry.matchingWallets,
+        };
+        this.emit('filterPass', event);
       }
-      reasons.push(...this.evaluateProfileFilters(
-        prefix,
-        active.settings,
-        validPercents,
-        counts,
-        samples
-      ));
     }
 
-    if (reasons.length === 0) {
-      entry.filterPassed = true;
-      const event: FilterPassEvent = {
-        walletAddress: entry.walletAddress,
-        mint: entry.mint,
-        sampleNumber,
-        elapsedSec,
-        settings: activeSettings[0].settings,
-        metrics,
-        buySol: entry.buySol,
-        matchingWallets: entry.matchingWallets,
-      };
-      this.emit('filterPass', event);
+    if (sampleNumber >= DEFAULT_APPLY_SAMPLE) {
       this.expireToken(entry).catch((err) =>
-        log.error(`Post-pass summary error for ${entry.mint}`, err)
+        log.error(`Sample #${DEFAULT_APPLY_SAMPLE} summary error for ${entry.mint}`, err)
       );
-      return;
     }
-
-    entry.filterAlerted = true;
-    const event: FilterFailEvent = {
-      walletAddress: entry.walletAddress,
-      mint: entry.mint,
-      sampleNumber,
-      elapsedSec,
-      reasons,
-      settings: activeSettings[0].settings,
-      metrics,
-      buySol: entry.buySol,
-      matchingWallets: entry.matchingWallets,
-    };
-    this.emit('filterFail', event);
-    this.expireToken(entry).catch((err) =>
-      log.error(`Post-fail summary error for ${entry.mint}`, err)
-    );
-  }
-
-  private evaluateProfileFilters(
-    prefix: string,
-    settings: WalletFilterProfileSettings,
-    validPercents: number[],
-    counts: number[],
-    samples: BundlerMetrics[]
-  ): string[] {
-    const reasons: string[] = [];
-    const minValidPercent = validPercents.length ? Math.min(...validPercents) : null;
-    const maxValidPercent = validPercents.length ? Math.max(...validPercents) : null;
-    const minCount = counts.length ? Math.min(...counts) : null;
-    const maxCount = counts.length ? Math.max(...counts) : null;
-    if (
-      minValidPercent !== null &&
-      settings.minBundlersPercent !== null &&
-      minValidPercent < settings.minBundlersPercent
-    ) {
-      reasons.push(`${prefix} lowest bundlers % ${minValidPercent} below min ${settings.minBundlersPercent}`);
-    }
-    if (
-      maxValidPercent !== null &&
-      settings.maxBundlersPercent !== null &&
-      maxValidPercent > settings.maxBundlersPercent
-    ) {
-      reasons.push(`${prefix} highest bundlers % ${maxValidPercent} above max ${settings.maxBundlersPercent}`);
-    }
-    if (
-      minCount !== null &&
-      settings.minBundlersCount !== null &&
-      minCount < settings.minBundlersCount
-    ) {
-      reasons.push(`${prefix} lowest bundlers count ${minCount} below min ${settings.minBundlersCount}`);
-    }
-    if (
-      maxCount !== null &&
-      settings.maxBundlersCount !== null &&
-      maxCount > settings.maxBundlersCount
-    ) {
-      reasons.push(`${prefix} highest bundlers count ${maxCount} above max ${settings.maxBundlersCount}`);
-    }
-    if (settings.maxPctAboveValue !== null && settings.maxPctAboveOccurrences !== null) {
-      const occurrences = validPercents.filter((value) => value > settings.maxPctAboveValue!).length;
-      if (occurrences > settings.maxPctAboveOccurrences) {
-        reasons.push(
-          `${prefix} ${occurrences} valid samples above ${settings.maxPctAboveValue}%, max allowed ${settings.maxPctAboveOccurrences}`
-        );
-      }
-    }
-    if (settings.maxPctBelowValue !== null && settings.maxPctBelowOccurrences !== null) {
-      const occurrences = validPercents.filter((value) => value < settings.maxPctBelowValue!).length;
-      if (occurrences > settings.maxPctBelowOccurrences) {
-        reasons.push(
-          `${prefix} ${occurrences} valid samples below ${settings.maxPctBelowValue}%, max allowed ${settings.maxPctBelowOccurrences}`
-        );
-      }
-    }
-    if (settings.sellIfNoPctAbove50) {
-      const hasPctAbove50 = validPercents.some((value) => value > 50);
-      if (!hasPctAbove50) {
-        reasons.push(`${prefix} no valid bundlers % sample above 50%`);
-      }
-    }
-    if (settings.sellIfFirstThreePctZero) {
-      const firstThree = samples.slice(0, 3).map((sample) => sample.bundlersPercent);
-      if (firstThree.length === 3 && firstThree.some((value) => value === null || value <= 0)) {
-        reasons.push(`${prefix} one of the first three bundlers % samples is 0% or missing`);
-      }
-    }
-    if (settings.sellIfNoTeenOrTwentyPct) {
-      const hasTeenOrTwenty = validPercents.some((value) => value >= 10 && value < 30);
-      if (!hasTeenOrTwenty) {
-        reasons.push(`${prefix} no valid bundlers % sample in the 10%-29.99% range`);
-      }
-    }
-    return reasons;
   }
 }

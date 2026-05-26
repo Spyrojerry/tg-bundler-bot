@@ -115,16 +115,14 @@ async function main(): Promise<void> {
   };
 
   function walletHasSellFilters(walletAddress: string): boolean {
-    const settings = db.getWalletSettings(walletAddress);
-    return settings.minBundlersCountChange !== null;
+    return db.getWalletSettings(walletAddress) !== null;
   }
 
   function linkedWalletModeLines(wallet: string): string[] {
-    const settings = db.getWalletSettings(wallet);
     return [
       `- <code>${html(wallet)}</code>`,
-      `  Initial reserve gate: <b>1B only</b>, apply #${settings.applyAtSample}`,
-      `  Sell count-change threshold: <b>${fmtSetting(settings.minBundlersCountChange)}</b>`,
+      `  Sell trigger: sample #1 initial base reserve is <b>1B</b>`,
+      `  Monitoring continues through sample #${20}`,
     ];
   }
 
@@ -377,44 +375,21 @@ async function main(): Promise<void> {
 
   function settingsReply(address: string, editCurrent = false): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
-    const settings = db.getWalletSettings(normalized);
-    const range = (min: number | null, max: number | null, suffix = ''): string =>
-      `${fmtSetting(min)}${suffix} - ${fmtSetting(max)}${suffix}`;
-    const buttons = [
-      [{ text: `Apply #: ${settings.applyAtSample}`, callback_data: `set:apply:${normalized}` }],
-      [
-        { text: `Min %: ${fmtSetting(settings.minBundlersPercent)}`, callback_data: `set:minPct:${normalized}` },
-        { text: `Max %: ${fmtSetting(settings.maxBundlersPercent)}`, callback_data: `set:maxPct:${normalized}` },
-      ],
-      [
-        { text: `Min Count: ${fmtSetting(settings.minBundlersCount)}`, callback_data: `set:minCnt:${normalized}` },
-        { text: `Max Count: ${fmtSetting(settings.maxBundlersCount)}`, callback_data: `set:maxCnt:${normalized}` },
-      ],
-      [{ text: `Count Change: ${fmtSetting(settings.minBundlersCountChange)}`, callback_data: `set:minInc:${normalized}` }],
-    ];
 
     return {
       text: [
         '<b>Filter Settings</b>',
         `<code>${html(normalized)}</code>`,
         '',
-        '<b>Reserve Gate</b>',
-        'Sell filters only evaluate when initial base reserve is exactly <b>1B</b>. If it is 206.9M or anything else, the token is left open.',
+        '<b>Current Flow</b>',
+        'Linked trading-wallet tokens are checked from sample <b>#1</b>.',
+        'If initial base reserve is exactly <b>1B</b>, the configured sell submits automatically.',
+        'If initial base reserve is not <b>1B</b>, the token is left open.',
         '',
-        '<b>Sample Filters</b>',
-        `Apply filters at sample: <b>#${settings.applyAtSample}</b>`,
-        `Observed bundlers % min/max: <b>${range(settings.minBundlersPercent, settings.maxBundlersPercent, '%')}</b>`,
-        `Observed bundler wallet count min/max: <b>${range(settings.minBundlersCount, settings.maxBundlersCount)}</b>`,
-        `Sell if count change is at least: <b>${fmtSetting(settings.minBundlersCountChange)}</b>`,
-        '',
-        'Count change is highest bundler wallet count minus lowest bundler wallet count.',
-        'Valid bundlers % samples are 1% or higher.',
-        '',
-        '<i>For min/max filters, Any disables only that side of the range.</i>',
+        'Samples, logs, Telegram sample cards, and the summary continue through sample <b>#20</b> either way.',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
-          ...buttons,
           [
             { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
             { text: 'Refresh', callback_data: `settings:refresh:${normalized}` },
@@ -583,10 +558,6 @@ async function main(): Promise<void> {
           antiMev: config.sellAntiMev,
         }
       );
-      if (result.status === 'confirmed') {
-        scheduler.removeToken(pending.event.mint);
-        db.updateTokenStatus(pending.event.walletAddress, pending.event.mint, 'stopped');
-      }
       await telegramBot.sendChat(chatId, sellReceipt(pending.event, result));
     } catch (err) {
       await telegramBot.sendChat(chatId, sellFailedReply(pending.event, err));
@@ -787,11 +758,16 @@ async function main(): Promise<void> {
           buySol: event.buySol ?? db.getToken(event.walletAddress, event.mint)?.buySol ?? null,
         },
         createdAt: Date.now(),
-        executing: false,
+        executing: true,
       });
-      telegramBot.sendFilterFailCard(event, sellAlertMarkup(sellId)).catch((err) =>
+      telegramBot.sendFilterFailCard(event).catch((err) =>
         log.warn('Telegram filter alert send failed', err)
       );
+      if (config.telegramChatId) {
+        void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+      } else {
+        log.warn('Sell trigger created, but TELEGRAM_CHAT_ID is not configured so no sell receipt chat is available.');
+      }
     });
     scheduler.on('filterPass', (event: FilterPassEvent) => {
       telegramBot.sendFilterPassCard(event).catch((err) =>

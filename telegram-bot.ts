@@ -363,7 +363,7 @@ export class TelegramBot {
       '<b>Reasons</b>',
       ...event.reasons.map((reason) => `- ${this.escapeHtml(reason)}`),
       '',
-      'Confirm below before any sell is submitted.',
+      'Sell submission started automatically with the configured sell settings.',
     ].join('\n');
   }
 
