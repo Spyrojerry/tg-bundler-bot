@@ -185,7 +185,7 @@ export class GmgnClient {
 
       if (result.success) {
         firstSuccess ??= result;
-        if (this.hasBundlerData(result.metrics)) return result;
+        if (this.hasDecisionData(result.metrics)) return result;
         continue;
       }
 
@@ -483,8 +483,7 @@ export class GmgnClient {
       d.bundler_count
     );
     const initialBaseReserve = this.parseNullableNumber(
-      pool.initial_base_reserve ??
-      d.initial_base_reserve
+      this.isAmmPool(pool.exchange) ? pool.initial_base_reserve : null
     );
     const topWallets = this.parseNullableNumber(
       walletTagsStat.top_wallets ??
@@ -516,5 +515,9 @@ export class GmgnClient {
       return Number.isFinite(n) ? n : null;
     }
     return null;
+  }
+
+  private isAmmPool(exchange: unknown): boolean {
+    return typeof exchange === 'string' && exchange.toLowerCase().includes('amm');
   }
 }
