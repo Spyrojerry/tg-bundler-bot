@@ -19,6 +19,7 @@ import { createLogger } from './logger';
 import { RateLimiter } from './rate-limiter';
 import { execFile } from 'child_process';
 import * as path from 'path';
+import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import {
   BundlerMetrics,
   FetchResult,
@@ -27,6 +28,8 @@ import {
   SellResult,
   ServiceConfig,
 } from './types';
+
+const bs58 = require('bs58') as { decode(value: string): Buffer };
 
 const log = createLogger('GMGN');
 
@@ -58,6 +61,9 @@ export class GmgnClient {
   private readonly baseUrl: string;
   private readonly apiKey:  string;
   private readonly fetchMode: ServiceConfig['gmgnFetchMode'];
+  private readonly jupiterSwapBaseUrl: string;
+  private readonly jupiterApiKey: string;
+  private readonly connection: Connection;
   private readonly chain  = 'sol';
   private readonly limiter: RateLimiter;
   private readonly baselineMinTime: number;
@@ -66,6 +72,9 @@ export class GmgnClient {
     this.baseUrl          = config.gmgnApiBaseUrl.replace(/\/$/, '');
     this.apiKey           = config.gmgnApiKey;
     this.fetchMode        = config.gmgnFetchMode;
+    this.jupiterSwapBaseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '');
+    this.jupiterApiKey    = config.jupiterApiKey;
+    this.connection       = new Connection(config.solanaRpcUrl, 'confirmed');
     this.limiter          = limiter;
     this.baselineMinTime  = config.rateLimitMinTime;
   }
@@ -107,72 +116,209 @@ export class GmgnClient {
     this.validateSolAddress(walletAddress, 'wallet address');
     this.validateSolAddress(mint, 'token mint');
 
-    const args = [
-      'swap',
-      '--chain',
-      this.chain,
-      '--from',
-      walletAddress,
-      '--input-token',
-      mint,
-      '--output-token',
-      SOL_MINT,
-      '--percent',
-      String(options.percent),
-    ];
-    if (options.antiMev) {
-      args.push('--anti-mev');
-    }
-    if (options.priorityFeeSol > 0) {
-      args.push('--priority-fee', String(options.priorityFeeSol));
-    }
+    const wallet = this.getJupiterWallet(walletAddress);
+    const mintPk = new PublicKey(mint);
+    const rawAmount = await this.getTokenSellAmount(wallet.publicKey, mintPk, options.percent);
 
-    if (options.autoSlippage) {
-      args.push('--auto-slippage');
-    } else {
-      args.push('--slippage', String(options.slippage));
-    }
-    args.push('--raw');
-
-    log.warn(`Submitting confirmed sell via gmgn-cli`, {
+    log.warn(`Submitting confirmed sell via Jupiter Swap V2`, {
       wallet: walletAddress,
       mint,
       percent: options.percent,
       outputToken: SOL_MINT,
-      slippage: options.autoSlippage ? 'auto' : options.slippage,
-      priorityFeeSol: options.priorityFeeSol,
-      antiMev: options.antiMev,
+      rawAmount: rawAmount.toString(),
     });
 
-    const raw = this.parseCliJson(await this.execGmgnCli(args));
-    let result = this.parseSellResult(raw, mint, options.percent);
+    const order = await this.getJupiterOrder(
+      mint,
+      SOL_MINT,
+      rawAmount,
+      walletAddress,
+      options.priorityFeeSol
+    );
+    const transactionBase64 = this.asString(order.transaction);
+    const requestId = this.asString(order.requestId);
+    if (!transactionBase64 || !requestId) {
+      const detail = this.asString(order.errorMessage) ?? this.asString(order.error) ?? 'order returned no transaction';
+      throw new Error(`Jupiter Swap V2 order failed: ${detail}`);
+    }
 
-    if (!['confirmed', 'failed', 'expired'].includes(result.status) && result.orderId) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        await sleep(5_000);
-        const orderId = result.orderId;
-        if (!orderId) break;
-        const orderRaw = this.parseCliJson(await this.execGmgnCli([
-          'order',
-          'get',
-          '--chain',
-          this.chain,
-          '--order-id',
-          orderId,
-          '--raw',
-        ]));
-        result = {
-          ...result,
-          ...this.parseSellResult(orderRaw, mint, options.percent),
-          orderId: this.asString(orderRaw.order_id) ?? result.orderId,
-          hash: this.asString(orderRaw.hash) ?? result.hash,
-          raw: orderRaw,
-        };
-        if (['confirmed', 'failed', 'expired'].includes(result.status)) break;
-      }
+    const transaction = VersionedTransaction.deserialize(Buffer.from(transactionBase64, 'base64'));
+    transaction.sign([wallet]);
+    const signedTransaction = Buffer.from(transaction.serialize()).toString('base64');
+    const execute = await this.executeJupiterOrder(signedTransaction, requestId);
+    const result = this.parseJupiterSellResult(order, execute, mint, options.percent);
+
+    if (result.status === 'failed') {
+      const detail = this.asString(execute.error) ?? this.asString(execute.message) ?? 'execution failed';
+      throw new Error(`Jupiter Swap V2 execute failed: ${detail}`);
     }
 
     return result;
+  }
+
+  private getJupiterWallet(expectedAddress: string): Keypair {
+    const key = this.readJupiterPrivateKey();
+    const wallet = Keypair.fromSecretKey(key);
+    const actual = wallet.publicKey.toBase58();
+    if (actual !== expectedAddress) {
+      throw new Error(
+        `Jupiter sell key public address ${actual} does not match trading wallet ${expectedAddress}`
+      );
+    }
+    return wallet;
+  }
+
+  private readJupiterPrivateKey(): Uint8Array {
+    const candidates = [
+      'JUPITER_PRIVATE_KEY',
+      'SOLANA_PRIVATE_KEY',
+      'TRADING_PRIVATE_KEY',
+      'PRIVATE_KEY',
+    ];
+    const found = candidates
+      .map((name) => ({ name, value: process.env[name]?.trim() }))
+      .find((item) => item.value);
+
+    if (!found?.value) {
+      throw new Error(
+        'Missing JUPITER_PRIVATE_KEY. Jupiter Swap V2 sell needs the Solana trading wallet private key; GMGN_PRIVATE_KEY is not used for this.'
+      );
+    }
+
+    try {
+      if (found.value.startsWith('[')) {
+        const parsed = JSON.parse(found.value) as unknown;
+        if (!Array.isArray(parsed)) {
+          throw new Error('JSON value is not an array');
+        }
+        return Uint8Array.from(parsed.map((n) => {
+          if (typeof n !== 'number' || n < 0 || n > 255 || !Number.isInteger(n)) {
+            throw new Error('JSON array must contain byte values from 0 to 255');
+          }
+          return n;
+        }));
+      }
+
+      if (/^\d+(,\s*\d+)+$/.test(found.value)) {
+        return Uint8Array.from(found.value.split(',').map((part) => {
+          const n = Number(part.trim());
+          if (!Number.isInteger(n) || n < 0 || n > 255) {
+            throw new Error('comma-separated private key must contain byte values from 0 to 255');
+          }
+          return n;
+        }));
+      }
+
+      return bs58.decode(found.value);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`Invalid ${found.name}: expected base58 or JSON byte array Solana secret key (${detail})`);
+    }
+  }
+
+  private async getTokenSellAmount(
+    owner: PublicKey,
+    mint: PublicKey,
+    percent: number
+  ): Promise<bigint> {
+    const accounts = await this.connection.getParsedTokenAccountsByOwner(owner, { mint });
+    let total = 0n;
+
+    for (const account of accounts.value) {
+      const parsed = account.account.data.parsed as {
+        info?: { tokenAmount?: { amount?: string } };
+      };
+      const raw = parsed.info?.tokenAmount?.amount;
+      if (raw && /^\d+$/.test(raw)) {
+        total += BigInt(raw);
+      }
+    }
+
+    if (total <= 0n) {
+      throw new Error(`No token balance found to sell for ${mint.toBase58()}`);
+    }
+
+    const bps = BigInt(Math.max(1, Math.min(10_000, Math.round(percent * 100))));
+    const sellAmount = (total * bps) / 10_000n;
+    if (sellAmount <= 0n) {
+      throw new Error(`Token balance is too small to sell ${percent}% of ${mint.toBase58()}`);
+    }
+    return sellAmount;
+  }
+
+  private async getJupiterOrder(
+    inputMint: string,
+    outputMint: string,
+    amount: bigint,
+    taker: string,
+    priorityFeeSol: number
+  ): Promise<Record<string, unknown>> {
+    const url = new URL(`${this.jupiterSwapBaseUrl}/order`);
+    url.searchParams.set('inputMint', inputMint);
+    url.searchParams.set('outputMint', outputMint);
+    url.searchParams.set('amount', amount.toString());
+    url.searchParams.set('taker', taker);
+    const priorityFeeLamports = Math.round(priorityFeeSol * 1_000_000_000);
+    if (priorityFeeLamports > 0) {
+      url.searchParams.set('priorityFeeLamports', String(priorityFeeLamports));
+      url.searchParams.set('broadcastFeeType', 'exactFee');
+    }
+    return this.fetchJupiterJson(url.toString(), 'GET');
+  }
+
+  private async executeJupiterOrder(
+    signedTransaction: string,
+    requestId: string
+  ): Promise<Record<string, unknown>> {
+    return this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/execute`, 'POST', {
+      signedTransaction,
+      requestId,
+    });
+  }
+
+  private async fetchJupiterJson(
+    url: string,
+    method: 'GET' | 'POST',
+    body?: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      'User-Agent': 'gmgn-monitor/1.0',
+    };
+    if (method === 'POST') {
+      headers['Content-Type'] = 'application/json';
+    }
+    headers['x-api-key'] = this.jupiterApiKey;
+
+    try {
+      const resp = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      const text = await resp.text();
+      const json = text.trim() ? JSON.parse(text) as Record<string, unknown> : {};
+
+      if (!resp.ok) {
+        const message = this.asString(json.error)
+          ?? this.asString(json.message)
+          ?? this.asString(json.errorMessage)
+          ?? `HTTP ${resp.status}`;
+        throw new Error(`Jupiter Swap V2 ${method} failed: ${message}`);
+      }
+
+      return json;
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(`Jupiter Swap V2 ${method} timeout after ${REQUEST_TIMEOUT}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async fetchDirect(mint: string): Promise<FetchResult> {
@@ -387,22 +533,37 @@ export class GmgnClient {
     return JSON.parse(stdout.slice(jsonStart)) as Record<string, unknown>;
   }
 
-  private parseSellResult(
-    raw: Record<string, unknown>,
+  private parseJupiterSellResult(
+    order: Record<string, unknown>,
+    execute: Record<string, unknown>,
     mint: string,
     soldPercent: number
   ): SellResult {
+    const status = this.normalizeJupiterStatus(this.asString(execute.status));
     return {
-      orderId: this.asString(raw.order_id),
-      hash: this.asString(raw.hash),
-      status: this.asString(raw.status) ?? 'unknown',
-      inputToken: this.asString(raw.input_token) ?? mint,
-      outputToken: this.asString(raw.output_token) ?? SOL_MINT,
+      orderId: this.asString(order.requestId),
+      hash: this.asString(execute.signature),
+      status,
+      inputToken: this.asString(order.inputMint) ?? mint,
+      outputToken: this.asString(order.outputMint) ?? SOL_MINT,
       soldPercent,
-      filledInputAmount: this.asString(raw.filled_input_amount),
-      filledOutputAmount: this.asString(raw.filled_output_amount),
-      raw,
+      filledInputAmount:
+        this.asString(execute.inputAmountResult) ??
+        this.asString(execute.totalInputAmount) ??
+        this.asString(order.inAmount),
+      filledOutputAmount:
+        this.asString(execute.outputAmountResult) ??
+        this.asString(execute.totalOutputAmount) ??
+        this.asString(order.outAmount),
+      raw: { order, execute },
     };
+  }
+
+  private normalizeJupiterStatus(status: string | null): string {
+    if (!status) return 'unknown';
+    if (status.toLowerCase() === 'success') return 'confirmed';
+    if (status.toLowerCase() === 'failed') return 'failed';
+    return status.toLowerCase();
   }
 
   private asString(value: unknown): string | null {

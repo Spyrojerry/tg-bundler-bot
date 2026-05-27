@@ -126,6 +126,8 @@ export interface ServiceConfig {
   gmgnApiKey: string;
   gmgnApiBaseUrl: string;
   gmgnFetchMode: 'auto' | 'direct' | 'cli';
+  jupiterSwapBaseUrl: string;
+  jupiterApiKey: string;
   monitorInterval: number;
   monitoringWindowMs: number;  // legacy env setting; linked tokens use apply-sample decisions
   rateLimitMinTime: number;

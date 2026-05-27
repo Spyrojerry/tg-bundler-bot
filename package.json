@@ -12,6 +12,7 @@
   "dependencies": {
     "@solana/web3.js": "^1.98.0",
     "@types/sql.js": "^1.4.11",
+    "bs58": "^4.0.1",
     "bottleneck": "^2.19.5",
     "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2",
