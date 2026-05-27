@@ -41,6 +41,7 @@ const BASE_RETRY_MS    = 1_000;
 const REQUEST_TIMEOUT  = 15_000;  // ms
 const BLOCKED_RETRY_MS = 60_000;
 const JUPITER_ORDER_RETRIES = 5;
+const JUPITER_SELL_RETRIES = 5;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
@@ -132,32 +133,61 @@ export class GmgnClient {
       rawAmount: rawAmount.toString(),
     });
 
-    const order = await this.getJupiterOrderWithRetry(
-      mint,
-      SOL_MINT,
+    return this.submitJupiterSellWithRetry(wallet, walletAddress, mint, rawAmount, options);
+  }
+
+  private async submitJupiterSellWithRetry(
+    wallet: Keypair,
+    walletAddress: string,
+    mint: string,
+    rawAmount: bigint,
+    options: SellOptions
+  ): Promise<SellResult> {
+    let lastError: unknown = null;
+
+    for (let attempt = 0; attempt <= JUPITER_SELL_RETRIES; attempt++) {
+      const order = await this.getJupiterOrderWithRetry(
+        mint,
+        SOL_MINT,
       rawAmount,
       walletAddress,
-      options.priorityFeeSol
-    );
-    const transactionBase64 = this.asString(order.transaction);
-    const requestId = this.asString(order.requestId);
-    if (!transactionBase64 || !requestId) {
-      const detail = this.asString(order.errorMessage) ?? this.asString(order.error) ?? 'order returned no transaction';
-      throw new Error(`Jupiter Swap V2 order failed: ${detail}`);
-    }
+      options.priorityFeeSol,
+      options
+      );
+      const transactionBase64 = this.asString(order.transaction);
+      const requestId = this.asString(order.requestId);
+      if (!transactionBase64 || !requestId) {
+        const detail = this.asString(order.errorMessage) ?? this.asString(order.error) ?? 'order returned no transaction';
+        throw new Error(`Jupiter Swap V2 order failed: ${detail}`);
+      }
 
-    const transaction = VersionedTransaction.deserialize(Buffer.from(transactionBase64, 'base64'));
-    transaction.sign([wallet]);
-    const signedTransaction = Buffer.from(transaction.serialize()).toString('base64');
-    const execute = await this.executeJupiterOrder(signedTransaction, requestId);
-    const result = this.parseJupiterSellResult(order, execute, mint, options.percent);
+      const transaction = VersionedTransaction.deserialize(Buffer.from(transactionBase64, 'base64'));
+      transaction.sign([wallet]);
+      const signedTransaction = Buffer.from(transaction.serialize()).toString('base64');
+      const execute = await this.executeJupiterOrder(signedTransaction, requestId);
+      const result = this.parseJupiterSellResult(order, execute, mint, options.percent);
 
-    if (result.status === 'failed') {
+      if (result.status !== 'failed') {
+        return result;
+      }
+
       const detail = this.asString(execute.error) ?? this.asString(execute.message) ?? 'execution failed';
-      throw new Error(`Jupiter Swap V2 execute failed: ${detail}`);
+      lastError = new Error(`Jupiter Swap V2 execute failed: ${detail}`);
+      if (attempt >= JUPITER_SELL_RETRIES || !this.isRetryableJupiterExecuteError(detail)) {
+        break;
+      }
+
+      const delay = BASE_RETRY_MS * 2 ** attempt;
+      log.warn('Jupiter execute failed; rebuilding order and retrying', {
+        mint,
+        attempt: attempt + 1,
+        retryInMs: delay,
+        error: detail,
+      });
+      await sleep(delay);
     }
 
-    return result;
+    throw lastError;
   }
 
   async quoteTokenSellForSol(
@@ -306,7 +336,8 @@ export class GmgnClient {
     outputMint: string,
     amount: bigint,
     taker?: string,
-    priorityFeeSol = 0
+    priorityFeeSol = 0,
+    options?: SellOptions
   ): Promise<Record<string, unknown>> {
     const url = new URL(`${this.jupiterSwapBaseUrl}/order`);
     url.searchParams.set('inputMint', inputMint);
@@ -320,6 +351,10 @@ export class GmgnClient {
       url.searchParams.set('priorityFeeLamports', String(priorityFeeLamports));
       url.searchParams.set('broadcastFeeType', 'exactFee');
     }
+    const slippageBps = this.toJupiterSlippageBps(options);
+    if (slippageBps !== null) {
+      url.searchParams.set('slippageBps', String(slippageBps));
+    }
     return this.fetchJupiterJson(url.toString(), 'GET');
   }
 
@@ -328,12 +363,13 @@ export class GmgnClient {
     outputMint: string,
     amount: bigint,
     taker?: string,
-    priorityFeeSol = 0
+    priorityFeeSol = 0,
+    options?: SellOptions
   ): Promise<Record<string, unknown>> {
     let lastError: unknown = null;
     for (let attempt = 0; attempt <= JUPITER_ORDER_RETRIES; attempt++) {
       try {
-        return await this.getJupiterOrder(inputMint, outputMint, amount, taker, priorityFeeSol);
+        return await this.getJupiterOrder(inputMint, outputMint, amount, taker, priorityFeeSol, options);
       } catch (err) {
         lastError = err;
         if (attempt >= JUPITER_ORDER_RETRIES || !this.isRetryableJupiterError(err)) {
@@ -362,6 +398,22 @@ export class GmgnClient {
       || message.includes('HTTP 502')
       || message.includes('HTTP 503')
       || message.includes('HTTP 504');
+  }
+
+  private isRetryableJupiterExecuteError(message: string): boolean {
+    const lower = message.toLowerCase();
+    return lower.includes('slippage tolerance exceeded')
+      || lower.includes('blockhash')
+      || lower.includes('expired')
+      || lower.includes('simulation')
+      || lower.includes('timeout')
+      || lower.includes('failed to get quotes');
+  }
+
+  private toJupiterSlippageBps(options?: SellOptions): number | null {
+    if (!options || options.autoSlippage) return null;
+    const bps = Math.round(options.slippage * 10_000);
+    return Math.max(1, Math.min(10_000, bps));
   }
 
   private async executeJupiterOrder(
