@@ -393,21 +393,29 @@ export class Scheduler extends EventEmitter {
       const second = topWallets[1] ?? null;
       const validFirst = first === 0 || first === 1;
       const validSecond = second === 1 || second === 3;
-      const shouldSell = sampleNumber === 2
-        ? !validFirst || !validSecond
-        : !validFirst || !validSecond || topWallets[2] !== second;
+        const shouldSell = sampleNumber === 2
+          ? !validFirst || !validSecond
+          : !validFirst || !validSecond || topWallets[2] !== second;
 
-      if (shouldSell) {
-        entry.filterAlerted = true;
-        const settings = this.db.getWalletSettings(entry.matchingWallets[0]);
-        const expected = sampleNumber === 2
-          ? '#1 must be 0 or 1, and #2 must be 1 or 3'
-          : '#1 must be 0 or 1, and #2-#3 must be 1-1 or 3-3';
-        const event: FilterFailEvent = {
-          walletAddress: entry.walletAddress,
-          mint: entry.mint,
-          sampleNumber,
-          elapsedSec,
+        if (shouldSell) {
+          entry.filterAlerted = true;
+          const settings = this.db.getWalletSettings(entry.matchingWallets[0]);
+          const expected = sampleNumber === 2
+            ? '#1 must be 0 or 1, and #2 must be 1 or 3'
+            : '#1 must be 0 or 1, and #2-#3 must be 1-1 or 3-3';
+          log.warn(`[FILTER FAIL] ${entry.mint} sample #${sampleNumber}; top wallets ${topWallets.map((value) => value ?? 'N/A').join(' -> ')}`, {
+            walletAddress: entry.walletAddress,
+            mint: entry.mint,
+            matchingWallets: entry.matchingWallets,
+            sampleNumber,
+            topWallets,
+            expected,
+          });
+          const event: FilterFailEvent = {
+            walletAddress: entry.walletAddress,
+            mint: entry.mint,
+            sampleNumber,
+            elapsedSec,
           reasons: [
             `Top wallets pattern failed by sample #${sampleNumber}: observed ${topWallets.map((value) => value ?? 'N/A').join(' -> ')}; expected ${expected}.`,
           ],
@@ -417,6 +425,14 @@ export class Scheduler extends EventEmitter {
           matchingWallets: entry.matchingWallets,
         };
         this.emit('filterFail', event);
+      } else {
+        log.info(`[FILTER HOLD] ${entry.mint} sample #${sampleNumber}; top wallets ${topWallets.map((value) => value ?? 'N/A').join(' -> ')}`, {
+          walletAddress: entry.walletAddress,
+          mint: entry.mint,
+          matchingWallets: entry.matchingWallets,
+          sampleNumber,
+          topWallets,
+        });
       }
     }
 
