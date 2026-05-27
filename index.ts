@@ -607,11 +607,41 @@ async function main(): Promise<void> {
     let lastLogAt = 0;
 
     while (pendingSells.has(sellId)) {
-      const quote = await gmgnClient.quoteTokenSellForSol(
-        pending.event.walletAddress,
-        pending.event.mint,
-        config.sellPercent
-      );
+      let quote: SellQuote;
+      try {
+        quote = await gmgnClient.quoteTokenSellForSol(
+          pending.event.walletAddress,
+          pending.event.mint,
+          config.sellPercent
+        );
+      } catch (err) {
+        const now = Date.now();
+        if (now - lastLogAt >= 30_000) {
+          lastLogAt = now;
+          log.warn('Profit gate quote failed; will retry', {
+            mint: pending.event.mint,
+            error: err instanceof Error ? err.message : String(err),
+            nextCheckMs: config.sellProfitCheckIntervalMs,
+          });
+        }
+        if (!notifiedWaiting && chatId && telegramBot) {
+          notifiedWaiting = true;
+          await telegramBot.sendChat(chatId, [
+            '<b>Sell Waiting For Profit Quote</b>',
+            `Wallet: <code>${html(pending.event.walletAddress)}</code>`,
+            `Token: <code>${html(pending.event.mint)}</code>`,
+            `Target P/L: <b>+${config.sellMinProfitPct}%</b>`,
+            'Jupiter quote is not ready yet. I will keep retrying instead of failing the sell.',
+            `Next check: ${Math.round(config.sellProfitCheckIntervalMs / 1000)}s`,
+            '',
+            '<b>Why sell is pending</b>',
+            ...pending.event.reasons.map((reason) => `- ${html(reason)}`),
+          ].join('\n'));
+        }
+        await sleep(config.sellProfitCheckIntervalMs);
+        continue;
+      }
+
       const pnl = quote.estimatedOutputSol - costBasis;
       const pnlPct = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
 

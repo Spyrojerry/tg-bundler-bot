@@ -40,6 +40,7 @@ const MAX_RETRIES      = 3;
 const BASE_RETRY_MS    = 1_000;
 const REQUEST_TIMEOUT  = 15_000;  // ms
 const BLOCKED_RETRY_MS = 60_000;
+const JUPITER_ORDER_RETRIES = 5;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
@@ -131,7 +132,7 @@ export class GmgnClient {
       rawAmount: rawAmount.toString(),
     });
 
-    const order = await this.getJupiterOrder(
+    const order = await this.getJupiterOrderWithRetry(
       mint,
       SOL_MINT,
       rawAmount,
@@ -170,7 +171,7 @@ export class GmgnClient {
     const owner = new PublicKey(walletAddress);
     const mintPk = new PublicKey(mint);
     const rawAmount = await this.getTokenSellAmount(owner, mintPk, percent);
-    const order = await this.getJupiterOrder(mint, SOL_MINT, rawAmount);
+    const order = await this.getJupiterOrderWithRetry(mint, SOL_MINT, rawAmount);
     const outputAmount = this.asString(order.outAmount);
     if (!outputAmount || !/^\d+$/.test(outputAmount)) {
       const detail = this.asString(order.errorMessage) ?? this.asString(order.error) ?? 'quote returned no outAmount';
@@ -320,6 +321,47 @@ export class GmgnClient {
       url.searchParams.set('broadcastFeeType', 'exactFee');
     }
     return this.fetchJupiterJson(url.toString(), 'GET');
+  }
+
+  private async getJupiterOrderWithRetry(
+    inputMint: string,
+    outputMint: string,
+    amount: bigint,
+    taker?: string,
+    priorityFeeSol = 0
+  ): Promise<Record<string, unknown>> {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= JUPITER_ORDER_RETRIES; attempt++) {
+      try {
+        return await this.getJupiterOrder(inputMint, outputMint, amount, taker, priorityFeeSol);
+      } catch (err) {
+        lastError = err;
+        if (attempt >= JUPITER_ORDER_RETRIES || !this.isRetryableJupiterError(err)) {
+          break;
+        }
+        const delay = BASE_RETRY_MS * 2 ** attempt;
+        log.warn('Jupiter order failed; retrying', {
+          inputMint,
+          outputMint,
+          attempt: attempt + 1,
+          retryInMs: delay,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        await sleep(delay);
+      }
+    }
+    throw lastError;
+  }
+
+  private isRetryableJupiterError(err: unknown): boolean {
+    const message = err instanceof Error ? err.message : String(err);
+    return message.includes('Failed to get quotes')
+      || message.includes('timeout')
+      || message.includes('HTTP 429')
+      || message.includes('HTTP 500')
+      || message.includes('HTTP 502')
+      || message.includes('HTTP 503')
+      || message.includes('HTTP 504');
   }
 
   private async executeJupiterOrder(
