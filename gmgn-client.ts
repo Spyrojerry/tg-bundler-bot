@@ -41,6 +41,8 @@ const BASE_RETRY_MS    = 1_000;
 const REQUEST_TIMEOUT  = 15_000;  // ms
 const BLOCKED_RETRY_MS = 60_000;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const TOKEN_BALANCE_RETRIES = 6;
+const TOKEN_BALANCE_RETRY_MS = 1_000;
 
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 
@@ -251,10 +253,10 @@ export class GmgnClient {
     mint: PublicKey,
     percent: number
   ): Promise<bigint> {
-    const accounts = await this.connection.getParsedTokenAccountsByOwner(owner, { mint });
+    const accounts = await this.getParsedTokenAccountsForMint(owner, mint);
     let total = 0n;
 
-    for (const account of accounts.value) {
+    for (const account of accounts) {
       const parsed = account.account.data.parsed as {
         info?: { tokenAmount?: { amount?: string } };
       };
@@ -274,6 +276,50 @@ export class GmgnClient {
       throw new Error(`Token balance is too small to sell ${percent}% of ${mint.toBase58()}`);
     }
     return sellAmount;
+  }
+
+  private async getParsedTokenAccountsForMint(
+    owner: PublicKey,
+    mint: PublicKey
+  ): Promise<Awaited<ReturnType<Connection['getParsedTokenAccountsByOwner']>>['value']> {
+    let lastError: unknown = null;
+
+    for (let attempt = 0; attempt <= TOKEN_BALANCE_RETRIES; attempt++) {
+      try {
+        const accounts = await this.connection.getParsedTokenAccountsByOwner(owner, { mint });
+        return accounts.value;
+      } catch (err) {
+        lastError = err;
+        const message = err instanceof Error ? err.message : String(err);
+        if (!message.includes('could not find mint') || attempt >= TOKEN_BALANCE_RETRIES) {
+          break;
+        }
+        await sleep(TOKEN_BALANCE_RETRY_MS);
+      }
+    }
+
+    log.warn('Mint lookup failed; falling back to owner token-account scan', {
+      owner: owner.toBase58(),
+      mint: mint.toBase58(),
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+
+    const [tokenAccounts, token2022Accounts] = await Promise.all([
+      this.connection.getParsedTokenAccountsByOwner(owner, {
+        programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
+      }),
+      this.connection.getParsedTokenAccountsByOwner(owner, {
+        programId: new PublicKey('TokenzQdBNbLqP5VEgTEoFZ3bUvdJr3XwsvC2Q5DA'),
+      }).then((result) => result.value).catch(() => []),
+    ]);
+
+    const targetMint = mint.toBase58();
+    return [...tokenAccounts.value, ...token2022Accounts].filter((account) => {
+      const parsed = account.account.data.parsed as {
+        info?: { mint?: string };
+      };
+      return parsed.info?.mint === targetMint;
+    });
   }
 
   private async getJupiterOrder(
