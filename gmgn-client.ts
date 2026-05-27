@@ -25,6 +25,7 @@ import {
   FetchResult,
   GmgnSecurityResponse,
   SellOptions,
+  SellQuote,
   SellResult,
   ServiceConfig,
 } from './types';
@@ -156,6 +157,35 @@ export class GmgnClient {
     return result;
   }
 
+  async quoteTokenSellForSol(
+    walletAddress: string,
+    mint: string,
+    percent: number
+  ): Promise<SellQuote> {
+    this.validateSolAddress(walletAddress, 'wallet address');
+    this.validateSolAddress(mint, 'token mint');
+
+    const owner = new PublicKey(walletAddress);
+    const mintPk = new PublicKey(mint);
+    const rawAmount = await this.getTokenSellAmount(owner, mintPk, percent);
+    const order = await this.getJupiterOrder(mint, SOL_MINT, rawAmount);
+    const outputAmount = this.asString(order.outAmount);
+    if (!outputAmount || !/^\d+$/.test(outputAmount)) {
+      const detail = this.asString(order.errorMessage) ?? this.asString(order.error) ?? 'quote returned no outAmount';
+      throw new Error(`Jupiter Swap V2 quote failed: ${detail}`);
+    }
+
+    return {
+      inputToken: this.asString(order.inputMint) ?? mint,
+      outputToken: this.asString(order.outputMint) ?? SOL_MINT,
+      soldPercent: percent,
+      inputAmount: this.asString(order.inAmount) ?? rawAmount.toString(),
+      outputAmount,
+      estimatedOutputSol: Number(BigInt(outputAmount)) / 1_000_000_000,
+      raw: order,
+    };
+  }
+
   private getJupiterWallet(expectedAddress: string): Keypair {
     const key = this.readJupiterPrivateKey();
     const wallet = Keypair.fromSecretKey(key);
@@ -250,14 +280,16 @@ export class GmgnClient {
     inputMint: string,
     outputMint: string,
     amount: bigint,
-    taker: string,
-    priorityFeeSol: number
+    taker?: string,
+    priorityFeeSol = 0
   ): Promise<Record<string, unknown>> {
     const url = new URL(`${this.jupiterSwapBaseUrl}/order`);
     url.searchParams.set('inputMint', inputMint);
     url.searchParams.set('outputMint', outputMint);
     url.searchParams.set('amount', amount.toString());
-    url.searchParams.set('taker', taker);
+    if (taker) {
+      url.searchParams.set('taker', taker);
+    }
     const priorityFeeLamports = Math.round(priorityFeeSol * 1_000_000_000);
     if (priorityFeeLamports > 0) {
       url.searchParams.set('priorityFeeLamports', String(priorityFeeLamports));

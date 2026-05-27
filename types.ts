@@ -141,6 +141,8 @@ export interface ServiceConfig {
   sellAutoSlippage: boolean;
   sellPriorityFeeSol: number;
   sellAntiMev: boolean;
+  sellMinProfitPct: number;
+  sellProfitCheckIntervalMs: number;
   port: number;
 }
 
@@ -202,6 +204,16 @@ export interface SellResult {
   soldPercent: number;
   filledInputAmount: string | null;
   filledOutputAmount: string | null;
+  raw: Record<string, unknown>;
+}
+
+export interface SellQuote {
+  inputToken: string;
+  outputToken: string;
+  soldPercent: number;
+  inputAmount: string;
+  outputAmount: string;
+  estimatedOutputSol: number;
   raw: Record<string, unknown>;
 }
 
