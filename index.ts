@@ -179,8 +179,8 @@ async function main(): Promise<void> {
         `Wallet: <code>${html(event.walletAddress)}</code>`,
         `Token: <code>${html(event.mint)}</code>`,
         `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
-        'Watching this token for buys from monitored wallets with reverse-buy sell trigger enabled.',
-        'If an enabled reverse-buy wallet buys it while this position is still open, sell submits immediately.',
+        'Watching this token for buys from wallets explicitly added to reverse-buy trigger list in settings.',
+        'If one of those wallets buys it while this position is still open, sell submits immediately.',
       ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
     });
 
@@ -201,9 +201,8 @@ async function main(): Promise<void> {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       log.info(`[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
       startWatchedWalletSummary(event);
-      const walletSettings = db.getWalletSettings(event.walletAddress);
-      if (!walletSettings.reverseBuySellTriggerEnabled) {
-        log.info(`[REVERSE BUY DISABLED] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+      if (!db.isReverseBuyWallet(event.walletAddress)) {
+        log.info(`[REVERSE BUY NOT CONFIGURED] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
         return;
       }
       const tradingPosition = pendingTradingBuys.get(event.mint);
@@ -233,7 +232,7 @@ async function main(): Promise<void> {
       `Token: <code>${html(event.mint)}</code>`,
       `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
       'Mode: monitor-only summary at sample #20.',
-      'Sell trigger only happens if this wallet has reverse-buy sell trigger enabled in wallet settings.',
+      'Sell trigger only happens if this wallet is explicitly added to reverse-buy trigger list in settings.',
     ].join('\n')).catch((err) => log.warn('Telegram watched-wallet monitor alert failed', err));
   }
 
@@ -375,7 +374,7 @@ async function main(): Promise<void> {
 
   function settingsReply(address: string, editCurrent = false): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
-    const settings = db.getWalletSettings(normalized);
+    const reverseBuyEnabled = db.isReverseBuyWallet(normalized);
 
     return {
       text: [
@@ -383,19 +382,19 @@ async function main(): Promise<void> {
         `<code>${html(normalized)}</code>`,
         '',
         '<b>Sell Trigger Flow</b>',
-        'When your trading wallet opens a token position, this token is watched for buys from monitored wallets that have reverse-buy trigger enabled.',
-        'If this wallet buys the same token while your trading position is still open and reverse-buy is enabled, sell submits immediately.',
+        'When your trading wallet opens a token position, this token is watched for buys from wallets explicitly added to reverse-buy trigger list.',
+        'If this wallet buys the same token while your trading position is still open and it is in that list, sell submits immediately.',
         'If your trading-wallet position exits first, the watched-buy trigger for that token is removed automatically.',
         '',
-        `Reverse-buy sell trigger: <b>${settings.reverseBuySellTriggerEnabled ? 'ENABLED' : 'DISABLED'}</b>`,
+        `Reverse-buy sell trigger: <b>${reverseBuyEnabled ? 'ENABLED' : 'DISABLED'}</b>`,
         'Sample cards, logs, and the sample <b>#20</b> summary still continue for watched-wallet monitoring regardless.',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
           [
             {
-              text: `${settings.reverseBuySellTriggerEnabled ? 'Disable' : 'Enable'} reverse-buy sell trigger`,
-              callback_data: `toggle:reversebuy:${normalized}`,
+              text: `${reverseBuyEnabled ? 'Remove' : 'Add'} wallet to reverse-buy sell list`,
+              callback_data: `${reverseBuyEnabled ? 'reverse:remove' : 'reverse:add'}:${normalized}`,
             },
           ],
           [
@@ -818,13 +817,23 @@ async function main(): Promise<void> {
             settings.sellIfFirstThreePctZero = !settings.sellIfFirstThreePctZero;
           } else if (callbackAction === 'teen20') {
             settings.sellIfNoTeenOrTwentyPct = !settings.sellIfNoTeenOrTwentyPct;
-          } else if (callbackAction === 'reversebuy') {
-            settings.reverseBuySellTriggerEnabled = !settings.reverseBuySellTriggerEnabled;
           } else {
             return 'Invalid setting.';
           }
           db.updateWalletSettings(normalized, settings);
           return settingsReply(normalized, true);
+        }
+        if (callbackKind === 'reverse' && callbackAction && callbackAddress) {
+          const normalized = new PublicKey(callbackAddress).toBase58();
+          if (callbackAction === 'add') {
+            db.addReverseBuyWallet(normalized);
+            return settingsReply(normalized, true);
+          }
+          if (callbackAction === 'remove') {
+            db.removeReverseBuyWallet(normalized);
+            return settingsReply(normalized, true);
+          }
+          return 'Invalid reverse-buy action.';
         }
         if (callbackKind === 'settings' && callbackAction === 'refresh' && callbackAddress) {
           return settingsReply(callbackAddress, true);

@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS monitored_wallets (
   added_at    TEXT NOT NULL,
   status      TEXT NOT NULL DEFAULT 'active'
 );
+CREATE TABLE IF NOT EXISTS reverse_buy_wallets (
+  address     TEXT PRIMARY KEY NOT NULL,
+  added_at    TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'active'
+);
 
 CREATE TABLE IF NOT EXISTS wallet_settings (
   wallet_address   TEXT PRIMARY KEY NOT NULL,
@@ -326,6 +331,37 @@ export class MonitorDatabase {
       `SELECT address FROM monitored_wallets WHERE status = 'active' ORDER BY added_at ASC`
     );
     return rows.map((r) => r.address);
+  }
+
+  addReverseBuyWallet(address: string): void {
+    this.run(
+      `INSERT INTO reverse_buy_wallets (address, added_at, status)
+       VALUES (?, ?, 'active')
+       ON CONFLICT(address) DO UPDATE SET status = 'active'`,
+      [address, new Date().toISOString()]
+    );
+  }
+
+  removeReverseBuyWallet(address: string): void {
+    this.run(
+      `UPDATE reverse_buy_wallets SET status = 'stopped' WHERE address = ?`,
+      [address]
+    );
+  }
+
+  getActiveReverseBuyWallets(): string[] {
+    const rows = this.query<{ address: string }>(
+      `SELECT address FROM reverse_buy_wallets WHERE status = 'active' ORDER BY added_at ASC`
+    );
+    return rows.map((r) => r.address);
+  }
+
+  isReverseBuyWallet(address: string): boolean {
+    const rows = this.query<{ found: number }>(
+      `SELECT 1 AS found FROM reverse_buy_wallets WHERE address = ? AND status = 'active'`,
+      [address]
+    );
+    return rows.length > 0;
   }
 
   // ── bundler_metrics table ──────────────────────────────────────────────────
