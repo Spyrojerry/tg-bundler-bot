@@ -162,6 +162,13 @@ export interface NewTokenEvent {
   matchingWallets?: string[];
 }
 
+export interface TokenExitEvent {
+  walletAddress: string;
+  mint: string;
+  detectedAt: number;
+  source: string;
+}
+
 export interface MonitorSampleEvent {
   walletAddress: string;
   mint: string;

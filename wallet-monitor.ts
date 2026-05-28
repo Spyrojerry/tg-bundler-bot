@@ -17,7 +17,7 @@ import {
 } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { createLogger } from './logger';
-import { NewTokenEvent, ServiceConfig, TokenHolding } from './types';
+import { NewTokenEvent, ServiceConfig, TokenExitEvent, TokenHolding } from './types';
 
 const log = createLogger('WALLET');
 const WALLET_COMMITMENT = 'processed';
@@ -41,6 +41,8 @@ export class WalletMonitor extends EventEmitter {
 
   /** All mints we've emitted a newToken event for (to avoid duplicates) */
   private knownMints: Set<string> = new Set();
+  /** Mints currently held with positive balance. */
+  private heldMints: Set<string> = new Set();
 
   /** Websocket logs subscription id returned by Connection.onLogs. */
   private logsSubscriptionId: number | null = null;
@@ -95,6 +97,7 @@ export class WalletMonitor extends EventEmitter {
       if (!this.hasPositiveBalance(h)) continue;
       this.existingTokens.add(h.mint);
       this.knownMints.add(h.mint);
+      this.heldMints.add(h.mint);
     }
 
     log.info(
@@ -163,6 +166,7 @@ export class WalletMonitor extends EventEmitter {
     try {
       const holdings = await this.fetchHoldings();
       const now = Date.now();
+      const currentlyHeld = new Set<string>();
 
       log.debug(`Poll complete: ${holdings.length} holding(s)`);
 
@@ -171,9 +175,11 @@ export class WalletMonitor extends EventEmitter {
           log.debug(`Skipping zero-balance mint ${holding.mint}; will keep watching`);
           continue;
         }
+        currentlyHeld.add(holding.mint);
 
         this.emitNewToken(holding.mint, now, holding.uiAmount ?? holding.amount, 'account-poll', null);
       }
+      this.detectExitedTokens(currentlyHeld, now, 'account-poll');
     } catch (err) {
       log.error('Failed to poll wallet holdings', err);
     } finally {
@@ -292,6 +298,24 @@ export class WalletMonitor extends EventEmitter {
     return spentLamports > 0
       ? parseFloat((spentLamports / LAMPORTS_PER_SOL).toFixed(6))
       : 0;
+  }
+
+  private detectExitedTokens(currentlyHeld: Set<string>, detectedAt: number, source: string): void {
+    for (const mint of this.heldMints) {
+      if (currentlyHeld.has(mint)) continue;
+      this.knownMints.delete(mint);
+      this.existingTokens.delete(mint);
+      this.minBuyUnknownLogged.delete(mint);
+      log.info(`[TOKEN EXITED] Mint: ${mint}  Source: ${source}`);
+      const event: TokenExitEvent = {
+        walletAddress: this.walletPubkey.toBase58(),
+        mint,
+        detectedAt,
+        source,
+      };
+      this.emit('tokenExited', event);
+    }
+    this.heldMints = currentlyHeld;
   }
 
   private emitNewToken(

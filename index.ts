@@ -28,6 +28,7 @@ import {
   NewTokenEvent,
   SellQuote,
   SellResult,
+  TokenExitEvent,
   TokenSummary,
   WalletFilterSettings,
 } from './types';
@@ -35,7 +36,6 @@ import { PublicKey } from '@solana/web3.js';
 import { randomBytes } from 'crypto';
 
 const log = createLogger('MAIN');
-const TRADING_LINK_WINDOW_MS = 5 * 60 * 1000;
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -76,9 +76,6 @@ async function main(): Promise<void> {
   const walletMonitors = new Map<string, WalletMonitor>();
   let tradingWalletMonitor: WalletMonitor | null = null;
   const pendingTradingBuys = new Map<string, NewTokenEvent>();
-  const pendingTradingBuyTimers = new Map<string, NodeJS.Timeout>();
-  const recentWatchedBuys = new Map<string, Set<string>>();
-  const activeTradingMints = new Set<string>();
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
     | { type: 'setting'; walletAddress: string; field: SettingField };
@@ -116,69 +113,98 @@ async function main(): Promise<void> {
     if (field === 'applyAtSample') return 'Use a positive whole number.';
     return 'Use a number, or send <code>off</code> to disable.';
   };
-
-  function walletHasSellFilters(walletAddress: string): boolean {
-    return db.getWalletSettings(walletAddress) !== null;
+  function hasPendingSellForMint(walletAddress: string, mint: string): boolean {
+    for (const pending of pendingSells.values()) {
+      if (pending.event.walletAddress === walletAddress && pending.event.mint === mint) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  function linkedWalletModeLines(wallet: string): string[] {
-    return [
-      `- <code>${html(wallet)}</code>`,
-      `  Sell filter: top wallets must start with 0 or 1, then 1 -> 1 or 3 -> 3`,
-      `  Monitoring continues through sample #${20}`,
-    ];
+  function queueWatchedWalletSell(
+    watchedBuy: NewTokenEvent,
+    tradingPosition: NewTokenEvent
+  ): void {
+    if (hasPendingSellForMint(tradingPosition.walletAddress, tradingPosition.mint)) {
+      log.info(`[SELL SKIP] Sell already pending for ${tradingPosition.mint}`);
+      return;
+    }
+
+    const event: FilterFailEvent = {
+      walletAddress: tradingPosition.walletAddress,
+      mint: tradingPosition.mint,
+      sampleNumber: 0,
+      elapsedSec: 0,
+      reasons: [
+        `Watched wallet ${watchedBuy.walletAddress} bought this token while your trading-wallet position was open.`,
+        'Configured action triggered: sell immediately on watched-wallet buy signal.',
+      ],
+      settings: db.getWalletSettings(watchedBuy.walletAddress),
+      metrics: {
+        mint: tradingPosition.mint,
+        timestamp: new Date().toISOString(),
+        bundlersPercent: null,
+        bundlersCount: null,
+        initialBaseReserve: null,
+        topWallets: null,
+        top10HolderRate: null,
+        bundledAmountRate: null,
+      },
+      buySol: tradingPosition.buySol ?? db.getToken(tradingPosition.walletAddress, tradingPosition.mint)?.buySol ?? null,
+      matchingWallets: [watchedBuy.walletAddress],
+    };
+    const sellId = randomBytes(5).toString('hex');
+    pendingSells.set(sellId, {
+      event,
+      createdAt: Date.now(),
+      executing: true,
+    });
+    telegramBot?.sendDefault([
+      '<b>Watched Wallet Buy Triggered Sell</b>',
+      `Watched wallet: <code>${html(watchedBuy.walletAddress)}</code>`,
+      `Trading wallet: <code>${html(tradingPosition.walletAddress)}</code>`,
+      `Token: <code>${html(tradingPosition.mint)}</code>`,
+      `Action: submit sell for <b>${config.sellPercent}%</b> immediately.`,
+    ].join('\n')).catch((err) => log.warn('Telegram watched-wallet sell trigger alert failed', err));
+    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
   }
 
   function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
-      const existingTimer = pendingTradingBuyTimers.get(event.mint);
-      if (existingTimer) clearTimeout(existingTimer);
       pendingTradingBuys.set(event.mint, event);
-      const expireTimer = setTimeout(() => {
-        pendingTradingBuyTimers.delete(event.mint);
-        if (activeTradingMints.has(event.mint)) return;
-        pendingTradingBuys.delete(event.mint);
-        log.info(`[TRADING BUY EXPIRED] No watched-wallet match within 5 minutes for ${event.mint}`);
-        telegramBot?.sendDefault([
-          '<b>Trading Wallet Buy Expired</b>',
-          `Token: <code>${html(event.mint)}</code>`,
-          'No watched wallet matched this token within 5 minutes.',
-        ].join('\n')).catch((err) => log.warn('Telegram trading buy expiry alert failed', err));
-      }, TRADING_LINK_WINDOW_MS);
-      pendingTradingBuyTimers.set(event.mint, expireTimer);
-
-      const matchedWallets = [...(recentWatchedBuys.get(event.mint) ?? new Set<string>())];
-
-      log.info(`[TRADING BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+      log.info(`[TRADING POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
       telegramBot?.sendDefault([
-        '<b>Trading Wallet Buy Detected</b>',
+        '<b>Trading Wallet Position Opened</b>',
         `Wallet: <code>${html(event.walletAddress)}</code>`,
         `Token: <code>${html(event.mint)}</code>`,
         `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
-        matchedWallets.length
-          ? `Already matched by watched wallet(s): <b>${matchedWallets.length}</b>`
-          : 'Waiting for a watched wallet to buy this token before monitoring starts.',
+        'Watching this token for buys from your monitored watched wallets.',
+        'If a watched wallet buys it while this position is still open, sell submits immediately.',
       ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
+    });
 
-      if (matchedWallets.length > 0) {
-        activateTradingToken(event.mint, matchedWallets);
-      }
+    walletMonitor.on('tokenExited', (event: TokenExitEvent) => {
+      if (!pendingTradingBuys.has(event.mint)) return;
+      pendingTradingBuys.delete(event.mint);
+      log.info(`[TRADING POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint} — stopped watched-wallet trigger watch`);
+      telegramBot?.sendDefault([
+        '<b>Trading Wallet Position Closed</b>',
+        `Wallet: <code>${html(event.walletAddress)}</code>`,
+        `Token: <code>${html(event.mint)}</code>`,
+        'Stopped waiting for watched-wallet buy triggers for this token.',
+      ].join('\n')).catch((err) => log.warn('Telegram trading exit alert failed', err));
     });
   }
 
   function wireWatchedWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       log.info(`[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
-      if (!walletHasSellFilters(event.walletAddress)) {
-        log.info(`[WATCHED BUY MONITOR-ONLY] Wallet ${event.walletAddress} has no bundler count-change setting`);
-      }
-      const wallets = recentWatchedBuys.get(event.mint) ?? new Set<string>();
-      wallets.add(event.walletAddress);
-      recentWatchedBuys.set(event.mint, wallets);
       startWatchedWalletSummary(event);
-
-      if (pendingTradingBuys.has(event.mint)) {
-        activateTradingToken(event.mint, [...wallets]);
+      const tradingPosition = pendingTradingBuys.get(event.mint);
+      if (tradingPosition) {
+        pendingTradingBuys.delete(event.mint);
+        queueWatchedWalletSell(event, tradingPosition);
       }
     });
   }
@@ -201,43 +227,8 @@ async function main(): Promise<void> {
       `Wallet: <code>${html(event.walletAddress)}</code>`,
       `Token: <code>${html(event.mint)}</code>`,
       `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
-      'Mode: monitor-only summary at sample #20. Sell decisions are disabled for watched-wallet-only monitoring.',
+      'Mode: monitor-only summary at sample #20. If your trading wallet is holding this token, this buy can trigger an immediate sell.',
     ].join('\n')).catch((err) => log.warn('Telegram watched-wallet monitor alert failed', err));
-  }
-
-  function activateTradingToken(mint: string, matchingWallets: string[]): void {
-    if (activeTradingMints.has(mint)) return;
-    const tradingBuy = pendingTradingBuys.get(mint);
-    if (!tradingBuy) return;
-    matchingWallets = [...new Set(matchingWallets)];
-    if (matchingWallets.length === 0) return;
-    activeTradingMints.add(mint);
-    const pendingTimer = pendingTradingBuyTimers.get(mint);
-    if (pendingTimer) clearTimeout(pendingTimer);
-    pendingTradingBuyTimers.delete(mint);
-    pendingTradingBuys.delete(mint);
-
-    if (!db.tokenExists(tradingBuy.walletAddress, mint)) {
-      db.insertToken({
-        walletAddress: tradingBuy.walletAddress,
-        mint,
-        firstSeen: new Date().toISOString(),
-        monitoringStatus: 'active',
-        detectedAt: tradingBuy.detectedAt,
-        buySol: tradingBuy.buySol,
-      });
-    }
-
-    scheduler.addToken({ ...tradingBuy, matchingWallets });
-    telegramBot?.sendDefault([
-      '<b>Watched Wallet Match Found</b>',
-      `Trading wallet token: <code>${html(mint)}</code>`,
-      `Matched watched wallets: <b>${matchingWallets.length}</b>`,
-      ...matchingWallets.slice(0, 5).flatMap((wallet) => linkedWalletModeLines(wallet)),
-      matchingWallets.length > 5 ? `...and ${matchingWallets.length - 5} more` : '',
-      '',
-      'Monitoring is now running on your trading-wallet position. Sample cards and the sample #20 summary will continue.',
-    ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram match alert failed', err));
   }
 
   async function startWallet(address: string): Promise<string> {
@@ -384,13 +375,12 @@ async function main(): Promise<void> {
         '<b>Filter Settings</b>',
         `<code>${html(normalized)}</code>`,
         '',
-        '<b>Current Flow</b>',
-        'Linked trading-wallet tokens are monitored from sample <b>#1</b>.',
-        'No reserve-based sell rule is active.',
-        'Top wallets sample #1 must be <b>0</b> or <b>1</b>, then samples #2-#3 must be <b>1 -> 1</b> or <b>3 -> 3</b>.',
-        'If sample #2 is not 1 or 3, it sells at sample #2. If sample #3 does not match sample #2, it sells at sample #3.',
+        '<b>Sell Trigger Flow</b>',
+        'When your trading wallet opens a token position, this token is watched for buys from monitored watched wallets.',
+        'If this watched wallet buys the same token while your trading position is still open, sell submits immediately.',
+        'If your trading-wallet position exits first, the watched-buy trigger for that token is removed automatically.',
         '',
-        'Samples, logs, Telegram sample cards, and the summary continue through sample <b>#20</b> either way.',
+        'Sample cards, logs, and the sample <b>#20</b> summary still continue for watched-wallet monitoring.',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
@@ -947,6 +937,21 @@ async function main(): Promise<void> {
     tradingWalletMonitor = new WalletMonitor(config, config.tradingWalletAddress, { enforceMinBuySol: false });
     wireTradingWalletMonitor(tradingWalletMonitor);
     await tradingWalletMonitor.start();
+    for (const mint of tradingWalletMonitor.existingMints) {
+      pendingTradingBuys.set(mint, {
+        walletAddress: config.tradingWalletAddress,
+        mint,
+        detectedAt: Date.now(),
+        buySol: db.getToken(config.tradingWalletAddress, mint)?.buySol ?? null,
+      });
+    }
+    if (tradingWalletMonitor.existingMints.size > 0) {
+      telegramBot?.sendDefault([
+        '<b>Trading Wallet Positions Loaded</b>',
+        `Wallet: <code>${html(config.tradingWalletAddress)}</code>`,
+        `Positions watched for watched-wallet buy triggers: <b>${tradingWalletMonitor.existingMints.size}</b>`,
+      ].join('\n')).catch((err) => log.warn('Telegram trading positions bootstrap alert failed', err));
+    }
   } else {
     log.warn('No TRADING_WALLET_ADDRESS configured; sell flow cannot detect your buys.');
   }
@@ -972,10 +977,6 @@ async function main(): Promise<void> {
     for (const monitor of walletMonitors.values()) {
       monitor.stop();
     }
-    for (const timer of pendingTradingBuyTimers.values()) {
-      clearTimeout(timer);
-    }
-    pendingTradingBuyTimers.clear();
     tradingWalletMonitor?.stop();
     telegramBot?.stop();
     scheduler.stop();
