@@ -235,6 +235,9 @@ export class Scheduler extends EventEmitter {
     const topWallets = samples
       .map((s) => s.topWallets)
       .filter((v): v is number => v !== null);
+    const top10HolderRates = samples
+      .map((s) => s.top10HolderRate)
+      .filter((v): v is number => v !== null);
 
     return {
       walletAddress,
@@ -261,6 +264,12 @@ export class Scheduler extends EventEmitter {
         last: topWallets.at(-1) ?? null,
         min: topWallets.length ? Math.min(...topWallets) : null,
         max: topWallets.length ? Math.max(...topWallets) : null,
+      },
+      top10HolderRate: {
+        first: top10HolderRates.at(0) ?? null,
+        last: top10HolderRates.at(-1) ?? null,
+        min: top10HolderRates.length ? Math.min(...top10HolderRates) : null,
+        max: top10HolderRates.length ? Math.max(...top10HolderRates) : null,
       },
     };
   }
@@ -291,6 +300,9 @@ export class Scheduler extends EventEmitter {
       `║  Top Wallets`,
       `║    First : ${fmt(s.topWallets.first)}   Last : ${fmt(s.topWallets.last)}`,
       `║    Min   : ${fmt(s.topWallets.min)}   Max  : ${fmt(s.topWallets.max)}`,
+      `║  Top 10 Holder %`,
+      `║    First : ${fmt(s.top10HolderRate.first, '%')}   Last : ${fmt(s.top10HolderRate.last, '%')}`,
+      `║    Min   : ${fmt(s.top10HolderRate.min, '%')}   Max  : ${fmt(s.top10HolderRate.max, '%')}`,
       `╚══════════════════════════════════════════════════════════╝`,
       ``,
     ];
@@ -310,6 +322,7 @@ export class Scheduler extends EventEmitter {
       bundlersPercent: s.bundlersPercent,
       bundlersCount: s.bundlersCount,
       topWallets: s.topWallets,
+      top10HolderRate: s.top10HolderRate,
     }) + '\n');
   }
 
@@ -335,13 +348,15 @@ export class Scheduler extends EventEmitter {
           `[MONITOR +${elapsed}s]  Mint: ${mint.slice(0, 8)}…  ` +
           `Bundlers%: ${metrics.bundlersPercent ?? 'N/A'}  ` +
           `Count: ${metrics.bundlersCount ?? 'N/A'}  ` +
-          `TopWallets: ${metrics.topWallets ?? 'N/A'}`,
+          `TopWallets: ${metrics.topWallets ?? 'N/A'}  ` +
+          `Top10Holder%: ${metrics.top10HolderRate ?? 'N/A'}`,
           {
             mint,
             time:            metrics.timestamp,
             bundlersPercent: metrics.bundlersPercent,
             bundlersCount:   metrics.bundlersCount,
             topWallets: metrics.topWallets,
+            top10HolderRate: metrics.top10HolderRate,
           }
         );
 
@@ -352,6 +367,7 @@ export class Scheduler extends EventEmitter {
             bundlersPercent: metrics.bundlersPercent,
             bundlersCount:   metrics.bundlersCount,
             topWallets: metrics.topWallets,
+            top10HolderRate: metrics.top10HolderRate,
           }) + '\n'
         );
 

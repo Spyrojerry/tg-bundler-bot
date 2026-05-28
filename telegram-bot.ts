@@ -312,6 +312,7 @@ export class TelegramBot {
       `Bundlers: <b>${this.fmt(metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(metrics.bundlersCount)}</b>`,
       `Top wallets: <b>${this.fmt(metrics.topWallets)}</b>`,
+      `Top 10 holder rate: <b>${this.fmt(metrics.top10HolderRate, '%')}</b>`,
       `Matched wallets: <b>${event.matchingWallets.length}</b>`,
       `Time: ${metrics.timestamp}`,
     ].join('\n');
@@ -339,6 +340,10 @@ export class TelegramBot {
       `First: ${this.fmt(summary.topWallets.first)} | Last: ${this.fmt(summary.topWallets.last)}`,
       `Min: ${this.fmt(summary.topWallets.min)} | Max: ${this.fmt(summary.topWallets.max)}`,
       '',
+      '<b>Top 10 Holder %</b>',
+      `First: ${this.fmt(summary.top10HolderRate.first, '%')} | Last: ${this.fmt(summary.top10HolderRate.last, '%')}`,
+      `Min: ${this.fmt(summary.top10HolderRate.min, '%')} | Max: ${this.fmt(summary.top10HolderRate.max, '%')}`,
+      '',
       '<i>Filter note: normal % filters ignore samples below 1%.</i>',
     ].join('\n');
   }
@@ -352,6 +357,7 @@ export class TelegramBot {
       `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
       `Top wallets: <b>${this.fmt(event.metrics.topWallets)}</b>`,
+      `Top 10 holder rate: <b>${this.fmt(event.metrics.top10HolderRate, '%')}</b>`,
       `Matched wallets: <b>${event.matchingWallets.length}</b>`,
       '',
       '<b>Reasons</b>',
@@ -370,6 +376,7 @@ export class TelegramBot {
       `Bundlers: <b>${this.fmt(event.metrics.bundlersPercent, '%')}</b>`,
       `Bundler wallets: <b>${this.fmt(event.metrics.bundlersCount)}</b>`,
       `Top wallets: <b>${this.fmt(event.metrics.topWallets)}</b>`,
+      `Top 10 holder rate: <b>${this.fmt(event.metrics.top10HolderRate, '%')}</b>`,
       `Matched wallets: <b>${event.matchingWallets.length}</b>`,
       '',
       'Decision: position left open.',

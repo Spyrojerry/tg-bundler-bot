@@ -774,6 +774,7 @@ export class GmgnClient {
     d: Record<string, unknown>
   ): BundlerMetrics {
     const stat = this.asRecord(d.stat);
+    const dev = this.asRecord(d.dev);
     const walletTagsStat = this.asRecord(d.wallet_tags_stat);
     const pool = this.asRecord(d.pool);
 
@@ -800,6 +801,13 @@ export class GmgnClient {
       walletTagsStat.top_wallets ??
       d.top_wallets
     );
+    const top10HolderRateRaw = this.parseNullableNumber(
+      stat.top_10_holder_rate ??
+      dev.top_10_holder_rate ??
+      d.top_10_holder_rate
+    );
+    const top10HolderRate =
+      top10HolderRateRaw !== null ? parseFloat((top10HolderRateRaw * 100).toFixed(4)) : null;
 
     return {
       mint,
@@ -808,6 +816,7 @@ export class GmgnClient {
       bundlersCount: bundlersCount !== null ? Math.round(bundlersCount) : null,
       initialBaseReserve,
       topWallets: topWallets !== null ? Math.round(topWallets) : null,
+      top10HolderRate,
       bundledAmountRate: rawRate,
       rawData: JSON.stringify(d),
     };

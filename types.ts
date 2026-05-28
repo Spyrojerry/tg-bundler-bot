@@ -25,6 +25,7 @@ export interface BundlerMetrics {
   bundlersCount: number | null;     // bundle_num / bundler_count
   initialBaseReserve: number | null;
   topWallets: number | null;
+  top10HolderRate: number | null;   // top_10_holder_rate × 100
   bundledAmountRate: number | null; // raw rate (0-1) from API
   // Any extra fields the API returns — stored as JSON string in DB
   rawData?: string;
@@ -108,6 +109,12 @@ export interface TokenSummary {
   };
   initialBaseReserve: number | null;
   topWallets: {
+    first: number | null;
+    last: number | null;
+    min: number | null;
+    max: number | null;
+  };
+  top10HolderRate: {
     first: number | null;
     last: number | null;
     min: number | null;

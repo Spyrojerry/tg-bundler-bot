@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS bundler_metrics (
   bundlers_count       INTEGER,
   initial_base_reserve REAL,
   top_wallets          INTEGER,
+  top_10_holder_rate   REAL,
   bundled_amount_rate  REAL,
   raw_data             TEXT
 );
@@ -102,6 +103,7 @@ interface MetricRow {
   bundlers_count: number | null;
   initial_base_reserve: number | null;
   top_wallets: number | null;
+  top_10_holder_rate: number | null;
   bundled_amount_rate: number | null;
   raw_data: string | null;
 }
@@ -163,6 +165,9 @@ export class MonitorDatabase {
     }
     if (!metricColumns.some((c) => c.name === 'top_wallets')) {
       this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN top_wallets INTEGER`);
+    }
+    if (!metricColumns.some((c) => c.name === 'top_10_holder_rate')) {
+      this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN top_10_holder_rate REAL`);
     }
   }
 
@@ -327,8 +332,8 @@ export class MonitorDatabase {
   insertMetrics(m: BundlerMetrics): void {
     this.run(
       `INSERT INTO bundler_metrics
-         (wallet_address, mint, timestamp, bundlers_percent, bundlers_count, initial_base_reserve, top_wallets, bundled_amount_rate, raw_data)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (wallet_address, mint, timestamp, bundlers_percent, bundlers_count, initial_base_reserve, top_wallets, top_10_holder_rate, bundled_amount_rate, raw_data)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         m.walletAddress ?? '',
         m.mint,
@@ -337,6 +342,7 @@ export class MonitorDatabase {
         m.bundlersCount    ?? null,
         m.initialBaseReserve ?? null,
         m.topWallets ?? null,
+        m.top10HolderRate ?? null,
         m.bundledAmountRate ?? null,
         m.rawData          ?? null,
       ]
@@ -361,6 +367,7 @@ export class MonitorDatabase {
       bundlersCount:    r.bundlers_count,
       initialBaseReserve: r.initial_base_reserve,
       topWallets: r.top_wallets,
+      top10HolderRate: r.top_10_holder_rate,
       bundledAmountRate: r.bundled_amount_rate,
       rawData:          r.raw_data ?? undefined,
     }));
@@ -381,6 +388,7 @@ export class MonitorDatabase {
       bundlersCount:    r.bundlers_count,
       initialBaseReserve: r.initial_base_reserve,
       topWallets: r.top_wallets,
+      top10HolderRate: r.top_10_holder_rate,
       bundledAmountRate: r.bundled_amount_rate,
       rawData:          r.raw_data ?? undefined,
     }));
