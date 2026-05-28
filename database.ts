@@ -39,6 +39,7 @@ export const DEFAULT_WALLET_FILTER_PROFILE_SETTINGS: WalletFilterProfileSettings
 export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
   ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS,
   minBundlersCountChange: 20,
+  reverseBuySellTriggerEnabled: false,
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -464,6 +465,7 @@ export class MonitorDatabase {
     return {
       ...legacyProfile,
       minBundlersCountChange: parsed.minBundlersCountChange ?? (parsed as { minBundlersPercentIncrease?: number | null }).minBundlersPercentIncrease ?? DEFAULT_WALLET_FILTER_SETTINGS.minBundlersCountChange,
+      reverseBuySellTriggerEnabled: parsed.reverseBuySellTriggerEnabled ?? DEFAULT_WALLET_FILTER_SETTINGS.reverseBuySellTriggerEnabled,
     };
   }
 

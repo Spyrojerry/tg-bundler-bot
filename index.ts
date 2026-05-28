@@ -137,8 +137,8 @@ async function main(): Promise<void> {
       sampleNumber: 0,
       elapsedSec: 0,
       reasons: [
-        `Watched wallet ${watchedBuy.walletAddress} bought this token while your trading-wallet position was open.`,
-        'Configured action triggered: sell immediately on watched-wallet buy signal.',
+        `Reverse-buy wallet ${watchedBuy.walletAddress} bought this token while your trading-wallet position was open.`,
+        'Configured action triggered: sell immediately on reverse-buy wallet buy signal.',
       ],
       settings: db.getWalletSettings(watchedBuy.walletAddress),
       metrics: {
@@ -161,8 +161,8 @@ async function main(): Promise<void> {
       executing: true,
     });
     telegramBot?.sendDefault([
-      '<b>Watched Wallet Buy Triggered Sell</b>',
-      `Watched wallet: <code>${html(watchedBuy.walletAddress)}</code>`,
+      '<b>Reverse-Buy Wallet Triggered Sell</b>',
+      `Reverse-buy wallet: <code>${html(watchedBuy.walletAddress)}</code>`,
       `Trading wallet: <code>${html(tradingPosition.walletAddress)}</code>`,
       `Token: <code>${html(tradingPosition.mint)}</code>`,
       `Action: submit sell for <b>${config.sellPercent}%</b> immediately.`,
@@ -179,8 +179,8 @@ async function main(): Promise<void> {
         `Wallet: <code>${html(event.walletAddress)}</code>`,
         `Token: <code>${html(event.mint)}</code>`,
         `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
-        'Watching this token for buys from your monitored watched wallets.',
-        'If a watched wallet buys it while this position is still open, sell submits immediately.',
+        'Watching this token for buys from monitored wallets with reverse-buy sell trigger enabled.',
+        'If an enabled reverse-buy wallet buys it while this position is still open, sell submits immediately.',
       ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
     });
 
@@ -201,6 +201,11 @@ async function main(): Promise<void> {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       log.info(`[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
       startWatchedWalletSummary(event);
+      const walletSettings = db.getWalletSettings(event.walletAddress);
+      if (!walletSettings.reverseBuySellTriggerEnabled) {
+        log.info(`[REVERSE BUY DISABLED] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+        return;
+      }
       const tradingPosition = pendingTradingBuys.get(event.mint);
       if (tradingPosition) {
         pendingTradingBuys.delete(event.mint);
@@ -227,7 +232,8 @@ async function main(): Promise<void> {
       `Wallet: <code>${html(event.walletAddress)}</code>`,
       `Token: <code>${html(event.mint)}</code>`,
       `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
-      'Mode: monitor-only summary at sample #20. If your trading wallet is holding this token, this buy can trigger an immediate sell.',
+      'Mode: monitor-only summary at sample #20.',
+      'Sell trigger only happens if this wallet has reverse-buy sell trigger enabled in wallet settings.',
     ].join('\n')).catch((err) => log.warn('Telegram watched-wallet monitor alert failed', err));
   }
 
@@ -369,6 +375,7 @@ async function main(): Promise<void> {
 
   function settingsReply(address: string, editCurrent = false): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
+    const settings = db.getWalletSettings(normalized);
 
     return {
       text: [
@@ -376,14 +383,21 @@ async function main(): Promise<void> {
         `<code>${html(normalized)}</code>`,
         '',
         '<b>Sell Trigger Flow</b>',
-        'When your trading wallet opens a token position, this token is watched for buys from monitored watched wallets.',
-        'If this watched wallet buys the same token while your trading position is still open, sell submits immediately.',
+        'When your trading wallet opens a token position, this token is watched for buys from monitored wallets that have reverse-buy trigger enabled.',
+        'If this wallet buys the same token while your trading position is still open and reverse-buy is enabled, sell submits immediately.',
         'If your trading-wallet position exits first, the watched-buy trigger for that token is removed automatically.',
         '',
-        'Sample cards, logs, and the sample <b>#20</b> summary still continue for watched-wallet monitoring.',
+        `Reverse-buy sell trigger: <b>${settings.reverseBuySellTriggerEnabled ? 'ENABLED' : 'DISABLED'}</b>`,
+        'Sample cards, logs, and the sample <b>#20</b> summary still continue for watched-wallet monitoring regardless.',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
+          [
+            {
+              text: `${settings.reverseBuySellTriggerEnabled ? 'Disable' : 'Enable'} reverse-buy sell trigger`,
+              callback_data: `toggle:reversebuy:${normalized}`,
+            },
+          ],
           [
             { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
             { text: 'Refresh', callback_data: `settings:refresh:${normalized}` },
@@ -804,6 +818,8 @@ async function main(): Promise<void> {
             settings.sellIfFirstThreePctZero = !settings.sellIfFirstThreePctZero;
           } else if (callbackAction === 'teen20') {
             settings.sellIfNoTeenOrTwentyPct = !settings.sellIfNoTeenOrTwentyPct;
+          } else if (callbackAction === 'reversebuy') {
+            settings.reverseBuySellTriggerEnabled = !settings.reverseBuySellTriggerEnabled;
           } else {
             return 'Invalid setting.';
           }
