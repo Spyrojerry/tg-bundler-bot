@@ -32,6 +32,9 @@ import {
   TokenSummary,
   WalletFilterSettings,
 } from './types';
+import { HeliusClient, EarlyBundlerInfo } from './helius-client';
+import { BundlerMonitor, BundlerWallet, BundlerTransaction } from './bundler-monitor';
+import { EarlyBundlerOrchestrator, BundlerSellReason } from './early-bundler-orchestrator';
 import { PublicKey } from '@solana/web3.js';
 import { randomBytes } from 'crypto';
 
@@ -126,6 +129,245 @@ async function main(): Promise<void> {
     return false;
   }
 
+  let telegramBot: TelegramBot | null = null;
+
+  async function handleTelegramCommand(_chatId: string, text: string): Promise<string | TelegramReply> {
+    const chatId = _chatId;
+    const [command] = text.split(/\s+/, 1);
+
+    try {
+      if (command === '/callback') {
+        const [, data] = text.split(/\s+/, 2);
+        const parts = data?.split(':') ?? [];
+        const [callbackKind, callbackAction, callbackAddress] = parts;
+
+        if (data === 'menu:addwallet') {
+          pendingTelegramActions.set(chatId, { type: 'addwallet' });
+          return { text: 'Send the Solana wallet address to add.', trackPrompt: true };
+        }
+        if (data === 'menu:removewallet') {
+          pendingTelegramActions.set(chatId, { type: 'removewallet' });
+          return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
+        }
+        if (data === 'menu:refresh') return homeReply(true);
+        if (data === 'menu:wallets') return walletsReply(chatId);
+        if (data === 'menu:status') return statusReply();
+
+        if (callbackKind === 'sell' && callbackAction && callbackAddress) {
+          const pending = pendingSells.get(callbackAddress);
+          if (!pending) return 'This sell request is no longer available.';
+          if (callbackAction === 'ignore') {
+            pendingSells.delete(callbackAddress);
+            return 'Sell ignored.';
+          }
+          if (callbackAction === 'confirm') {
+            if (pending.executing) return 'Sell is already being submitted.';
+            pending.executing = true;
+            if (telegramBot) {
+              void executeSellAndNotify(chatId, callbackAddress, telegramBot);
+            }
+            return [
+              '<b>Sell submission started</b>',
+              `Token: <code>${html(pending.event.mint)}</code>`,
+              `Selling: <b>${config.sellPercent}%</b> for SOL`,
+              `Slippage: <b>${config.sellAutoSlippage ? 'auto' : config.sellSlippage}</b>`,
+              `Priority fee: <b>${config.sellPriorityFeeSol} SOL</b>`,
+              `Anti-MEV: <b>${config.sellAntiMev ? 'on' : 'off'}</b>`,
+              '',
+              'I will send the receipt here when GMGN returns the order result.',
+            ].join('\n');
+          }
+          return 'Invalid sell action.';
+        }
+
+        if (callbackKind === 'set' && callbackAction && callbackAddress) {
+          const field = settingFieldByCode[callbackAction];
+          if (!field) return 'Invalid setting.';
+          const normalized = new PublicKey(callbackAddress).toBase58();
+          pendingTelegramActions.set(chatId, {
+            type: 'setting',
+            walletAddress: normalized,
+            field,
+          });
+          return {
+            text: [
+              `Send a value for <b>${settingLabel[field]}</b>.`,
+              settingHint(field),
+            ].join('\n'),
+            trackPrompt: true,
+          };
+        }
+        if (callbackKind === 'toggle' && callbackAction && callbackAddress) {
+          const normalized = new PublicKey(callbackAddress).toBase58();
+          const settings = db.getWalletSettings(normalized);
+          if (callbackAction === 'first0') {
+            settings.sellIfFirstThreePctZero = !settings.sellIfFirstThreePctZero;
+          } else if (callbackAction === 'teen20') {
+            settings.sellIfNoTeenOrTwentyPct = !settings.sellIfNoTeenOrTwentyPct;
+          } else {
+            return 'Invalid setting.';
+          }
+          db.updateWalletSettings(normalized, settings);
+          return settingsReply(normalized, true);
+        }
+        if (callbackKind === 'reverse' && callbackAction && callbackAddress) {
+          const normalized = new PublicKey(callbackAddress).toBase58();
+          if (callbackAction === 'add') {
+            db.addReverseBuyWallet(normalized);
+            return settingsReply(normalized, true);
+          }
+          if (callbackAction === 'remove') {
+            db.removeReverseBuyWallet(normalized);
+            return settingsReply(normalized, true);
+          }
+          return 'Invalid reverse-buy action.';
+        }
+        if (callbackKind === 'settings' && callbackAction === 'refresh' && callbackAddress) {
+          return settingsReply(callbackAddress, true);
+        }
+
+        const [kind, action, address, context] = [callbackKind, callbackAction, callbackAddress, parts[3]];
+        if (kind !== 'wallet' || !address) return 'Invalid button action.';
+        if (action === 'add') {
+          await startWallet(address);
+          return walletSummaryReply(address, true);
+        }
+        if (action === 'remove') {
+          stopWallet(address);
+          return walletSummaryReply(address, true);
+        }
+        if (action === 'pause') {
+          pauseWallet(address);
+          return context === 'settings' ? settingsReply(address, true) : walletSummaryReply(address, true);
+        }
+        if (action === 'resume') {
+          await resumeWallet(address);
+          return context === 'settings' ? settingsReply(address, true) : walletSummaryReply(address, true);
+        }
+        if (action === 'settings') {
+          return settingsReply(address, true);
+        }
+        if (action === 'refresh') {
+          return walletSummaryReply(address, true);
+        }
+        return 'Invalid wallet action.';
+      }
+
+      if (command === '/start' || command === '/help') {
+        return homeReply();
+      }
+      if (command === '/wallets') {
+        return walletsReply(chatId);
+      }
+      if (command.startsWith('/w_')) {
+        const index = parseInt(command.substring(3));
+        const wallet = walletAliasesByChat.get(chatId)?.[index] ?? walletAliasesByChat.get('__default__')?.[index];
+        if (!wallet) return 'Wallet shortcut not found. Send /wallets to refresh the list.';
+        return walletSummaryReply(wallet);
+      }
+      if (command === '/status') {
+        return statusReply();
+      }
+
+      if (!text.startsWith('/')) {
+        return walletSummaryReply(text);
+      }
+
+      return 'Unknown command. Send /help.';
+    } catch (err) {
+      return html(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  telegramBot = config.telegramBotToken
+    ? new TelegramBot(config, handleTelegramCommand)
+    : null;
+
+  if (telegramBot) {
+    scheduler.on('sample', (event: MonitorSampleEvent) => {
+      telegramBot.sendSampleCard(event).catch((err) =>
+        log.warn('Telegram sample send failed', err)
+      );
+    });
+    scheduler.on('summary', (summary: TokenSummary) => {
+      telegramBot.sendSummaryCard(summary).catch((err) =>
+        log.warn('Telegram summary send failed', err)
+      );
+    });
+    telegramBot.start();
+  }
+
+  scheduler.on('filterFail', (event: FilterFailEvent) => {
+    const sellId = randomBytes(5).toString('hex');
+    pendingSells.set(sellId, {
+      event: {
+        ...event,
+        buySol: event.buySol ?? db.getToken(event.walletAddress, event.mint)?.buySol ?? null,
+      },
+      createdAt: Date.now(),
+      executing: true,
+    });
+    telegramBot?.sendFilterFailCard(event).catch((err) =>
+      log.warn('Telegram filter alert send failed', err)
+    );
+    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+  });
+
+  // ── 5. Early Bundler Orchestrator ─────────────────────────────────────────
+  const earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot);
+
+  earlyBundlerOrchestrator.on('sellTrigger', (trigger) => {
+    const { position, type, walletAddress, soldPercentage, reason } = trigger;
+    
+    // Check if sell already pending
+    if (hasPendingSellForMint(position.tradingWallet, position.mint)) {
+      log.info(`[EARLY BUNDLER SELL SKIP] Sell already pending for ${position.mint}`);
+      return;
+    }
+
+    const sellReasons = [
+      `Early bundler activity detected for token ${position.mint}`,
+      reason || `Trigger type: ${type}`,
+    ];
+    if (walletAddress) sellReasons.push(`Bundler wallet: ${walletAddress}`);
+    if (soldPercentage) sellReasons.push(`Bundler sold: ${soldPercentage.toFixed(2)}%`);
+
+    const event: FilterFailEvent = {
+      walletAddress: position.tradingWallet,
+      mint: position.mint,
+      sampleNumber: 0,
+      elapsedSec: 0,
+      reasons: sellReasons,
+      settings: db.getWalletSettings(position.tradingWallet),
+      metrics: {
+        mint: position.mint,
+        timestamp: new Date().toISOString(),
+        bundlersPercent: null,
+        bundlersCount: null,
+        initialBaseReserve: null,
+        topWallets: null,
+        top10HolderRate: null,
+        bundledAmountRate: null,
+      },
+      buySol: position.buySol,
+      matchingWallets: walletAddress ? [walletAddress] : [],
+    };
+
+    const sellId = randomBytes(5).toString('hex');
+    pendingSells.set(sellId, {
+      event,
+      createdAt: Date.now(),
+      executing: true,
+    });
+
+    log.info(`[EARLY BUNDLER SELL TRIGGER] ${type} for ${position.mint}`, {
+      sellId,
+      reason,
+    });
+
+    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+  });
+
   function queueWatchedWalletSell(
     watchedBuy: NewTokenEvent,
     tradingPosition: NewTokenEvent
@@ -178,6 +420,12 @@ async function main(): Promise<void> {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
       pendingTradingBuys.set(event.mint, event);
       log.info(`[TRADING POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+      
+      // Also trigger early bundler detection
+      earlyBundlerOrchestrator.handleTradingWalletBuy(event).catch((err) => {
+        log.error('Failed to trigger early bundler detection', err);
+      });
+
       telegramBot?.sendDefault([
         '<b>Trading Wallet Position Opened</b>',
         `Wallet: <code>${html(event.walletAddress)}</code>`,
@@ -185,6 +433,8 @@ async function main(): Promise<void> {
         `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
         'Watching this token for buys from wallets explicitly added to reverse-buy trigger list in settings.',
         'If one of those wallets buys it while this position is still open, sell submits immediately.',
+        '',
+        '<b>Early Bundler Bot</b>: Detection started. I will notify you if early bundler activity is detected.',
       ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
     });
 
@@ -192,11 +442,19 @@ async function main(): Promise<void> {
       if (!pendingTradingBuys.has(event.mint)) return;
       pendingTradingBuys.delete(event.mint);
       log.info(`[TRADING POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint} — stopped watched-wallet trigger watch`);
+      
+      // Also notify orchestrator
+      earlyBundlerOrchestrator.handleTradingWalletExit(event).catch((err) => {
+        log.error('Failed to notify early bundler orchestrator of exit', err);
+      });
+
       telegramBot?.sendDefault([
         '<b>Trading Wallet Position Closed</b>',
         `Wallet: <code>${html(event.walletAddress)}</code>`,
         `Token: <code>${html(event.mint)}</code>`,
         'Stopped waiting for watched-wallet buy triggers for this token.',
+        '',
+        '<b>Early Bundler Bot</b>: Monitoring stopped for this token.',
       ].join('\n')).catch((err) => log.warn('Telegram trading exit alert failed', err));
     });
   }
@@ -229,13 +487,11 @@ async function main(): Promise<void> {
       });
     }
 
-    scheduler.addToken({ ...event, matchingWallets: [] });
     telegramBot?.sendDefault([
       '<b>Watched Wallet Monitoring Started</b>',
       `Wallet: <code>${html(event.walletAddress)}</code>`,
       `Token: <code>${html(event.mint)}</code>`,
       `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
-      'Mode: monitor-only summary at sample #20.',
       'Sell trigger only happens if this wallet is explicitly added to reverse-buy trigger list in settings.',
     ].join('\n')).catch((err) => log.warn('Telegram watched-wallet monitor alert failed', err));
   }
@@ -383,6 +639,7 @@ async function main(): Promise<void> {
     const reverseBuyEnabled = db.isReverseBuyWallet(normalized);
     const settings = db.getWalletSettings(normalized);
     const minSolBuyDisplay = settings.minSolBuy === null ? 'Default' : `${settings.minSolBuy} SOL`;
+    const isPaused = pausedWallets.has(normalized);
 
     return {
       text: [
@@ -392,13 +649,15 @@ async function main(): Promise<void> {
         '<b>Buy Settings</b>',
         `Min SOL buy: <b>${minSolBuyDisplay}</b>`,
         '',
+        '<b>Status</b>',
+        `Monitoring: <b>${isPaused ? 'PAUSED' : 'RUNNING'}</b>`,
+        '',
         '<b>Sell Trigger Flow</b>',
         'When your trading wallet opens a token position, this token is watched for buys from wallets explicitly added to reverse-buy trigger list.',
         'If this wallet buys the same token while your trading position is still open and it is in that list, sell submits immediately.',
         'If your trading-wallet position exits first, the watched-buy trigger for that token is removed automatically.',
         '',
         `Reverse-buy sell trigger: <b>${reverseBuyEnabled ? 'ENABLED' : 'DISABLED'}</b>`,
-        'Sample cards, logs, and the sample <b>#20</b> summary still continue for watched-wallet monitoring regardless.',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
@@ -406,6 +665,12 @@ async function main(): Promise<void> {
             {
               text: 'Set min SOL buy',
               callback_data: `set:minSol:${normalized}`,
+            },
+          ],
+          [
+            {
+              text: isPaused ? 'Resume monitoring' : 'Pause monitoring',
+              callback_data: `wallet:${isPaused ? 'resume' : 'pause'}:${normalized}:settings`,
             },
           ],
           [
@@ -439,8 +704,7 @@ async function main(): Promise<void> {
         `Wallets monitored: <b>${walletMonitors.size}</b>`,
         `Running wallets: <b>${runningWallets}</b>`,
         `Paused wallets: <b>${pausedWallets.size}</b>`,
-        `Active linked tokens: <b>${scheduler.activeCount}</b>`,
-        'Filter timing: apply-sample driven',
+        'Filter timing: early bundler & reverse-buy driven',
         `Poll interval: ${config.monitorInterval}ms`,
         `Min buy: ${config.minBuySol} SOL`,
         '',
@@ -486,8 +750,7 @@ async function main(): Promise<void> {
   function statusReply(): string {
     return [
       `Wallets: ${walletMonitors.size}`,
-      `Active tokens: ${scheduler.activeCount}`,
-      'Filter timing: apply-sample driven',
+      'Filter timing: early bundler & reverse-buy driven',
       `Interval: ${config.monitorInterval}ms`,
     ].join('\n');
   }
@@ -758,221 +1021,6 @@ async function main(): Promise<void> {
       pendingSells.delete(sellId);
     }
   }
-
-  let telegramBot: TelegramBot | null = null;
-
-  async function handleTelegramCommand(_chatId: string, text: string): Promise<string | TelegramReply> {
-    const chatId = _chatId;
-    const [command] = text.split(/\s+/, 1);
-
-    try {
-      if (command === '/callback') {
-        const [, data] = text.split(/\s+/, 2);
-        const parts = data?.split(':') ?? [];
-        const [callbackKind, callbackAction, callbackAddress] = parts;
-
-        if (data === 'menu:addwallet') {
-          pendingTelegramActions.set(chatId, { type: 'addwallet' });
-          return { text: 'Send the Solana wallet address to add.', trackPrompt: true };
-        }
-        if (data === 'menu:removewallet') {
-          pendingTelegramActions.set(chatId, { type: 'removewallet' });
-          return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
-        }
-        if (data === 'menu:refresh') return homeReply(true);
-        if (data === 'menu:wallets') return walletsReply(chatId);
-        if (data === 'menu:status') return statusReply();
-
-        if (callbackKind === 'sell' && callbackAction && callbackAddress) {
-          const pending = pendingSells.get(callbackAddress);
-          if (!pending) return 'This sell request is no longer available.';
-          if (callbackAction === 'ignore') {
-            pendingSells.delete(callbackAddress);
-            return 'Sell ignored.';
-          }
-          if (callbackAction === 'confirm') {
-            if (pending.executing) return 'Sell is already being submitted.';
-            pending.executing = true;
-            if (telegramBot) {
-              void executeSellAndNotify(chatId, callbackAddress, telegramBot);
-            }
-            return [
-              '<b>Sell submission started</b>',
-              `Token: <code>${html(pending.event.mint)}</code>`,
-              `Selling: <b>${config.sellPercent}%</b> for SOL`,
-              `Slippage: <b>${config.sellAutoSlippage ? 'auto' : config.sellSlippage}</b>`,
-              `Priority fee: <b>${config.sellPriorityFeeSol} SOL</b>`,
-              `Anti-MEV: <b>${config.sellAntiMev ? 'on' : 'off'}</b>`,
-              '',
-              'I will send the receipt here when GMGN returns the order result.',
-            ].join('\n');
-          }
-          return 'Invalid sell action.';
-        }
-
-        if (callbackKind === 'set' && callbackAction && callbackAddress) {
-          const field = settingFieldByCode[callbackAction];
-          if (!field) return 'Invalid setting.';
-          const normalized = new PublicKey(callbackAddress).toBase58();
-          pendingTelegramActions.set(chatId, {
-            type: 'setting',
-            walletAddress: normalized,
-            field,
-          });
-          return {
-            text: [
-              `Send a value for <b>${settingLabel[field]}</b>.`,
-              settingHint(field),
-            ].join('\n'),
-            trackPrompt: true,
-          };
-        }
-        if (callbackKind === 'toggle' && callbackAction && callbackAddress) {
-          const normalized = new PublicKey(callbackAddress).toBase58();
-          const settings = db.getWalletSettings(normalized);
-          if (callbackAction === 'first0') {
-            settings.sellIfFirstThreePctZero = !settings.sellIfFirstThreePctZero;
-          } else if (callbackAction === 'teen20') {
-            settings.sellIfNoTeenOrTwentyPct = !settings.sellIfNoTeenOrTwentyPct;
-          } else {
-            return 'Invalid setting.';
-          }
-          db.updateWalletSettings(normalized, settings);
-          return settingsReply(normalized, true);
-        }
-        if (callbackKind === 'reverse' && callbackAction && callbackAddress) {
-          const normalized = new PublicKey(callbackAddress).toBase58();
-          if (callbackAction === 'add') {
-            db.addReverseBuyWallet(normalized);
-            return settingsReply(normalized, true);
-          }
-          if (callbackAction === 'remove') {
-            db.removeReverseBuyWallet(normalized);
-            return settingsReply(normalized, true);
-          }
-          return 'Invalid reverse-buy action.';
-        }
-        if (callbackKind === 'settings' && callbackAction === 'refresh' && callbackAddress) {
-          return settingsReply(callbackAddress, true);
-        }
-
-        const [kind, action, address] = [callbackKind, callbackAction, callbackAddress];
-        if (kind !== 'wallet' || !address) return 'Invalid button action.';
-        if (action === 'add') {
-          await startWallet(address);
-          return walletSummaryReply(address, true);
-        }
-        if (action === 'remove') {
-          stopWallet(address);
-          return walletSummaryReply(address, true);
-        }
-        if (action === 'pause') {
-          pauseWallet(address);
-          return walletSummaryReply(address, true);
-        }
-        if (action === 'resume') {
-          await resumeWallet(address);
-          return walletSummaryReply(address, true);
-        }
-        if (action === 'settings') return settingsReply(address, true);
-        if (action === 'refresh') return walletSummaryReply(address, true);
-        return 'Invalid button action.';
-      }
-
-      const pendingAction = pendingTelegramActions.get(chatId);
-      if (pendingAction && !text.startsWith('/')) {
-        pendingTelegramActions.delete(chatId);
-        if (pendingAction.type === 'addwallet') {
-          await startWallet(text);
-          return walletSummaryReply(text);
-        }
-        if (pendingAction.type === 'removewallet') {
-          stopWallet(text);
-          return homeReply();
-        }
-        if (pendingAction.type === 'setting') {
-          const message = updateSetting(
-            pendingAction.walletAddress,
-            pendingAction.field,
-            text
-          );
-          if (!message.startsWith('Updated ')) return message;
-          return settingsReply(pendingAction.walletAddress);
-        }
-      }
-
-      if (command === '/cancel') {
-        pendingTelegramActions.delete(chatId);
-        return 'Cancelled.';
-      }
-      if (command === '/start' || command === '/help') {
-        return homeReply();
-      }
-      if (command === '/addwallet') {
-        pendingTelegramActions.set(chatId, { type: 'addwallet' });
-        return { text: 'Send the Solana wallet address to add.', trackPrompt: true };
-      }
-      if (command === '/removewallet') {
-        pendingTelegramActions.set(chatId, { type: 'removewallet' });
-        return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
-      }
-      if (command === '/wallets') {
-        return walletsReply(chatId);
-      }
-      const walletAlias = command.match(/^\/w_(\d+)$/);
-      if (walletAlias) {
-        const wallets = walletAliasesByChat.get(chatId) ?? walletAliasesByChat.get('__default__') ?? [...walletMonitors.keys()];
-        const wallet = wallets[Number(walletAlias[1])];
-        if (!wallet) return 'Wallet shortcut not found. Send /wallets to refresh the list.';
-        return walletSummaryReply(wallet);
-      }
-      if (command === '/status') {
-        return statusReply();
-      }
-
-      if (!text.startsWith('/')) {
-        return walletSummaryReply(text);
-      }
-
-      return 'Unknown command. Send /help.';
-    } catch (err) {
-      return html(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  telegramBot = config.telegramBotToken
-    ? new TelegramBot(config, handleTelegramCommand)
-    : null;
-
-  if (telegramBot) {
-    scheduler.on('sample', (event: MonitorSampleEvent) => {
-      telegramBot.sendSampleCard(event).catch((err) =>
-        log.warn('Telegram sample send failed', err)
-      );
-    });
-    scheduler.on('summary', (summary: TokenSummary) => {
-      telegramBot.sendSummaryCard(summary).catch((err) =>
-        log.warn('Telegram summary send failed', err)
-      );
-    });
-    telegramBot.start();
-  }
-
-  scheduler.on('filterFail', (event: FilterFailEvent) => {
-    const sellId = randomBytes(5).toString('hex');
-    pendingSells.set(sellId, {
-      event: {
-        ...event,
-        buySol: event.buySol ?? db.getToken(event.walletAddress, event.mint)?.buySol ?? null,
-      },
-      createdAt: Date.now(),
-      executing: true,
-    });
-    telegramBot?.sendFilterFailCard(event).catch((err) =>
-      log.warn('Telegram filter alert send failed', err)
-    );
-    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
-  });
 
   // ── 6. Start everything ───────────────────────────────────────────────────
   if (config.tradingWalletAddress) {

@@ -242,3 +242,47 @@ export type FetchResult =
       retryAfterMs?: number;
       nonRetryable?: boolean;
     };
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Early Bundler Bot Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Represents an early bundler wallet that bought into a token */
+export interface EarlyBundlerWallet {
+  id?: number;
+  walletAddress: string;
+  initialTokenAmount: number;
+  signature: string;
+  slot: number;
+  timestamp: number;
+}
+
+/** Represents a trading position being monitored for early bundler activity */
+export interface EarlyBundlerPosition {
+  id?: number;
+  tradingWallet: string;
+  mint: string;
+  tokenAmount: number;
+  buySol: number | null;
+  status: 'active' | 'exited';
+  createdAt: string;
+  bundlerWallets: EarlyBundlerWallet[];
+}
+
+/** Event emitted when a bundler wallet performs a transaction */
+export interface BundlerTransactionEvent {
+  bundlerWalletId: number;
+  walletAddress: string;
+  mint: string;
+  signature: string;
+  tokenAmount: number;
+  slot: number;
+  timestamp: number;
+  type: 'buy' | 'sell';
+}
+
+/** Sell trigger reason for early bundler bot */
+export type BundlerSellReason =
+  | { type: 'bundler_buy'; walletAddress: string }
+  | { type: 'bundler_sell_40pct'; walletAddress: string; soldPercentage: number }
+  | { type: 'position_closed'; reason: string };

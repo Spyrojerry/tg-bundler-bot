@@ -88,6 +88,47 @@ CREATE TABLE IF NOT EXISTS bundler_metrics (
 
 CREATE INDEX IF NOT EXISTS idx_bm_mint      ON bundler_metrics(mint);
 CREATE INDEX IF NOT EXISTS idx_bm_timestamp ON bundler_metrics(timestamp);
+
+CREATE TABLE IF NOT EXISTS early_bundler_positions (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  trading_wallet       TEXT    NOT NULL,
+  mint                 TEXT    NOT NULL,
+  token_amount         REAL    NOT NULL,
+  buy_sol              REAL,
+  status               TEXT    NOT NULL DEFAULT 'active',
+  created_at           TEXT    NOT NULL,
+  exited_at            TEXT,
+  exit_reason          TEXT,
+  UNIQUE(trading_wallet, mint)
+);
+
+CREATE TABLE IF NOT EXISTS early_bundler_wallets (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  position_id          INTEGER NOT NULL,
+  wallet_address       TEXT    NOT NULL,
+  initial_token_amount REAL    NOT NULL,
+  signature            TEXT    NOT NULL,
+  slot                 INTEGER NOT NULL,
+  timestamp            INTEGER NOT NULL,
+  status               TEXT    NOT NULL DEFAULT 'monitoring',
+  total_sold_amount    REAL    NOT NULL DEFAULT 0,
+  FOREIGN KEY (position_id) REFERENCES early_bundler_positions(id) ON DELETE CASCADE,
+  UNIQUE(position_id, wallet_address)
+);
+
+CREATE TABLE IF NOT EXISTS bundler_wallet_sells (
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  bundler_wallet_id    INTEGER NOT NULL,
+  signature            TEXT    NOT NULL,
+  token_amount_sold    REAL    NOT NULL,
+  slot                 INTEGER NOT NULL,
+  timestamp            INTEGER NOT NULL,
+  FOREIGN KEY (bundler_wallet_id) REFERENCES early_bundler_wallets(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ebp_status ON early_bundler_positions(status);
+CREATE INDEX IF NOT EXISTS idx_ebw_position ON early_bundler_wallets(position_id);
+CREATE INDEX IF NOT EXISTS idx_bws_bundler ON bundler_wallet_sells(bundler_wallet_id);
 `;
 
 // ── Row shapes returned by sql.js ─────────────────────────────────────────────
@@ -513,6 +554,122 @@ export class MonitorDatabase {
        VALUES (?, ?)
        ON CONFLICT(wallet_address) DO UPDATE SET filter_settings = excluded.filter_settings`,
       [walletAddress, JSON.stringify(settings)]
+    );
+  }
+
+  // ── Early Bundler Positions ───────────────────────────────────────────────
+
+  insertEarlyBundlerPosition(
+    tradingWallet: string,
+    mint: string,
+    tokenAmount: number,
+    buySol: number | null
+  ): number {
+    this.run(
+      `INSERT INTO early_bundler_positions (trading_wallet, mint, token_amount, buy_sol, status, created_at)
+       VALUES (?, ?, ?, ?, 'active', ?)`,
+      [tradingWallet, mint, tokenAmount, buySol, new Date().toISOString()]
+    );
+    const rows = this.query<{ id: number }>(`SELECT last_insert_rowid() as id`);
+    return rows[0].id;
+  }
+
+  getActiveEarlyBundlerPosition(tradingWallet: string, mint: string): { id: number; tokenAmount: number; buySol: number | null } | null {
+    const rows = this.query<{ id: number; token_amount: number; buy_sol: number | null }>(
+      `SELECT id, token_amount, buy_sol FROM early_bundler_positions 
+       WHERE trading_wallet = ? AND mint = ? AND status = 'active'`,
+      [tradingWallet, mint]
+    );
+    if (rows.length === 0) return null;
+    return { id: rows[0].id, tokenAmount: rows[0].token_amount, buySol: rows[0].buy_sol };
+  }
+
+  closeEarlyBundlerPosition(
+    positionId: number,
+    exitReason: string
+  ): void {
+    this.run(
+      `UPDATE early_bundler_positions 
+       SET status = 'exited', exited_at = ?, exit_reason = ?
+       WHERE id = ?`,
+      [new Date().toISOString(), exitReason, positionId]
+    );
+  }
+
+  // ── Early Bundler Wallets ─────────────────────────────────────────────────
+
+  insertEarlyBundlerWallet(
+    positionId: number,
+    walletAddress: string,
+    initialTokenAmount: number,
+    signature: string,
+    slot: number,
+    timestamp: number
+  ): number {
+    this.run(
+      `INSERT INTO early_bundler_wallets 
+       (position_id, wallet_address, initial_token_amount, signature, slot, timestamp, status, total_sold_amount)
+       VALUES (?, ?, ?, ?, ?, ?, 'monitoring', 0)`,
+      [positionId, walletAddress, initialTokenAmount, signature, slot, timestamp]
+    );
+    const rows = this.query<{ id: number }>(`SELECT last_insert_rowid() as id`);
+    return rows[0].id;
+  }
+
+  getActiveBundlerWallets(positionId: number): Array<{
+    id: number;
+    walletAddress: string;
+    initialTokenAmount: number;
+    totalSoldAmount: number;
+  }> {
+    const rows = this.query<{
+      id: number;
+      wallet_address: string;
+      initial_token_amount: number;
+      total_sold_amount: number;
+    }>(
+      `SELECT id, wallet_address, initial_token_amount, total_sold_amount 
+       FROM early_bundler_wallets 
+       WHERE position_id = ? AND status = 'monitoring'`,
+      [positionId]
+    );
+    return rows.map((r) => ({
+      id: r.id,
+      walletAddress: r.wallet_address,
+      initialTokenAmount: r.initial_token_amount,
+      totalSoldAmount: r.total_sold_amount,
+    }));
+  }
+
+  updateBundlerWalletSoldAmount(bundlerWalletId: number, soldAmount: number): void {
+    this.run(
+      `UPDATE early_bundler_wallets 
+       SET total_sold_amount = total_sold_amount + ? 
+       WHERE id = ?`,
+      [soldAmount, bundlerWalletId]
+    );
+  }
+
+  stopMonitoringBundlerWallet(bundlerWalletId: number): void {
+    this.run(
+      `UPDATE early_bundler_wallets SET status = 'stopped' WHERE id = ?`,
+      [bundlerWalletId]
+    );
+  }
+
+  // ── Bundler Wallet Sells ──────────────────────────────────────────────────
+
+  recordBundlerWalletSell(
+    bundlerWalletId: number,
+    signature: string,
+    tokenAmountSold: number,
+    slot: number,
+    timestamp: number
+  ): void {
+    this.run(
+      `INSERT INTO bundler_wallet_sells (bundler_wallet_id, signature, token_amount_sold, slot, timestamp)
+       VALUES (?, ?, ?, ?, ?)`,
+      [bundlerWalletId, signature, tokenAmountSold, slot, timestamp]
     );
   }
 
