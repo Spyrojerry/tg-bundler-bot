@@ -357,6 +357,21 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     });
   }
 
+  /**
+   * Shutdown the orchestrator and stop any active monitoring
+   */
+  async shutdown(): Promise<void> {
+    this.isShuttingDown = true;
+    
+    if (this.bundlerMonitor) {
+      await this.bundlerMonitor.stopMonitoring();
+      this.bundlerMonitor = null;
+    }
+    
+    this.activePosition = null;
+    log.info('Early Bundler Orchestrator shut down');
+  }
+
   // ── Telegram Notifications ────────────────────────────────────────────────
 
   private async sendBundlerDetectedNotification(

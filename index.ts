@@ -4,11 +4,10 @@
 //  Boot sequence:
 //    1. Load + validate environment config
 //    2. Open SQLite database
-//    3. Initialise RateLimiter + GmgnClient + Scheduler
-//    4. Start WalletMonitor → snapshot existing tokens
-//    5. Wire newToken events → Scheduler + DB
-//    6. Start Scheduler
-//    7. Register SIGINT/SIGTERM for graceful shutdown
+//    3. Initialise RateLimiter + GmgnClient
+//    4. Initialise EarlyBundlerOrchestrator
+//    5. Initialise TelegramBot
+//    6. Register SIGINT/SIGTERM for graceful shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
 import 'dotenv/config';
@@ -17,19 +16,15 @@ import { loadConfig } from './config';
 import { MonitorDatabase } from './database';
 import { RateLimiter } from './rate-limiter';
 import { GmgnClient } from './gmgn-client';
-import { Scheduler } from './scheduler';
 import { WalletMonitor } from './wallet-monitor';
 import { InlineKeyboardMarkup, TelegramBot, TelegramReply } from './telegram-bot';
 import { startHealthServer } from './health-server';
 import {
   FilterFailEvent,
-  FilterPassEvent,
-  MonitorSampleEvent,
   NewTokenEvent,
   SellQuote,
   SellResult,
   TokenExitEvent,
-  TokenSummary,
   WalletFilterSettings,
 } from './types';
 import { HeliusClient, EarlyBundlerInfo } from './helius-client';
@@ -72,8 +67,10 @@ async function main(): Promise<void> {
   );
   const gmgnClient = new GmgnClient(config, limiter);
 
-  // ── 4. Scheduler ──────────────────────────────────────────────────────────
-  const scheduler = new Scheduler(config, gmgnClient, db, limiter);
+  let telegramBot: TelegramBot | null = null;
+
+  // ── 4. Early Bundler Orchestrator ─────────────────────────────────────────
+  const earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot);
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
@@ -81,45 +78,12 @@ async function main(): Promise<void> {
   const pendingTradingBuys = new Map<string, NewTokenEvent>();
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
-    | { type: 'setting'; walletAddress: string; field: SettingField };
+    | { type: 'minSol'; walletAddress: string };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
   const pausedWallets = new Set<string>();
   const walletAliasesByChat = new Map<string, string[]>();
 
-  type SettingField = keyof Pick<
-    WalletFilterSettings,
-    | 'applyAtSample'
-    | 'minBundlersPercent'
-    | 'maxBundlersPercent'
-    | 'minBundlersCount'
-    | 'maxBundlersCount'
-    | 'minBundlersCountChange'
-    | 'minSolBuy'
-  >;
-  const settingFieldByCode: Record<string, SettingField> = {
-    apply: 'applyAtSample',
-    minPct: 'minBundlersPercent',
-    maxPct: 'maxBundlersPercent',
-    minCnt: 'minBundlersCount',
-    maxCnt: 'maxBundlersCount',
-    minInc: 'minBundlersCountChange',
-    minSol: 'minSolBuy',
-  };
-  const settingLabel: Record<SettingField, string> = {
-    applyAtSample: 'Apply at sample #',
-    minBundlersPercent: 'Min bundlers %',
-    maxBundlersPercent: 'Max bundlers %',
-    minBundlersCount: 'Min bundlers count',
-    maxBundlersCount: 'Max bundlers count',
-    minBundlersCountChange: 'Min count change to sell',
-    minSolBuy: 'Min SOL buy',
-  };
-  const settingHint = (field: SettingField): string => {
-    if (field === 'applyAtSample') return 'Use a positive whole number.';
-    if (field === 'minSolBuy') return 'Use a number (e.g., 0.01), or send <code>off</code> to use default.';
-    return 'Use a number, or send <code>off</code> to disable.';
-  };
   function hasPendingSellForMint(walletAddress: string, mint: string): boolean {
     for (const pending of pendingSells.values()) {
       if (pending.event.walletAddress === walletAddress && pending.event.mint === mint) {
@@ -128,8 +92,6 @@ async function main(): Promise<void> {
     }
     return false;
   }
-
-  let telegramBot: TelegramBot | null = null;
 
   async function handleTelegramCommand(_chatId: string, text: string): Promise<string | TelegramReply> {
     const chatId = _chatId;
@@ -180,35 +142,19 @@ async function main(): Promise<void> {
           return 'Invalid sell action.';
         }
 
-        if (callbackKind === 'set' && callbackAction && callbackAddress) {
-          const field = settingFieldByCode[callbackAction];
-          if (!field) return 'Invalid setting.';
+        if (callbackKind === 'set' && callbackAction === 'minSol' && callbackAddress) {
           const normalized = new PublicKey(callbackAddress).toBase58();
           pendingTelegramActions.set(chatId, {
-            type: 'setting',
+            type: 'minSol',
             walletAddress: normalized,
-            field,
           });
           return {
             text: [
-              `Send a value for <b>${settingLabel[field]}</b>.`,
-              settingHint(field),
+              `Send a minimum SOL value for <code>${html(normalized)}</code>.`,
+              'Use a number (e.g., 0.01), or send <code>off</code> to use default.',
             ].join('\n'),
             trackPrompt: true,
           };
-        }
-        if (callbackKind === 'toggle' && callbackAction && callbackAddress) {
-          const normalized = new PublicKey(callbackAddress).toBase58();
-          const settings = db.getWalletSettings(normalized);
-          if (callbackAction === 'first0') {
-            settings.sellIfFirstThreePctZero = !settings.sellIfFirstThreePctZero;
-          } else if (callbackAction === 'teen20') {
-            settings.sellIfNoTeenOrTwentyPct = !settings.sellIfNoTeenOrTwentyPct;
-          } else {
-            return 'Invalid setting.';
-          }
-          db.updateWalletSettings(normalized, settings);
-          return settingsReply(normalized, true);
         }
         if (callbackKind === 'reverse' && callbackAction && callbackAddress) {
           const normalized = new PublicKey(callbackAddress).toBase58();
@@ -270,6 +216,24 @@ async function main(): Promise<void> {
       }
 
       if (!text.startsWith('/')) {
+        const pendingAction = pendingTelegramActions.get(chatId);
+        if (pendingAction) {
+          pendingTelegramActions.delete(chatId);
+          if (pendingAction.type === 'addwallet') {
+            return await startWallet(text);
+          }
+          if (pendingAction.type === 'removewallet') {
+            return stopWallet(text);
+          }
+          if (pendingAction.type === 'minSol') {
+            const message = updateMinSol(
+              pendingAction.walletAddress,
+              text
+            );
+            if (!message.startsWith('Updated ')) return message;
+            return settingsReply(pendingAction.walletAddress);
+          }
+        }
         return walletSummaryReply(text);
       }
 
@@ -284,37 +248,8 @@ async function main(): Promise<void> {
     : null;
 
   if (telegramBot) {
-    scheduler.on('sample', (event: MonitorSampleEvent) => {
-      telegramBot.sendSampleCard(event).catch((err) =>
-        log.warn('Telegram sample send failed', err)
-      );
-    });
-    scheduler.on('summary', (summary: TokenSummary) => {
-      telegramBot.sendSummaryCard(summary).catch((err) =>
-        log.warn('Telegram summary send failed', err)
-      );
-    });
     telegramBot.start();
   }
-
-  scheduler.on('filterFail', (event: FilterFailEvent) => {
-    const sellId = randomBytes(5).toString('hex');
-    pendingSells.set(sellId, {
-      event: {
-        ...event,
-        buySol: event.buySol ?? db.getToken(event.walletAddress, event.mint)?.buySol ?? null,
-      },
-      createdAt: Date.now(),
-      executing: true,
-    });
-    telegramBot?.sendFilterFailCard(event).catch((err) =>
-      log.warn('Telegram filter alert send failed', err)
-    );
-    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
-  });
-
-  // ── 5. Early Bundler Orchestrator ─────────────────────────────────────────
-  const earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot);
 
   earlyBundlerOrchestrator.on('sellTrigger', (trigger) => {
     const { position, type, walletAddress, soldPercentage, reason } = trigger;
@@ -558,37 +493,26 @@ async function main(): Promise<void> {
     value === null ? 'Any' : String(value);
   const enabledMark = (enabled: boolean): string => enabled ? '✅' : '❌';
 
-  function updateSetting(
+  function updateMinSol(
     walletAddress: string,
-    field: SettingField,
     rawValue: string
   ): string {
     const normalized = new PublicKey(walletAddress).toBase58();
     const trimmed = rawValue.trim().toLowerCase();
     const settings = db.getWalletSettings(normalized);
-    const targetRecord = settings as unknown as Record<string, number | boolean | null>;
 
-    if (trimmed === 'off' || trimmed === 'any' || trimmed === 'none') {
-      if (field === 'applyAtSample') {
-        return 'Apply sample cannot be disabled. Send a positive whole number.';
-      }
-      targetRecord[field] = null;
+    if (trimmed === 'off' || trimmed === 'any' || trimmed === 'none' || trimmed === 'default') {
+      settings.minSolBuy = null;
     } else {
       const value = Number(trimmed);
       if (!Number.isFinite(value) || value < 0) {
         return `Invalid value. Send a non-negative number, or "off".`;
       }
-      if (field === 'applyAtSample') {
-        const n = Math.trunc(value);
-        if (n <= 0) return 'Apply sample must be at least 1.';
-        targetRecord[field] = n;
-      } else {
-        targetRecord[field] = value;
-      }
+      settings.minSolBuy = value;
     }
 
     db.updateWalletSettings(normalized, settings);
-    return `Updated ${settingLabel[field]} for <code>${html(normalized)}</code>.`;
+    return `Updated Min SOL buy for <code>${html(normalized)}</code>.`;
   }
 
   function walletSummaryReply(address: string, editCurrent = false): TelegramReply {
@@ -609,8 +533,6 @@ async function main(): Promise<void> {
         `<code>${html(normalized)}</code>`,
         '',
         `Status: <b>${status}</b>`,
-        `Tokens seen: ${db.tokenCountForWallet(normalized)}`,
-        `Samples stored: ${db.sampleCountForWallet(normalized)}`,
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: isMonitoring
@@ -643,21 +565,17 @@ async function main(): Promise<void> {
 
     return {
       text: [
-        '<b>Filter Settings</b>',
+        '<b>Wallet Settings</b>',
         `<code>${html(normalized)}</code>`,
         '',
-        '<b>Buy Settings</b>',
+        `Status: <b>${isPaused ? 'PAUSED' : 'RUNNING'}</b>`,
         `Min SOL buy: <b>${minSolBuyDisplay}</b>`,
+        `Reverse-buy trigger: <b>${reverseBuyEnabled ? 'ENABLED' : 'DISABLED'}</b>`,
         '',
-        '<b>Status</b>',
-        `Monitoring: <b>${isPaused ? 'PAUSED' : 'RUNNING'}</b>`,
-        '',
-        '<b>Sell Trigger Flow</b>',
-        'When your trading wallet opens a token position, this token is watched for buys from wallets explicitly added to reverse-buy trigger list.',
-        'If this wallet buys the same token while your trading position is still open and it is in that list, sell submits immediately.',
-        'If your trading-wallet position exits first, the watched-buy trigger for that token is removed automatically.',
-        '',
-        `Reverse-buy sell trigger: <b>${reverseBuyEnabled ? 'ENABLED' : 'DISABLED'}</b>`,
+        '<b>Flow Description</b>',
+        '• When your trading wallet buys a token, early bundlers are detected.',
+        '• If this wallet buys the same token, an immediate sell is triggered.',
+        '• If a bundler sells 40% of holdings, an immediate sell is triggered.',
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
@@ -675,7 +593,7 @@ async function main(): Promise<void> {
           ],
           [
             {
-              text: `${reverseBuyEnabled ? 'Remove' : 'Add'} wallet to reverse-buy sell list`,
+              text: `${reverseBuyEnabled ? 'Remove' : 'Add'} reverse-buy trigger`,
               callback_data: `${reverseBuyEnabled ? 'reverse:remove' : 'reverse:add'}:${normalized}`,
             },
           ],
@@ -699,13 +617,15 @@ async function main(): Promise<void> {
 
     return {
       text: [
-        '<b>GMGN Bundler Monitor</b>',
+        '<b>Early Bundler Bot</b>',
         '',
         `Wallets monitored: <b>${walletMonitors.size}</b>`,
         `Running wallets: <b>${runningWallets}</b>`,
         `Paused wallets: <b>${pausedWallets.size}</b>`,
-        'Filter timing: early bundler & reverse-buy driven',
-        `Poll interval: ${config.monitorInterval}ms`,
+        '',
+        '<b>Status</b>',
+        'Filter: early bundler & reverse-buy',
+        `Interval: ${config.monitorInterval}ms`,
         `Min buy: ${config.minBuySol} SOL`,
         '',
         '<b>Monitored Wallets</b>',
@@ -749,8 +669,9 @@ async function main(): Promise<void> {
 
   function statusReply(): string {
     return [
+      '<b>Bot Status</b>',
       `Wallets: ${walletMonitors.size}`,
-      'Filter timing: early bundler & reverse-buy driven',
+      'Filter: early bundler & reverse-buy',
       `Interval: ${config.monitorInterval}ms`,
     ].join('\n');
   }
@@ -1050,10 +971,8 @@ async function main(): Promise<void> {
     if (wallet === config.tradingWalletAddress) continue;
     await startWallet(wallet);
   }
-  scheduler.start();
 
   log.info(`Service fully started — monitoring ${walletMonitors.size} wallet(s) for new tokens`);
-  log.info(`Safe token capacity at current rate limit: ${scheduler.safeTokenCapacity} tokens`);
 
   // ── 7. Graceful shutdown ──────────────────────────────────────────────────
   let shutting_down = false;
@@ -1069,8 +988,9 @@ async function main(): Promise<void> {
     }
     tradingWalletMonitor?.stop();
     telegramBot?.stop();
-    scheduler.stop();
     healthServer.close();
+
+    await earlyBundlerOrchestrator.shutdown();
 
     await limiter.drain().catch((e) => log.warn('Limiter drain error', e));
     db.close();
