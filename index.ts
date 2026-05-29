@@ -848,6 +848,8 @@ async function main(): Promise<void> {
     const costBasis = buySol * (config.sellPercent / 100);
     let notifiedWaiting = false;
     let lastLogAt = 0;
+    let quoteRetryCount = 0;
+    const MAX_QUOTE_RETRIES = 5;
 
     while (pendingSells.has(sellId)) {
       let quote: SellQuote;
@@ -857,16 +859,36 @@ async function main(): Promise<void> {
           pending.event.mint,
           config.sellPercent
         );
+        // Reset retry count on success
+        quoteRetryCount = 0;
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const isNoBalance = message.includes('No token balance found');
+        
         const now = Date.now();
-        if (now - lastLogAt >= 30_000) {
+        if (now - lastLogAt >= 30_000 || isNoBalance) {
           lastLogAt = now;
-          log.warn('Profit gate quote failed; will retry', {
+          log.warn(isNoBalance ? 'Profit gate stopped: no balance found' : 'Profit gate quote failed; will retry', {
             mint: pending.event.mint,
-            error: err instanceof Error ? err.message : String(err),
+            error: message,
+            attempt: isNoBalance ? undefined : `${quoteRetryCount + 1}/${MAX_QUOTE_RETRIES}`,
             nextCheckMs: config.sellProfitCheckIntervalMs,
           });
         }
+
+        if (isNoBalance) {
+          return false;
+        }
+
+        quoteRetryCount++;
+        if (quoteRetryCount >= MAX_QUOTE_RETRIES) {
+          log.error(`Profit gate aborted after ${MAX_QUOTE_RETRIES} quote failures`, {
+            mint: pending.event.mint,
+            error: message,
+          });
+          return false;
+        }
+
         if (!notifiedWaiting && chatId && telegramBot) {
           notifiedWaiting = true;
           await telegramBot.sendChat(chatId, [
@@ -944,6 +966,23 @@ async function main(): Promise<void> {
     if (!pending) return;
 
     try {
+      // Preliminary balance check to avoid entering profit gate if already sold
+      const owner = new PublicKey(pending.event.walletAddress);
+      const mintPk = new PublicKey(pending.event.mint);
+      
+      let accounts;
+      try {
+        accounts = await gmgnClient.getParsedTokenAccountsForMint(owner, mintPk);
+      } catch (err) {
+        // If we can't check balance, we'll let the profit gate try once
+        accounts = null;
+      }
+
+      if (accounts && accounts.length === 0) {
+        log.info(`[SELL ABORT] No token accounts found for ${pending.event.mint}, assuming already sold.`);
+        return;
+      }
+
       const readyToSell = await waitForProfitBeforeSell(chatId, sellId, telegramBot);
       if (!readyToSell) return;
       const currentPending = pendingSells.get(sellId);

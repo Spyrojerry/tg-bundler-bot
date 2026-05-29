@@ -309,7 +309,7 @@ export class GmgnClient {
     return sellAmount;
   }
 
-  private async getParsedTokenAccountsForMint(
+  public async getParsedTokenAccountsForMint(
     owner: PublicKey,
     mint: PublicKey
   ): Promise<Awaited<ReturnType<Connection['getParsedTokenAccountsByOwner']>>['value']> {
