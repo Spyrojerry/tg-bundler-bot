@@ -171,7 +171,7 @@ export class BundlerMonitor extends EventEmitter {
     if (soldPercentage >= 40) {
       log.info(`40% sell threshold reached for bundler ${walletAddress}: ${soldPercentage.toFixed(2)}%`);
       
-      if (this.positionId && this.tradingWallet && this.mint) {
+      if (this.positionId !== null && this.tradingWallet && this.mint) {
         this.emit('thresholdReached', {
           walletAddress,
           mint: this.mint,
@@ -226,6 +226,28 @@ export class BundlerMonitor extends EventEmitter {
 
       if (!tx || !this.mint) return;
 
+      // ── Detect Market Swap vs. Simple Transfer ──────────────────────────────
+      // To be a buy or sell (market swap), native SOL balance must also change
+      // in the opposite direction (e.g., token UP, SOL DOWN).
+      const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toBase58());
+      const walletIndex = accountKeys.indexOf(walletAddress);
+      
+      if (walletIndex === -1) {
+        log.warn(`Wallet ${walletAddress} not found in transaction accounts for ${signature}`);
+        return;
+      }
+
+      const preSol = BigInt(tx.meta?.preBalances[walletIndex] ?? '0');
+      const postSol = BigInt(tx.meta?.postBalances[walletIndex] ?? '0');
+      const solDelta = postSol - preSol; // Positive = received SOL, Negative = spent SOL
+      const fee = BigInt(tx.meta?.fee ?? 0);
+
+      // A transfer typically only spends the fee. A swap spends/receives much more than the fee.
+      // We use a small buffer (e.g., 0.001 SOL) to distinguish swaps from transfers.
+      const SWAP_THRESHOLD_LAMPORTS = 1_000_000n; // 0.001 SOL
+      const isSpendSol = solDelta < -(fee + SWAP_THRESHOLD_LAMPORTS);
+      const isReceiveSol = solDelta > SWAP_THRESHOLD_LAMPORTS;
+
       const preBalances = tx.meta?.preTokenBalances ?? [];
       const postBalances = tx.meta?.postTokenBalances ?? [];
       
@@ -243,25 +265,35 @@ export class BundlerMonitor extends EventEmitter {
         const diffUi = Math.abs(Number(diff) / Math.pow(10, post.uiTokenAmount.decimals));
 
         if (diff > 0n) {
-          // Bundler bought tokens
-          this.processBundlerBuy(walletAddress, {
-            signature,
-            mint: this.mint,
-            tokenAmount: diffUi,
-            slot: tx.slot,
-            timestamp: tx.blockTime || Math.floor(Date.now() / 1000),
-            walletAddress,
-          });
+          // Token balance increased
+          if (isSpendSol) {
+            // Market BUY (Token UP, SOL DOWN)
+            this.processBundlerBuy(walletAddress, {
+              signature,
+              mint: this.mint,
+              tokenAmount: diffUi,
+              slot: tx.slot,
+              timestamp: tx.blockTime || Math.floor(Date.now() / 1000),
+              walletAddress,
+            });
+          } else {
+            log.info(`[BUNDLER IGNORE] Token increase detected for ${walletAddress} but no SOL spend (Transfer In).`);
+          }
         } else if (diff < 0n) {
-          // Bundler sold tokens
-          this.processBundlerSell(walletAddress, {
-            signature,
-            mint: this.mint,
-            tokenAmount: post.uiTokenAmount.uiAmount || 0, // This will be overwritten by actualSoldAmount in processBundlerSell
-            slot: tx.slot,
-            timestamp: tx.blockTime || Math.floor(Date.now() / 1000),
-            walletAddress,
-          }, diffUi);
+          // Token balance decreased
+          if (isReceiveSol) {
+            // Market SELL (Token DOWN, SOL UP)
+            this.processBundlerSell(walletAddress, {
+              signature,
+              mint: this.mint,
+              tokenAmount: post.uiTokenAmount.uiAmount || 0, // This will be overwritten by actualSoldAmount in processBundlerSell
+              slot: tx.slot,
+              timestamp: tx.blockTime || Math.floor(Date.now() / 1000),
+              walletAddress,
+            }, diffUi);
+          } else {
+            log.info(`[BUNDLER IGNORE] Token decrease detected for ${walletAddress} but no SOL receive (Transfer Out).`);
+          }
         }
       }
     } catch (err) {
@@ -273,7 +305,7 @@ export class BundlerMonitor extends EventEmitter {
     * Process a detected bundler buy transaction
    */
   processBundlerBuy(walletAddress: string, transaction: Omit<BundlerTransaction, 'type'>): void {
-    if (!this.positionId || !this.tradingWallet || !this.mint) {
+    if (this.positionId === null || !this.tradingWallet || !this.mint) {
       log.warn('Cannot process bundler buy - monitor not initialized');
       return;
     }
@@ -307,7 +339,7 @@ export class BundlerMonitor extends EventEmitter {
     transaction: Omit<BundlerTransaction, 'type'>,
     actualSoldAmount: number
   ): void {
-    if (!this.positionId || !this.tradingWallet || !this.mint) {
+    if (this.positionId === null || !this.tradingWallet || !this.mint) {
       log.warn('Cannot process bundler sell - monitor not initialized');
       return;
     }

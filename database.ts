@@ -565,6 +565,11 @@ export class MonitorDatabase {
     tokenAmount: number,
     buySol: number | null
   ): number {
+    const existing = this.getActiveEarlyBundlerPosition(tradingWallet, mint);
+    if (existing) {
+      return existing.id;
+    }
+
     this.run(
       `INSERT INTO early_bundler_positions (trading_wallet, mint, token_amount, buy_sol, status, created_at)
        VALUES (?, ?, ?, ?, 'active', ?)`,
@@ -606,6 +611,14 @@ export class MonitorDatabase {
     slot: number,
     timestamp: number
   ): number {
+    const rows_existing = this.query<{ id: number }>(
+      `SELECT id FROM early_bundler_wallets WHERE position_id = ? AND wallet_address = ?`,
+      [positionId, walletAddress]
+    );
+    if (rows_existing.length > 0) {
+      return rows_existing[0].id;
+    }
+
     this.run(
       `INSERT INTO early_bundler_wallets 
        (position_id, wallet_address, initial_token_amount, signature, slot, timestamp, status, total_sold_amount)
