@@ -142,6 +142,7 @@ export interface ServiceConfig {
   rateLimitMinTime: number;
   rateLimitMaxConcurrent: number;
   dbPath: string;
+  heliusApiKey: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;

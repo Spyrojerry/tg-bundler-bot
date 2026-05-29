@@ -51,20 +51,37 @@ export class HeliusClient {
     
     log.info(`Fetching early bundlers for mint ${mintAddress}`);
     
-    try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        throw new Error(`Helius API error: ${response.status} ${response.statusText}`);
+    let lastError: Error | null = null;
+    
+    // Retry up to 3 times with a delay, as tokens might be very new
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+        }
+        
+        const data = await response.json() as HeliusTransaction[];
+        log.info(`Received ${data.length} transactions from Helius (attempt ${attempt})`);
+        
+        if (data.length === 0) {
+          throw new Error('No transactions found for mint yet');
+        }
+        
+        return this.parseEarlyBundlers(data, mintAddress);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        log.warn(`Attempt ${attempt} failed to fetch early bundlers`, { error: lastError.message });
+        
+        if (attempt < 3) {
+          await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+        }
       }
-      
-      const data = await response.json() as HeliusTransaction[];
-      log.info(`Received ${data.length} transactions from Helius`);
-      
-      return this.parseEarlyBundlers(data, mintAddress);
-    } catch (err) {
-      log.error('Failed to fetch early bundlers from Helius', err);
-      throw err;
     }
+    
+    log.error('Failed to fetch early bundlers from Helius after all attempts', lastError);
+    throw lastError;
   }
 
   /**
@@ -76,7 +93,8 @@ export class HeliusClient {
     try {
       const response = await fetch(url);
       if (!response.ok) {
-        throw new Error(`Helius API error: ${response.status} ${response.statusText}`);
+        const text = await response.text();
+        throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
       }
       
       return await response.json() as HeliusTransaction[];

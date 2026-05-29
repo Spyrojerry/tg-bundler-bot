@@ -77,6 +77,7 @@ export function loadConfig(): ServiceConfig {
   const gmgnFetchMode    = optional('GMGN_FETCH_MODE', 'cli');
   const jupiterSwapBaseUrl = optional('JUPITER_SWAP_BASE_URL', 'https://api.jup.ag/swap/v2');
   const jupiterApiKey    = required('JUPITER_API_KEY');
+  const heliusApiKey     = optional('HELIUS_API_KEY', '');
   const dbPath           = optional('DB_PATH', './data/monitor.db');
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
@@ -138,6 +139,7 @@ export function loadConfig(): ServiceConfig {
     rateLimitMinTime,
     rateLimitMaxConcurrent,
     dbPath,
+    heliusApiKey,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,

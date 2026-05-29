@@ -64,12 +64,11 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     this.db = db;
     this.telegramBot = telegramBot;
     
-    // Initialize Helius client with API key from config or environment
-    const heliusApiKey = process.env.HELIUS_API_KEY || '';
-    if (!heliusApiKey) {
+    // Initialize Helius client with API key from config
+    if (!config.heliusApiKey) {
       log.warn('HELIUS_API_KEY not configured - early bundler bot will not function');
     }
-    this.heliusClient = new HeliusClient(heliusApiKey);
+    this.heliusClient = new HeliusClient(config.heliusApiKey);
     
     this.connection = new Connection(config.solanaRpcUrl, {
       commitment: 'confirmed',

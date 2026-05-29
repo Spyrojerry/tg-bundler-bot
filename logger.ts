@@ -26,8 +26,18 @@ function log(level: Level, label: string, message: string, data?: unknown): void
   const prefix = `[${ts}] [${level.toUpperCase().padEnd(5)}] [${label}]`;
 
   if (data !== undefined) {
-    const extra =
-      typeof data === 'object' ? JSON.stringify(data, null, 0) : String(data);
+    let extra: string;
+    if (data instanceof Error) {
+      extra = JSON.stringify({
+        ...data,
+        message: data.message,
+        stack: data.stack
+      }, null, 0);
+    } else if (typeof data === 'object' && data !== null) {
+      extra = JSON.stringify(data, null, 0);
+    } else {
+      extra = String(data);
+    }
     process.stdout.write(`${prefix} ${message} ${extra}\n`);
   } else {
     process.stdout.write(`${prefix} ${message}\n`);
