@@ -303,6 +303,8 @@ async function main(): Promise<void> {
     void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
   });
 
+  // ── 5. Bot Logic ──────────────────────────────────────────────────────────
+
   function queueWatchedWalletSell(
     watchedBuy: NewTokenEvent,
     tradingPosition: NewTokenEvent
@@ -516,11 +518,12 @@ async function main(): Promise<void> {
     rawValue: string
   ): string {
     const normalized = new PublicKey(walletAddress).toBase58();
+    const isTrading = normalized === config.tradingWalletAddress;
     const trimmed = rawValue.trim().toLowerCase();
     const settings = db.getWalletSettings(normalized);
 
     if (trimmed === 'off' || trimmed === 'any' || trimmed === 'none' || trimmed === 'default') {
-      settings.minSolBuy = null;
+      settings.minSolBuy = isTrading ? 0 : null;
     } else {
       const value = Number(trimmed);
       if (!Number.isFinite(value) || value < 0) {
@@ -538,86 +541,47 @@ async function main(): Promise<void> {
     const isTrading = normalized === config.tradingWalletAddress;
     const isMonitoring = isTrading ? !!tradingWalletMonitor : walletMonitors.has(normalized);
     const isPaused = pausedWallets.has(normalized);
+    const reverseBuyEnabled = !isTrading && db.isReverseBuyWallet(normalized);
+    const settings = db.getWalletSettings(normalized);
+    const minSolBuy = settings.minSolBuy ?? (isTrading ? 0 : config.minBuySol);
     const status = !isMonitoring ? 'Not active' : isPaused ? 'Paused' : 'Active';
     
-    let actionButton;
-    if (isTrading) {
-      actionButton = { text: 'Trading Wallet (ENV)', callback_data: 'none' };
-    } else {
-      actionButton = !isMonitoring
-        ? { text: 'Add wallet', callback_data: `wallet:add:${normalized}` }
-        : { text: 'Remove wallet', callback_data: `wallet:remove:${normalized}` };
-    }
-
     const pauseButton = isPaused
       ? { text: 'Continue monitoring', callback_data: `wallet:resume:${normalized}` }
       : { text: 'Pause monitoring', callback_data: `wallet:pause:${normalized}` };
 
-    return {
-      text: [
-        isTrading ? '<b>💳 Trading Wallet</b>' : '<b>✅ Watched Wallet</b>',
-        `<code>${html(normalized)}</code>`,
-        '',
-        `Status: <b>${status}</b>`,
-        isTrading ? '<i>This wallet triggers early bundler detection when it buys tokens.</i>' : '',
-      ].filter(Boolean).join('\n'),
-      replyMarkup: {
-        inline_keyboard: isMonitoring
-          ? [
-              [{ text: 'Settings', callback_data: `wallet:settings:${normalized}` }],
-              [pauseButton, actionButton],
-              [
-                { text: 'Back', callback_data: 'menu:refresh' },
-                { text: 'Refresh', callback_data: `wallet:refresh:${normalized}` },
-              ],
-            ]
-          : [
-              [actionButton],
-              [
-                { text: 'Back', callback_data: 'menu:refresh' },
-                { text: 'Refresh', callback_data: `wallet:refresh:${normalized}` },
-              ],
-            ],
-      },
-      editCurrent,
-    };
-  }
+    const keyboard = [];
+    
+    // Row 1: Min SOL Button
+    keyboard.push([{
+      text: `Min SOL: ${minSolBuy}`,
+      callback_data: `set:minSol:${normalized}`,
+    }]);
 
-  function settingsReply(address: string, editCurrent = false): TelegramReply {
-    const normalized = new PublicKey(address).toBase58();
-    const isTrading = normalized === config.tradingWalletAddress;
-    const reverseBuyEnabled = db.isReverseBuyWallet(normalized);
-    const settings = db.getWalletSettings(normalized);
-    const minSolBuyDisplay = settings.minSolBuy === null ? 'Default' : `${settings.minSolBuy} SOL`;
-    const isPaused = pausedWallets.has(normalized);
+    // Row 2: Pause and Action Buttons
+    const row2 = [pauseButton];
+    if (isTrading) {
+      // No extra action button for trading wallet
+    } else {
+      row2.push(!isMonitoring
+        ? { text: 'Add wallet', callback_data: `wallet:add:${normalized}` }
+        : { text: 'Remove wallet', callback_data: `wallet:remove:${normalized}` }
+      );
+    }
+    keyboard.push(row2);
 
-    const keyboard = [
-      [
-        {
-          text: 'Set min SOL buy',
-          callback_data: `set:minSol:${normalized}`,
-        },
-      ],
-      [
-        {
-          text: isPaused ? 'Resume monitoring' : 'Pause monitoring',
-          callback_data: `wallet:${isPaused ? 'resume' : 'pause'}:${normalized}:settings`,
-        },
-      ],
-    ];
-
-    if (!isTrading) {
-      keyboard.push([
-        {
-          text: `${reverseBuyEnabled ? 'Remove' : 'Add'} reverse-buy trigger`,
-          callback_data: `${reverseBuyEnabled ? 'reverse:remove' : 'reverse:add'}:${normalized}`,
-        },
-      ]);
+    // Row 3: Reverse Buy (only for watched wallets)
+    if (!isTrading && isMonitoring) {
+      keyboard.push([{
+        text: `${reverseBuyEnabled ? 'Remove' : 'Add'} reverse-buy trigger`,
+        callback_data: `${reverseBuyEnabled ? 'reverse:remove' : 'reverse:add'}:${normalized}`,
+      }]);
     }
 
+    // Row 4: Navigation
     keyboard.push([
-      { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
-      { text: 'Refresh', callback_data: `settings:refresh:${normalized}` },
+      { text: 'Back', callback_data: 'menu:refresh' },
+      { text: 'Refresh', callback_data: `wallet:refresh:${normalized}` },
     ]);
 
     const flowDesc = isTrading
@@ -636,12 +600,12 @@ async function main(): Promise<void> {
 
     return {
       text: [
-        isTrading ? '<b>💳 Trading Wallet Settings</b>' : '<b>✅ Watched Wallet Settings</b>',
+        isTrading ? '<b>💳 Trading Wallet</b>' : '<b>✅ Watched Wallet</b>',
         `<code>${html(normalized)}</code>`,
         '',
-        `Status: <b>${isPaused ? 'PAUSED' : 'RUNNING'}</b>`,
-        `Min SOL buy: <b>${minSolBuyDisplay}</b>`,
-        !isTrading ? `Reverse-buy trigger: <b>${reverseBuyEnabled ? 'ENABLED' : 'DISABLED'}</b>` : '',
+        `Status: <b>${status}</b>`,
+        `Min SOL: <b>${minSolBuy}</b>`,
+        !isTrading && isMonitoring ? `Reverse-buy: <b>${reverseBuyEnabled ? 'ENABLED' : 'DISABLED'}</b>` : '',
         '',
         ...flowDesc,
       ].filter(Boolean).join('\n'),
@@ -650,6 +614,10 @@ async function main(): Promise<void> {
       },
       editCurrent,
     };
+  }
+
+  function settingsReply(address: string, editCurrent = false): TelegramReply {
+    return walletSummaryReply(address, editCurrent);
   }
 
   function homeReply(editCurrent = false): TelegramReply {
