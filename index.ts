@@ -465,6 +465,15 @@ async function main(): Promise<void> {
 
   function pauseWallet(address: string): string {
     const normalized = new PublicKey(address).toBase58();
+    
+    if (normalized === config.tradingWalletAddress) {
+      if (!tradingWalletMonitor) return `Trading wallet is not active.`;
+      if (pausedWallets.has(normalized)) return `Trading wallet is already paused.`;
+      tradingWalletMonitor.stop();
+      pausedWallets.add(normalized);
+      return `Paused monitoring your TRADING wallet <code>${normalized}</code>`;
+    }
+
     const monitor = walletMonitors.get(normalized);
     if (!monitor) return `Wallet is not monitored: <code>${normalized}</code>`;
     if (pausedWallets.has(normalized)) return `Wallet is already paused: <code>${normalized}</code>`;
@@ -475,6 +484,15 @@ async function main(): Promise<void> {
 
   async function resumeWallet(address: string): Promise<string> {
     const normalized = new PublicKey(address).toBase58();
+
+    if (normalized === config.tradingWalletAddress) {
+      if (!tradingWalletMonitor) return `Trading wallet is not active.`;
+      if (!pausedWallets.has(normalized)) return `Trading wallet is already running.`;
+      pausedWallets.delete(normalized);
+      await tradingWalletMonitor.start();
+      return `Continued monitoring your TRADING wallet <code>${normalized}</code>`;
+    }
+
     const monitor = walletMonitors.get(normalized);
     if (!monitor) return `Wallet is not monitored: <code>${normalized}</code>`;
     if (!pausedWallets.has(normalized)) return `Wallet is already running: <code>${normalized}</code>`;
@@ -517,23 +535,32 @@ async function main(): Promise<void> {
 
   function walletSummaryReply(address: string, editCurrent = false): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
-    const isMonitoring = walletMonitors.has(normalized);
+    const isTrading = normalized === config.tradingWalletAddress;
+    const isMonitoring = isTrading ? !!tradingWalletMonitor : walletMonitors.has(normalized);
     const isPaused = pausedWallets.has(normalized);
-    const status = !isMonitoring ? 'Not monitoring' : isPaused ? 'Paused' : 'Monitoring';
-    const actionButton = !isMonitoring
-      ? { text: 'Add wallet', callback_data: `wallet:add:${normalized}` }
-      : { text: 'Remove wallet', callback_data: `wallet:remove:${normalized}` };
+    const status = !isMonitoring ? 'Not active' : isPaused ? 'Paused' : 'Active';
+    
+    let actionButton;
+    if (isTrading) {
+      actionButton = { text: 'Trading Wallet (ENV)', callback_data: 'none' };
+    } else {
+      actionButton = !isMonitoring
+        ? { text: 'Add wallet', callback_data: `wallet:add:${normalized}` }
+        : { text: 'Remove wallet', callback_data: `wallet:remove:${normalized}` };
+    }
+
     const pauseButton = isPaused
       ? { text: 'Continue monitoring', callback_data: `wallet:resume:${normalized}` }
       : { text: 'Pause monitoring', callback_data: `wallet:pause:${normalized}` };
 
     return {
       text: [
-        '<b>Wallet</b>',
+        isTrading ? '<b>💳 Trading Wallet</b>' : '<b>✅ Watched Wallet</b>',
         `<code>${html(normalized)}</code>`,
         '',
         `Status: <b>${status}</b>`,
-      ].join('\n'),
+        isTrading ? '<i>This wallet triggers early bundler detection when it buys tokens.</i>' : '',
+      ].filter(Boolean).join('\n'),
       replyMarkup: {
         inline_keyboard: isMonitoring
           ? [
@@ -558,50 +585,68 @@ async function main(): Promise<void> {
 
   function settingsReply(address: string, editCurrent = false): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
+    const isTrading = normalized === config.tradingWalletAddress;
     const reverseBuyEnabled = db.isReverseBuyWallet(normalized);
     const settings = db.getWalletSettings(normalized);
     const minSolBuyDisplay = settings.minSolBuy === null ? 'Default' : `${settings.minSolBuy} SOL`;
     const isPaused = pausedWallets.has(normalized);
 
+    const keyboard = [
+      [
+        {
+          text: 'Set min SOL buy',
+          callback_data: `set:minSol:${normalized}`,
+        },
+      ],
+      [
+        {
+          text: isPaused ? 'Resume monitoring' : 'Pause monitoring',
+          callback_data: `wallet:${isPaused ? 'resume' : 'pause'}:${normalized}:settings`,
+        },
+      ],
+    ];
+
+    if (!isTrading) {
+      keyboard.push([
+        {
+          text: `${reverseBuyEnabled ? 'Remove' : 'Add'} reverse-buy trigger`,
+          callback_data: `${reverseBuyEnabled ? 'reverse:remove' : 'reverse:add'}:${normalized}`,
+        },
+      ]);
+    }
+
+    keyboard.push([
+      { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
+      { text: 'Refresh', callback_data: `settings:refresh:${normalized}` },
+    ]);
+
+    const flowDesc = isTrading
+      ? [
+          '<b>Flow Description</b>',
+          '• When this wallet buys a token, early bundlers are detected.',
+          '• Monitoring begins for identified bundler wallets.',
+          '• If a bundler sells 40%, an immediate sell is triggered.',
+        ]
+      : [
+          '<b>Flow Description</b>',
+          '• When your trading wallet buys a token, early bundlers are detected.',
+          '• If this wallet buys the same token, an immediate sell is triggered.',
+          '• If a bundler sells 40% of holdings, an immediate sell is triggered.',
+        ];
+
     return {
       text: [
-        '<b>Wallet Settings</b>',
+        isTrading ? '<b>💳 Trading Wallet Settings</b>' : '<b>✅ Watched Wallet Settings</b>',
         `<code>${html(normalized)}</code>`,
         '',
         `Status: <b>${isPaused ? 'PAUSED' : 'RUNNING'}</b>`,
         `Min SOL buy: <b>${minSolBuyDisplay}</b>`,
-        `Reverse-buy trigger: <b>${reverseBuyEnabled ? 'ENABLED' : 'DISABLED'}</b>`,
+        !isTrading ? `Reverse-buy trigger: <b>${reverseBuyEnabled ? 'ENABLED' : 'DISABLED'}</b>` : '',
         '',
-        '<b>Flow Description</b>',
-        '• When your trading wallet buys a token, early bundlers are detected.',
-        '• If this wallet buys the same token, an immediate sell is triggered.',
-        '• If a bundler sells 40% of holdings, an immediate sell is triggered.',
-      ].join('\n'),
+        ...flowDesc,
+      ].filter(Boolean).join('\n'),
       replyMarkup: {
-        inline_keyboard: [
-          [
-            {
-              text: 'Set min SOL buy',
-              callback_data: `set:minSol:${normalized}`,
-            },
-          ],
-          [
-            {
-              text: isPaused ? 'Resume monitoring' : 'Pause monitoring',
-              callback_data: `wallet:${isPaused ? 'resume' : 'pause'}:${normalized}:settings`,
-            },
-          ],
-          [
-            {
-              text: `${reverseBuyEnabled ? 'Remove' : 'Add'} reverse-buy trigger`,
-              callback_data: `${reverseBuyEnabled ? 'reverse:remove' : 'reverse:add'}:${normalized}`,
-            },
-          ],
-          [
-            { text: 'Back', callback_data: `wallet:refresh:${normalized}` },
-            { text: 'Refresh', callback_data: `settings:refresh:${normalized}` },
-          ],
-        ],
+        inline_keyboard: keyboard,
       },
       editCurrent,
     };
@@ -609,26 +654,41 @@ async function main(): Promise<void> {
 
   function homeReply(editCurrent = false): TelegramReply {
     const wallets = [...walletMonitors.keys()];
-    walletAliasesByChat.set('__default__', wallets);
-    const walletLines = wallets.length
-      ? wallets.map((wallet, index) => `✅ /w_${index} <code>${html(wallet)}</code>`)
-      : ['No wallets are currently monitored.'];
-    const runningWallets = wallets.length - pausedWallets.size;
+    const tradingWallet = config.tradingWalletAddress;
+    
+    // Add trading wallet to aliases so it can be navigated to via /w_T or similar
+    // Actually, let's just add it to the list if it exists
+    const allWallets = tradingWallet ? [tradingWallet, ...wallets] : wallets;
+    walletAliasesByChat.set('__default__', allWallets);
+    
+    const walletLines = allWallets.map((wallet, index) => {
+      const isTrading = wallet === tradingWallet;
+      const isPaused = pausedWallets.has(wallet);
+      const label = isTrading ? '💳 TRADING' : '✅ WATCHED';
+      const status = isPaused ? ' (PAUSED)' : '';
+      return `${label} /w_${index} <code>${html(wallet)}</code>${status}`;
+    });
+
+    if (walletLines.length === 0) {
+      walletLines.push('No wallets are currently monitored.');
+    }
+
+    const runningWallets = allWallets.length - pausedWallets.size;
 
     return {
       text: [
         '<b>Early Bundler Bot</b>',
         '',
-        `Wallets monitored: <b>${walletMonitors.size}</b>`,
-        `Running wallets: <b>${runningWallets}</b>`,
-        `Paused wallets: <b>${pausedWallets.size}</b>`,
+        `Wallets total: <b>${allWallets.length}</b>`,
+        `Running: <b>${runningWallets}</b>`,
+        `Paused: <b>${pausedWallets.size}</b>`,
         '',
         '<b>Status</b>',
         'Filter: early bundler & reverse-buy',
         `Interval: ${config.monitorInterval}ms`,
         `Min buy: ${config.minBuySol} SOL`,
         '',
-        '<b>Monitored Wallets</b>',
+        '<b>Wallets List</b>',
         ...walletLines,
         '',
         'Send any Solana wallet address to preview it, then add or remove it with one tap.',
@@ -654,13 +714,24 @@ async function main(): Promise<void> {
 
   function walletsReply(chatId: string): TelegramReply {
     const wallets = [...walletMonitors.keys()];
-    walletAliasesByChat.set(chatId, wallets);
+    const tradingWallet = config.tradingWalletAddress;
+    const allWallets = tradingWallet ? [tradingWallet, ...wallets] : wallets;
+    walletAliasesByChat.set(chatId, allWallets);
+    
+    const lines = allWallets.map((w, i) => {
+      const isTrading = w === tradingWallet;
+      const isPaused = pausedWallets.has(w);
+      const label = isTrading ? '💳' : '✅';
+      const status = isPaused ? ' (PAUSED)' : '';
+      return `${label} /w_${i} <code>${html(w)}</code>${status}`;
+    });
+
     return {
-      text: wallets.length
-        ? `Monitoring ${wallets.length} wallet(s):\n${wallets.map((w, i) => `✅ /w_${i} <code>${html(w)}</code>`).join('\n')}`
+      text: lines.length
+        ? `Monitored wallets:\n${lines.join('\n')}`
         : 'No wallets are being monitored.',
       replyMarkup: {
-        inline_keyboard: wallets.length
+        inline_keyboard: lines.length
           ? [[{ text: 'Back', callback_data: 'menu:refresh' }]]
           : [[{ text: 'Add wallet', callback_data: 'menu:addwallet' }]],
       },
