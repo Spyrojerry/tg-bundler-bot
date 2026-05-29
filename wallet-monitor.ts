@@ -57,7 +57,7 @@ export class WalletMonitor extends EventEmitter {
   constructor(
     config: ServiceConfig,
     walletAddress?: string,
-    options: { enforceMinBuySol?: boolean } = {}
+    options: { enforceMinBuySol?: boolean; minBuySol?: number } = {}
   ) {
     super();
 
@@ -77,7 +77,11 @@ export class WalletMonitor extends EventEmitter {
     }
 
     this.pollInterval = config.walletPollInterval;
-    this.minBuySol = options.enforceMinBuySol === false ? 0 : config.minBuySol;
+    if (options.minBuySol !== undefined) {
+      this.minBuySol = options.minBuySol;
+    } else {
+      this.minBuySol = options.enforceMinBuySol === false ? 0 : config.minBuySol;
+    }
     this.wsEndpoint = config.solanaWsUrl;
   }
 

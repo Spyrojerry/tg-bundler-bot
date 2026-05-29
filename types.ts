@@ -86,6 +86,7 @@ export interface WalletFilterProfileSettings {
 export interface WalletFilterSettings extends WalletFilterProfileSettings {
   minBundlersCountChange: number | null;
   reverseBuySellTriggerEnabled: boolean;
+  minSolBuy: number | null;
 }
 
 /** Summary emitted after a token reaches its apply-sample decision */

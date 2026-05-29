@@ -40,6 +40,7 @@ export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
   ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS,
   minBundlersCountChange: 20,
   reverseBuySellTriggerEnabled: false,
+  minSolBuy: null,
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -502,6 +503,7 @@ export class MonitorDatabase {
       ...legacyProfile,
       minBundlersCountChange: parsed.minBundlersCountChange ?? (parsed as { minBundlersPercentIncrease?: number | null }).minBundlersPercentIncrease ?? DEFAULT_WALLET_FILTER_SETTINGS.minBundlersCountChange,
       reverseBuySellTriggerEnabled: parsed.reverseBuySellTriggerEnabled ?? DEFAULT_WALLET_FILTER_SETTINGS.reverseBuySellTriggerEnabled,
+      minSolBuy: parsed.minSolBuy ?? DEFAULT_WALLET_FILTER_SETTINGS.minSolBuy,
     };
   }
 

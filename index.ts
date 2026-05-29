@@ -92,6 +92,7 @@ async function main(): Promise<void> {
     | 'minBundlersCount'
     | 'maxBundlersCount'
     | 'minBundlersCountChange'
+    | 'minSolBuy'
   >;
   const settingFieldByCode: Record<string, SettingField> = {
     apply: 'applyAtSample',
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
     minCnt: 'minBundlersCount',
     maxCnt: 'maxBundlersCount',
     minInc: 'minBundlersCountChange',
+    minSol: 'minSolBuy',
   };
   const settingLabel: Record<SettingField, string> = {
     applyAtSample: 'Apply at sample #',
@@ -108,9 +110,11 @@ async function main(): Promise<void> {
     minBundlersCount: 'Min bundlers count',
     maxBundlersCount: 'Max bundlers count',
     minBundlersCountChange: 'Min count change to sell',
+    minSolBuy: 'Min SOL buy',
   };
   const settingHint = (field: SettingField): string => {
     if (field === 'applyAtSample') return 'Use a positive whole number.';
+    if (field === 'minSolBuy') return 'Use a number (e.g., 0.01), or send <code>off</code> to use default.';
     return 'Use a number, or send <code>off</code> to disable.';
   };
   function hasPendingSellForMint(walletAddress: string, mint: string): boolean {
@@ -243,7 +247,9 @@ async function main(): Promise<void> {
     }
 
     db.addWallet(normalized);
-    const monitor = new WalletMonitor(config, normalized, { enforceMinBuySol: true });
+    const settings = db.getWalletSettings(normalized);
+    const minBuySol = settings.minSolBuy !== null && settings.minSolBuy > 0 ? settings.minSolBuy : undefined;
+    const monitor = new WalletMonitor(config, normalized, { enforceMinBuySol: true, minBuySol });
     wireWatchedWalletMonitor(monitor);
     pausedWallets.delete(normalized);
     await monitor.start();
@@ -375,11 +381,16 @@ async function main(): Promise<void> {
   function settingsReply(address: string, editCurrent = false): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
     const reverseBuyEnabled = db.isReverseBuyWallet(normalized);
+    const settings = db.getWalletSettings(normalized);
+    const minSolBuyDisplay = settings.minSolBuy === null ? 'Default' : `${settings.minSolBuy} SOL`;
 
     return {
       text: [
         '<b>Filter Settings</b>',
         `<code>${html(normalized)}</code>`,
+        '',
+        '<b>Buy Settings</b>',
+        `Min SOL buy: <b>${minSolBuyDisplay}</b>`,
         '',
         '<b>Sell Trigger Flow</b>',
         'When your trading wallet opens a token position, this token is watched for buys from wallets explicitly added to reverse-buy trigger list.',
@@ -391,6 +402,12 @@ async function main(): Promise<void> {
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
+          [
+            {
+              text: 'Set min SOL buy',
+              callback_data: `set:minSol:${normalized}`,
+            },
+          ],
           [
             {
               text: `${reverseBuyEnabled ? 'Remove' : 'Add'} wallet to reverse-buy sell list`,
