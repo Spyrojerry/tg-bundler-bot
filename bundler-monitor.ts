@@ -16,11 +16,23 @@ import type { ServiceConfig } from './types';
 
 const log = createLogger('BUNDLER');
 
+type ParsedTokenBalance = {
+  accountIndex: number;
+  mint: string;
+  owner?: string;
+  uiTokenAmount: {
+    amount: string;
+    decimals: number;
+  };
+};
+
 export interface BundlerWallet {
   id: number;
   walletAddress: string;
   initialTokenAmount: number;
   totalSoldAmount: number;
+  source?: 'early_bundler' | 'receiver';
+  parentWalletAddress?: string;
 }
 
 export interface BundlerTransaction {
@@ -31,6 +43,8 @@ export interface BundlerTransaction {
   slot: number;
   timestamp: number;
   type: 'buy' | 'sell';
+  source: 'early_bundler' | 'receiver';
+  parentWalletAddress?: string;
 }
 
 export interface BundlerMonitorEvents {
@@ -46,6 +60,8 @@ export interface BundlerMonitorEvents {
     tradingWallet: string;
     positionId: number;
     soldPercentage: number;
+    source: 'early_bundler' | 'receiver';
+    parentWalletAddress?: string;
   }) => void;
   error: (error: Error) => void;
 }
@@ -63,23 +79,31 @@ export declare interface BundlerMonitor {
 
 export class BundlerMonitor extends EventEmitter {
   private readonly connection: Connection;
+  private readonly receiverConnection: Connection;
   private readonly config: ServiceConfig;
   private readonly heliusClient: HeliusClient;
+  private readonly receiverHeliusClient: HeliusClient;
   private positionId: number | null = null;
   private tradingWallet: string | null = null;
   private mint: string | null = null;
   private bundlerWallets: Map<string, BundlerWallet> = new Map();
+  private walletSources: Map<string, 'early_bundler' | 'receiver'> = new Map();
   private isRunning = false;
   private processedSignatures: Set<string> = new Set();
-  private subscriptionIds: Map<string, number> = new Map();
+  private subscriptionIds: Map<string, { id: number; connection: Connection }> = new Map();
 
   constructor(config: ServiceConfig, heliusClient: HeliusClient) {
     super();
     this.config = config;
     this.heliusClient = heliusClient;
+    this.receiverHeliusClient = new HeliusClient(config.receiverHeliusApiKey || config.heliusApiKey);
     this.connection = new Connection(config.solanaRpcUrl, {
       commitment: 'processed',
       wsEndpoint: config.solanaWsUrl,
+    });
+    this.receiverConnection = new Connection(config.receiverSolanaRpcUrl, {
+      commitment: 'processed',
+      wsEndpoint: config.receiverSolanaWsUrl,
     });
   }
 
@@ -101,9 +125,12 @@ export class BundlerMonitor extends EventEmitter {
     this.tradingWallet = tradingWallet;
     this.mint = mint;
     this.bundlerWallets.clear();
+    this.walletSources.clear();
 
     for (const wallet of bundlerWallets) {
-      this.bundlerWallets.set(wallet.walletAddress, wallet);
+      const source = wallet.source ?? 'early_bundler';
+      this.bundlerWallets.set(wallet.walletAddress, { ...wallet, source });
+      this.walletSources.set(wallet.walletAddress, source);
     }
 
     this.isRunning = true;
@@ -129,9 +156,9 @@ export class BundlerMonitor extends EventEmitter {
     this.isRunning = false;
 
     // Unsubscribe from all WebSocket listeners
-    for (const [walletAddress, subId] of this.subscriptionIds.entries()) {
+    for (const [walletAddress, subscription] of this.subscriptionIds.entries()) {
       try {
-        await this.connection.removeOnLogsListener(subId);
+        await subscription.connection.removeOnLogsListener(subscription.id);
         log.debug(`Unsubscribed from logs for ${walletAddress}`);
       } catch (err) {
         log.warn(`Failed to unsubscribe from logs for ${walletAddress}`, err);
@@ -145,6 +172,7 @@ export class BundlerMonitor extends EventEmitter {
     this.tradingWallet = null;
     this.mint = null;
     this.bundlerWallets.clear();
+    this.walletSources.clear();
     this.processedSignatures.clear();
   }
 
@@ -178,6 +206,8 @@ export class BundlerMonitor extends EventEmitter {
           tradingWallet: this.tradingWallet,
           positionId: this.positionId,
           soldPercentage,
+          source: wallet.source ?? 'early_bundler',
+          parentWalletAddress: wallet.parentWalletAddress,
         });
       }
     }
@@ -187,9 +217,18 @@ export class BundlerMonitor extends EventEmitter {
     if (!this.isRunning || !this.mint) return;
 
     for (const walletAddress of this.bundlerWallets.keys()) {
+      this.subscribeWallet(walletAddress, 'early_bundler');
+    }
+  }
+
+  private subscribeWallet(walletAddress: string, source: 'early_bundler' | 'receiver'): void {
+    if (!this.isRunning || this.subscriptionIds.has(walletAddress)) return;
+
+    try {
       const pubkey = new PublicKey(walletAddress);
+      const connection = source === 'receiver' ? this.receiverConnection : this.connection;
       
-      const subId = this.connection.onLogs(
+      const subId = connection.onLogs(
         pubkey,
         (logInfo) => {
           if (logInfo.err) return;
@@ -202,8 +241,10 @@ export class BundlerMonitor extends EventEmitter {
         'processed'
       );
       
-      this.subscriptionIds.set(walletAddress, subId);
-      log.debug(`Subscribed to logs for bundler ${walletAddress} (id=${subId})`);
+      this.subscriptionIds.set(walletAddress, { id: subId, connection });
+      log.debug(`Subscribed to logs for ${source} wallet ${walletAddress} (id=${subId})`);
+    } catch (err) {
+      log.warn(`Failed to subscribe to ${source} wallet ${walletAddress}`, err);
     }
   }
 
@@ -213,10 +254,14 @@ export class BundlerMonitor extends EventEmitter {
     this.processedSignatures.add(signature);
     
     try {
+      if (await this.processEnhancedSignature(signature, walletAddress)) return;
+
       // Retry a few times to get the transaction if it's not immediately available
+      const source = this.walletSources.get(walletAddress) ?? 'early_bundler';
+      const transactionConnection = source === 'receiver' ? this.receiverConnection : this.connection;
       let tx = null;
       for (let attempt = 1; attempt <= 5; attempt++) {
-        tx = await this.connection.getParsedTransaction(signature, {
+        tx = await transactionConnection.getParsedTransaction(signature, {
           commitment: 'confirmed',
           maxSupportedTransactionVersion: 0,
         });
@@ -248,51 +293,45 @@ export class BundlerMonitor extends EventEmitter {
       const isSpendSol = solDelta < -(fee + SWAP_THRESHOLD_LAMPORTS);
       const isReceiveSol = solDelta > SWAP_THRESHOLD_LAMPORTS;
 
-      const preBalances = tx.meta?.preTokenBalances ?? [];
-      const postBalances = tx.meta?.postTokenBalances ?? [];
-      
-      // Find relevant token transfers for our mint and the bundler wallet
-      for (const post of postBalances) {
-        if (post.owner !== walletAddress || post.mint !== this.mint) continue;
+      const tokenDeltas = this.getTokenDeltas(tx.meta?.preTokenBalances ?? [], tx.meta?.postTokenBalances ?? []);
+      const walletTokenDelta = tokenDeltas
+        .filter((delta) => delta.owner === walletAddress)
+        .reduce((sum, delta) => sum + delta.diff, 0n);
+      const decimals = tokenDeltas.find((delta) => delta.owner === walletAddress)?.decimals
+        ?? tokenDeltas[0]?.decimals
+        ?? 0;
+      const diffUi = Math.abs(Number(walletTokenDelta) / Math.pow(10, decimals));
 
-        const before = preBalances.find(
-          (pre) => pre.accountIndex === post.accountIndex && pre.mint === post.mint
-        );
-        
-        const preAmount = BigInt(before?.uiTokenAmount.amount ?? '0');
-        const postAmount = BigInt(post.uiTokenAmount.amount);
-        const diff = postAmount - preAmount;
-        const diffUi = Math.abs(Number(diff) / Math.pow(10, post.uiTokenAmount.decimals));
-
-        if (diff > 0n) {
-          // Token balance increased
-          if (isSpendSol) {
-            // Market BUY (Token UP, SOL DOWN)
-            this.processBundlerBuy(walletAddress, {
-              signature,
-              mint: this.mint,
-              tokenAmount: diffUi,
-              slot: tx.slot,
-              timestamp: tx.blockTime || Math.floor(Date.now() / 1000),
-              walletAddress,
-            });
-          } else {
-            log.info(`[BUNDLER IGNORE] Token increase detected for ${walletAddress} but no SOL spend (Transfer In).`);
-          }
-        } else if (diff < 0n) {
-          // Token balance decreased
-          if (isReceiveSol) {
-            // Market SELL (Token DOWN, SOL UP)
-            this.processBundlerSell(walletAddress, {
-              signature,
-              mint: this.mint,
-              tokenAmount: post.uiTokenAmount.uiAmount || 0, // This will be overwritten by actualSoldAmount in processBundlerSell
-              slot: tx.slot,
-              timestamp: tx.blockTime || Math.floor(Date.now() / 1000),
-              walletAddress,
-            }, diffUi);
-          } else {
-            log.info(`[BUNDLER IGNORE] Token decrease detected for ${walletAddress} but no SOL receive (Transfer Out).`);
+      if (walletTokenDelta > 0n) {
+        if (isSpendSol) {
+          this.processBundlerBuy(walletAddress, {
+            signature,
+            mint: this.mint,
+            tokenAmount: diffUi,
+            slot: tx.slot,
+            timestamp: tx.blockTime || Math.floor(Date.now() / 1000),
+            walletAddress,
+          });
+        } else {
+          log.info(`[BUNDLER IGNORE] Token increase detected for ${walletAddress} but no SOL spend (Transfer In).`);
+        }
+      } else if (walletTokenDelta < 0n) {
+        if (isReceiveSol) {
+          this.processBundlerSell(walletAddress, {
+            signature,
+            mint: this.mint,
+            tokenAmount: diffUi,
+            slot: tx.slot,
+            timestamp: tx.blockTime || Math.floor(Date.now() / 1000),
+            walletAddress,
+          }, diffUi);
+        } else {
+          log.info(`[BUNDLER TRANSFER OUT] ${source} ${walletAddress} sent ${diffUi} token(s)`, {
+            signature,
+            mint: this.mint,
+          });
+          if (source === 'early_bundler') {
+            this.processTransferOut(walletAddress, tokenDeltas, signature, tx.slot, tx.blockTime || Math.floor(Date.now() / 1000));
           }
         }
       }
@@ -300,11 +339,222 @@ export class BundlerMonitor extends EventEmitter {
        log.error(`Error processing bundler signature ${signature}`, err);
      }
    }
+
+  private async processEnhancedSignature(signature: string, walletAddress: string): Promise<boolean> {
+    if (!this.mint) return false;
+
+    const source = this.walletSources.get(walletAddress) ?? 'early_bundler';
+    const client = source === 'receiver' ? this.receiverHeliusClient : this.heliusClient;
+    let enhancedTx: HeliusTransaction | undefined;
+
+    try {
+      const transactions = await client.getTransactionsBySignatures([signature]);
+      enhancedTx = transactions[0];
+    } catch (err) {
+      log.debug(`Enhanced Helius fetch failed for ${signature}; falling back to parsed RPC`, err);
+      return false;
+    }
+
+    if (!enhancedTx || enhancedTx.signature !== signature) return false;
+    if (enhancedTx.type !== 'SWAP' && enhancedTx.type !== 'TRANSFER') return false;
+
+    const transfers = (enhancedTx.tokenTransfers ?? []).filter((transfer) =>
+      transfer.mint === this.mint
+      && transfer.tokenAmount > 0
+      && (transfer.fromUserAccount === walletAddress || transfer.toUserAccount === walletAddress)
+    );
+
+    if (transfers.length === 0) return true;
+
+    const slot = enhancedTx.slot;
+    const timestamp = enhancedTx.timestamp || Math.floor(Date.now() / 1000);
+
+    if (enhancedTx.type === 'SWAP') {
+      const boughtAmount = transfers
+        .filter((transfer) => transfer.toUserAccount === walletAddress)
+        .reduce((sum, transfer) => sum + transfer.tokenAmount, 0);
+      const soldAmount = transfers
+        .filter((transfer) => transfer.fromUserAccount === walletAddress)
+        .reduce((sum, transfer) => sum + transfer.tokenAmount, 0);
+
+      if (boughtAmount > 0) {
+        this.processBundlerBuy(walletAddress, {
+          signature,
+          mint: this.mint,
+          tokenAmount: boughtAmount,
+          slot,
+          timestamp,
+          walletAddress,
+        });
+      }
+
+      if (soldAmount > 0) {
+        this.processBundlerSell(walletAddress, {
+          signature,
+          mint: this.mint,
+          tokenAmount: soldAmount,
+          slot,
+          timestamp,
+          walletAddress,
+        }, soldAmount);
+      }
+
+      return true;
+    }
+
+    if (enhancedTx.type === 'TRANSFER' && source === 'early_bundler') {
+      const receiverTransfers = transfers.filter((transfer) =>
+        transfer.fromUserAccount === walletAddress
+        && transfer.toUserAccount
+        && transfer.toUserAccount !== walletAddress
+        && transfer.toUserAccount !== this.tradingWallet
+      );
+
+      for (const transfer of receiverTransfers) {
+        this.addReceiverWallet(
+          walletAddress,
+          transfer.toUserAccount,
+          transfer.tokenAmount,
+          signature,
+          slot,
+          timestamp
+        );
+      }
+
+      return true;
+    }
+
+    log.info(`[BUNDLER IGNORE] ${source} ${walletAddress} ${enhancedTx.type} did not match buy/sell/receiver rules`, {
+      signature,
+      mint: this.mint,
+    });
+    return true;
+  }
+
+  private getTokenDeltas(
+    preBalances: readonly ParsedTokenBalance[],
+    postBalances: readonly ParsedTokenBalance[]
+  ): Array<{ accountIndex: number; owner: string | undefined; diff: bigint; decimals: number }> {
+    const byAccount = new Map<number, {
+      accountIndex: number;
+      owner: string | undefined;
+      preAmount: bigint;
+      postAmount: bigint;
+      decimals: number;
+    }>();
+
+    for (const pre of preBalances ?? []) {
+      if (pre.mint !== this.mint) continue;
+      byAccount.set(pre.accountIndex, {
+        accountIndex: pre.accountIndex,
+        owner: pre.owner,
+        preAmount: BigInt(pre.uiTokenAmount.amount),
+        postAmount: 0n,
+        decimals: pre.uiTokenAmount.decimals,
+      });
+    }
+
+    for (const post of postBalances ?? []) {
+      if (post.mint !== this.mint) continue;
+      const existing = byAccount.get(post.accountIndex);
+      if (existing) {
+        existing.owner = post.owner ?? existing.owner;
+        existing.postAmount = BigInt(post.uiTokenAmount.amount);
+        existing.decimals = post.uiTokenAmount.decimals;
+      } else {
+        byAccount.set(post.accountIndex, {
+          accountIndex: post.accountIndex,
+          owner: post.owner,
+          preAmount: 0n,
+          postAmount: BigInt(post.uiTokenAmount.amount),
+          decimals: post.uiTokenAmount.decimals,
+        });
+      }
+    }
+
+    return [...byAccount.values()]
+      .map((entry) => ({
+        accountIndex: entry.accountIndex,
+        owner: entry.owner,
+        diff: entry.postAmount - entry.preAmount,
+        decimals: entry.decimals,
+      }))
+      .filter((entry) => entry.diff !== 0n);
+  }
+
+  private processTransferOut(
+    senderWalletAddress: string,
+    tokenDeltas: Array<{ owner: string | undefined; diff: bigint; decimals: number }>,
+    signature: string,
+    slot: number,
+    timestamp: number
+  ): void {
+    if (!this.mint || !this.tradingWallet || this.positionId === null) return;
+
+    const receivers = tokenDeltas.filter((delta) =>
+      delta.diff > 0n
+      && delta.owner
+      && delta.owner !== senderWalletAddress
+      && delta.owner !== this.tradingWallet
+    );
+
+    for (const receiver of receivers) {
+      const receiverAddress = receiver.owner!;
+      const receivedAmount = Number(receiver.diff) / Math.pow(10, receiver.decimals);
+      this.addReceiverWallet(senderWalletAddress, receiverAddress, receivedAmount, signature, slot, timestamp);
+    }
+  }
+
+  private addReceiverWallet(
+    senderWalletAddress: string,
+    receiverAddress: string,
+    receivedAmount: number,
+    signature: string,
+    slot: number,
+    timestamp: number
+  ): void {
+    if (!this.mint || receivedAmount <= 0) return;
+
+    const existing = this.bundlerWallets.get(receiverAddress);
+    if (existing) {
+      existing.initialTokenAmount += receivedAmount;
+      log.info(`[RECEIVER WALLET UPDATED] ${receiverAddress} received more ${this.mint}`, {
+        senderWalletAddress,
+        receivedAmount,
+        initialTokenAmount: existing.initialTokenAmount,
+        signature,
+      });
+      return;
+    }
+
+    const wallet: BundlerWallet = {
+      id: -1,
+      walletAddress: receiverAddress,
+      initialTokenAmount: receivedAmount,
+      totalSoldAmount: 0,
+      source: 'receiver',
+      parentWalletAddress: senderWalletAddress,
+    };
+
+    this.bundlerWallets.set(receiverAddress, wallet);
+    this.walletSources.set(receiverAddress, 'receiver');
+    this.subscribeWallet(receiverAddress, 'receiver');
+
+    log.info(`[RECEIVER WALLET MONITORING STARTED] ${receiverAddress}`, {
+      senderWalletAddress,
+      mint: this.mint,
+      receivedAmount,
+      signature,
+      slot,
+      timestamp,
+      receiverRpcUrl: this.config.receiverSolanaRpcUrl,
+    });
+  }
  
    /**
     * Process a detected bundler buy transaction
    */
-  processBundlerBuy(walletAddress: string, transaction: Omit<BundlerTransaction, 'type'>): void {
+  processBundlerBuy(walletAddress: string, transaction: Omit<BundlerTransaction, 'type' | 'source' | 'parentWalletAddress'>): void {
     if (this.positionId === null || !this.tradingWallet || !this.mint) {
       log.warn('Cannot process bundler buy - monitor not initialized');
       return;
@@ -328,6 +578,8 @@ export class BundlerMonitor extends EventEmitter {
       walletAddress,
       tradingWallet: this.tradingWallet,
       positionId: this.positionId,
+      source: wallet.source ?? 'early_bundler',
+      parentWalletAddress: wallet.parentWalletAddress,
     });
   }
 
@@ -336,7 +588,7 @@ export class BundlerMonitor extends EventEmitter {
    */
   processBundlerSell(
     walletAddress: string,
-    transaction: Omit<BundlerTransaction, 'type'>,
+    transaction: Omit<BundlerTransaction, 'type' | 'source' | 'parentWalletAddress'>,
     actualSoldAmount: number
   ): void {
     if (this.positionId === null || !this.tradingWallet || !this.mint) {
@@ -371,6 +623,8 @@ export class BundlerMonitor extends EventEmitter {
       tradingWallet: this.tradingWallet,
       positionId: this.positionId,
       cumulativeSoldPercentage,
+      source: wallet.source ?? 'early_bundler',
+      parentWalletAddress: wallet.parentWalletAddress,
     });
   }
 }

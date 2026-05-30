@@ -143,6 +143,9 @@ export interface ServiceConfig {
   rateLimitMaxConcurrent: number;
   dbPath: string;
   heliusApiKey: string;
+  receiverHeliusApiKey: string;
+  receiverSolanaRpcUrl: string;
+  receiverSolanaWsUrl: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;

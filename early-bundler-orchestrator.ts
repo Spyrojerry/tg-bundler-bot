@@ -33,7 +33,7 @@ export interface EarlyBundlerPosition {
 }
 
 export interface BundlerSellReason {
-  type: 'bundler_buy' | 'bundler_sell_40pct' | 'trading_wallet_exit';
+  type: 'bundler_buy' | 'bundler_sell_40pct';
   walletAddress?: string;
   soldPercentage?: number;
   reason?: string;
@@ -228,13 +228,6 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     const closedPosition = this.activePosition;
     this.activePosition = null;
 
-    // Emit event
-    this.emit('sellTrigger', {
-      type: 'trading_wallet_exit',
-      reason: 'Trading wallet exited position',
-      position: closedPosition,
-    });
-
     // Send Telegram notification
     await this.sendPositionClosedNotification(closedPosition, 'Trading wallet exited position');
 
@@ -252,8 +245,11 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
 
     // Handle bundler buy → immediate sell
     this.bundlerMonitor.on('bundlerBuy', async (event) => {
+      const label = event.source === 'receiver' ? 'Receiver wallet' : 'Bundler';
       log.info(`[EARLY BUNDLER] Bundler BUY detected - triggering immediate sell`, {
         walletAddress: event.walletAddress,
+        source: event.source,
+        parentWalletAddress: event.parentWalletAddress,
         mint: event.mint,
         tokenAmount: event.tokenAmount,
         signature: event.signature,
@@ -262,13 +258,15 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       await this.triggerSell({
         type: 'bundler_buy',
         walletAddress: event.walletAddress,
-      }, `Bundler ${event.walletAddress.slice(0, 8)}... bought the token - selling immediately`);
+      }, `${label} ${event.walletAddress.slice(0, 8)}... bought the token - selling immediately`);
     });
 
     // Handle bundler sell → check 40% threshold
     this.bundlerMonitor.on('bundlerSell', async (event) => {
       log.info(`[EARLY BUNDLER] Bundler SELL detected`, {
         walletAddress: event.walletAddress,
+        source: event.source,
+        parentWalletAddress: event.parentWalletAddress,
         mint: event.mint,
         tokenAmount: event.tokenAmount,
         cumulativeSoldPercentage: event.cumulativeSoldPercentage,
@@ -298,8 +296,11 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
 
     // Handle 40% threshold reached
     this.bundlerMonitor.on('thresholdReached', async (event) => {
+      const label = event.source === 'receiver' ? 'Receiver wallet' : 'Bundler';
       log.info(`[EARLY BUNDLER] 40% sell threshold reached - triggering sell`, {
         walletAddress: event.walletAddress,
+        source: event.source,
+        parentWalletAddress: event.parentWalletAddress,
         mint: event.mint,
         soldPercentage: event.soldPercentage,
       });
@@ -308,7 +309,7 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
         type: 'bundler_sell_40pct',
         walletAddress: event.walletAddress,
         soldPercentage: event.soldPercentage,
-      }, `Bundler ${event.walletAddress.slice(0, 8)}... sold ${event.soldPercentage.toFixed(1)}% of holdings - selling immediately`);
+      }, `${label} ${event.walletAddress.slice(0, 8)}... sold ${event.soldPercentage.toFixed(1)}% of holdings - selling immediately`);
     });
   }
 

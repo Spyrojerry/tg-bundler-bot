@@ -50,6 +50,8 @@ async function main(): Promise<void> {
     tradingWallet:   config.tradingWalletAddress,
     rpc:             config.solanaRpcUrl,
     ws:              config.solanaWsUrl,
+    receiverRpc:     config.receiverSolanaRpcUrl,
+    receiverWs:      config.receiverSolanaWsUrl,
     minBuySol:       config.minBuySol,
     gmgnFetchMode:   config.gmgnFetchMode,
     monitorInterval: config.monitorInterval,
@@ -70,7 +72,7 @@ async function main(): Promise<void> {
   let telegramBot: TelegramBot | null = null;
 
   // ── 4. Early Bundler Orchestrator ─────────────────────────────────────────
-  const earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot);
+  let earlyBundlerOrchestrator: EarlyBundlerOrchestrator;
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
@@ -250,6 +252,8 @@ async function main(): Promise<void> {
   if (telegramBot) {
     telegramBot.start();
   }
+
+  earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot);
 
   earlyBundlerOrchestrator.on('sellTrigger', (trigger) => {
     const { position, type, walletAddress, soldPercentage, reason } = trigger;

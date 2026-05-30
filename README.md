@@ -105,6 +105,7 @@ GMGN_API_KEY=<your GMGN API key>
 
 # Optional — tune as needed
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+RECEIVER_HELIUS_API_KEY=<optional second Helius key for transfer receivers>
 WALLET_POLL_INTERVAL=5000    # ms between wallet checks
 MONITOR_INTERVAL=3000        # target ms between GMGN polls per token
 RATE_LIMIT_MIN_TIME=500      # minimum ms between any two GMGN requests

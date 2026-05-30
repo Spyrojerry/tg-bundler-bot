@@ -26,6 +26,10 @@ function deriveWsUrl(httpUrl: string): string {
   return httpUrl;
 }
 
+function heliusRpcUrl(apiKey: string): string {
+  return `https://mainnet.helius-rpc.com/?api-key=${apiKey}`;
+}
+
 function optionalInt(key: string, defaultVal: number): number {
   const raw = process.env[key]?.trim();
   if (!raw) return defaultVal;
@@ -78,6 +82,15 @@ export function loadConfig(): ServiceConfig {
   const jupiterSwapBaseUrl = optional('JUPITER_SWAP_BASE_URL', 'https://api.jup.ag/swap/v2');
   const jupiterApiKey    = required('JUPITER_API_KEY');
   const heliusApiKey     = optional('HELIUS_API_KEY', '');
+  const receiverHeliusApiKey = optional('RECEIVER_HELIUS_API_KEY', '');
+  const receiverSolanaRpcUrl = optional(
+    'RECEIVER_SOLANA_RPC_URL',
+    receiverHeliusApiKey ? heliusRpcUrl(receiverHeliusApiKey) : solanaRpcUrl
+  );
+  const receiverSolanaWsUrl = optional(
+    'RECEIVER_SOLANA_WS_URL',
+    deriveWsUrl(receiverSolanaRpcUrl)
+  );
   const dbPath           = optional('DB_PATH', './data/monitor.db');
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
@@ -140,6 +153,9 @@ export function loadConfig(): ServiceConfig {
     rateLimitMaxConcurrent,
     dbPath,
     heliusApiKey,
+    receiverHeliusApiKey,
+    receiverSolanaRpcUrl,
+    receiverSolanaWsUrl,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,

@@ -10,6 +10,7 @@ export interface HeliusTransaction {
   signature: string;
   slot: number;
   timestamp: number;
+  type?: string;
   tokenTransfers?: Array<{
     fromUserAccount: string;
     toUserAccount: string;
@@ -21,7 +22,6 @@ export interface HeliusTransaction {
     toUserAccount: string;
     amount: number;
   }>;
-  type?: string;
 }
 
 export interface EarlyBundlerInfo {
@@ -100,6 +100,28 @@ export class HeliusClient {
       return await response.json() as HeliusTransaction[];
     } catch (err) {
       log.error(`Failed to fetch transactions for ${address} from Helius`, err);
+      throw err;
+    }
+  }
+
+  async getTransactionsBySignatures(signatures: string[]): Promise<HeliusTransaction[]> {
+    if (signatures.length === 0) return [];
+    const url = `${this.baseUrl}/v0/transactions?api-key=${this.apiKey}`;
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactions: signatures }),
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+      }
+
+      return await response.json() as HeliusTransaction[];
+    } catch (err) {
+      log.error(`Failed to fetch transactions by signature from Helius`, err);
       throw err;
     }
   }
