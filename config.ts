@@ -107,8 +107,6 @@ export function loadConfig(): ServiceConfig {
   const sellPercent            = optionalNumber('SELL_PERCENT', 100);
   const sellSlippage           = optionalNumber('SELL_SLIPPAGE', 0.3);
   const sellPriorityFeeSol     = optionalNumber('SELL_PRIORITY_FEE_SOL', 0.000012);
-  const sellMinProfitPct       = optionalNumber('SELL_MIN_PROFIT_PCT', 0.1);
-  const sellProfitCheckIntervalMs = optionalInt('SELL_PROFIT_CHECK_INTERVAL_MS', 2_000);
   const port                   = optionalInt('PORT', 8080);
 
   if (!isValidLogLevel(rawLogLevel)) {
@@ -131,10 +129,6 @@ export function loadConfig(): ServiceConfig {
   if (sellPercent <= 0 || sellPercent > 100) {
     throw new Error('SELL_PERCENT must be greater than 0 and at most 100');
   }
-  if (sellProfitCheckIntervalMs < 1_000) {
-    throw new Error('SELL_PROFIT_CHECK_INTERVAL_MS must be at least 1000ms');
-  }
-
   return {
     walletAddress,
     tradingWalletAddress,
@@ -164,8 +158,6 @@ export function loadConfig(): ServiceConfig {
     sellAutoSlippage,
     sellPriorityFeeSol,
     sellAntiMev,
-    sellMinProfitPct,
-    sellProfitCheckIntervalMs,
     port,
   };
 }

@@ -154,8 +154,6 @@ export interface ServiceConfig {
   sellAutoSlippage: boolean;
   sellPriorityFeeSol: number;
   sellAntiMev: boolean;
-  sellMinProfitPct: number;
-  sellProfitCheckIntervalMs: number;
   port: number;
 }
 

@@ -22,7 +22,6 @@ import { startHealthServer } from './health-server';
 import {
   FilterFailEvent,
   NewTokenEvent,
-  SellQuote,
   SellResult,
   TokenExitEvent,
   WalletFilterSettings,
@@ -34,8 +33,6 @@ import { PublicKey } from '@solana/web3.js';
 import { randomBytes } from 'crypto';
 
 const log = createLogger('MAIN');
-const sleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -789,178 +786,6 @@ async function main(): Promise<void> {
     ].join('\n');
   }
 
-  function profitGateStatusReply(
-    event: FilterFailEvent,
-    quote: SellQuote,
-    costBasis: number,
-    pnl: number,
-    pnlPct: number
-  ): string {
-    const fmtSol = (value: number): string => `${parseFloat(value.toFixed(6))} SOL`;
-    return [
-      '<b>Sell Waiting For Profit</b>',
-      `Wallet: <code>${html(event.walletAddress)}</code>`,
-      `Token: <code>${html(event.mint)}</code>`,
-      `Target P/L: <b>+${config.sellMinProfitPct}%</b>`,
-      `Current P/L: <b>${parseFloat(pnlPct.toFixed(3))}%</b> (${fmtSol(pnl)})`,
-      `Estimated receive: <b>${fmtSol(quote.estimatedOutputSol)}</b>`,
-      `Cost basis sold: ${fmtSol(costBasis)}`,
-      `Next check: ${Math.round(config.sellProfitCheckIntervalMs / 1000)}s`,
-      '',
-      '<b>Why sell is pending</b>',
-      ...event.reasons.map((reason) => `- ${html(reason)}`),
-    ].join('\n');
-  }
-
-  function profitGateReachedReply(
-    event: FilterFailEvent,
-    quote: SellQuote,
-    costBasis: number,
-    pnl: number,
-    pnlPct: number
-  ): string {
-    const fmtSol = (value: number): string => `${parseFloat(value.toFixed(6))} SOL`;
-    return [
-      '<b>Profit Target Reached</b>',
-      `Token: <code>${html(event.mint)}</code>`,
-      `Current P/L: <b>${parseFloat(pnlPct.toFixed(3))}%</b> (${fmtSol(pnl)})`,
-      `Estimated receive: <b>${fmtSol(quote.estimatedOutputSol)}</b>`,
-      `Cost basis sold: ${fmtSol(costBasis)}`,
-      '',
-      `Submitting Jupiter sell for <b>${config.sellPercent}%</b>.`,
-    ].join('\n');
-  }
-
-  async function waitForProfitBeforeSell(
-    chatId: string | null,
-    sellId: string,
-    telegramBot: TelegramBot | null
-  ): Promise<boolean> {
-    const pending = pendingSells.get(sellId);
-    if (!pending) return false;
-    if (config.sellMinProfitPct <= 0) return true;
-
-    const buySol = pending.event.buySol;
-    if (buySol === null || buySol <= 0) {
-      log.warn('Profit gate skipped because buy SOL is unknown', {
-        mint: pending.event.mint,
-        wallet: pending.event.walletAddress,
-      });
-      return true;
-    }
-
-    const costBasis = buySol * (config.sellPercent / 100);
-    let notifiedWaiting = false;
-    let lastLogAt = 0;
-    let quoteRetryCount = 0;
-    const MAX_QUOTE_RETRIES = 5;
-
-    while (pendingSells.has(sellId)) {
-      let quote: SellQuote;
-      try {
-        quote = await gmgnClient.quoteTokenSellForSol(
-          pending.event.walletAddress,
-          pending.event.mint,
-          config.sellPercent
-        );
-        // Reset retry count on success
-        quoteRetryCount = 0;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const isNoBalance = message.includes('No token balance found');
-        
-        const now = Date.now();
-        if (now - lastLogAt >= 30_000 || isNoBalance) {
-          lastLogAt = now;
-          log.warn(isNoBalance ? 'Profit gate stopped: no balance found' : 'Profit gate quote failed; will retry', {
-            mint: pending.event.mint,
-            error: message,
-            attempt: isNoBalance ? undefined : `${quoteRetryCount + 1}/${MAX_QUOTE_RETRIES}`,
-            nextCheckMs: config.sellProfitCheckIntervalMs,
-          });
-        }
-
-        if (isNoBalance) {
-          return false;
-        }
-
-        quoteRetryCount++;
-        if (quoteRetryCount >= MAX_QUOTE_RETRIES) {
-          log.error(`Profit gate aborted after ${MAX_QUOTE_RETRIES} quote failures`, {
-            mint: pending.event.mint,
-            error: message,
-          });
-          return false;
-        }
-
-        if (!notifiedWaiting && chatId && telegramBot) {
-          notifiedWaiting = true;
-          await telegramBot.sendChat(chatId, [
-            '<b>Sell Waiting For Profit Quote</b>',
-            `Wallet: <code>${html(pending.event.walletAddress)}</code>`,
-            `Token: <code>${html(pending.event.mint)}</code>`,
-            `Target P/L: <b>+${config.sellMinProfitPct}%</b>`,
-            'Jupiter quote is not ready yet. I will keep retrying instead of failing the sell.',
-            `Next check: ${Math.round(config.sellProfitCheckIntervalMs / 1000)}s`,
-            '',
-            '<b>Why sell is pending</b>',
-            ...pending.event.reasons.map((reason) => `- ${html(reason)}`),
-          ].join('\n'));
-        }
-        await sleep(config.sellProfitCheckIntervalMs);
-        continue;
-      }
-
-      const pnl = quote.estimatedOutputSol - costBasis;
-      const pnlPct = costBasis > 0 ? (pnl / costBasis) * 100 : 0;
-
-      if (pnlPct >= config.sellMinProfitPct) {
-        log.info('Profit gate reached; submitting sell', {
-          mint: pending.event.mint,
-          pnlPct,
-          estimatedOutputSol: quote.estimatedOutputSol,
-          costBasis,
-        });
-        if (chatId && telegramBot && notifiedWaiting) {
-          await telegramBot.sendChat(chatId, profitGateReachedReply(
-            pending.event,
-            quote,
-            costBasis,
-            pnl,
-            pnlPct
-          ));
-        }
-        return true;
-      }
-
-      const now = Date.now();
-      if (!notifiedWaiting && chatId && telegramBot) {
-        notifiedWaiting = true;
-        await telegramBot.sendChat(chatId, profitGateStatusReply(
-          pending.event,
-          quote,
-          costBasis,
-          pnl,
-          pnlPct
-        ));
-      }
-      if (now - lastLogAt >= 30_000) {
-        lastLogAt = now;
-        log.info('Waiting for profit before sell', {
-          mint: pending.event.mint,
-          pnlPct,
-          targetPct: config.sellMinProfitPct,
-          estimatedOutputSol: quote.estimatedOutputSol,
-          costBasis,
-        });
-      }
-
-      await sleep(config.sellProfitCheckIntervalMs);
-    }
-
-    return false;
-  }
-
   async function executeSellAndNotify(
     chatId: string | null,
     sellId: string,
@@ -987,8 +812,6 @@ async function main(): Promise<void> {
         return;
       }
 
-      const readyToSell = await waitForProfitBeforeSell(chatId, sellId, telegramBot);
-      if (!readyToSell) return;
       const currentPending = pendingSells.get(sellId);
       if (!currentPending) return;
 
