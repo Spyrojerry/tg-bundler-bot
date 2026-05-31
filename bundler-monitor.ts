@@ -16,6 +16,8 @@ import type { ServiceConfig } from './types';
 
 const log = createLogger('BUNDLER');
 const F1_PROGRAM_ID = 'FJX4qJbmhQ7ou8a99LNJMB1QYaKq5bvbqwxbawiUwkD2';
+const F1_BATCH_DELAY_MS = 250;
+const F1_BATCH_MAX_SIGNATURES = 10;
 
 type ParsedTokenBalance = {
   accountIndex: number;
@@ -107,6 +109,8 @@ export class BundlerMonitor extends EventEmitter {
   private isRunning = false;
   private processedSignatures: Set<string> = new Set();
   private subscriptionIds: Map<string, { id: number; connection: Connection }> = new Map();
+  private f1SignatureQueue: string[] = [];
+  private f1QueueTimer: NodeJS.Timeout | null = null;
 
   constructor(config: ServiceConfig, heliusClient: HeliusClient) {
     super();
@@ -188,6 +192,11 @@ export class BundlerMonitor extends EventEmitter {
       }
     }
     this.subscriptionIds.clear();
+    if (this.f1QueueTimer) {
+      clearTimeout(this.f1QueueTimer);
+      this.f1QueueTimer = null;
+    }
+    this.f1SignatureQueue = [];
 
     log.info(`Stopped monitoring early bundler wallets for position ${this.positionId}`);
 
@@ -291,9 +300,7 @@ export class BundlerMonitor extends EventEmitter {
           if (logInfo.err) return;
 
           log.info(`[F1 VAULT WS TX] ${this.creatorVaultAddress?.slice(0, 8)}...: ${logInfo.signature}`);
-          this.processCreatorVaultSignature(logInfo.signature).catch((err) => {
-            log.error(`Failed to process creator vault signature ${logInfo.signature}`, err);
-          });
+          this.enqueueCreatorVaultSignature(logInfo.signature);
         },
         'processed'
       );
@@ -309,50 +316,90 @@ export class BundlerMonitor extends EventEmitter {
     }
   }
 
-  private async processCreatorVaultSignature(signature: string): Promise<void> {
+  private enqueueCreatorVaultSignature(signature: string): void {
+    const processedKey = `creator-vault:${signature}`;
+    if (this.processedSignatures.has(processedKey) || this.f1SignatureQueue.includes(signature)) return;
+
+    this.f1SignatureQueue.push(signature);
+    if (this.f1SignatureQueue.length >= F1_BATCH_MAX_SIGNATURES) {
+      void this.flushCreatorVaultSignatureBatch();
+      return;
+    }
+
+    if (!this.f1QueueTimer) {
+      this.f1QueueTimer = setTimeout(() => {
+        this.f1QueueTimer = null;
+        void this.flushCreatorVaultSignatureBatch();
+      }, F1_BATCH_DELAY_MS);
+    }
+  }
+
+  private async flushCreatorVaultSignatureBatch(): Promise<void> {
     if (!this.isRunning || !this.creatorVaultAddress || !this.mint || !this.tradingWallet || this.positionId === null) {
       return;
     }
 
-    const processedKey = `creator-vault:${signature}`;
-    if (this.processedSignatures.has(processedKey)) return;
-    this.processedSignatures.add(processedKey);
+    if (this.f1QueueTimer) {
+      clearTimeout(this.f1QueueTimer);
+      this.f1QueueTimer = null;
+    }
+
+    const signatures = this.f1SignatureQueue.splice(0, F1_BATCH_MAX_SIGNATURES);
+    if (signatures.length === 0) return;
+    for (const signature of signatures) {
+      this.processedSignatures.add(`creator-vault:${signature}`);
+    }
 
     try {
-      let tx = null;
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        tx = await this.f1Connection.getParsedTransaction(signature, {
+      let txs: Awaited<ReturnType<Connection['getParsedTransactions']>> = [];
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        txs = await this.f1Connection.getParsedTransactions(signatures, {
           commitment: 'confirmed',
           maxSupportedTransactionVersion: 0,
         });
-        if (tx) break;
+        if (txs.some(Boolean)) break;
         await new Promise((resolve) => setTimeout(resolve, attempt * 250));
       }
 
-      if (!tx) return;
-      if (!this.hasProgramId(tx.transaction.message.instructions, F1_PROGRAM_ID)) {
-        const innerInstructions = tx.meta?.innerInstructions?.flatMap((inner) => inner.instructions) ?? [];
-        if (!this.hasProgramId(innerInstructions, F1_PROGRAM_ID)) return;
+      for (let i = 0; i < signatures.length; i++) {
+        const tx = txs[i];
+        if (tx) this.processCreatorVaultTransaction(signatures[i], tx);
       }
-
-      log.info('[F1 PROGRAM DETECTED] Creator vault transaction matched F1 program', {
-        creatorVaultAddress: this.creatorVaultAddress,
-        mint: this.mint,
-        signature,
-        programId: F1_PROGRAM_ID,
-      });
-
-      this.emit('creatorVaultF1', {
-        creatorVaultAddress: this.creatorVaultAddress,
-        mint: this.mint,
-        tradingWallet: this.tradingWallet,
-        positionId: this.positionId,
-        signature,
-        programId: F1_PROGRAM_ID,
-      });
     } catch (err) {
-      log.error(`Error processing creator vault signature ${signature}`, err);
+      log.error('Error processing creator vault signature batch', err);
+    } finally {
+      if (this.f1SignatureQueue.length > 0) {
+        void this.flushCreatorVaultSignatureBatch();
+      }
     }
+  }
+
+  private processCreatorVaultTransaction(
+    signature: string,
+    tx: NonNullable<Awaited<ReturnType<Connection['getParsedTransaction']>>>
+  ): void {
+    if (!this.creatorVaultAddress || !this.mint || !this.tradingWallet || this.positionId === null) return;
+
+    if (!this.hasProgramId(tx.transaction.message.instructions, F1_PROGRAM_ID)) {
+      const innerInstructions = tx.meta?.innerInstructions?.flatMap((inner) => inner.instructions) ?? [];
+      if (!this.hasProgramId(innerInstructions, F1_PROGRAM_ID)) return;
+    }
+
+    log.info('[F1 PROGRAM DETECTED] Creator vault transaction matched F1 program', {
+      creatorVaultAddress: this.creatorVaultAddress,
+      mint: this.mint,
+      signature,
+      programId: F1_PROGRAM_ID,
+    });
+
+    this.emit('creatorVaultF1', {
+      creatorVaultAddress: this.creatorVaultAddress,
+      mint: this.mint,
+      tradingWallet: this.tradingWallet,
+      positionId: this.positionId,
+      signature,
+      programId: F1_PROGRAM_ID,
+    });
   }
 
   private hasProgramId(instructions: readonly ParsedInstructionLike[], programId: string): boolean {
