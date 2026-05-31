@@ -31,6 +31,7 @@ export interface EarlyBundlerInfo {
   slot: number;
   timestamp: number;
   isMint: boolean;
+  creatorVaultAddress?: string;
 }
 
 export class HeliusClient {
@@ -146,6 +147,7 @@ export class HeliusClient {
           slot: tx.slot,
           timestamp: tx.timestamp,
           isMint,
+          creatorVaultAddress: isMint ? this.extractCreatorVaultAddress(tx) : undefined,
         });
         
         log.info(`Found ${isMint ? 'mint' : 'bundler'}: ${tokenTransfer.toUserAccount} - ${tokenTransfer.tokenAmount} tokens`);
@@ -153,5 +155,25 @@ export class HeliusClient {
     }
     
     return bundlers;
+  }
+
+  private extractCreatorVaultAddress(tx: HeliusTransaction): string | undefined {
+    if (tx.type !== 'CREATE') return undefined;
+    const transfers = tx.nativeTransfers ?? [];
+
+    for (let i = 0; i < transfers.length - 1; i++) {
+      const transfer = transfers[i];
+      const nextTransfer = transfers[i + 1];
+      if (
+        transfer.amount === 890_880
+        && transfer.toUserAccount
+        && nextTransfer?.toUserAccount === transfer.toUserAccount
+      ) {
+        log.info(`Found creator vault address: ${transfer.toUserAccount}`);
+        return transfer.toUserAccount;
+      }
+    }
+
+    return undefined;
   }
 }

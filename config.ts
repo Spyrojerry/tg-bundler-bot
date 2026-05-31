@@ -91,6 +91,15 @@ export function loadConfig(): ServiceConfig {
     'RECEIVER_SOLANA_WS_URL',
     deriveWsUrl(receiverSolanaRpcUrl)
   );
+  const f1HeliusApiKey = optional('F1_HELIUS_API_KEY', '');
+  const f1SolanaRpcUrl = optional(
+    'F1_SOLANA_RPC_URL',
+    f1HeliusApiKey ? heliusRpcUrl(f1HeliusApiKey) : solanaRpcUrl
+  );
+  const f1SolanaWsUrl = optional(
+    'F1_SOLANA_WS_URL',
+    deriveWsUrl(f1SolanaRpcUrl)
+  );
   const dbPath           = optional('DB_PATH', './data/monitor.db');
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
@@ -150,6 +159,9 @@ export function loadConfig(): ServiceConfig {
     receiverHeliusApiKey,
     receiverSolanaRpcUrl,
     receiverSolanaWsUrl,
+    f1HeliusApiKey,
+    f1SolanaRpcUrl,
+    f1SolanaWsUrl,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,

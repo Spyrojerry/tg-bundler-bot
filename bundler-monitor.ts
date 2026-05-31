@@ -15,6 +15,7 @@ import { HeliusClient, HeliusTransaction } from './helius-client';
 import type { ServiceConfig } from './types';
 
 const log = createLogger('BUNDLER');
+const F1_PROGRAM_ID = 'FJX4qJbmhQ7ou8a99LNJMB1QYaKq5bvbqwxbawiUwkD2';
 
 type ParsedTokenBalance = {
   accountIndex: number;
@@ -24,6 +25,11 @@ type ParsedTokenBalance = {
     amount: string;
     decimals: number;
   };
+};
+
+type ParsedInstructionLike = {
+  programId?: unknown;
+  innerInstructions?: ParsedInstructionLike[];
 };
 
 export interface BundlerWallet {
@@ -63,6 +69,14 @@ export interface BundlerMonitorEvents {
     source: 'early_bundler' | 'receiver';
     parentWalletAddress?: string;
   }) => void;
+  creatorVaultF1: (event: {
+    creatorVaultAddress: string;
+    mint: string;
+    tradingWallet: string;
+    positionId: number;
+    signature: string;
+    programId: string;
+  }) => void;
   error: (error: Error) => void;
 }
 
@@ -80,12 +94,14 @@ export declare interface BundlerMonitor {
 export class BundlerMonitor extends EventEmitter {
   private readonly connection: Connection;
   private readonly receiverConnection: Connection;
+  private readonly f1Connection: Connection;
   private readonly config: ServiceConfig;
   private readonly heliusClient: HeliusClient;
   private readonly receiverHeliusClient: HeliusClient;
   private positionId: number | null = null;
   private tradingWallet: string | null = null;
   private mint: string | null = null;
+  private creatorVaultAddress: string | null = null;
   private bundlerWallets: Map<string, BundlerWallet> = new Map();
   private walletSources: Map<string, 'early_bundler' | 'receiver'> = new Map();
   private isRunning = false;
@@ -105,6 +121,10 @@ export class BundlerMonitor extends EventEmitter {
       commitment: 'processed',
       wsEndpoint: config.receiverSolanaWsUrl,
     });
+    this.f1Connection = new Connection(config.f1SolanaRpcUrl, {
+      commitment: 'processed',
+      wsEndpoint: config.f1SolanaWsUrl,
+    });
   }
 
   /**
@@ -114,7 +134,8 @@ export class BundlerMonitor extends EventEmitter {
     positionId: number,
     tradingWallet: string,
     mint: string,
-    bundlerWallets: BundlerWallet[]
+    bundlerWallets: BundlerWallet[],
+    creatorVaultAddress?: string
   ): Promise<void> {
     if (this.isRunning) {
       log.warn('BundlerMonitor already running, stopping previous monitoring');
@@ -124,6 +145,7 @@ export class BundlerMonitor extends EventEmitter {
     this.positionId = positionId;
     this.tradingWallet = tradingWallet;
     this.mint = mint;
+    this.creatorVaultAddress = creatorVaultAddress ?? null;
     this.bundlerWallets.clear();
     this.walletSources.clear();
 
@@ -143,6 +165,7 @@ export class BundlerMonitor extends EventEmitter {
 
     // Start WebSocket monitoring for each bundler wallet
     this.startWsMonitoring();
+    this.startCreatorVaultMonitoring();
   }
 
   /**
@@ -171,6 +194,7 @@ export class BundlerMonitor extends EventEmitter {
     this.positionId = null;
     this.tradingWallet = null;
     this.mint = null;
+    this.creatorVaultAddress = null;
     this.bundlerWallets.clear();
     this.walletSources.clear();
     this.processedSignatures.clear();
@@ -246,6 +270,110 @@ export class BundlerMonitor extends EventEmitter {
     } catch (err) {
       log.warn(`Failed to subscribe to ${source} wallet ${walletAddress}`, err);
     }
+  }
+
+  private startCreatorVaultMonitoring(): void {
+    if (!this.isRunning || !this.creatorVaultAddress) {
+      log.warn('Creator vault F1 monitoring skipped: no creator vault address found for mint', {
+        mint: this.mint,
+      });
+      return;
+    }
+
+    const subscriptionKey = `creator-vault:${this.creatorVaultAddress}`;
+    if (this.subscriptionIds.has(subscriptionKey)) return;
+
+    try {
+      const pubkey = new PublicKey(this.creatorVaultAddress);
+      const subId = this.f1Connection.onLogs(
+        pubkey,
+        (logInfo) => {
+          if (logInfo.err) return;
+
+          log.info(`[F1 VAULT WS TX] ${this.creatorVaultAddress?.slice(0, 8)}...: ${logInfo.signature}`);
+          this.processCreatorVaultSignature(logInfo.signature).catch((err) => {
+            log.error(`Failed to process creator vault signature ${logInfo.signature}`, err);
+          });
+        },
+        'processed'
+      );
+
+      this.subscriptionIds.set(subscriptionKey, { id: subId, connection: this.f1Connection });
+      log.info('Creator vault F1 monitoring started', {
+        creatorVaultAddress: this.creatorVaultAddress,
+        mint: this.mint,
+        f1RpcUrl: this.config.f1SolanaRpcUrl,
+      });
+    } catch (err) {
+      log.warn(`Failed to subscribe to creator vault ${this.creatorVaultAddress}`, err);
+    }
+  }
+
+  private async processCreatorVaultSignature(signature: string): Promise<void> {
+    if (!this.isRunning || !this.creatorVaultAddress || !this.mint || !this.tradingWallet || this.positionId === null) {
+      return;
+    }
+
+    const processedKey = `creator-vault:${signature}`;
+    if (this.processedSignatures.has(processedKey)) return;
+    this.processedSignatures.add(processedKey);
+
+    try {
+      let tx = null;
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        tx = await this.f1Connection.getParsedTransaction(signature, {
+          commitment: 'processed' as 'confirmed',
+          maxSupportedTransactionVersion: 0,
+        });
+        if (tx) break;
+        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
+
+      if (!tx) return;
+      if (!this.hasProgramId(tx.transaction.message.instructions, F1_PROGRAM_ID)) {
+        const innerInstructions = tx.meta?.innerInstructions?.flatMap((inner) => inner.instructions) ?? [];
+        if (!this.hasProgramId(innerInstructions, F1_PROGRAM_ID)) return;
+      }
+
+      log.info('[F1 PROGRAM DETECTED] Creator vault transaction matched F1 program', {
+        creatorVaultAddress: this.creatorVaultAddress,
+        mint: this.mint,
+        signature,
+        programId: F1_PROGRAM_ID,
+      });
+
+      this.emit('creatorVaultF1', {
+        creatorVaultAddress: this.creatorVaultAddress,
+        mint: this.mint,
+        tradingWallet: this.tradingWallet,
+        positionId: this.positionId,
+        signature,
+        programId: F1_PROGRAM_ID,
+      });
+    } catch (err) {
+      log.error(`Error processing creator vault signature ${signature}`, err);
+    }
+  }
+
+  private hasProgramId(instructions: readonly ParsedInstructionLike[], programId: string): boolean {
+    for (const instruction of instructions) {
+      const instructionProgramId = this.programIdToString(instruction.programId);
+      if (instructionProgramId === programId) return true;
+      if (instruction.innerInstructions && this.hasProgramId(instruction.innerInstructions, programId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private programIdToString(programId: unknown): string | null {
+    if (!programId) return null;
+    if (typeof programId === 'string') return programId;
+    if (typeof programId === 'object' && 'toBase58' in programId) {
+      const value = (programId as { toBase58: () => string }).toBase58();
+      return value;
+    }
+    return String(programId);
   }
 
   private async processSignature(signature: string, walletAddress: string): Promise<void> {

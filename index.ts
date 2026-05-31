@@ -49,6 +49,8 @@ async function main(): Promise<void> {
     ws:              config.solanaWsUrl,
     receiverRpc:     config.receiverSolanaRpcUrl,
     receiverWs:      config.receiverSolanaWsUrl,
+    f1Rpc:           config.f1SolanaRpcUrl,
+    f1Ws:            config.f1SolanaWsUrl,
     minBuySol:       config.minBuySol,
     gmgnFetchMode:   config.gmgnFetchMode,
     monitorInterval: config.monitorInterval,

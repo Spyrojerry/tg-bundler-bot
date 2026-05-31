@@ -29,11 +29,12 @@ export interface EarlyBundlerPosition {
   mint: string;
   tokenAmount: number;
   buySol: number | null;
+  creatorVaultAddress?: string;
   bundlerWallets: BundlerWallet[];
 }
 
 export interface BundlerSellReason {
-  type: 'bundler_buy' | 'bundler_sell_40pct';
+  type: 'bundler_buy' | 'bundler_sell_40pct' | 'creator_vault_f1';
   walletAddress?: string;
   soldPercentage?: number;
   reason?: string;
@@ -118,6 +119,7 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       });
 
       // Step 2: Create database position (skip the first one as it's the mint)
+      const creatorVaultAddress = earlyBundlers.find(b => b.isMint)?.creatorVaultAddress;
       const bundlerWallets = earlyBundlers.filter(b => !b.isMint);
       
       if (bundlerWallets.length === 0) {
@@ -160,6 +162,7 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
         mint: event.mint,
         tokenAmount: 0,
         buySol: event.buySol,
+        creatorVaultAddress,
         bundlerWallets: storedBundlerWallets,
       };
 
@@ -171,7 +174,8 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
         positionId,
         event.walletAddress,
         event.mint,
-        storedBundlerWallets
+        storedBundlerWallets,
+        creatorVaultAddress
       );
 
       // Step 6: Emit event
@@ -186,6 +190,7 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       log.info(`[EARLY BUNDLER] Setup complete - monitoring ${storedBundlerWallets.length} bundler wallets`, {
         positionId,
         mint: event.mint,
+        creatorVaultAddress,
       });
 
     } catch (err) {
@@ -311,6 +316,21 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
         soldPercentage: event.soldPercentage,
       }, `${label} ${event.walletAddress.slice(0, 8)}... sold ${event.soldPercentage.toFixed(1)}% of holdings - selling immediately`);
     });
+
+    this.bundlerMonitor.on('creatorVaultF1', async (event) => {
+      log.info('[EARLY BUNDLER] Creator vault F1 program detected - triggering sell', {
+        creatorVaultAddress: event.creatorVaultAddress,
+        mint: event.mint,
+        signature: event.signature,
+        programId: event.programId,
+      });
+
+      await this.triggerSell({
+        type: 'creator_vault_f1',
+        walletAddress: event.creatorVaultAddress,
+        reason: `Creator vault ${event.creatorVaultAddress.slice(0, 8)}... used F1 program ${event.programId}`,
+      }, `Creator vault ${event.creatorVaultAddress.slice(0, 8)}... used F1 program - selling immediately`);
+    });
   }
 
   /**
@@ -391,12 +411,13 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       '<b>🚨 Early Bundler Detected</b>',
       `Token: <code>${html(position.mint)}</code>`,
       `Trading Wallet: <code>${html(position.tradingWallet)}</code>`,
+      position.creatorVaultAddress ? `Creator Vault: <code>${html(position.creatorVaultAddress)}</code>` : '',
       '',
       '<b>Detected Bundler Wallets:</b>',
       ...bundlerLines,
       '',
       'I am now monitoring these wallets. If any of them buy more or sell 40% of their holdings, I will trigger an immediate sell.',
-    ].join('\n')).catch(err => log.warn('Failed to send bundler detected notification', err));
+    ].filter(Boolean).join('\n')).catch(err => log.warn('Failed to send bundler detected notification', err));
   }
 
   private async sendBundlerSellNotification(

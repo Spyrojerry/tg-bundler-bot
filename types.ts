@@ -146,6 +146,9 @@ export interface ServiceConfig {
   receiverHeliusApiKey: string;
   receiverSolanaRpcUrl: string;
   receiverSolanaWsUrl: string;
+  f1HeliusApiKey: string;
+  f1SolanaRpcUrl: string;
+  f1SolanaWsUrl: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;
