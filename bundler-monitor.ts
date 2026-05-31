@@ -322,7 +322,7 @@ export class BundlerMonitor extends EventEmitter {
       let tx = null;
       for (let attempt = 1; attempt <= 5; attempt++) {
         tx = await this.f1Connection.getParsedTransaction(signature, {
-          commitment: 'processed' as 'confirmed',
+          commitment: 'confirmed',
           maxSupportedTransactionVersion: 0,
         });
         if (tx) break;
