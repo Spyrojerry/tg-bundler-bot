@@ -36,6 +36,7 @@ import { randomBytes } from 'crypto';
 const log = createLogger('MAIN');
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+const INSIDER_MIN_MARKET_CAP_USD = 1_000;
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -382,6 +383,28 @@ async function main(): Promise<void> {
 
     void (async () => {
       try {
+        const marketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(trigger.mint);
+        if (marketCapUsd !== null && marketCapUsd < INSIDER_MIN_MARKET_CAP_USD) {
+          log.warn('[INSIDER BUY SKIP] Market cap below minimum', {
+            mint: trigger.mint,
+            marketCapUsd,
+            minMarketCapUsd: INSIDER_MIN_MARKET_CAP_USD,
+          });
+          await telegramBot?.sendDefault([
+            '<b>Insider Buy Skipped</b>',
+            `Token: <code>${html(trigger.mint)}</code>`,
+            `Market cap: <b>$${marketCapUsd.toLocaleString()}</b>`,
+            `Minimum: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
+          ].join('\n'));
+          return;
+        }
+
+        if (marketCapUsd === null) {
+          log.warn('[INSIDER BUY MC UNKNOWN] Could not determine market cap; continuing with buy', {
+            mint: trigger.mint,
+          });
+        }
+
         const result = await gmgnClient.buyTokenWithSol(
           config.tradingWalletAddress!,
           trigger.mint,

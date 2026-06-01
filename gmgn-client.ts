@@ -114,6 +114,24 @@ export class GmgnClient {
     };
   }
 
+  async fetchTokenMarketCapUsd(mint: string): Promise<number | null> {
+    this.validateSolAddress(mint, 'mint');
+
+    const endpoints = ['v1/token/info', 'v1/token/security'];
+    for (const endpoint of endpoints) {
+      const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
+      if (!data) continue;
+
+      const marketCap = this.extractMarketCapUsd(data);
+      if (marketCap !== null) {
+        this.limiter.onSuccess(this.baselineMinTime);
+        return marketCap;
+      }
+    }
+
+    return null;
+  }
+
   async sellTokenForSol(
     walletAddress: string,
     mint: string,
@@ -661,6 +679,42 @@ export class GmgnClient {
     }
   }
 
+  private async fetchRawTokenData(
+    endpoint: string,
+    mint: string
+  ): Promise<Record<string, unknown> | null> {
+    const url = `${this.baseUrl}/${endpoint}?chain=${this.chain}&address=${mint}`;
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'X-API-KEY': this.apiKey,
+          Accept: 'application/json',
+          'User-Agent': 'gmgn-monitor/1.0',
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (resp.status === 429) {
+        const retryMs = this.getRetryDelayMs(resp) ?? BLOCKED_RETRY_MS;
+        this.limiter.onRateLimited(retryMs);
+        return null;
+      }
+      if (!resp.ok) return null;
+
+      const json = (await resp.json()) as GmgnSecurityResponse;
+      if (json.code !== undefined && json.code !== 0) return null;
+
+      return this.unwrapResponseData(json);
+    } catch {
+      return null;
+    }
+  }
+
   private async fetchWithCli(mint: string): Promise<FetchResult> {
     const commands = ['info'];
     let firstSuccess: FetchResult | null = null;
@@ -872,6 +926,29 @@ export class GmgnClient {
       bundledAmountRate: rawRate,
       rawData: JSON.stringify(d),
     };
+  }
+
+  private extractMarketCapUsd(data: Record<string, unknown>): number | null {
+    const candidates = [
+      data.market_cap,
+      data.marketcap,
+      data.market_cap_usd,
+      data.mkt_cap,
+      data.fdv,
+      data.fdv_usd,
+      data.fully_diluted_valuation,
+      this.asRecord(data.pool).market_cap,
+      this.asRecord(data.pool).market_cap_usd,
+      this.asRecord(data.stat).market_cap,
+      this.asRecord(data.stat).market_cap_usd,
+    ];
+
+    for (const candidate of candidates) {
+      const parsed = this.parseNullableNumber(candidate);
+      if (parsed !== null && parsed >= 0) return parsed;
+    }
+
+    return null;
   }
 
   private asRecord(value: unknown): Record<string, unknown> {
