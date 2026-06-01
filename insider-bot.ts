@@ -95,6 +95,10 @@ export class InsiderBot extends EventEmitter {
     insiderWallet: string;
     mint: string;
   } | null = null;
+  private insiderSequenceState: {
+    hasSeenTransfer: boolean;
+    sellCountAfterTransfer: number;
+  } | null = null;
 
   constructor(config: ServiceConfig) {
     super();
@@ -112,6 +116,7 @@ export class InsiderBot extends EventEmitter {
 
   clearActivePosition(): void {
     this.activePosition = null;
+    this.insiderSequenceState = null;
     if (this.insiderSubId !== null) {
       const subId = this.insiderSubId;
       this.insiderSubId = null;
@@ -186,6 +191,7 @@ export class InsiderBot extends EventEmitter {
     this.mintBuyers.clear();
     this.processedSignatures.clear();
     this.activePosition = null;
+    this.insiderSequenceState = null;
   }
 
   markPositionBought(trigger: InsiderBuyTrigger): void {
@@ -562,6 +568,11 @@ export class InsiderBot extends EventEmitter {
       'processed'
     );
 
+    this.insiderSequenceState = {
+      hasSeenTransfer: false,
+      sellCountAfterTransfer: 0,
+    };
+
     log.info('Insider wallet exit watch started', {
       insiderWallet,
       positionMint,
@@ -576,29 +587,136 @@ export class InsiderBot extends EventEmitter {
     const key = `insider:${signature}`;
     if (this.processedSignatures.has(key)) return;
     this.processedSignatures.add(key);
-    const buy = await this.findInsiderWalletBuy(signature, insiderWallet);
-    if (!buy) return;
 
-    log.warn('Insider wallet made a later buy; sell trigger fired', {
-      insiderWallet,
-      positionMint,
-      insiderBuyMint: buy.mint,
-      signature,
-    });
+    const analysis = await this.analyzeInsiderTransaction(signature, insiderWallet);
+    if (!analysis) return;
 
-    this.emit('sellTrigger', {
-      followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
-      insiderWallet,
-      positionMint,
-      insiderBuyMint: buy.mint,
-      signature,
-    });
+    const { type, mint } = analysis;
 
+    // Existing logic: Sell on next buy
+    if (type === 'buy') {
+      log.warn('Insider wallet made a later buy; sell trigger fired', {
+        insiderWallet,
+        positionMint,
+        insiderBuyMint: mint,
+        signature,
+      });
+
+      this.emit('sellTrigger', {
+        followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
+        insiderWallet,
+        positionMint,
+        insiderBuyMint: mint || '',
+        signature,
+      });
+      await this.stopInsiderWatch();
+      return;
+    }
+
+    // New logic: Transfer -> 2 Sells -> Next Buy/Sell
+    if (this.insiderSequenceState) {
+      if (type === 'transfer') {
+        if (!this.insiderSequenceState.hasSeenTransfer) {
+          log.info('Insider wallet transfer detected; starting sequence watch', { signature, insiderWallet });
+          this.insiderSequenceState.hasSeenTransfer = true;
+        }
+      } else if (type === 'sell' && this.insiderSequenceState.hasSeenTransfer) {
+        this.insiderSequenceState.sellCountAfterTransfer += 1;
+        log.info(`Insider wallet sell #${this.insiderSequenceState.sellCountAfterTransfer} detected after transfer`, { signature, insiderWallet });
+        
+        // If we already had 2 sells, and this is the "next" tx (which is a sell), trigger.
+        if (this.insiderSequenceState.sellCountAfterTransfer > 2) {
+          log.warn('Insider wallet transfer-sell sequence completed (3rd sell); sell trigger fired', {
+            insiderWallet,
+            positionMint,
+            signature,
+          });
+
+          this.emit('sellTrigger', {
+            followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
+            insiderWallet,
+            positionMint,
+            insiderBuyMint: mint || 'unknown',
+            signature,
+          });
+          await this.stopInsiderWatch();
+          return;
+        }
+      } else if (this.insiderSequenceState.hasSeenTransfer && this.insiderSequenceState.sellCountAfterTransfer >= 2) {
+        // If we have seen transfer and 2 sells, and this is the "next" tx (which is a buy or something else), trigger.
+        log.warn('Insider wallet transfer-sell sequence completed (next tx after 2 sells); sell trigger fired', {
+          insiderWallet,
+          positionMint,
+          signature,
+          type,
+        });
+
+        this.emit('sellTrigger', {
+          followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
+          insiderWallet,
+          positionMint,
+          insiderBuyMint: mint || 'unknown',
+          signature,
+        });
+        await this.stopInsiderWatch();
+        return;
+      }
+    }
+  }
+
+  private async stopInsiderWatch(): Promise<void> {
     if (this.insiderSubId !== null) {
       const subId = this.insiderSubId;
       this.insiderSubId = null;
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
     }
+    this.insiderSequenceState = null;
+  }
+
+  private async analyzeInsiderTransaction(
+    signature: string,
+    insiderWallet: string
+  ): Promise<{ type: 'buy' | 'sell' | 'transfer' | 'other'; mint?: string } | null> {
+    if (this.config.insiderHeliusApiKey) {
+      const heliusTx = await this.fetchHeliusTransaction(signature);
+      if (heliusTx) {
+        const swaps = this.getHeliusPoolSwaps(heliusTx);
+        const buy = swaps.find(s => s.direction === 'buy' && s.wallet === insiderWallet);
+        if (buy) return { type: 'buy', mint: buy.mint };
+        
+        const sell = swaps.find(s => s.direction === 'sell' && s.wallet === insiderWallet);
+        if (sell) return { type: 'sell', mint: sell.mint };
+
+        // Check for transfer
+        for (const transfer of heliusTx.tokenTransfers ?? []) {
+          if (transfer.fromUserAccount === insiderWallet && !this.isKnownPoolAuthority(transfer.toUserAccount ?? '')) {
+            return { type: 'transfer', mint: transfer.mint };
+          }
+        }
+      }
+    }
+
+    const tx = await this.fetchParsedTransaction(signature);
+    if (!tx) return null;
+
+    const deltas = this.getTokenDeltas(tx.meta?.preTokenBalances ?? [], tx.meta?.postTokenBalances ?? []);
+    
+    // Check for buy/sell via pool
+    const isBuy = deltas.some(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
+    if (isBuy) {
+      const b = deltas.find(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
+      return { type: 'buy', mint: b?.mint };
+    }
+
+    const isSell = deltas.some(d => d.owner === insiderWallet && d.rawDiff < 0n && d.mint !== SOL_MINT);
+    if (isSell) {
+      const s = deltas.find(d => d.owner === insiderWallet && d.rawDiff < 0n && d.mint !== SOL_MINT);
+      const poolReceived = deltas.some(d => this.isKnownPoolAuthority(d.owner) && d.rawDiff > 0n && d.mint === s?.mint);
+      if (poolReceived) return { type: 'sell', mint: s?.mint };
+      return { type: 'transfer', mint: s?.mint };
+    }
+
+    return { type: 'other' };
   }
 
   private async fetchParsedTransaction(signature: string): Promise<NonNullable<Awaited<ReturnType<Connection['getParsedTransaction']>>> | null> {
@@ -611,20 +729,6 @@ export class InsiderBot extends EventEmitter {
       await new Promise((resolve) => setTimeout(resolve, attempt * 250));
     }
     return null;
-  }
-
-  private async findInsiderWalletBuy(
-    signature: string,
-    insiderWallet: string
-  ): Promise<{ mint: string; amount: number } | null> {
-    if (this.config.insiderHeliusApiKey) {
-      const heliusTx = await this.fetchHeliusTransaction(signature);
-      const heliusBuy = heliusTx ? this.findHeliusWalletBuy(heliusTx, insiderWallet) : null;
-      if (heliusBuy) return heliusBuy;
-    }
-
-    const tx = await this.fetchParsedTransaction(signature);
-    return tx ? this.findWalletBuy(tx, insiderWallet) : null;
   }
 
   private async fetchHeliusTransaction(signature: string): Promise<HeliusEnhancedTransaction | null> {
@@ -649,22 +753,6 @@ export class InsiderBot extends EventEmitter {
         body: text,
       });
       await new Promise((resolve) => setTimeout(resolve, attempt * 500));
-    }
-
-    return null;
-  }
-
-  private findHeliusWalletBuy(
-    tx: HeliusEnhancedTransaction,
-    wallet: string
-  ): { mint: string; amount: number } | null {
-    const buy = this.getHeliusPoolSwaps(tx)
-      .find((swap) => swap.direction === 'buy' && swap.wallet === wallet);
-    if (buy) {
-      return {
-        mint: buy.mint,
-        amount: buy.amount,
-      };
     }
 
     return null;
