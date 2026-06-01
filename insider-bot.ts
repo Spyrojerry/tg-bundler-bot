@@ -643,11 +643,27 @@ export class InsiderBot extends EventEmitter {
 
     while (hasMore) {
       iterations += 1;
-      const txs = await this.fetchHeliusTransactionsAfter(insiderWallet, currentAfter);
+      let txs = await this.fetchHeliusTransactionsAfter(insiderWallet, currentAfter);
       
+      // Fallback: If after-signature is too old or missing from index, fetch most recent
+      if (txs === null) {
+        log.warn('Helius after-signature failed; falling back to recent transactions', { insiderWallet, afterSignature });
+        const recent = await this.fetchHeliusTransactionsRecent(insiderWallet);
+        const startIndex = recent.findIndex(tx => tx.signature === currentAfter);
+        
+        if (startIndex !== -1) {
+          // If found, process everything that happened after it (index 0 to startIndex-1)
+          // We reverse it to process chronologically
+          txs = recent.slice(0, startIndex).reverse();
+          log.info(`Found ${txs.length} transactions after original signature in recent history`, { insiderWallet });
+        } else {
+          log.warn('Original signature not found in recent history; skipping catch-up', { insiderWallet });
+          txs = [];
+        }
+        hasMore = false; // Fallback only does one page
+      }
+
       if (txs.length === 0) {
-        // If this is a real-time update and we found nothing "after" the notification signature,
-        // we should at least process the notification signature itself.
         if (isRealtimeUpdate && iterations === 1) {
           await this.processInsiderWalletSignature(insiderWallet, positionMint, afterSignature);
         }
@@ -663,12 +679,10 @@ export class InsiderBot extends EventEmitter {
         currentAfter = tx.signature;
       }
 
-      // If we got less than 100, we're likely caught up (Helius limit is usually 100)
       if (txs.length < 100) {
         hasMore = false;
       }
 
-      // Safety break for infinite loops
       if (iterations > 20) break;
     }
   }
@@ -676,7 +690,7 @@ export class InsiderBot extends EventEmitter {
   private async fetchHeliusTransactionsAfter(
     address: string,
     afterSignature: string
-  ): Promise<HeliusEnhancedTransaction[]> {
+  ): Promise<HeliusEnhancedTransaction[] | null> {
     const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}&after-signature=${afterSignature}`;
 
     for (let attempt = 1; attempt <= 3; attempt++) {
@@ -686,6 +700,12 @@ export class InsiderBot extends EventEmitter {
           return await response.json() as HeliusEnhancedTransaction[];
         }
         const text = await response.text();
+        
+        // Return null for 400 errors to trigger fallback
+        if (response.status === 400) {
+          return null;
+        }
+
         log.warn(`Helius catch-up fetch attempt ${attempt}/3 failed`, { status: response.status, body: text });
       } catch (err) {
         log.warn(`Helius catch-up fetch attempt ${attempt}/3 error`, err);
@@ -693,6 +713,22 @@ export class InsiderBot extends EventEmitter {
       await new Promise(r => setTimeout(r, attempt * 1000));
     }
 
+    return [];
+  }
+
+  private async fetchHeliusTransactionsRecent(
+    address: string
+  ): Promise<HeliusEnhancedTransaction[]> {
+    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?token-accounts=none&api-key=${this.config.insiderHeliusApiKey}`;
+    
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        return await response.json() as HeliusEnhancedTransaction[];
+      }
+    } catch (err) {
+      log.error('Failed to fetch recent Helius transactions', err);
+    }
     return [];
   }
 
