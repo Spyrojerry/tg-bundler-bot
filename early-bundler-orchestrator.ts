@@ -40,13 +40,15 @@ export interface BundlerSellReason {
   reason?: string;
 }
 
-export declare interface EarlyBundlerOrchestrator {
+export interface EarlyBundlerOrchestrator {
   on(event: 'sellTrigger', listener: (trigger: BundlerSellReason & { position: EarlyBundlerPosition }) => void): this;
   on(event: 'bundlerDetected', listener: (data: { position: EarlyBundlerPosition; bundlers: EarlyBundlerInfo[] }) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
   emit(event: 'sellTrigger', trigger: BundlerSellReason & { position: EarlyBundlerPosition }): boolean;
   emit(event: 'bundlerDetected', data: { position: EarlyBundlerPosition; bundlers: EarlyBundlerInfo[] }): boolean;
   emit(event: 'error', error: Error): boolean;
+  getActivePosition(): EarlyBundlerPosition | null;
+  setEnabled(enabled: boolean): void;
 }
 
 export class EarlyBundlerOrchestrator extends EventEmitter {

@@ -67,13 +67,14 @@ export interface InsiderSellTrigger {
   signature: string;
 }
 
-export declare interface InsiderBot {
+export interface InsiderBot {
   on(event: 'buyTrigger', listener: (trigger: InsiderBuyTrigger) => void): this;
   on(event: 'sellTrigger', listener: (trigger: InsiderSellTrigger) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
   emit(event: 'buyTrigger', trigger: InsiderBuyTrigger): boolean;
   emit(event: 'sellTrigger', trigger: InsiderSellTrigger): boolean;
   emit(event: 'error', error: Error): boolean;
+  getActivePosition(): { followedWallet: string; insiderWallet: string; mint: string } | null;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -103,6 +104,10 @@ export class InsiderBot extends EventEmitter {
       commitment: 'processed',
       wsEndpoint: config.insiderSolanaWsUrl,
     });
+  }
+
+  getActivePosition(): { followedWallet: string; insiderWallet: string; mint: string } | null {
+    return this.activePosition;
   }
 
   setBuySol(value: number): void {

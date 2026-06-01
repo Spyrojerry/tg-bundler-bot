@@ -119,14 +119,30 @@ export class GmgnClient {
 
     const endpoints = ['v1/token/info', 'v1/token/security'];
     for (const endpoint of endpoints) {
-      const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
-      if (!data) continue;
+      try {
+        const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
+        if (!data) continue;
 
-      const marketCap = this.extractMarketCapUsd(data);
-      if (marketCap !== null) {
-        this.limiter.onSuccess(this.baselineMinTime);
-        return marketCap;
+        const marketCap = this.extractMarketCapUsd(data);
+        if (marketCap !== null) {
+          this.limiter.onSuccess(this.baselineMinTime);
+          return marketCap;
+        }
+      } catch (err) {
+        log.debug(`Failed to fetch market cap from ${endpoint}`, { mint, error: String(err) });
       }
+    }
+
+    // Fallback to CLI
+    try {
+      const cliResult = await this.fetchWithCli(mint);
+      if (cliResult.success && cliResult.metrics.rawData) {
+        const data = JSON.parse(cliResult.metrics.rawData) as Record<string, unknown>;
+        const marketCap = this.extractMarketCapUsd(data);
+        if (marketCap !== null) return marketCap;
+      }
+    } catch (err) {
+      log.debug(`Failed to fetch market cap from CLI fallback`, { mint, error: String(err) });
     }
 
     return null;

@@ -37,6 +37,7 @@ const log = createLogger('MAIN');
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const INSIDER_MIN_MARKET_CAP_USD = 1_000;
+const MCAP_CHECK_INTERVAL_MS = 30_000;
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -598,6 +599,89 @@ async function main(): Promise<void> {
         queueWatchedWalletSell(event, tradingPosition);
       }
     });
+  }
+
+  async function checkAndSellIfLowMcap(mint: string, context: 'insider' | 'bundler'): Promise<void> {
+    if (!config.tradingWalletAddress) return;
+    if (hasPendingSellForMint(config.tradingWalletAddress, mint)) return;
+
+    try {
+      const marketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(mint);
+      if (marketCapUsd !== null && marketCapUsd < INSIDER_MIN_MARKET_CAP_USD) {
+        log.warn(`[MCAP SELL TRIGGER] Market cap $${marketCapUsd.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}`, { context });
+
+        const event: FilterFailEvent = {
+          walletAddress: config.tradingWalletAddress,
+          mint,
+          sampleNumber: 0,
+          elapsedSec: 0,
+          reasons: [
+            `Market cap $${marketCapUsd.toLocaleString()} fell below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
+            `Context: ${context} position.`,
+            'Periodic market cap checker triggered automatic sell.',
+          ],
+          settings: db.getWalletSettings(config.tradingWalletAddress),
+          metrics: {
+            mint,
+            timestamp: new Date().toISOString(),
+            bundlersPercent: null,
+            bundlersCount: null,
+            initialBaseReserve: null,
+            topWallets: null,
+            top10HolderRate: null,
+            bundledAmountRate: null,
+          },
+          buySol: context === 'insider' ? insiderBot.getBuySol() : null,
+          matchingWallets: [],
+        };
+
+        const sellId = randomBytes(5).toString('hex');
+        pendingSells.set(sellId, {
+          event,
+          createdAt: Date.now(),
+          executing: true,
+        });
+
+        telegramBot?.sendDefault([
+          '<b>🚨 Market Cap Sell Triggered</b>',
+          `Token: <code>${html(mint)}</code>`,
+          `Market Cap: <b>$${marketCapUsd.toLocaleString()}</b>`,
+          `Threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
+          `Action: submit sell for <b>${config.sellPercent}%</b>.`,
+        ].join('\n')).catch((err) => log.warn('Telegram mcap sell alert failed', err));
+
+        void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+      }
+    } catch (err) {
+      log.error(`Failed to check market cap for ${mint}`, err);
+    }
+  }
+
+  function startMarketCapChecker(): void {
+    log.info(`Starting periodic market cap checker (interval: ${MCAP_CHECK_INTERVAL_MS}ms)`);
+    setInterval(async () => {
+      if (!config.tradingWalletAddress) return;
+
+      // 1. Check InsiderBot active position
+      const insiderPos = insiderBot.getActivePosition();
+      if (insiderPos) {
+        await checkAndSellIfLowMcap(insiderPos.mint, 'insider');
+      }
+
+      // 2. Check EarlyBundlerOrchestrator active position
+      const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
+      if (bundlerPos) {
+        await checkAndSellIfLowMcap(bundlerPos.mint, 'bundler');
+      }
+
+      // 3. Check pendingTradingBuys (if not already checked)
+      if (botMode === 'bundler') {
+        for (const mint of pendingTradingBuys.keys()) {
+          if (bundlerPos?.mint === mint) continue;
+          await checkAndSellIfLowMcap(mint, 'bundler');
+        }
+      }
+    }, MCAP_CHECK_INTERVAL_MS);
   }
 
   function startWatchedWalletSummary(event: NewTokenEvent): void {
@@ -1205,6 +1289,7 @@ async function main(): Promise<void> {
 
   // ── 6. Start active mode ──────────────────────────────────────────────────
   await stopBundlerModeServices('Service started in Insider mode');
+  startMarketCapChecker();
 
   log.info(`Service fully started — mode=${botMode}, bundler wallets active=${walletMonitors.size}`);
 
