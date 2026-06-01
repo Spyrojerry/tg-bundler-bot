@@ -8,6 +8,12 @@ const log = createLogger('INSIDER');
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const KNOWN_POOL_AUTHORITIES = new Set([
   'FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM',
+  '5Q544fKrZM6W6y77W4A2B4L2S97E6q5nN5T6v8D5H5', // Raydium Authority
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium V4
+  '9W959DqmcGTu2YHcR6Yn3S3XN6XN6S6S6S6S6S6S6S', // Orca
+  'Eo7WjKq67rjJQSvbdBk6RToZp4EAtX4F2Xv7V95v2', // Meteora
+  '6EF8rrecthR5DkjtvAXth2Jy1Gq3BvF4YQDQe4N362K', // Pump.fun
+  'TSLpA7P3qPqbeXh3WfJLue2osyZH1G1A2A2A2A2A2A2', // Meteora Vault
 ]);
 
 type ParsedTokenBalance = {
@@ -29,6 +35,7 @@ interface TokenDelta {
 
 interface HeliusEnhancedTransaction {
   signature?: string;
+  timestamp?: number;
   feePayer?: string;
   tokenTransfers?: Array<{
     fromUserAccount?: string;
@@ -280,6 +287,14 @@ export class InsiderBot extends EventEmitter {
       const { fetchedTxs, swapTxs } = await this.fetchEarliestMintSwapTransactions(mint);
       this.mintScanCount = swapTxs.length;
       this.mintBuyers.clear();
+
+      if (swapTxs.length > 0 && attempt === 1) {
+        log.info('Analyzing earliest mint transactions', {
+          mint,
+          firstTxTimestamp: swapTxs[0].timestamp,
+          firstTxSignature: swapTxs[0].signature,
+        });
+      }
 
       for (let i = 0; i < swapTxs.length; i++) {
         const tx = swapTxs[i];
