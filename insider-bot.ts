@@ -621,6 +621,9 @@ export class InsiderBot extends EventEmitter {
     if (startSignature && this.config.insiderHeliusApiKey) {
       try {
         log.info('Performing insider catch-up...', { insiderWallet, startSignature });
+        // Process the start signature itself first to ensure we don't miss anything in it
+        await this.processInsiderWalletSignature(insiderWallet, positionMint, startSignature);
+        // Then catch up on everything after it
         await this.catchupInsiderWallet(insiderWallet, positionMint, startSignature);
         log.info('Insider catch-up complete');
       } catch (err) {
@@ -652,6 +655,21 @@ export class InsiderBot extends EventEmitter {
     afterSignature: string,
     isRealtimeUpdate = false
   ): Promise<void> {
+    // If it's a real-time update, just fetch the specific transaction context using Enhanced API (POST)
+    // as requested by the user, instead of the brittle after-signature address scan.
+    if (isRealtimeUpdate) {
+      log.info('Processing real-time transaction via Enhanced API', { signature: afterSignature });
+      const heliusTx = await this.fetchHeliusTransaction(afterSignature);
+      if (heliusTx) {
+        await this.processInsiderWalletSignature(insiderWallet, positionMint, afterSignature, heliusTx);
+      } else {
+        // Fallback to address polling if specific fetch fails
+        await this.pollAddressHistoryForMissing(insiderWallet, positionMint, afterSignature);
+      }
+      return;
+    }
+
+    // Historical catch-up still uses the sequential after-signature method if possible
     let currentAfter = afterSignature;
     let hasMore = true;
     let iterations = 0;
@@ -667,26 +685,23 @@ export class InsiderBot extends EventEmitter {
         const startIndex = recent.findIndex(tx => tx.signature === currentAfter);
         
         if (startIndex !== -1) {
-          // If found, process everything that happened after it (index 0 to startIndex-1)
-          // We reverse it to process chronologically
           txs = recent.slice(0, startIndex).reverse();
-          log.info(`Found ${txs.length} transactions after original signature in recent history`, { insiderWallet });
+          if (txs.length > 0) {
+            log.info(`Found ${txs.length} transactions after original signature in recent history`, { insiderWallet });
+          }
         } else {
           log.warn('Original signature not found in recent history; skipping catch-up', { insiderWallet });
           txs = [];
         }
-        hasMore = false; // Fallback only does one page
+        hasMore = false; 
       }
 
       if (txs.length === 0) {
-        if (isRealtimeUpdate && iterations === 1) {
-          await this.processInsiderWalletSignature(insiderWallet, positionMint, afterSignature);
-        }
         hasMore = false;
         break;
       }
 
-      log.info(`Processing batch of ${txs.length} transactions for ${isRealtimeUpdate ? 'real-time' : 'catch-up'}`, { insiderWallet });
+      log.info(`Processing batch of ${txs.length} transactions for catch-up`, { insiderWallet });
       
       for (const tx of txs) {
         if (!tx.signature) continue;
@@ -699,6 +714,18 @@ export class InsiderBot extends EventEmitter {
       }
 
       if (iterations > 20) break;
+    }
+  }
+
+  private async pollAddressHistoryForMissing(
+    address: string,
+    positionMint: string,
+    missingSignature: string
+  ): Promise<void> {
+    const recent = await this.fetchHeliusTransactionsRecent(address);
+    const tx = recent.find(t => t.signature === missingSignature);
+    if (tx) {
+      await this.processInsiderWalletSignature(address, positionMint, missingSignature, tx);
     }
   }
 
