@@ -681,17 +681,6 @@ export class InsiderBot extends EventEmitter {
       const buy = await this.findInsiderWalletBuy(signature, insiderWallet, historicalTx);
       if (!buy) return;
 
-      if (buy.amount < 100_000) {
-        log.info('Insider wallet made a dust buy; ignoring', {
-          insiderWallet,
-          positionMint,
-          insiderBuyMint: buy.mint,
-          amount: buy.amount,
-          signature,
-        });
-        return;
-      }
-
       log.warn('🚨🚨 [INSIDER EXIT SIGNAL] 🚨🚨', {
         insiderWallet,
         positionMint,
