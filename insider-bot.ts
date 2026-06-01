@@ -98,6 +98,14 @@ export interface InsiderBot {
   clearActivePosition(): void;
 }
 
+interface InsiderAnalysis {
+  mint: string;
+  isTransferIn: boolean; // Received tokens from non-pool
+  isBuy: boolean;        // Swap SOL/WSOL -> Token
+  isSell: boolean;       // Swap Token -> SOL/WSOL
+  isActivity: boolean;   // Any transaction involving the target mint
+}
+
 export class InsiderBot extends EventEmitter {
   private readonly config: ServiceConfig;
   private readonly connection: Connection;
@@ -762,65 +770,50 @@ export class InsiderBot extends EventEmitter {
     afterSignature: string,
     isRealtimeUpdate = false
   ): Promise<void> {
-    // If it's a real-time update, just fetch the specific transaction context using Enhanced API (POST)
-    // as requested by the user, instead of the brittle after-signature address scan.
+    // 1. Fetch transactions
+    let txs: HeliusEnhancedTransaction[] = [];
+    
     if (isRealtimeUpdate) {
       log.info('Processing real-time transaction via Enhanced API', { signature: afterSignature });
       const heliusTx = await this.fetchHeliusTransaction(afterSignature);
-      if (heliusTx) {
-        await this.processInsiderWalletSignature(insiderWallet, positionMint, afterSignature, heliusTx);
-      } else {
-        // Fallback to address polling if specific fetch fails
+      if (heliusTx) txs = [heliusTx];
+      else {
         await this.pollAddressHistoryForMissing(insiderWallet, positionMint, afterSignature);
+        return;
       }
-      return;
+    } else {
+      let currentAfter = afterSignature;
+      let iterations = 0;
+      let hasMore = true;
+
+      while (hasMore && iterations < 5) {
+        iterations++;
+        const batch = await this.fetchHeliusTransactionsAfter(insiderWallet, currentAfter);
+        if (batch === null || batch.length === 0) {
+          if (batch === null && iterations === 1) {
+            log.warn('Helius after-signature failed; falling back to recent transactions', { insiderWallet, afterSignature });
+            const recent = await this.fetchHeliusTransactionsRecent(insiderWallet);
+            const startIndex = recent.findIndex(tx => tx.signature === currentAfter);
+            if (startIndex !== -1) {
+              txs = recent.slice(0, startIndex).reverse();
+            }
+          }
+          hasMore = false;
+        } else {
+          txs.push(...batch);
+          currentAfter = batch[batch.length - 1].signature ?? currentAfter;
+          if (batch.length < 100) hasMore = false;
+        }
+      }
     }
 
-    // Historical catch-up still uses the sequential after-signature method if possible
-    let currentAfter = afterSignature;
-    let hasMore = true;
-    let iterations = 0;
-
-    while (hasMore) {
-      iterations += 1;
-      let txs = await this.fetchHeliusTransactionsAfter(insiderWallet, currentAfter);
-      
-      // Fallback: If after-signature is too old or missing from index, fetch most recent
-      if (txs === null) {
-        log.warn('Helius after-signature failed; falling back to recent transactions', { insiderWallet, afterSignature });
-        const recent = await this.fetchHeliusTransactionsRecent(insiderWallet);
-        const startIndex = recent.findIndex(tx => tx.signature === currentAfter);
-        
-        if (startIndex !== -1) {
-          txs = recent.slice(0, startIndex).reverse();
-          if (txs.length > 0) {
-            log.info(`Found ${txs.length} transactions after original signature in recent history`, { insiderWallet });
-          }
-        } else {
-          log.warn('Original signature not found in recent history; skipping catch-up', { insiderWallet });
-          txs = [];
-        }
-        hasMore = false; 
-      }
-
-      if (txs.length === 0) {
-        hasMore = false;
-        break;
-      }
-
-      log.info(`Processing batch of ${txs.length} transactions for catch-up`, { insiderWallet });
-      
+    // 2. Process transactions in order
+    if (txs.length > 0) {
+      log.info(`Processing ${txs.length} transactions for insider ${insiderWallet}`, { isRealtimeUpdate });
       for (const tx of txs) {
         if (!tx.signature) continue;
         await this.processInsiderWalletSignature(insiderWallet, positionMint, tx.signature, tx);
-        currentAfter = tx.signature;
       }
-
-      if (txs.length < 100) {
-        hasMore = false;
-      }
-
-      if (iterations > 20) break;
     }
   }
 
@@ -936,11 +929,11 @@ export class InsiderBot extends EventEmitter {
       const analysis = await this.analyzeInsiderTransaction(signature, insiderWallet, positionMint, historicalTx);
       if (!analysis) return;
 
-      const { type, mint } = analysis;
+      const { isTransferIn, isActivity, mint } = analysis;
       const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
       if (this.preBuySequence.state === 'WAITING_FOR_TRANSFER') {
-        if (type === 'transfer' && mint === positionMint) {
+        if (isTransferIn && mint === positionMint) {
           log.warn('Insider Entry Stage 1: Transfer In detected', { insiderWallet, positionMint, signature });
           this.preBuySequence.state = 'WAITING_FOR_TX_1';
           
@@ -949,26 +942,25 @@ export class InsiderBot extends EventEmitter {
             `Insider: <code>${html(insiderWallet)}</code>`,
             `Token: <code>${html(positionMint)}</code>`,
             '',
-            'Waiting for 2 subsequent transactions (Buy/Sell/Swap) before buying.',
+            'Waiting for 2 subsequent transactions (Any activity) before buying.',
           ].join('\n')).catch(() => undefined);
         }
       } else if (this.preBuySequence.state === 'WAITING_FOR_TX_1') {
-        if ((type === 'buy' || type === 'sell' || type === 'swap') && mint === positionMint) {
-          log.warn('Insider Entry Stage 2: Tx #1 detected', { insiderWallet, positionMint, type, signature });
+        if (isActivity && mint === positionMint) {
+          log.warn('Insider Entry Stage 2: Tx #1 detected', { insiderWallet, positionMint, signature });
           this.preBuySequence.state = 'WAITING_FOR_TX_2';
 
           this.telegramBot?.sendDefault([
             '<b>🔄 Insider Sequence: [2/3] Tx #1 Detected</b>',
             `Insider: <code>${html(insiderWallet)}</code>`,
             `Token: <code>${html(positionMint)}</code>`,
-            `Action: <b>${type.toUpperCase()}</b>`,
             '',
             'Waiting for 1 more transaction before buying.',
           ].join('\n')).catch(() => undefined);
         }
       } else if (this.preBuySequence.state === 'WAITING_FOR_TX_2') {
-        if ((type === 'buy' || type === 'sell' || type === 'swap') && mint === positionMint) {
-          log.warn('Insider Entry Stage 3: Tx #2 detected - TRIGGERING BUY', { insiderWallet, positionMint, type, signature });
+        if (isActivity && mint === positionMint) {
+          log.warn('Insider Entry Stage 3: Tx #2 detected - TRIGGERING BUY', { insiderWallet, positionMint, signature });
           
           const seq = this.preBuySequence;
           this.preBuySequence = null;
@@ -977,7 +969,6 @@ export class InsiderBot extends EventEmitter {
             '<b>🚀 Insider Sequence: [3/3] Tx #2 Detected - BUYING</b>',
             `Insider: <code>${html(insiderWallet)}</code>`,
             `Token: <code>${html(positionMint)}</code>`,
-            `Action: <b>${type.toUpperCase()}</b>`,
             `Signature: <code>${html(signature)}</code>`,
           ].join('\n')).catch(() => undefined);
 
@@ -998,70 +989,109 @@ export class InsiderBot extends EventEmitter {
     insiderWallet: string,
     targetMint: string,
     historicalTx?: HeliusEnhancedTransaction
-  ): Promise<{ type: 'buy' | 'sell' | 'swap' | 'transfer' | 'other'; mint?: string } | null> {
+  ): Promise<InsiderAnalysis | null> {
     if (this.config.insiderHeliusApiKey) {
       const heliusTx = historicalTx || await this.fetchHeliusTransaction(signature);
       if (heliusTx) {
         const swaps = this.getHeliusPoolSwaps(heliusTx);
-        
-        // 1. Check for Buy (Exit Monitoring or Entry Confirmation)
-        const buy = swaps.find(s => s.direction === 'buy' && s.wallet === insiderWallet);
-        if (buy) return { type: 'buy', mint: buy.mint };
-        
-        // 2. Check for Sell (Entry Confirmation)
-        const sell = swaps.find(s => s.direction === 'sell' && s.wallet === insiderWallet && s.mint === targetMint);
-        if (sell) return { type: 'sell', mint: sell.mint };
+        const result: InsiderAnalysis = {
+          mint: targetMint,
+          isTransferIn: false,
+          isBuy: false,
+          isSell: false,
+          isActivity: false,
+        };
 
-        // 3. Check for Swap (Unknown Direction but involves Target Mint)
-        const anySwap = swaps.find(s => s.wallet === insiderWallet && s.mint === targetMint);
-        if (anySwap) return { type: 'swap', mint: anySwap.mint };
+        log.debug('Analyzing transaction', {
+          signature,
+          type: heliusTx.type,
+          swapsFound: swaps.length,
+          insiderWallet,
+          targetMint
+        });
 
-        // 4. Check for Transfer In (Stage 1)
+        // 1. Check Swaps
+        for (const swap of swaps) {
+          if (swap.wallet === insiderWallet && swap.mint === targetMint) {
+            result.isActivity = true;
+            if (swap.direction === 'buy') result.isBuy = true;
+            if (swap.direction === 'sell') result.isSell = true;
+          }
+        }
+
+        // 2. Check Transfers
         for (const transfer of heliusTx.tokenTransfers ?? []) {
-          if (transfer.toUserAccount === insiderWallet && transfer.mint === targetMint) {
-            // Check if it's NOT a buy (which we handled above)
-            // A simple transfer in from another wallet
-            const fromIsPool = this.isKnownPoolAuthority(transfer.fromUserAccount ?? '');
-            if (!fromIsPool) {
-              return { type: 'transfer', mint: transfer.mint };
+          if (transfer.mint === targetMint) {
+            const isToInsider = transfer.toUserAccount === insiderWallet;
+            const isFromInsider = transfer.fromUserAccount === insiderWallet;
+
+            if (isToInsider || isFromInsider) {
+              result.isActivity = true;
+            }
+
+            if (isToInsider) {
+              const fromIsPool = this.isKnownPoolAuthority(transfer.fromUserAccount ?? '');
+              if (!fromIsPool) {
+                result.isTransferIn = true;
+              }
             }
           }
         }
 
-        // 5. General Activity Fallback: If Helius says it's a swap and targetMint is involved
-        if (heliusTx.type === 'SWAP' || heliusTx.type === 'CLOSE_ACCOUNT' || heliusTx.type === 'TRANSFER') {
-          const involvesTarget = (heliusTx.tokenTransfers ?? []).some(t => t.mint === targetMint && (t.fromUserAccount === insiderWallet || t.toUserAccount === insiderWallet));
-          if (involvesTarget) return { type: 'swap', mint: targetMint };
+        // 3. Fallback for activity
+        if (!result.isActivity) {
+          const types = ['SWAP', 'CLOSE_ACCOUNT', 'TRANSFER'];
+          if (heliusTx.type && types.includes(heliusTx.type)) {
+            const involvesTarget = (heliusTx.tokenTransfers ?? []).some(t => 
+              t.mint === targetMint && (t.fromUserAccount === insiderWallet || t.toUserAccount === insiderWallet)
+            );
+            if (involvesTarget) {
+              result.isActivity = true;
+            }
+          }
+        }
+
+        if (result.isActivity || result.isTransferIn) {
+          log.info('Insider transaction analyzed', { 
+            signature, 
+            isTransferIn: result.isTransferIn, 
+            isBuy: result.isBuy, 
+            isSell: result.isSell, 
+            isActivity: result.isActivity 
+          });
+          return result;
         }
       }
     }
 
-    // Standard RPC fallback (simplified for now)
+    // Standard RPC fallback
     if (historicalTx) return null; 
 
     const tx = await this.fetchParsedTransaction(signature);
     if (!tx) return null;
 
     const deltas = this.getTokenDeltas(tx.meta?.preTokenBalances ?? [], tx.meta?.postTokenBalances ?? []);
-    
-    // Check for buy (any mint)
-    const b = deltas.find(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
-    if (b) return { type: 'buy', mint: b.mint };
+    const result: InsiderAnalysis = {
+      mint: targetMint,
+      isTransferIn: false,
+      isBuy: false,
+      isSell: false,
+      isActivity: false,
+    };
 
-    // Check for target mint activity
     const targetDelta = deltas.find(d => d.owner === insiderWallet && d.mint === targetMint);
     if (targetDelta) {
-      if (targetDelta.rawDiff < 0n) {
-        return { type: 'swap', mint: targetMint };
-      }
-      if (targetDelta.rawDiff > 0n) {
-        // Check if it's a transfer or a buy (RPC doesn't easily tell us if it's a swap without pool analysis)
-        // For simplicity, if we didn't find a "buy" above, call it a transfer
-        return { type: 'transfer', mint: targetMint };
-      }
+      result.isActivity = true;
+      if (targetDelta.rawDiff > 0n) result.isTransferIn = true; // RPC fallback treats all incoming as transfer
     }
 
-    return { type: 'other' };
+    const otherBuy = deltas.find(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
+    if (otherBuy) {
+      result.isBuy = true;
+      result.mint = otherBuy.mint;
+    }
+
+    return (result.isActivity || result.isTransferIn) ? result : null;
   }
 
   private async findInsiderWalletBuy(
