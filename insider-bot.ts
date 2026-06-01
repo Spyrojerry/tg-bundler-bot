@@ -247,10 +247,7 @@ export class InsiderBot extends EventEmitter {
 
     while (this.mintScanActive) {
       attempt += 1;
-      const txs = await this.fetchEarliestMintTransactions(mint);
-      const swapTxs = txs
-        .filter((tx) => this.getHeliusPoolSwaps(tx, mint).length > 0)
-        .slice(0, 20);
+      const { fetchedTxs, swapTxs } = await this.fetchEarliestMintSwapTransactions(mint);
       this.mintScanCount = swapTxs.length;
       this.mintBuyers.clear();
 
@@ -271,7 +268,7 @@ export class InsiderBot extends EventEmitter {
           mint,
           signature,
           scannedSwapTxs: this.mintScanCount,
-          fetchedTxs: txs.length,
+          fetchedTxs,
         });
         await this.stopMintScanOnly();
         this.emit('buyTrigger', {
@@ -289,7 +286,7 @@ export class InsiderBot extends EventEmitter {
           followedWallet,
           mint,
           scannedSwapTxs: this.mintScanCount,
-          fetchedTxs: txs.length,
+          fetchedTxs,
         });
         await this.stopMintScanOnly();
         return;
@@ -299,15 +296,47 @@ export class InsiderBot extends EventEmitter {
         followedWallet,
         mint,
         receivedSwapTxs: swapTxs.length,
-        fetchedTxs: txs.length,
+        fetchedTxs,
         attempt,
       });
       await new Promise((resolve) => setTimeout(resolve, Math.min(1_000 + attempt * 500, 5_000)));
     }
   }
 
-  private async fetchEarliestMintTransactions(mint: string): Promise<HeliusEnhancedTransaction[]> {
-    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}&limit=100`;
+  private async fetchEarliestMintSwapTransactions(
+    mint: string
+  ): Promise<{ fetchedTxs: number; swapTxs: HeliusEnhancedTransaction[] }> {
+    const swapTxs: HeliusEnhancedTransaction[] = [];
+    let fetchedTxs = 0;
+    let afterSignature: string | null = null;
+
+    while (swapTxs.length < 20 && this.mintScanActive) {
+      const batch = await this.fetchEarliestMintTransactionPage(mint, afterSignature);
+      fetchedTxs += batch.length;
+      if (batch.length === 0) break;
+
+      for (const tx of batch) {
+        if (this.getHeliusPoolSwaps(tx, mint).length === 0) continue;
+        swapTxs.push(tx);
+        if (swapTxs.length >= 20) break;
+      }
+
+      afterSignature = batch[batch.length - 1]?.signature ?? null;
+      if (batch.length < 50 || !afterSignature) break;
+    }
+
+    return {
+      fetchedTxs,
+      swapTxs: swapTxs.slice(0, 20),
+    };
+  }
+
+  private async fetchEarliestMintTransactionPage(
+    mint: string,
+    afterSignature: string | null
+  ): Promise<HeliusEnhancedTransaction[]> {
+    const afterParam = afterSignature ? `&after-signature=${afterSignature}` : '';
+    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}${afterParam}&limit=50`;
 
     for (let attempt = 1; attempt <= 5; attempt++) {
       const response = await fetch(url);
