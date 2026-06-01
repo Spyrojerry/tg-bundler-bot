@@ -378,7 +378,7 @@ export class InsiderBot extends EventEmitter {
           scannedSwapTxs: this.mintScanCount,
           fetchedTxs,
         });
-        await this.stopMintScanOnly();
+        await this.resetForNewToken();
         return;
       }
 
@@ -717,7 +717,7 @@ export class InsiderBot extends EventEmitter {
         mint,
         scannedTxs: this.mintScanCount,
       });
-      await this.stopMintScanOnly();
+      await this.resetForNewToken();
     }
   }
 
