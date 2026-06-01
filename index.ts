@@ -414,14 +414,6 @@ async function main(): Promise<void> {
     }
 
     log.warn('[INSIDER BUY TRIGGER]', trigger);
-    telegramBot?.sendDefault([
-      '<b>🚀 Insider Entry Sequence Completed</b>',
-      `Insider: <code>${html(trigger.insiderWallet)}</code>`,
-      `Token: <code>${html(trigger.mint)}</code>`,
-      `Buying: <b>${trigger.buySol} SOL</b>`,
-      '',
-      'Submitting swap...',
-    ].join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
 
     void (async () => {
       try {
@@ -433,10 +425,12 @@ async function main(): Promise<void> {
             minMarketCapUsd: INSIDER_MIN_MARKET_CAP_USD,
           });
           await telegramBot?.sendDefault([
-            '<b>Insider Buy Skipped</b>',
+            '<b>⚠️ Insider Buy Skipped</b>',
             `Token: <code>${html(trigger.mint)}</code>`,
             `Market cap: <b>$${marketCapUsd.toLocaleString()}</b>`,
-            `Minimum: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
+            `Minimum required: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
+            '',
+            'Reason: Market cap is too low to enter.',
           ].join('\n'));
           return;
         }
@@ -446,6 +440,16 @@ async function main(): Promise<void> {
             mint: trigger.mint,
           });
         }
+
+        telegramBot?.sendDefault([
+          '<b>🚀 Insider Entry Triggered</b>',
+          `Insider: <code>${html(trigger.insiderWallet)}</code>`,
+          `Token: <code>${html(trigger.mint)}</code>`,
+          `Buying: <b>${trigger.buySol} SOL</b>`,
+          `Market Cap: <b>$${marketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
+          '',
+          'Submitting swap...',
+        ].join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
 
         const result = await gmgnClient.buyTokenWithSol(
           config.tradingWalletAddress!,
@@ -461,13 +465,14 @@ async function main(): Promise<void> {
         const initialMarketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(trigger.mint);
 
         await telegramBot?.sendDefault([
-          '<b>Insider Buy Submitted</b>',
+          '<b>✅ Insider Buy Completed</b>',
           `Token: <code>${html(trigger.mint)}</code>`,
           `Status: <b>${html(result.status)}</b>`,
           `Market Cap: <b>$${initialMarketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
           result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
           '',
-          'Watching insider wallet for its next buy. When it buys again, I will sell this position.',
+          '<b>Exit Strategy Active</b>',
+          'Watching insider wallet for its NEXT buy transaction. I will sell this position immediately when detected.',
         ].filter(Boolean).join('\n'), {
           replyMarkup: {
             inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${trigger.mint}:i` }]],
@@ -476,7 +481,7 @@ async function main(): Promise<void> {
       } catch (err) {
         log.error('Insider buy failed', err);
         await telegramBot?.sendDefault([
-          '<b>Insider Buy Failed</b>',
+          '<b>❌ Insider Buy Failed</b>',
           `Token: <code>${html(trigger.mint)}</code>`,
           `Error: ${html(err instanceof Error ? err.message : String(err))}`,
         ].join('\n'));
@@ -530,12 +535,16 @@ async function main(): Promise<void> {
     });
 
     telegramBot?.sendDefault([
-      '<b>Insider Sell Triggered</b>',
+      '<b>🚨 Insider Sell Triggered</b>',
       `Position token: <code>${html(trigger.positionMint)}</code>`,
       `Insider wallet: <code>${html(trigger.insiderWallet)}</code>`,
       `Insider bought: <code>${html(trigger.insiderBuyMint)}</code>`,
       `Action: submit sell for <b>${config.sellPercent}%</b>.`,
-    ].join('\n')).catch((err) => log.warn('Telegram insider sell alert failed', err));
+    ].join('\n'), {
+      replyMarkup: {
+        inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${trigger.positionMint}:i` }]],
+      },
+    }).catch((err) => log.warn('Telegram insider sell alert failed', err));
 
     void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
   });
@@ -693,6 +702,14 @@ async function main(): Promise<void> {
           executing: true,
         });
 
+        // Clear active position immediately on sell trigger to prevent checker from firing again
+        if (context === 'insider') {
+          insiderBot.clearActivePosition();
+        } else if (context === 'bundler') {
+          earlyBundlerOrchestrator.clearActivePosition();
+          pendingTradingBuys.delete(mint);
+        }
+
         telegramBot?.sendDefault([
           '<b>🚨 Market Cap Sell Triggered</b>',
           `Token: <code>${html(mint)}</code>`,
@@ -701,16 +718,7 @@ async function main(): Promise<void> {
           `Action: submit sell for <b>${config.sellPercent}%</b>.`,
         ].join('\n')).catch((err) => log.warn('Telegram mcap sell alert failed', err));
 
-        void (async () => {
-          await executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
-          // After sell finishes (or fails but we're done trying), clear the positions to stop repeated triggers
-          if (context === 'insider') {
-            insiderBot.clearActivePosition();
-          } else if (context === 'bundler') {
-            earlyBundlerOrchestrator.clearActivePosition();
-            pendingTradingBuys.delete(mint);
-          }
-        })();
+        void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
       }
     } catch (err) {
       log.error(`Failed to check market cap for ${mint}`, err);

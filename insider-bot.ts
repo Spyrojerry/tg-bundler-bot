@@ -36,6 +36,8 @@ interface TokenDelta {
 interface HeliusEnhancedTransaction {
   signature?: string;
   timestamp?: number;
+  type?: string;
+  description?: string;
   feePayer?: string;
   tokenTransfers?: Array<{
     fromUserAccount?: string;
@@ -48,6 +50,14 @@ interface HeliusEnhancedTransaction {
     toUserAccount?: string;
     amount?: number;
   }>;
+  events?: {
+    swap?: {
+      nativeInput?: { account: string; amount: string };
+      nativeOutput?: { account: string; amount: string };
+      tokenInputs?: Array<{ userCashFlowAccount: string; amount: string; mint: string }>;
+      tokenOutputs?: Array<{ userCashFlowAccount: string; amount: string; mint: string }>;
+    };
+  };
 }
 
 type HeliusPoolSwapDirection = 'buy' | 'sell';
@@ -450,30 +460,127 @@ export class InsiderBot extends EventEmitter {
   private getHeliusPoolSwaps(tx: HeliusEnhancedTransaction, onlyMint?: string): HeliusPoolSwap[] {
     const swaps: HeliusPoolSwap[] = [];
 
-    for (const transfer of tx.tokenTransfers ?? []) {
+    // 1. Try to use Helius native swap events first (most accurate)
+    if (tx.events?.swap) {
+      const e = tx.events.swap;
+      // Handle token outputs (Buy)
+      for (const out of e.tokenOutputs ?? []) {
+        if (onlyMint && out.mint !== onlyMint) continue;
+        swaps.push({
+          wallet: out.userCashFlowAccount,
+          direction: 'buy',
+          mint: out.mint,
+          amount: parseFloat(out.amount),
+        });
+      }
+      // Handle token inputs (Sell)
+      for (const input of e.tokenInputs ?? []) {
+        if (onlyMint && input.mint !== onlyMint) continue;
+        swaps.push({
+          wallet: input.userCashFlowAccount,
+          direction: 'sell',
+          mint: input.mint,
+          amount: parseFloat(input.amount),
+        });
+      }
+      if (swaps.length > 0) return swaps;
+    }
+
+    // 2. Value Exchange Detection (Implicit Swaps)
+    // If Helius missed the swap event, look for tokens moving one way and SOL/WSOL the other way
+    // involving the same user account.
+    const tokenTransfers = tx.tokenTransfers ?? [];
+    const nativeTransfers = tx.nativeTransfers ?? [];
+
+    // Group transfers by user account
+    const userActivity = new Map<string, {
+      tokenIn: Array<{ mint: string, amount: number }>,
+      tokenOut: Array<{ mint: string, amount: number }>,
+      solIn: number,
+      solOut: number
+    }>();
+
+    const getOrCreate = (wallet: string) => {
+      if (!userActivity.has(wallet)) {
+        userActivity.set(wallet, { tokenIn: [], tokenOut: [], solIn: 0, solOut: 0 });
+      }
+      return userActivity.get(wallet)!;
+    };
+
+    for (const t of tokenTransfers) {
+      if (!t.mint) continue;
+      if (t.mint === SOL_MINT) {
+        if (t.toUserAccount) getOrCreate(t.toUserAccount).solIn += t.tokenAmount ?? 0;
+        if (t.fromUserAccount) getOrCreate(t.fromUserAccount).solOut += t.tokenAmount ?? 0;
+      } else {
+        if (t.toUserAccount) getOrCreate(t.toUserAccount).tokenIn.push({ mint: t.mint, amount: t.tokenAmount ?? 0 });
+        if (t.fromUserAccount) getOrCreate(t.fromUserAccount).tokenOut.push({ mint: t.mint, amount: t.tokenAmount ?? 0 });
+      }
+    }
+
+    for (const n of nativeTransfers) {
+      const solAmount = (n.amount ?? 0) / 1e9;
+      if (n.toUserAccount) getOrCreate(n.toUserAccount).solIn += solAmount;
+      if (n.fromUserAccount) getOrCreate(n.fromUserAccount).solOut += solAmount;
+    }
+
+    for (const [wallet, activity] of userActivity.entries()) {
+      if (this.isKnownPoolAuthority(wallet)) continue;
+
+      // Buy: SOL Out, Token In
+      if ((activity.solOut > 0 || activity.solIn < 0) && activity.tokenIn.length > 0) {
+        for (const tin of activity.tokenIn) {
+          if (onlyMint && tin.mint !== onlyMint) continue;
+          swaps.push({ wallet, direction: 'buy', mint: tin.mint, amount: tin.amount });
+        }
+      }
+      // Sell: Token Out, SOL In
+      if (activity.tokenOut.length > 0 && (activity.solIn > 0 || activity.solOut < 0)) {
+        for (const tout of activity.tokenOut) {
+          if (onlyMint && tout.mint !== onlyMint) continue;
+          swaps.push({ wallet, direction: 'sell', mint: tout.mint, amount: tout.amount });
+        }
+      }
+    }
+
+    if (swaps.length > 0) return swaps;
+
+    // 3. Fallback to transaction type and description + Known Pool Authorities
+    const isHeliusSwap = tx.type === 'SWAP' || (tx.description && tx.description.toLowerCase().includes('swapped'));
+
+    for (const transfer of tokenTransfers) {
       if (!transfer.mint || transfer.mint === SOL_MINT) continue;
       if (onlyMint && transfer.mint !== onlyMint) continue;
 
       const fromIsPool = this.isKnownPoolAuthority(transfer.fromUserAccount ?? '');
       const toIsPool = this.isKnownPoolAuthority(transfer.toUserAccount ?? '');
-      if (fromIsPool === toIsPool) continue;
+      
+      let wallet: string | undefined;
+      let direction: HeliusPoolSwapDirection | undefined;
 
-      const wallet = fromIsPool ? transfer.toUserAccount : transfer.fromUserAccount;
-      if (!wallet || this.isKnownPoolAuthority(wallet)) continue;
-
-      const tokenDirection: HeliusPoolSwapDirection = fromIsPool ? 'buy' : 'sell';
-      const solDirection = this.getHeliusSolDirection(tx, wallet);
-
-      if (solDirection && solDirection !== tokenDirection) {
-        continue;
+      if (fromIsPool !== toIsPool) {
+        wallet = fromIsPool ? transfer.toUserAccount : transfer.fromUserAccount;
+        direction = fromIsPool ? 'buy' : 'sell';
+      } else if (isHeliusSwap) {
+        // If it's a swap but we don't know the pool, the fee payer or signer is usually the user
+        // and the other side is the pool.
+        if (transfer.fromUserAccount === tx.feePayer) {
+          wallet = transfer.fromUserAccount;
+          direction = 'sell';
+        } else if (transfer.toUserAccount === tx.feePayer) {
+          wallet = transfer.toUserAccount;
+          direction = 'buy';
+        }
       }
 
-      swaps.push({
-        wallet,
-        direction: tokenDirection,
-        mint: transfer.mint,
-        amount: transfer.tokenAmount ?? 0,
-      });
+      if (wallet && direction && !this.isKnownPoolAuthority(wallet)) {
+        swaps.push({
+          wallet,
+          direction,
+          mint: transfer.mint,
+          amount: transfer.tokenAmount ?? 0,
+        });
+      }
     }
 
     return swaps;
@@ -834,37 +941,41 @@ export class InsiderBot extends EventEmitter {
 
       if (this.preBuySequence.state === 'WAITING_FOR_TRANSFER') {
         if (type === 'transfer' && mint === positionMint) {
-          log.info('Insider entry sequence: Transfer detected. Moving to Tx #1 watch.', { signature, mint });
+          log.warn('Insider Entry Stage 1: Transfer In detected', { insiderWallet, positionMint, signature });
           this.preBuySequence.state = 'WAITING_FOR_TX_1';
           
           this.telegramBot?.sendDefault([
-            '<b>🔄 Insider Sequence: Transfer Detected</b>',
-            `Token: <code>${html(positionMint)}</code>`,
+            '<b>🔄 Insider Sequence: [1/3] Transfer In Detected</b>',
             `Insider: <code>${html(insiderWallet)}</code>`,
-            'Waiting for 2 subsequent transactions before buying.',
+            `Token: <code>${html(positionMint)}</code>`,
+            '',
+            'Waiting for 2 subsequent transactions (Buy/Sell/Swap) before buying.',
           ].join('\n')).catch(() => undefined);
         }
       } else if (this.preBuySequence.state === 'WAITING_FOR_TX_1') {
-        if ((type === 'buy' || type === 'sell') && mint === positionMint) {
-          log.info('Insider entry sequence: Tx #1 detected. Moving to Tx #2 watch.', { signature, mint, type });
+        if ((type === 'buy' || type === 'sell' || type === 'swap') && mint === positionMint) {
+          log.warn('Insider Entry Stage 2: Tx #1 detected', { insiderWallet, positionMint, type, signature });
           this.preBuySequence.state = 'WAITING_FOR_TX_2';
 
           this.telegramBot?.sendDefault([
-            '<b>🔄 Insider Sequence: Tx #1 Detected</b>',
+            '<b>🔄 Insider Sequence: [2/3] Tx #1 Detected</b>',
+            `Insider: <code>${html(insiderWallet)}</code>`,
             `Token: <code>${html(positionMint)}</code>`,
             `Action: <b>${type.toUpperCase()}</b>`,
+            '',
             'Waiting for 1 more transaction before buying.',
           ].join('\n')).catch(() => undefined);
         }
       } else if (this.preBuySequence.state === 'WAITING_FOR_TX_2') {
-        if ((type === 'buy' || type === 'sell') && mint === positionMint) {
-          log.warn('Insider entry sequence: Tx #2 detected. TRIGGERING BUY.', { signature, mint, type });
+        if ((type === 'buy' || type === 'sell' || type === 'swap') && mint === positionMint) {
+          log.warn('Insider Entry Stage 3: Tx #2 detected - TRIGGERING BUY', { insiderWallet, positionMint, type, signature });
           
           const seq = this.preBuySequence;
           this.preBuySequence = null;
 
           this.telegramBot?.sendDefault([
-            '<b>🚀 Insider Sequence: Tx #2 Detected - BUYING</b>',
+            '<b>🚀 Insider Sequence: [3/3] Tx #2 Detected - BUYING</b>',
+            `Insider: <code>${html(insiderWallet)}</code>`,
             `Token: <code>${html(positionMint)}</code>`,
             `Action: <b>${type.toUpperCase()}</b>`,
             `Signature: <code>${html(signature)}</code>`,
@@ -887,26 +998,45 @@ export class InsiderBot extends EventEmitter {
     insiderWallet: string,
     targetMint: string,
     historicalTx?: HeliusEnhancedTransaction
-  ): Promise<{ type: 'buy' | 'sell' | 'transfer' | 'other'; mint?: string } | null> {
+  ): Promise<{ type: 'buy' | 'sell' | 'swap' | 'transfer' | 'other'; mint?: string } | null> {
     if (this.config.insiderHeliusApiKey) {
       const heliusTx = historicalTx || await this.fetchHeliusTransaction(signature);
       if (heliusTx) {
         const swaps = this.getHeliusPoolSwaps(heliusTx);
+        
+        // 1. Check for Buy (Exit Monitoring or Entry Confirmation)
         const buy = swaps.find(s => s.direction === 'buy' && s.wallet === insiderWallet);
         if (buy) return { type: 'buy', mint: buy.mint };
         
+        // 2. Check for Sell (Entry Confirmation)
         const sell = swaps.find(s => s.direction === 'sell' && s.wallet === insiderWallet && s.mint === targetMint);
         if (sell) return { type: 'sell', mint: sell.mint };
 
+        // 3. Check for Swap (Unknown Direction but involves Target Mint)
+        const anySwap = swaps.find(s => s.wallet === insiderWallet && s.mint === targetMint);
+        if (anySwap) return { type: 'swap', mint: anySwap.mint };
+
+        // 4. Check for Transfer In (Stage 1)
         for (const transfer of heliusTx.tokenTransfers ?? []) {
-          if (transfer.fromUserAccount !== insiderWallet && transfer.toUserAccount === insiderWallet && transfer.mint === targetMint) {
-            return { type: 'transfer', mint: transfer.mint };
+          if (transfer.toUserAccount === insiderWallet && transfer.mint === targetMint) {
+            // Check if it's NOT a buy (which we handled above)
+            // A simple transfer in from another wallet
+            const fromIsPool = this.isKnownPoolAuthority(transfer.fromUserAccount ?? '');
+            if (!fromIsPool) {
+              return { type: 'transfer', mint: transfer.mint };
+            }
           }
+        }
+
+        // 5. General Activity Fallback: If Helius says it's a swap and targetMint is involved
+        if (heliusTx.type === 'SWAP' || heliusTx.type === 'CLOSE_ACCOUNT' || heliusTx.type === 'TRANSFER') {
+          const involvesTarget = (heliusTx.tokenTransfers ?? []).some(t => t.mint === targetMint && (t.fromUserAccount === insiderWallet || t.toUserAccount === insiderWallet));
+          if (involvesTarget) return { type: 'swap', mint: targetMint };
         }
       }
     }
 
-    // Standard RPC fallback only if not catch-up (historicalTx)
+    // Standard RPC fallback (simplified for now)
     if (historicalTx) return null; 
 
     const tx = await this.fetchParsedTransaction(signature);
@@ -914,22 +1044,19 @@ export class InsiderBot extends EventEmitter {
 
     const deltas = this.getTokenDeltas(tx.meta?.preTokenBalances ?? [], tx.meta?.postTokenBalances ?? []);
     
-    // Check for buy
-    const isBuy = deltas.some(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
-    if (isBuy) {
-      const b = deltas.find(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
-      return { type: 'buy', mint: b?.mint };
-    }
+    // Check for buy (any mint)
+    const b = deltas.find(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
+    if (b) return { type: 'buy', mint: b.mint };
 
-    // Check for sell vs transfer
+    // Check for target mint activity
     const targetDelta = deltas.find(d => d.owner === insiderWallet && d.mint === targetMint);
     if (targetDelta) {
       if (targetDelta.rawDiff < 0n) {
-        const poolReceived = deltas.some(d => this.isKnownPoolAuthority(d.owner) && d.rawDiff > 0n && d.mint === targetMint);
-        return { type: poolReceived ? 'sell' : 'other', mint: targetMint };
+        return { type: 'swap', mint: targetMint };
       }
       if (targetDelta.rawDiff > 0n) {
-        // Transfer in
+        // Check if it's a transfer or a buy (RPC doesn't easily tell us if it's a swap without pool analysis)
+        // For simplicity, if we didn't find a "buy" above, call it a transfer
         return { type: 'transfer', mint: targetMint };
       }
     }
