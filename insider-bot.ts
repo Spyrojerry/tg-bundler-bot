@@ -128,14 +128,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   clearActivePosition(): void {
-    this.activePosition = null;
-    this.preBuySequence = null;
-    if (this.insiderSubId !== null) {
-      const subId = this.insiderSubId;
-      this.insiderSubId = null;
-      this.connection.removeOnLogsListener(subId).catch(() => undefined);
-    }
-    log.info('Insider active position cleared');
+    void this.resetForNewToken();
   }
 
   setBuySol(value: number): void {
@@ -572,6 +565,31 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  private async resetForNewToken(): Promise<void> {
+    log.info('Resetting InsiderBot for new token detection');
+    
+    // 1. Stop any active mint scanning
+    await this.stopMintScanOnly();
+
+    // 2. Stop any active insider wallet monitoring
+    if (this.insiderSubId !== null) {
+      await this.connection.removeOnLogsListener(this.insiderSubId).catch(() => undefined);
+      this.insiderSubId = null;
+    }
+
+    // 3. Clear all transient state except the followed wallet
+    this.firstBuyHandled = false;
+    this.mintScanCount = 0;
+    this.mintBuyers.clear();
+    this.activePosition = null;
+    this.preBuySequence = null;
+    this.processedSignatures.clear();
+
+    log.info('InsiderBot reset complete; waiting for next buy from followed wallet', {
+      followedWallet: this.followedWallet
+    });
+  }
+
   private async startInsiderWalletWatch(
     insiderWallet: string,
     positionMint: string,
@@ -600,10 +618,9 @@ export class InsiderBot extends EventEmitter {
       new PublicKey(insiderWallet),
       (logInfo) => {
         if (logInfo.err) return;
-        this.processInsiderWalletSignature(insiderWallet, positionMint, logInfo.signature).catch((err) => {
-          log.error(`Failed to process insider wallet signature ${logInfo.signature}`, err);
-          this.emit('error', err instanceof Error ? err : new Error(String(err)));
-        });
+        
+        // Use batch fetch for real-time updates as well to ensure we don't miss txs in the same block
+        void this.catchupInsiderWallet(insiderWallet, positionMint, logInfo.signature, true);
       },
       'processed'
     );
@@ -617,23 +634,28 @@ export class InsiderBot extends EventEmitter {
   private async catchupInsiderWallet(
     insiderWallet: string,
     positionMint: string,
-    afterSignature: string
+    afterSignature: string,
+    isRealtimeUpdate = false
   ): Promise<void> {
     let currentAfter = afterSignature;
     let hasMore = true;
+    let iterations = 0;
 
     while (hasMore) {
+      iterations += 1;
       const txs = await this.fetchHeliusTransactionsAfter(insiderWallet, currentAfter);
+      
       if (txs.length === 0) {
+        // If this is a real-time update and we found nothing "after" the notification signature,
+        // we should at least process the notification signature itself.
+        if (isRealtimeUpdate && iterations === 1) {
+          await this.processInsiderWalletSignature(insiderWallet, positionMint, afterSignature);
+        }
         hasMore = false;
         break;
       }
 
-      log.info(`Processing ${txs.length} historical transactions for catch-up`, { insiderWallet });
-      
-      // Helius returns txs in chronological order when using after-signature? 
-      // Actually, standard Helius /transactions endpoint returns newest first.
-      // But user mentioned: sort-order=asc
+      log.info(`Processing batch of ${txs.length} transactions for ${isRealtimeUpdate ? 'real-time' : 'catch-up'}`, { insiderWallet });
       
       for (const tx of txs) {
         if (!tx.signature) continue;
@@ -641,10 +663,13 @@ export class InsiderBot extends EventEmitter {
         currentAfter = tx.signature;
       }
 
-      // If we got less than 100, we're likely caught up
+      // If we got less than 100, we're likely caught up (Helius limit is usually 100)
       if (txs.length < 100) {
         hasMore = false;
       }
+
+      // Safety break for infinite loops
+      if (iterations > 20) break;
     }
   }
 
