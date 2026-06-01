@@ -42,6 +42,15 @@ interface HeliusEnhancedTransaction {
   }>;
 }
 
+type HeliusPoolSwapDirection = 'buy' | 'sell';
+
+interface HeliusPoolSwap {
+  wallet: string;
+  direction: HeliusPoolSwapDirection;
+  mint: string;
+  amount: number;
+}
+
 export interface InsiderBuyTrigger {
   followedWallet: string;
   insiderWallet: string;
@@ -242,8 +251,15 @@ export class InsiderBot extends EventEmitter {
       this.mintScanCount = Math.min(txs.length, 20);
       this.mintBuyers.clear();
 
-      for (const tx of txs.slice(0, 20)) {
-        const insiderWallet = this.findEarlyHeliusInsider(tx, followedWallet, mint);
+      const earliestTxs = txs.slice(0, 20);
+      for (let i = 0; i < earliestTxs.length; i++) {
+        const tx = earliestTxs[i];
+        const insiderWallet = this.findEarlyHeliusInsider(
+          tx,
+          earliestTxs.slice(0, i),
+          followedWallet,
+          mint
+        );
         if (!insiderWallet) continue;
 
         const signature = tx.signature ?? '';
@@ -308,20 +324,15 @@ export class InsiderBot extends EventEmitter {
 
   private findEarlyHeliusInsider(
     tx: HeliusEnhancedTransaction,
+    priorTxs: HeliusEnhancedTransaction[],
     followedWallet: string,
     mint: string
   ): string | null {
-    for (const buyer of this.getHeliusMintBuyers(tx, mint)) {
-      if (buyer !== followedWallet && !this.isKnownPoolAuthority(buyer)) {
-        this.mintBuyers.add(buyer);
-      }
-    }
-
     for (const seller of this.getHeliusMintSellers(tx, mint)) {
       if (
         seller !== followedWallet
         && !this.isKnownPoolAuthority(seller)
-        && !this.mintBuyers.has(seller)
+        && !this.hasPriorHeliusMintBuy(priorTxs, seller, mint)
       ) {
         return seller;
       }
@@ -330,38 +341,67 @@ export class InsiderBot extends EventEmitter {
     return null;
   }
 
+  private hasPriorHeliusMintBuy(
+    priorTxs: HeliusEnhancedTransaction[],
+    wallet: string,
+    mint: string
+  ): boolean {
+    return priorTxs.some((tx) => this.getHeliusMintBuyers(tx, mint).has(wallet));
+  }
+
   private getHeliusMintBuyers(tx: HeliusEnhancedTransaction, mint: string): Set<string> {
-    const buyers = new Set<string>();
-    for (const transfer of tx.tokenTransfers ?? []) {
-      if (
-        transfer.mint === mint
-        && transfer.toUserAccount
-        && this.isKnownPoolAuthority(transfer.fromUserAccount ?? '')
-        && this.walletPaidPoolAuthority(tx, transfer.toUserAccount)
-      ) {
-        buyers.add(transfer.toUserAccount);
-      }
-    }
-    return buyers;
+    return new Set(
+      this.getHeliusPoolSwaps(tx, mint)
+        .filter((swap) => swap.direction === 'buy')
+        .map((swap) => swap.wallet)
+    );
   }
 
   private getHeliusMintSellers(tx: HeliusEnhancedTransaction, mint: string): Set<string> {
-    const sellers = new Set<string>();
-    for (const transfer of tx.tokenTransfers ?? []) {
-      if (
-        transfer.mint === mint
-        && transfer.fromUserAccount
-        && this.isKnownPoolAuthority(transfer.toUserAccount ?? '')
-        && this.poolAuthorityPaidWallet(tx, transfer.fromUserAccount)
-      ) {
-        sellers.add(transfer.fromUserAccount);
-      }
-    }
-    return sellers;
+    return new Set(
+      this.getHeliusPoolSwaps(tx, mint)
+        .filter((swap) => swap.direction === 'sell')
+        .map((swap) => swap.wallet)
+    );
   }
 
-  private walletPaidPoolAuthority(tx: HeliusEnhancedTransaction, wallet: string): boolean {
-    return (tx.tokenTransfers ?? []).some((transfer) =>
+  private getHeliusPoolSwaps(tx: HeliusEnhancedTransaction, onlyMint?: string): HeliusPoolSwap[] {
+    const swaps: HeliusPoolSwap[] = [];
+
+    for (const transfer of tx.tokenTransfers ?? []) {
+      if (!transfer.mint || transfer.mint === SOL_MINT) continue;
+      if (onlyMint && transfer.mint !== onlyMint) continue;
+
+      const fromIsPool = this.isKnownPoolAuthority(transfer.fromUserAccount ?? '');
+      const toIsPool = this.isKnownPoolAuthority(transfer.toUserAccount ?? '');
+      if (fromIsPool === toIsPool) continue;
+
+      const wallet = fromIsPool ? transfer.toUserAccount : transfer.fromUserAccount;
+      if (!wallet || this.isKnownPoolAuthority(wallet)) continue;
+
+      const tokenDirection: HeliusPoolSwapDirection = fromIsPool ? 'buy' : 'sell';
+      const solDirection = this.getHeliusSolDirection(tx, wallet);
+
+      if (solDirection && solDirection !== tokenDirection) {
+        continue;
+      }
+
+      swaps.push({
+        wallet,
+        direction: tokenDirection,
+        mint: transfer.mint,
+        amount: transfer.tokenAmount ?? 0,
+      });
+    }
+
+    return swaps;
+  }
+
+  private getHeliusSolDirection(
+    tx: HeliusEnhancedTransaction,
+    wallet: string
+  ): HeliusPoolSwapDirection | null {
+    const walletSentSolToPool = (tx.tokenTransfers ?? []).some((transfer) =>
       transfer.mint === SOL_MINT
       && transfer.fromUserAccount === wallet
       && this.isKnownPoolAuthority(transfer.toUserAccount ?? '')
@@ -370,10 +410,9 @@ export class InsiderBot extends EventEmitter {
       && this.isKnownPoolAuthority(transfer.toUserAccount ?? '')
       && (transfer.amount ?? 0) > 0
     );
-  }
+    if (walletSentSolToPool) return 'buy';
 
-  private poolAuthorityPaidWallet(tx: HeliusEnhancedTransaction, wallet: string): boolean {
-    return (tx.tokenTransfers ?? []).some((transfer) =>
+    const poolSentSolToWallet = (tx.tokenTransfers ?? []).some((transfer) =>
       transfer.mint === SOL_MINT
       && this.isKnownPoolAuthority(transfer.fromUserAccount ?? '')
       && transfer.toUserAccount === wallet
@@ -382,6 +421,9 @@ export class InsiderBot extends EventEmitter {
       && transfer.toUserAccount === wallet
       && (transfer.amount ?? 0) > 0
     );
+    if (poolSentSolToWallet) return 'sell';
+
+    return null;
   }
 
   private async processMintSignature(
@@ -567,19 +609,13 @@ export class InsiderBot extends EventEmitter {
     tx: HeliusEnhancedTransaction,
     wallet: string
   ): { mint: string; amount: number } | null {
-    for (const transfer of tx.tokenTransfers ?? []) {
-      if (
-        transfer.mint
-        && transfer.mint !== SOL_MINT
-        && transfer.toUserAccount === wallet
-        && this.isKnownPoolAuthority(transfer.fromUserAccount ?? '')
-        && this.walletPaidPoolAuthority(tx, wallet)
-      ) {
-        return {
-          mint: transfer.mint,
-          amount: transfer.tokenAmount ?? 0,
-        };
-      }
+    const buy = this.getHeliusPoolSwaps(tx)
+      .find((swap) => swap.direction === 'buy' && swap.wallet === wallet);
+    if (buy) {
+      return {
+        mint: buy.mint,
+        amount: buy.amount,
+      };
     }
 
     return null;
