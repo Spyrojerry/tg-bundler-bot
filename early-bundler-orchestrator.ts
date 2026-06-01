@@ -57,6 +57,7 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
   private readonly connection: Connection;
   private bundlerMonitor: BundlerMonitor | null = null;
   private activePosition: EarlyBundlerPosition | null = null;
+  private isEnabled = true;
   private isShuttingDown = false;
 
   constructor(config: ServiceConfig, db: MonitorDatabase, telegramBot: TelegramBot | null = null) {
@@ -81,8 +82,8 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
    * This triggers the early bundler detection flow
    */
   async handleTradingWalletBuy(event: NewTokenEvent): Promise<void> {
-    if (this.isShuttingDown) {
-      log.warn('Orchestrator is shutting down, ignoring trading wallet buy');
+    if (this.isShuttingDown || !this.isEnabled) {
+      log.warn('Early bundler orchestrator is inactive, ignoring trading wallet buy');
       return;
     }
 
@@ -104,6 +105,13 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     try {
       // Step 1: Fetch early bundlers from Helius
       const earlyBundlers = await this.heliusClient.getEarlyBundlers(event.mint);
+
+      if (this.isShuttingDown || !this.isEnabled) {
+        log.info('Early bundler mode became inactive during fetch; skipping setup', {
+          mint: event.mint,
+        });
+        return;
+      }
       
       if (earlyBundlers.length === 0) {
         log.warn('No early bundlers found for token', { mint: event.mint });
@@ -340,6 +348,11 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     reason: BundlerSellReason,
     message: string
   ): Promise<void> {
+    if (!this.isEnabled) {
+      log.info('Ignoring early bundler sell trigger because orchestrator is inactive', { reason });
+      return;
+    }
+
     if (!this.activePosition) {
       log.warn('Cannot trigger sell - no active position');
       return;
@@ -382,6 +395,7 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
    */
   async shutdown(): Promise<void> {
     this.isShuttingDown = true;
+    this.isEnabled = false;
     
     if (this.bundlerMonitor) {
       await this.bundlerMonitor.stopMonitoring();
@@ -390,6 +404,30 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     
     this.activePosition = null;
     log.info('Early Bundler Orchestrator shut down');
+  }
+
+  async stopActiveMonitoring(reason = 'Bundler mode stopped'): Promise<void> {
+    this.isEnabled = false;
+
+    if (this.bundlerMonitor) {
+      await this.bundlerMonitor.stopMonitoring();
+      this.bundlerMonitor = null;
+    }
+
+    if (this.activePosition) {
+      this.db.closeEarlyBundlerPosition(this.activePosition.positionId, reason);
+      log.info('[EARLY BUNDLER] Active position closed because bundler mode stopped', {
+        positionId: this.activePosition.positionId,
+        mint: this.activePosition.mint,
+        reason,
+      });
+    }
+
+    this.activePosition = null;
+  }
+
+  setEnabled(enabled: boolean): void {
+    this.isEnabled = enabled;
   }
 
   // ── Telegram Notifications ────────────────────────────────────────────────

@@ -122,11 +122,13 @@ async function main(): Promise<void> {
         if (data === 'menu:wallets') return walletsReply(chatId);
         if (data === 'menu:status') return statusReply();
         if (data === 'mode:insider') {
+          await stopBundlerModeServices('Switched to Insider mode');
           botMode = 'insider';
           return homeReply(true);
         }
         if (data === 'mode:bundler') {
           botMode = 'bundler';
+          await startBundlerModeServices();
           return homeReply(true);
         }
         if (data === 'insider:follow') {
@@ -304,6 +306,14 @@ async function main(): Promise<void> {
   earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot);
 
   earlyBundlerOrchestrator.on('sellTrigger', (trigger) => {
+    if (botMode !== 'bundler') {
+      log.info('[EARLY BUNDLER SELL SKIP] Ignoring sell trigger because Bundler mode is inactive', {
+        mint: trigger.position.mint,
+        mode: botMode,
+      });
+      return;
+    }
+
     const { position, type, walletAddress, soldPercentage, reason } = trigger;
     
     // Check if sell already pending
@@ -507,6 +517,7 @@ async function main(): Promise<void> {
 
   function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
+      if (botMode !== 'bundler') return;
       pendingTradingBuys.set(event.mint, event);
       log.info(`[TRADING POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
       
@@ -528,6 +539,7 @@ async function main(): Promise<void> {
     });
 
     walletMonitor.on('tokenExited', (event: TokenExitEvent) => {
+      if (botMode !== 'bundler') return;
       if (!pendingTradingBuys.has(event.mint)) return;
       pendingTradingBuys.delete(event.mint);
       log.info(`[TRADING POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint} — stopped watched-wallet trigger watch`);
@@ -550,6 +562,7 @@ async function main(): Promise<void> {
 
   function wireWatchedWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
+      if (botMode !== 'bundler') return;
       log.info(`[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
       startWatchedWalletSummary(event);
       if (!db.isReverseBuyWallet(event.walletAddress)) {
@@ -653,6 +666,62 @@ async function main(): Promise<void> {
     pausedWallets.delete(normalized);
     await monitor.start();
     return `Continued monitoring <code>${normalized}</code>`;
+  }
+
+  async function startBundlerModeServices(): Promise<void> {
+    earlyBundlerOrchestrator.setEnabled(true);
+
+    if (config.tradingWalletAddress && !tradingWalletMonitor) {
+      tradingWalletMonitor = new WalletMonitor(config, config.tradingWalletAddress, { enforceMinBuySol: false });
+      wireTradingWalletMonitor(tradingWalletMonitor);
+      await tradingWalletMonitor.start();
+
+      for (const mint of tradingWalletMonitor.existingMints) {
+        pendingTradingBuys.set(mint, {
+          walletAddress: config.tradingWalletAddress,
+          mint,
+          detectedAt: Date.now(),
+          buySol: db.getToken(config.tradingWalletAddress, mint)?.buySol ?? null,
+        });
+      }
+
+      if (tradingWalletMonitor.existingMints.size > 0) {
+        telegramBot?.sendDefault([
+          '<b>Trading Wallet Positions Loaded</b>',
+          `Wallet: <code>${html(config.tradingWalletAddress)}</code>`,
+          `Positions watched for watched-wallet buy triggers: <b>${tradingWalletMonitor.existingMints.size}</b>`,
+        ].join('\n')).catch((err) => log.warn('Telegram trading positions bootstrap alert failed', err));
+      }
+    } else if (!config.tradingWalletAddress) {
+      log.warn('No TRADING_WALLET_ADDRESS configured; bundler sell flow cannot detect your buys.');
+    }
+
+    const wallets = db.getActiveWallets();
+    for (const wallet of wallets) {
+      if (wallet === config.tradingWalletAddress || walletMonitors.has(wallet)) continue;
+      await startWallet(wallet);
+    }
+
+    log.info('Bundler mode services started', {
+      watchedWallets: walletMonitors.size,
+      tradingWalletActive: !!tradingWalletMonitor,
+    });
+  }
+
+  async function stopBundlerModeServices(reason = 'Bundler mode stopped'): Promise<void> {
+    for (const monitor of walletMonitors.values()) {
+      monitor.stop();
+    }
+    walletMonitors.clear();
+
+    tradingWalletMonitor?.stop();
+    tradingWalletMonitor = null;
+    pendingTradingBuys.clear();
+    pausedWallets.clear();
+
+    await earlyBundlerOrchestrator.stopActiveMonitoring(reason);
+
+    log.info('Bundler mode services stopped', { reason });
   }
 
   const html = (value: string): string =>
@@ -1111,36 +1180,10 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── 6. Start everything ───────────────────────────────────────────────────
-  if (config.tradingWalletAddress) {
-    tradingWalletMonitor = new WalletMonitor(config, config.tradingWalletAddress, { enforceMinBuySol: false });
-    wireTradingWalletMonitor(tradingWalletMonitor);
-    await tradingWalletMonitor.start();
-    for (const mint of tradingWalletMonitor.existingMints) {
-      pendingTradingBuys.set(mint, {
-        walletAddress: config.tradingWalletAddress,
-        mint,
-        detectedAt: Date.now(),
-        buySol: db.getToken(config.tradingWalletAddress, mint)?.buySol ?? null,
-      });
-    }
-    if (tradingWalletMonitor.existingMints.size > 0) {
-      telegramBot?.sendDefault([
-        '<b>Trading Wallet Positions Loaded</b>',
-        `Wallet: <code>${html(config.tradingWalletAddress)}</code>`,
-        `Positions watched for watched-wallet buy triggers: <b>${tradingWalletMonitor.existingMints.size}</b>`,
-      ].join('\n')).catch((err) => log.warn('Telegram trading positions bootstrap alert failed', err));
-    }
-  } else {
-    log.warn('No TRADING_WALLET_ADDRESS configured; sell flow cannot detect your buys.');
-  }
-  const wallets = db.getActiveWallets();
-  for (const wallet of wallets) {
-    if (wallet === config.tradingWalletAddress) continue;
-    await startWallet(wallet);
-  }
+  // ── 6. Start active mode ──────────────────────────────────────────────────
+  await stopBundlerModeServices('Service started in Insider mode');
 
-  log.info(`Service fully started — monitoring ${walletMonitors.size} wallet(s) for new tokens`);
+  log.info(`Service fully started — mode=${botMode}, bundler wallets active=${walletMonitors.size}`);
 
   // ── 7. Graceful shutdown ──────────────────────────────────────────────────
   let shutting_down = false;
