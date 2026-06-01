@@ -141,6 +141,15 @@ async function main(): Promise<void> {
           await insiderBot.stop();
           return homeReply(true);
         }
+        if (data === 'insider:resume') {
+          const followedWallet = insiderBot.getFollowedWallet();
+          if (!followedWallet) {
+            pendingTelegramActions.set(chatId, { type: 'insiderFollowWallet' });
+            return { text: 'Send the wallet address for Insider Bot to follow.', trackPrompt: true };
+          }
+          await insiderBot.followWallet(followedWallet);
+          return homeReply(true);
+        }
 
         if (callbackKind === 'sell' && callbackAction && callbackAddress) {
           const pending = pendingSells.get(callbackAddress);
@@ -766,12 +775,17 @@ async function main(): Promise<void> {
   function homeReply(editCurrent = false): TelegramReply {
     if (botMode === 'insider') {
       const followedWallet = insiderBot.getFollowedWallet();
+      const insiderRunning = insiderBot.isRunning();
+      const insiderStatus = insiderRunning ? 'Running' : followedWallet ? 'Paused' : 'Idle';
+      const stopResumeButton = followedWallet && !insiderRunning
+        ? { text: 'Resume', callback_data: 'insider:resume' }
+        : { text: 'Stop', callback_data: 'insider:stop' };
       return {
         text: [
           '<b>Insider Bot</b>',
           '',
           `Mode: <b>Insider</b>`,
-          `Status: <b>${insiderBot.isRunning() ? 'Running' : 'Idle'}</b>`,
+          `Status: <b>${insiderStatus}</b>`,
           `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : '<b>Not set</b>'}`,
           `Buy SOL: <b>${insiderBot.getBuySol()}</b>`,
           '',
@@ -791,7 +805,7 @@ async function main(): Promise<void> {
               { text: 'Buy SOL', callback_data: 'insider:buysol' },
             ],
             [
-              { text: 'Stop', callback_data: 'insider:stop' },
+              stopResumeButton,
               { text: 'Refresh', callback_data: 'menu:refresh' },
             ],
           ],
@@ -893,11 +907,13 @@ async function main(): Promise<void> {
 
   function statusReply(): string {
     if (botMode === 'insider') {
+      const followedWallet = insiderBot.getFollowedWallet();
+      const insiderStatus = insiderBot.isRunning() ? 'Running' : followedWallet ? 'Paused' : 'Idle';
       return [
         '<b>Bot Status</b>',
         'Mode: Insider',
-        `Status: ${insiderBot.isRunning() ? 'Running' : 'Idle'}`,
-        `Follow wallet: ${insiderBot.getFollowedWallet() ?? 'not set'}`,
+        `Status: ${insiderStatus}`,
+        `Follow wallet: ${followedWallet ?? 'not set'}`,
         `Buy SOL: ${insiderBot.getBuySol()}`,
       ].join('\n');
     }
