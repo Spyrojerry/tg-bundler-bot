@@ -717,24 +717,51 @@ async function main(): Promise<void> {
     }
   }
 
+  async function checkAndStopIfLowMcap(mint: string): Promise<void> {
+    try {
+      const currentMc = await gmgnClient.fetchTokenMarketCapUsd(mint);
+      if (currentMc !== null && currentMc < INSIDER_MIN_MARKET_CAP_USD) {
+        log.warn(`[MCAP MONITOR STOP] Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}. Stopping monitoring.`);
+        
+        insiderBot.clearActivePosition();
+
+        telegramBot?.sendDefault([
+          '<b>⚠️ Insider Monitoring Stopped</b>',
+          `Token: <code>${html(mint)}</code>`,
+          `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
+          `Threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
+          'Reason: Market cap fell below minimum requirement. Entry sequence aborted.',
+        ].join('\n')).catch((err) => log.warn('Telegram mcap monitor stop alert failed', err));
+      }
+    } catch (err) {
+      log.error(`Failed to check market cap for monitoring stop: ${mint}`, err);
+    }
+  }
+
   function startMarketCapChecker(): void {
     log.info(`Starting periodic market cap checker (interval: ${MCAP_CHECK_INTERVAL_MS}ms)`);
     setInterval(async () => {
+      // 1. Check InsiderBot pre-buy sequence (NEW)
+      const preBuyMint = insiderBot.getPreBuyMint();
+      if (preBuyMint) {
+        await checkAndStopIfLowMcap(preBuyMint);
+      }
+
       if (!config.tradingWalletAddress) return;
 
-      // 1. Check InsiderBot active position
+      // 2. Check InsiderBot active position
       const insiderPos = insiderBot.getActivePosition();
       if (insiderPos) {
         await checkAndSellIfLowMcap(insiderPos.mint, 'insider');
       }
 
-      // 2. Check EarlyBundlerOrchestrator active position
+      // 3. Check EarlyBundlerOrchestrator active position
       const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
       if (bundlerPos) {
         await checkAndSellIfLowMcap(bundlerPos.mint, 'bundler');
       }
 
-      // 3. Check pendingTradingBuys (if not already checked)
+      // 4. Check pendingTradingBuys (if not already checked)
       if (botMode === 'bundler') {
         for (const mint of pendingTradingBuys.keys()) {
           if (bundlerPos?.mint === mint) continue;

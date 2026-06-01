@@ -76,6 +76,7 @@ export interface InsiderBot {
   emit(event: 'sellTrigger', trigger: InsiderSellTrigger): boolean;
   emit(event: 'error', error: Error): boolean;
   getActivePosition(): { followedWallet: string; insiderWallet: string; mint: string } | null;
+  getPreBuyMint(): string | null;
   markPositionBought(trigger: InsiderBuyTrigger): void;
   clearActivePosition(): void;
 }
@@ -120,6 +121,10 @@ export class InsiderBot extends EventEmitter {
 
   getActivePosition(): { followedWallet: string; insiderWallet: string; mint: string } | null {
     return this.activePosition;
+  }
+
+  getPreBuyMint(): string | null {
+    return this.preBuySequence?.mint ?? null;
   }
 
   clearActivePosition(): void {
