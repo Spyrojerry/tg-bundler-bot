@@ -964,6 +964,18 @@ export class GmgnClient {
       if (parsed !== null && parsed >= 0) return parsed;
     }
 
+    // Fallback: Calculate MC = Price * Supply
+    const price = this.parseNullableNumber(this.asRecord(data.price).price);
+    const supply = this.parseNullableNumber(data.circulating_supply ?? data.total_supply);
+
+    if (price !== null && supply !== null) {
+      const calculatedMc = price * supply;
+      if (calculatedMc >= 0) {
+        log.debug('Calculated market cap from price and supply', { price, supply, calculatedMc });
+        return calculatedMc;
+      }
+    }
+
     return null;
   }
 
