@@ -75,6 +75,8 @@ export interface InsiderBot {
   emit(event: 'sellTrigger', trigger: InsiderSellTrigger): boolean;
   emit(event: 'error', error: Error): boolean;
   getActivePosition(): { followedWallet: string; insiderWallet: string; mint: string } | null;
+  markPositionBought(trigger: InsiderBuyTrigger): void;
+  clearActivePosition(): void;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -95,6 +97,13 @@ export class InsiderBot extends EventEmitter {
     insiderWallet: string;
     mint: string;
   } | null = null;
+  private preBuySequence: {
+    followedWallet: string;
+    insiderWallet: string;
+    mint: string;
+    state: 'WAITING_FOR_TRANSFER' | 'WAITING_FOR_SELL_1' | 'WAITING_FOR_SELL_2';
+    entrySignature: string;
+  } | null = null;
 
   constructor(config: ServiceConfig) {
     super();
@@ -112,6 +121,7 @@ export class InsiderBot extends EventEmitter {
 
   clearActivePosition(): void {
     this.activePosition = null;
+    this.preBuySequence = null;
     if (this.insiderSubId !== null) {
       const subId = this.insiderSubId;
       this.insiderSubId = null;
@@ -186,6 +196,7 @@ export class InsiderBot extends EventEmitter {
     this.mintBuyers.clear();
     this.processedSignatures.clear();
     this.activePosition = null;
+    this.preBuySequence = null;
   }
 
   markPositionBought(trigger: InsiderBuyTrigger): void {
@@ -194,7 +205,10 @@ export class InsiderBot extends EventEmitter {
       insiderWallet: trigger.insiderWallet,
       mint: trigger.mint,
     };
-    void this.startInsiderWalletWatch(trigger.insiderWallet, trigger.mint);
+    this.preBuySequence = null;
+    this.startInsiderWalletWatch(trigger.insiderWallet, trigger.mint).catch((err) => {
+      log.error('Failed to restart insider watch after buy', err);
+    });
   }
 
   private async processFollowWalletSignature(signature: string): Promise<void> {
@@ -277,7 +291,7 @@ export class InsiderBot extends EventEmitter {
         if (!insiderWallet) continue;
 
         const signature = tx.signature ?? '';
-        log.warn('Insider wallet detected from earliest mint sell before visible buy', {
+        log.warn('Insider wallet detected; starting entry sequence watch (Waiting for Transfer)', {
           followedWallet,
           insiderWallet,
           mint,
@@ -286,13 +300,16 @@ export class InsiderBot extends EventEmitter {
           fetchedTxs,
         });
         await this.stopMintScanOnly();
-        this.emit('buyTrigger', {
+
+        this.preBuySequence = {
           followedWallet,
           insiderWallet,
           mint,
-          signature,
-          buySol: this.buySol,
-        });
+          state: 'WAITING_FOR_TRANSFER',
+          entrySignature: signature,
+        };
+
+        await this.startInsiderWalletWatch(insiderWallet, mint);
         return;
       }
 
@@ -507,7 +524,7 @@ export class InsiderBot extends EventEmitter {
     );
 
     if (insiderSell) {
-      log.warn('Insider wallet detected from early mint sell before visible buy', {
+      log.warn('Insider wallet detected; starting entry sequence watch (Waiting for Transfer)', {
         followedWallet,
         insiderWallet: insiderSell.owner,
         mint,
@@ -515,13 +532,16 @@ export class InsiderBot extends EventEmitter {
         scannedTxs: this.mintScanCount,
       });
       await this.stopMintScanOnly();
-      this.emit('buyTrigger', {
+      
+      this.preBuySequence = {
         followedWallet,
         insiderWallet: insiderSell.owner,
         mint,
-        signature,
-        buySol: this.buySol,
-      });
+        state: 'WAITING_FOR_TRANSFER',
+        entrySignature: signature,
+      };
+
+      await this.startInsiderWalletWatch(insiderSell.owner, mint);
       return;
     }
 
@@ -576,29 +596,132 @@ export class InsiderBot extends EventEmitter {
     const key = `insider:${signature}`;
     if (this.processedSignatures.has(key)) return;
     this.processedSignatures.add(key);
-    const buy = await this.findInsiderWalletBuy(signature, insiderWallet);
-    if (!buy) return;
 
-    log.warn('Insider wallet made a later buy; sell trigger fired', {
-      insiderWallet,
-      positionMint,
-      insiderBuyMint: buy.mint,
-      signature,
-    });
+    // Case 1: Active Position (Exit Monitoring)
+    if (this.activePosition) {
+      const buy = await this.findInsiderWalletBuy(signature, insiderWallet);
+      if (!buy) return;
 
-    this.emit('sellTrigger', {
-      followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
-      insiderWallet,
-      positionMint,
-      insiderBuyMint: buy.mint,
-      signature,
-    });
+      if (buy.amount < 100_000) {
+        log.info('Insider wallet made a small buy; skipping sell trigger', {
+          insiderWallet,
+          positionMint,
+          insiderBuyMint: buy.mint,
+          amount: buy.amount,
+          signature,
+        });
+        return;
+      }
 
-    if (this.insiderSubId !== null) {
-      const subId = this.insiderSubId;
-      this.insiderSubId = null;
-      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+      log.warn('Insider wallet made a significant later buy; sell trigger fired', {
+        insiderWallet,
+        positionMint,
+        insiderBuyMint: buy.mint,
+        amount: buy.amount,
+        signature,
+      });
+
+      this.emit('sellTrigger', {
+        followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
+        insiderWallet,
+        positionMint,
+        insiderBuyMint: buy.mint,
+        signature,
+      });
+
+      if (this.insiderSubId !== null) {
+        const subId = this.insiderSubId;
+        this.insiderSubId = null;
+        await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+      }
+      return;
     }
+
+    // Case 2: Pre-Buy Sequence (Entry Monitoring)
+    if (this.preBuySequence && this.preBuySequence.insiderWallet === insiderWallet) {
+      const analysis = await this.analyzeInsiderTransaction(signature, insiderWallet, positionMint);
+      if (!analysis) return;
+
+      const { type, mint } = analysis;
+
+      if (this.preBuySequence.state === 'WAITING_FOR_TRANSFER') {
+        if (type === 'transfer' && mint === positionMint) {
+          log.info('Insider entry sequence: Transfer detected. Moving to Sell #1 watch.', { signature, mint });
+          this.preBuySequence.state = 'WAITING_FOR_SELL_1';
+        }
+      } else if (this.preBuySequence.state === 'WAITING_FOR_SELL_1') {
+        if (type === 'sell' && mint === positionMint) {
+          log.info('Insider entry sequence: Sell #1 detected. Moving to Sell #2 watch.', { signature, mint });
+          this.preBuySequence.state = 'WAITING_FOR_SELL_2';
+        }
+      } else if (this.preBuySequence.state === 'WAITING_FOR_SELL_2') {
+        if (type === 'sell' && mint === positionMint) {
+          log.warn('Insider entry sequence: Sell #2 detected. TRIGGERING BUY.', { signature, mint });
+          
+          const seq = this.preBuySequence;
+          this.preBuySequence = null;
+
+          this.emit('buyTrigger', {
+            followedWallet: seq.followedWallet,
+            insiderWallet: seq.insiderWallet,
+            mint: seq.mint,
+            signature: signature,
+            buySol: this.buySol,
+          });
+        }
+      }
+    }
+  }
+
+  private async analyzeInsiderTransaction(
+    signature: string,
+    insiderWallet: string,
+    targetMint: string
+  ): Promise<{ type: 'buy' | 'sell' | 'transfer' | 'other'; mint?: string } | null> {
+    if (this.config.insiderHeliusApiKey) {
+      const heliusTx = await this.fetchHeliusTransaction(signature);
+      if (heliusTx) {
+        const swaps = this.getHeliusPoolSwaps(heliusTx);
+        const buy = swaps.find(s => s.direction === 'buy' && s.wallet === insiderWallet);
+        if (buy) return { type: 'buy', mint: buy.mint };
+        
+        const sell = swaps.find(s => s.direction === 'sell' && s.wallet === insiderWallet && s.mint === targetMint);
+        if (sell) return { type: 'sell', mint: sell.mint };
+
+        for (const transfer of heliusTx.tokenTransfers ?? []) {
+          if (transfer.fromUserAccount !== insiderWallet && transfer.toUserAccount === insiderWallet && transfer.mint === targetMint) {
+            return { type: 'transfer', mint: transfer.mint };
+          }
+        }
+      }
+    }
+
+    const tx = await this.fetchParsedTransaction(signature);
+    if (!tx) return null;
+
+    const deltas = this.getTokenDeltas(tx.meta?.preTokenBalances ?? [], tx.meta?.postTokenBalances ?? []);
+    
+    // Check for buy
+    const isBuy = deltas.some(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
+    if (isBuy) {
+      const b = deltas.find(d => d.owner === insiderWallet && d.rawDiff > 0n && d.mint !== SOL_MINT);
+      return { type: 'buy', mint: b?.mint };
+    }
+
+    // Check for sell vs transfer
+    const targetDelta = deltas.find(d => d.owner === insiderWallet && d.mint === targetMint);
+    if (targetDelta) {
+      if (targetDelta.rawDiff < 0n) {
+        const poolReceived = deltas.some(d => this.isKnownPoolAuthority(d.owner) && d.rawDiff > 0n && d.mint === targetMint);
+        return { type: poolReceived ? 'sell' : 'other', mint: targetMint };
+      }
+      if (targetDelta.rawDiff > 0n) {
+        // Transfer in
+        return { type: 'transfer', mint: targetMint };
+      }
+    }
+
+    return { type: 'other' };
   }
 
   private async findInsiderWalletBuy(
