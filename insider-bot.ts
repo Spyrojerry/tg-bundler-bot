@@ -2,6 +2,7 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { createLogger } from './logger';
 import type { ServiceConfig } from './types';
+import { TelegramBot } from './telegram-bot';
 
 const log = createLogger('INSIDER');
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -82,6 +83,7 @@ export interface InsiderBot {
 export class InsiderBot extends EventEmitter {
   private readonly config: ServiceConfig;
   private readonly connection: Connection;
+  private readonly telegramBot: TelegramBot | null;
   private followedWallet: string | null = null;
   private buySol: number;
   private followSubId: number | null = null;
@@ -101,13 +103,14 @@ export class InsiderBot extends EventEmitter {
     followedWallet: string;
     insiderWallet: string;
     mint: string;
-    state: 'WAITING_FOR_TRANSFER' | 'WAITING_FOR_SELL_1' | 'WAITING_FOR_SELL_2';
+    state: 'WAITING_FOR_TRANSFER' | 'WAITING_FOR_TX_1' | 'WAITING_FOR_TX_2';
     entrySignature: string;
   } | null = null;
 
-  constructor(config: ServiceConfig) {
+  constructor(config: ServiceConfig, telegramBot: TelegramBot | null = null) {
     super();
     this.config = config;
+    this.telegramBot = telegramBot;
     this.buySol = config.insiderBuySol;
     this.connection = new Connection(config.insiderSolanaRpcUrl, {
       commitment: 'processed',
@@ -603,7 +606,7 @@ export class InsiderBot extends EventEmitter {
       if (!buy) return;
 
       if (buy.amount < 100_000) {
-        log.info('Insider wallet made a small buy; skipping sell trigger', {
+        log.info('Insider wallet made a dust buy; ignoring', {
           insiderWallet,
           positionMint,
           insiderBuyMint: buy.mint,
@@ -613,13 +616,24 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
-      log.warn('Insider wallet made a significant later buy; sell trigger fired', {
+      log.warn('🚨🚨 [INSIDER EXIT SIGNAL] 🚨🚨', {
         insiderWallet,
         positionMint,
         insiderBuyMint: buy.mint,
         amount: buy.amount,
         signature,
       });
+
+      const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      this.telegramBot?.sendDefault([
+        '<b>🚨 Insider Exit Signal Detected</b>',
+        `Insider: <code>${html(insiderWallet)}</code>`,
+        `Current Position: <code>${html(positionMint)}</code>`,
+        `Insider Buy: <code>${html(buy.mint)}</code>`,
+        `Buy Amount: <b>${buy.amount.toLocaleString()} tokens</b>`,
+        '',
+        '<b>Triggering immediate sell...</b>',
+      ].join('\n')).catch(() => undefined);
 
       this.emit('sellTrigger', {
         followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
@@ -643,23 +657,45 @@ export class InsiderBot extends EventEmitter {
       if (!analysis) return;
 
       const { type, mint } = analysis;
+      const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
       if (this.preBuySequence.state === 'WAITING_FOR_TRANSFER') {
         if (type === 'transfer' && mint === positionMint) {
-          log.info('Insider entry sequence: Transfer detected. Moving to Sell #1 watch.', { signature, mint });
-          this.preBuySequence.state = 'WAITING_FOR_SELL_1';
+          log.info('Insider entry sequence: Transfer detected. Moving to Tx #1 watch.', { signature, mint });
+          this.preBuySequence.state = 'WAITING_FOR_TX_1';
+          
+          this.telegramBot?.sendDefault([
+            '<b>🔄 Insider Sequence: Transfer Detected</b>',
+            `Token: <code>${html(positionMint)}</code>`,
+            `Insider: <code>${html(insiderWallet)}</code>`,
+            'Waiting for 2 subsequent transactions before buying.',
+          ].join('\n')).catch(() => undefined);
         }
-      } else if (this.preBuySequence.state === 'WAITING_FOR_SELL_1') {
-        if (type === 'sell' && mint === positionMint) {
-          log.info('Insider entry sequence: Sell #1 detected. Moving to Sell #2 watch.', { signature, mint });
-          this.preBuySequence.state = 'WAITING_FOR_SELL_2';
+      } else if (this.preBuySequence.state === 'WAITING_FOR_TX_1') {
+        if ((type === 'buy' || type === 'sell') && mint === positionMint) {
+          log.info('Insider entry sequence: Tx #1 detected. Moving to Tx #2 watch.', { signature, mint, type });
+          this.preBuySequence.state = 'WAITING_FOR_TX_2';
+
+          this.telegramBot?.sendDefault([
+            '<b>🔄 Insider Sequence: Tx #1 Detected</b>',
+            `Token: <code>${html(positionMint)}</code>`,
+            `Action: <b>${type.toUpperCase()}</b>`,
+            'Waiting for 1 more transaction before buying.',
+          ].join('\n')).catch(() => undefined);
         }
-      } else if (this.preBuySequence.state === 'WAITING_FOR_SELL_2') {
-        if (type === 'sell' && mint === positionMint) {
-          log.warn('Insider entry sequence: Sell #2 detected. TRIGGERING BUY.', { signature, mint });
+      } else if (this.preBuySequence.state === 'WAITING_FOR_TX_2') {
+        if ((type === 'buy' || type === 'sell') && mint === positionMint) {
+          log.warn('Insider entry sequence: Tx #2 detected. TRIGGERING BUY.', { signature, mint, type });
           
           const seq = this.preBuySequence;
           this.preBuySequence = null;
+
+          this.telegramBot?.sendDefault([
+            '<b>🚀 Insider Sequence: Tx #2 Detected - BUYING</b>',
+            `Token: <code>${html(positionMint)}</code>`,
+            `Action: <b>${type.toUpperCase()}</b>`,
+            `Signature: <code>${html(signature)}</code>`,
+          ].join('\n')).catch(() => undefined);
 
           this.emit('buyTrigger', {
             followedWallet: seq.followedWallet,

@@ -74,10 +74,10 @@ async function main(): Promise<void> {
   const gmgnClient = new GmgnClient(config, limiter);
 
   let telegramBot: TelegramBot | null = null;
+  let insiderBot: InsiderBot;
 
   // ── 4. Early Bundler Orchestrator ─────────────────────────────────────────
   let earlyBundlerOrchestrator: EarlyBundlerOrchestrator;
-  const insiderBot = new InsiderBot(config);
   let botMode: 'insider' | 'bundler' = 'insider';
 
   const healthServer = startHealthServer(config.port);
@@ -334,6 +334,8 @@ async function main(): Promise<void> {
     ? new TelegramBot(config, handleTelegramCommand)
     : null;
 
+  insiderBot = new InsiderBot(config, telegramBot);
+
   if (telegramBot) {
     telegramBot.start();
   }
@@ -412,11 +414,12 @@ async function main(): Promise<void> {
 
     log.warn('[INSIDER BUY TRIGGER]', trigger);
     telegramBot?.sendDefault([
-      '<b>Insider Signal Detected</b>',
-      `Followed wallet: <code>${html(trigger.followedWallet)}</code>`,
-      `Insider wallet: <code>${html(trigger.insiderWallet)}</code>`,
+      '<b>🚀 Insider Entry Sequence Completed</b>',
+      `Insider: <code>${html(trigger.insiderWallet)}</code>`,
       `Token: <code>${html(trigger.mint)}</code>`,
       `Buying: <b>${trigger.buySol} SOL</b>`,
+      '',
+      'Submitting swap...',
     ].join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
 
     void (async () => {
