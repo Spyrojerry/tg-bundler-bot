@@ -114,11 +114,11 @@ async function main(): Promise<void> {
 
         if (data === 'menu:addwallet') {
           pendingTelegramActions.set(chatId, { type: 'addwallet' });
-          return { text: 'Send the Solana wallet address to add.', trackPrompt: true };
+          return { text: 'Send the Solana wallet address to add.', trackPrompt: true, editCurrent: true };
         }
         if (data === 'menu:removewallet') {
           pendingTelegramActions.set(chatId, { type: 'removewallet' });
-          return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
+          return { text: 'Send the Solana wallet address to remove.', trackPrompt: true, editCurrent: true };
         }
         if (data === 'menu:refresh') return homeReply(true);
         if (data.startsWith('r:m:')) {
@@ -154,8 +154,8 @@ async function main(): Promise<void> {
             editCurrent: true,
           };
         }
-        if (data === 'menu:wallets') return walletsReply(chatId);
-        if (data === 'menu:status') return statusReply();
+        if (data === 'menu:wallets') return walletsReply(chatId, true);
+        if (data === 'menu:status') return statusReply(true);
         if (data === 'mode:insider') {
           await stopBundlerModeServices('Switched to Insider mode');
           botMode = 'insider';
@@ -168,11 +168,11 @@ async function main(): Promise<void> {
         }
         if (data === 'insider:follow') {
           pendingTelegramActions.set(chatId, { type: 'insiderFollowWallet' });
-          return { text: 'Send the wallet address for Insider Bot to follow.', trackPrompt: true };
+          return { text: 'Send the wallet address for Insider Bot to follow.', trackPrompt: true, editCurrent: true };
         }
         if (data === 'insider:buysol') {
           pendingTelegramActions.set(chatId, { type: 'insiderBuySol' });
-          return { text: 'Send the SOL amount Insider Bot should buy with.', trackPrompt: true };
+          return { text: 'Send the SOL amount Insider Bot should buy with.', trackPrompt: true, editCurrent: true };
         }
         if (data === 'insider:stop') {
           await insiderBot.stop();
@@ -182,7 +182,7 @@ async function main(): Promise<void> {
           const followedWallet = insiderBot.getFollowedWallet();
           if (!followedWallet) {
             pendingTelegramActions.set(chatId, { type: 'insiderFollowWallet' });
-            return { text: 'Send the wallet address for Insider Bot to follow.', trackPrompt: true };
+            return { text: 'Send the wallet address for Insider Bot to follow.', trackPrompt: true, editCurrent: true };
           }
           await insiderBot.followWallet(followedWallet);
           return homeReply(true);
@@ -227,6 +227,7 @@ async function main(): Promise<void> {
               'Use a number (e.g., 0.01), or send <code>off</code> to use default.',
             ].join('\n'),
             trackPrompt: true,
+            editCurrent: true,
           };
         }
         if (callbackKind === 'reverse' && callbackAction && callbackAddress) {
@@ -1114,7 +1115,7 @@ async function main(): Promise<void> {
     };
   }
 
-  function walletsReply(chatId: string): TelegramReply {
+  function walletsReply(chatId: string, editCurrent = false): TelegramReply {
     const wallets = [...walletMonitors.keys()];
     const tradingWallet = config.tradingWalletAddress;
     const allWallets = tradingWallet ? [tradingWallet, ...wallets] : wallets;
@@ -1137,29 +1138,39 @@ async function main(): Promise<void> {
           ? [[{ text: 'Back', callback_data: 'menu:refresh' }]]
           : [[{ text: 'Add wallet', callback_data: 'menu:addwallet' }]],
       },
+      editCurrent,
     };
   }
 
-  function statusReply(): string {
+  function statusReply(editCurrent = false): TelegramReply {
+    let text = '';
     if (botMode === 'insider') {
       const followedWallet = insiderBot.getFollowedWallet();
       const insiderStatus = insiderBot.isRunning() ? 'Running' : followedWallet ? 'Paused' : 'Idle';
-      return [
+      text = [
         '<b>Bot Status</b>',
         'Mode: Insider',
         `Status: ${insiderStatus}`,
         `Follow wallet: ${followedWallet ?? 'not set'}`,
         `Buy SOL: ${insiderBot.getBuySol()}`,
       ].join('\n');
+    } else {
+      text = [
+        '<b>Bot Status</b>',
+        'Mode: Bundler',
+        `Wallets: ${walletMonitors.size}`,
+        'Filter: early bundler & reverse-buy',
+        `Interval: ${config.monitorInterval}ms`,
+      ].join('\n');
     }
 
-    return [
-      '<b>Bot Status</b>',
-      'Mode: Bundler',
-      `Wallets: ${walletMonitors.size}`,
-      'Filter: early bundler & reverse-buy',
-      `Interval: ${config.monitorInterval}ms`,
-    ].join('\n');
+    return {
+      text,
+      replyMarkup: {
+        inline_keyboard: [[{ text: 'Back', callback_data: 'menu:refresh' }]],
+      },
+      editCurrent,
+    };
   }
 
   function sellAlertMarkup(sellId: string): InlineKeyboardMarkup {
