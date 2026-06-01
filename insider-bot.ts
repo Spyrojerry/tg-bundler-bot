@@ -209,7 +209,7 @@ export class InsiderBot extends EventEmitter {
       mint: trigger.mint,
     };
     this.preBuySequence = null;
-    this.startInsiderWalletWatch(trigger.insiderWallet, trigger.mint).catch((err) => {
+    this.startInsiderWalletWatch(trigger.insiderWallet, trigger.mint, trigger.signature).catch((err) => {
       log.error('Failed to restart insider watch after buy', err);
     });
   }
@@ -312,7 +312,7 @@ export class InsiderBot extends EventEmitter {
           entrySignature: signature,
         };
 
-        await this.startInsiderWalletWatch(insiderWallet, mint);
+        await this.startInsiderWalletWatch(insiderWallet, mint, signature);
         return;
       }
 
@@ -544,7 +544,7 @@ export class InsiderBot extends EventEmitter {
         entrySignature: signature,
       };
 
-      await this.startInsiderWalletWatch(insiderSell.owner, mint);
+      await this.startInsiderWalletWatch(insiderSell.owner, mint, signature);
       return;
     }
 
@@ -567,12 +567,30 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async startInsiderWalletWatch(insiderWallet: string, positionMint: string): Promise<void> {
+  private async startInsiderWalletWatch(
+    insiderWallet: string,
+    positionMint: string,
+    startSignature?: string
+  ): Promise<void> {
     if (this.insiderSubId !== null) {
       await this.connection.removeOnLogsListener(this.insiderSubId).catch(() => undefined);
       this.insiderSubId = null;
     }
 
+    log.info('Starting insider wallet watch', { insiderWallet, positionMint, startSignature });
+
+    // 1. If we have a start signature, catch up on all transactions since then
+    if (startSignature && this.config.insiderHeliusApiKey) {
+      try {
+        log.info('Performing insider catch-up...', { insiderWallet, startSignature });
+        await this.catchupInsiderWallet(insiderWallet, positionMint, startSignature);
+        log.info('Insider catch-up complete');
+      } catch (err) {
+        log.error('Insider catch-up failed; proceeding with real-time only', err);
+      }
+    }
+
+    // 2. Start real-time monitoring
     this.insiderSubId = this.connection.onLogs(
       new PublicKey(insiderWallet),
       (logInfo) => {
@@ -585,16 +603,74 @@ export class InsiderBot extends EventEmitter {
       'processed'
     );
 
-    log.info('Insider wallet exit watch started', {
+    log.info('Insider wallet real-time watch active', {
       insiderWallet,
       positionMint,
     });
   }
 
+  private async catchupInsiderWallet(
+    insiderWallet: string,
+    positionMint: string,
+    afterSignature: string
+  ): Promise<void> {
+    let currentAfter = afterSignature;
+    let hasMore = true;
+
+    while (hasMore) {
+      const txs = await this.fetchHeliusTransactionsAfter(insiderWallet, currentAfter);
+      if (txs.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      log.info(`Processing ${txs.length} historical transactions for catch-up`, { insiderWallet });
+      
+      // Helius returns txs in chronological order when using after-signature? 
+      // Actually, standard Helius /transactions endpoint returns newest first.
+      // But user mentioned: sort-order=asc
+      
+      for (const tx of txs) {
+        if (!tx.signature) continue;
+        await this.processInsiderWalletSignature(insiderWallet, positionMint, tx.signature, tx);
+        currentAfter = tx.signature;
+      }
+
+      // If we got less than 100, we're likely caught up
+      if (txs.length < 100) {
+        hasMore = false;
+      }
+    }
+  }
+
+  private async fetchHeliusTransactionsAfter(
+    address: string,
+    afterSignature: string
+  ): Promise<HeliusEnhancedTransaction[]> {
+    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}&after-signature=${afterSignature}`;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await fetch(url);
+        if (response.ok) {
+          return await response.json() as HeliusEnhancedTransaction[];
+        }
+        const text = await response.text();
+        log.warn(`Helius catch-up fetch attempt ${attempt}/3 failed`, { status: response.status, body: text });
+      } catch (err) {
+        log.warn(`Helius catch-up fetch attempt ${attempt}/3 error`, err);
+      }
+      await new Promise(r => setTimeout(r, attempt * 1000));
+    }
+
+    return [];
+  }
+
   private async processInsiderWalletSignature(
     insiderWallet: string,
     positionMint: string,
-    signature: string
+    signature: string,
+    historicalTx?: HeliusEnhancedTransaction
   ): Promise<void> {
     const key = `insider:${signature}`;
     if (this.processedSignatures.has(key)) return;
@@ -602,7 +678,7 @@ export class InsiderBot extends EventEmitter {
 
     // Case 1: Active Position (Exit Monitoring)
     if (this.activePosition) {
-      const buy = await this.findInsiderWalletBuy(signature, insiderWallet);
+      const buy = await this.findInsiderWalletBuy(signature, insiderWallet, historicalTx);
       if (!buy) return;
 
       if (buy.amount < 100_000) {
@@ -653,7 +729,7 @@ export class InsiderBot extends EventEmitter {
 
     // Case 2: Pre-Buy Sequence (Entry Monitoring)
     if (this.preBuySequence && this.preBuySequence.insiderWallet === insiderWallet) {
-      const analysis = await this.analyzeInsiderTransaction(signature, insiderWallet, positionMint);
+      const analysis = await this.analyzeInsiderTransaction(signature, insiderWallet, positionMint, historicalTx);
       if (!analysis) return;
 
       const { type, mint } = analysis;
@@ -712,10 +788,11 @@ export class InsiderBot extends EventEmitter {
   private async analyzeInsiderTransaction(
     signature: string,
     insiderWallet: string,
-    targetMint: string
+    targetMint: string,
+    historicalTx?: HeliusEnhancedTransaction
   ): Promise<{ type: 'buy' | 'sell' | 'transfer' | 'other'; mint?: string } | null> {
     if (this.config.insiderHeliusApiKey) {
-      const heliusTx = await this.fetchHeliusTransaction(signature);
+      const heliusTx = historicalTx || await this.fetchHeliusTransaction(signature);
       if (heliusTx) {
         const swaps = this.getHeliusPoolSwaps(heliusTx);
         const buy = swaps.find(s => s.direction === 'buy' && s.wallet === insiderWallet);
@@ -731,6 +808,9 @@ export class InsiderBot extends EventEmitter {
         }
       }
     }
+
+    // Standard RPC fallback only if not catch-up (historicalTx)
+    if (historicalTx) return null; 
 
     const tx = await this.fetchParsedTransaction(signature);
     if (!tx) return null;
@@ -762,13 +842,16 @@ export class InsiderBot extends EventEmitter {
 
   private async findInsiderWalletBuy(
     signature: string,
-    insiderWallet: string
+    insiderWallet: string,
+    historicalTx?: HeliusEnhancedTransaction
   ): Promise<{ mint: string; amount: number } | null> {
     if (this.config.insiderHeliusApiKey) {
-      const heliusTx = await this.fetchHeliusTransaction(signature);
+      const heliusTx = historicalTx || await this.fetchHeliusTransaction(signature);
       const heliusBuy = heliusTx ? this.findHeliusWalletBuy(heliusTx, insiderWallet) : null;
       if (heliusBuy) return heliusBuy;
     }
+
+    if (historicalTx) return null;
 
     const tx = await this.fetchParsedTransaction(signature);
     return tx ? this.findWalletBuy(tx, insiderWallet) : null;
