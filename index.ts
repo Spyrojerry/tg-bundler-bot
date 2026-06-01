@@ -121,8 +121,9 @@ async function main(): Promise<void> {
           return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
         }
         if (data === 'menu:refresh') return homeReply(true);
-        if (data.startsWith('refresh:mcap:')) {
-          const [, , mint, context] = parts;
+        if (data.startsWith('r:m:')) {
+          const [, , mint, contextCode] = parts;
+          const context = contextCode === 'i' ? 'insider' : 'bundler';
           const currentMarketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(mint);
           const currentPrice = await gmgnClient.quoteTokenSellForSol(config.tradingWalletAddress!, mint, 100).catch(() => null);
           
@@ -148,7 +149,7 @@ async function main(): Promise<void> {
           return {
             text: lines.join('\n'),
             replyMarkup: {
-              inline_keyboard: [[{ text: '🔄 Refresh', callback_data: `refresh:mcap:${mint}:${context}` }]],
+              inline_keyboard: [[{ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` }]],
             },
             editCurrent: true,
           };
@@ -465,7 +466,7 @@ async function main(): Promise<void> {
           'Watching insider wallet for its next buy. When it buys again, I will sell this position.',
         ].filter(Boolean).join('\n'), {
           replyMarkup: {
-            inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `refresh:mcap:${trigger.mint}:insider` }]],
+            inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${trigger.mint}:i` }]],
           },
         });
       } catch (err) {

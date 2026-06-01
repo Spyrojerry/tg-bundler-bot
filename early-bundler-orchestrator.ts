@@ -474,7 +474,7 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       'I am now monitoring these wallets. If any of them buy more or sell 40% of their holdings, I will trigger an immediate sell.',
     ].filter(Boolean).join('\n'), {
       replyMarkup: {
-        inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `refresh:mcap:${position.mint}:bundler` }]],
+        inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${position.mint}:b` }]],
       },
     }).catch(err => log.warn('Failed to send bundler detected notification', err));
   }
