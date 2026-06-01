@@ -122,6 +122,9 @@ export class InsiderBot extends EventEmitter {
   private mintBuyers = new Set<string>();
   private processedSignatures = new Set<string>();
   private boughtMints = new Set<string>();
+  private insiderCatchupCursorSignature: string | null = null;
+  private insiderRealtimeCatchupInFlight = false;
+  private insiderRealtimeCatchupPending = false;
   private activePosition: {
     followedWallet: string;
     insiderWallet: string;
@@ -133,6 +136,9 @@ export class InsiderBot extends EventEmitter {
     mint: string;
     state: 'WAITING_FOR_TX_1' | 'WAITING_FOR_TX_2';
     entrySignature: string;
+    skippedInitialTransferIn: boolean;
+    countedActivityTxs: number;
+    sawBuyTx: boolean;
   } | null = null;
 
   constructor(config: ServiceConfig, telegramBot: TelegramBot | null = null) {
@@ -226,6 +232,9 @@ export class InsiderBot extends EventEmitter {
     this.mintScanActive = false;
     this.mintBuyers.clear();
     this.processedSignatures.clear();
+    this.insiderCatchupCursorSignature = null;
+    this.insiderRealtimeCatchupInFlight = false;
+    this.insiderRealtimeCatchupPending = false;
     this.activePosition = null;
     this.preBuySequence = null;
   }
@@ -365,6 +374,9 @@ export class InsiderBot extends EventEmitter {
           mint,
           state: 'WAITING_FOR_TX_1',
           entrySignature: signature,
+          skippedInitialTransferIn: false,
+          countedActivityTxs: 0,
+          sawBuyTx: false,
         };
 
         await this.startInsiderWalletWatch(insiderWallet, mint, signature);
@@ -705,6 +717,9 @@ export class InsiderBot extends EventEmitter {
         mint,
         state: 'WAITING_FOR_TX_1',
         entrySignature: signature,
+        skippedInitialTransferIn: false,
+        countedActivityTxs: 0,
+        sawBuyTx: false,
       };
 
       await this.startInsiderWalletWatch(insiderSell.owner, mint, signature);
@@ -736,6 +751,9 @@ export class InsiderBot extends EventEmitter {
       this.insiderSubId = null;
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
     }
+    this.insiderCatchupCursorSignature = null;
+    this.insiderRealtimeCatchupInFlight = false;
+    this.insiderRealtimeCatchupPending = false;
   }
 
   private async resetForNewToken(): Promise<void> {
@@ -773,6 +791,9 @@ export class InsiderBot extends EventEmitter {
     }
 
     log.info('Starting insider wallet watch', { insiderWallet, positionMint, startSignature });
+    this.insiderCatchupCursorSignature = startSignature ?? null;
+    this.insiderRealtimeCatchupInFlight = false;
+    this.insiderRealtimeCatchupPending = false;
 
     // 1. If we have a start signature, catch up on all transactions since then
     if (startSignature && this.config.insiderHeliusApiKey) {
@@ -793,8 +814,8 @@ export class InsiderBot extends EventEmitter {
       new PublicKey(insiderWallet),
       (logInfo) => {
         if (logInfo.err) return;
-        
-        // Use batch fetch for real-time updates as well to ensure we don't miss txs in the same block
+
+        // Use address-history catch-up so we read every tx after the last processed cursor.
         void this.catchupInsiderWallet(insiderWallet, positionMint, logInfo.signature, true);
       },
       'processed'
@@ -812,95 +833,72 @@ export class InsiderBot extends EventEmitter {
     afterSignature: string,
     isRealtimeUpdate = false
   ): Promise<void> {
-    const key = `insider:${afterSignature}`;
-    if (isRealtimeUpdate && this.processedSignatures.has(key)) return;
-
-    // 1. Fetch transactions
-    let txs: HeliusEnhancedTransaction[] = [];
-    
     if (isRealtimeUpdate) {
-      log.info('Processing real-time transaction via Enhanced API', { signature: afterSignature });
-      const heliusTx = await this.fetchHeliusTransaction(afterSignature);
-      if (heliusTx) txs = [heliusTx];
-      else {
-        await this.pollAddressHistoryForMissing(insiderWallet, positionMint, afterSignature);
+      this.insiderRealtimeCatchupPending = true;
+      if (this.insiderRealtimeCatchupInFlight) {
         return;
       }
-    } else {
-      let currentAfter = afterSignature;
-      let iterations = 0;
-      let hasMore = true;
+    }
 
-      while (hasMore && iterations < 5) {
-        iterations++;
-        const batch = await this.fetchHeliusTransactionsAfter(insiderWallet, currentAfter);
-        if (batch === null || batch.length === 0) {
-          if (batch === null && iterations === 1) {
-            log.warn('Helius after-signature failed; falling back to recent transactions', { insiderWallet, afterSignature });
-            const recent = await this.fetchHeliusTransactionsRecent(insiderWallet);
-            const startIndex = recent.findIndex(tx => tx.signature === currentAfter);
-            if (startIndex !== -1) {
-              txs = recent.slice(0, startIndex).reverse();
-            }
+    if (isRealtimeUpdate) {
+      this.insiderRealtimeCatchupInFlight = true;
+    }
+
+    try {
+      do {
+        if (isRealtimeUpdate) {
+          this.insiderRealtimeCatchupPending = false;
+        }
+
+        const cursorSignature = isRealtimeUpdate
+          ? this.insiderCatchupCursorSignature ?? afterSignature
+          : afterSignature;
+        const txs = await this.fetchHeliusTransactionsAfterCursor(insiderWallet, cursorSignature, isRealtimeUpdate ? afterSignature : undefined);
+
+        if (txs.length > 0) {
+          log.info(`Processing ${txs.length} transactions for insider ${insiderWallet}`, {
+            isRealtimeUpdate,
+            afterSignature: cursorSignature,
+          });
+          for (const tx of txs) {
+            if (!tx.signature) continue;
+            // isHistorical = true if this is NOT a real-time update
+            await this.processInsiderWalletSignature(insiderWallet, positionMint, tx.signature, tx, !isRealtimeUpdate);
+            this.insiderCatchupCursorSignature = tx.signature;
           }
-          hasMore = false;
-        } else {
-          txs.push(...batch);
-          currentAfter = batch[batch.length - 1].signature ?? currentAfter;
-          if (batch.length < 100) hasMore = false;
         }
-      }
-    }
-
-    // 2. Process transactions in order
-    if (txs.length > 0) {
-      log.info(`Processing ${txs.length} transactions for insider ${insiderWallet}`, { isRealtimeUpdate });
-      for (const tx of txs) {
-        if (!tx.signature) continue;
-        // isHistorical = true if this is NOT a real-time update
-        await this.processInsiderWalletSignature(insiderWallet, positionMint, tx.signature, tx, !isRealtimeUpdate);
+      } while (isRealtimeUpdate && this.insiderRealtimeCatchupPending);
+    } finally {
+      if (isRealtimeUpdate) {
+        this.insiderRealtimeCatchupInFlight = false;
       }
     }
   }
 
-  private async pollAddressHistoryForMissing(
+  private async fetchHeliusTransactionsAfterCursor(
     address: string,
-    positionMint: string,
-    missingSignature: string
-  ): Promise<void> {
+    afterSignature: string,
+    observedSignature?: string
+  ): Promise<HeliusEnhancedTransaction[]> {
+    if (observedSignature) {
+      log.info('Processing real-time transactions via address history', {
+        observedSignature,
+        afterSignature,
+      });
+    }
+
     const recent = await this.fetchHeliusTransactionsRecent(address);
-    const tx = recent.find(t => t.signature === missingSignature);
-    if (tx) {
-      await this.processInsiderWalletSignature(address, positionMint, missingSignature, tx);
-    }
-  }
-
-  private async fetchHeliusTransactionsAfter(
-    address: string,
-    afterSignature: string
-  ): Promise<HeliusEnhancedTransaction[] | null> {
-    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${address}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}&after-signature=${afterSignature}`;
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const response = await fetch(url);
-        if (response.ok) {
-          return await response.json() as HeliusEnhancedTransaction[];
-        }
-        const text = await response.text();
-        
-        // Return null for 400 errors to trigger fallback
-        if (response.status === 400) {
-          return null;
-        }
-
-        log.warn(`Helius catch-up fetch attempt ${attempt}/3 failed`, { status: response.status, body: text });
-      } catch (err) {
-        log.warn(`Helius catch-up fetch attempt ${attempt}/3 error`, err);
-      }
-      await new Promise(r => setTimeout(r, attempt * 1000));
+    const cursorIndex = recent.findIndex((tx) => tx.signature === afterSignature);
+    if (cursorIndex !== -1) {
+      return recent.slice(0, cursorIndex).reverse();
     }
 
+    log.info('Insider recent history does not yet include cursor signature', {
+      address,
+      afterSignature,
+      observedSignature,
+      recentCount: recent.length,
+    });
     return [];
   }
 
@@ -918,6 +916,39 @@ export class InsiderBot extends EventEmitter {
       log.error('Failed to fetch recent Helius transactions', err);
     }
     return [];
+  }
+
+  private updatePreBuySequenceProgress(
+    signature: string,
+    analysis: InsiderAnalysis
+  ): { counted: boolean; staleWindowPassed: boolean } {
+    const seq = this.preBuySequence;
+    if (!seq || !analysis.isActivity) {
+      return { counted: false, staleWindowPassed: false };
+    }
+
+    if (!seq.skippedInitialTransferIn && analysis.isTransferIn) {
+      seq.skippedInitialTransferIn = true;
+      log.info('Ignoring initial transfer-in for insider entry sequence', {
+        insiderWallet: seq.insiderWallet,
+        mint: seq.mint,
+        signature,
+      });
+      return { counted: false, staleWindowPassed: false };
+    }
+
+    seq.countedActivityTxs += 1;
+    if (analysis.isBuy) {
+      seq.sawBuyTx = true;
+    }
+    if (seq.state === 'WAITING_FOR_TX_1') {
+      seq.state = 'WAITING_FOR_TX_2';
+    }
+
+    return {
+      counted: true,
+      staleWindowPassed: seq.sawBuyTx && seq.countedActivityTxs >= 2,
+    };
   }
 
   private async processInsiderWalletSignature(
@@ -983,57 +1014,66 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
+      const analysis = await this.analyzeInsiderTransaction(signature, insiderWallet, positionMint, historicalTx);
+      if (!analysis) return;
+      if (!analysis.isActivity) return;
+
+      const previousState = this.preBuySequence.state;
+      const progress = this.updatePreBuySequenceProgress(signature, analysis);
+      if (!progress.counted) return;
+
       if (isHistorical) {
-        log.warn('Skipping historical transaction for entry sequence counting', { signature });
+        if (progress.staleWindowPassed) {
+          log.warn('Skipping stale insider entry sequence after historical catch-up', {
+            insiderWallet,
+            positionMint,
+            signature,
+            countedActivityTxs: this.preBuySequence?.countedActivityTxs,
+            sawBuyTx: this.preBuySequence?.sawBuyTx,
+          });
+          await this.resetForNewToken();
+        }
         return;
       }
 
-      const analysis = await this.analyzeInsiderTransaction(signature, insiderWallet, positionMint, historicalTx);
-      if (!analysis) return;
-
-      const { isActivity, summary } = analysis;
+      const { summary } = analysis;
       const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const activityLine = summary ? `Activity: <b>${html(summary)}</b>` : 'Activity: <b>Detected</b>';
       const sigLine = `Tx: <code>${html(this.short(signature))}</code>`;
 
-      if (this.preBuySequence.state === 'WAITING_FOR_TX_1') {
-        if (isActivity) {
-          log.warn('Insider Entry Stage 1: Tx #1 detected', { insiderWallet, positionMint, signature });
-          this.preBuySequence.state = 'WAITING_FOR_TX_2';
+      if (previousState === 'WAITING_FOR_TX_1') {
+        log.warn('Insider Entry Stage 1: Tx #1 detected', { insiderWallet, positionMint, signature });
 
-          this.telegramBot?.sendDefault([
-            '<b>🔄 Insider Sequence: [1/2] Tx #1 Detected</b>',
-            `Insider: <code>${html(insiderWallet)}</code>`,
-            `Token: <code>${html(positionMint)}</code>`,
-            activityLine,
-            sigLine,
-            '',
-            'Waiting for 1 more transaction before buying.',
-          ].join('\n')).catch(() => undefined);
-        }
-      } else if (this.preBuySequence.state === 'WAITING_FOR_TX_2') {
-        if (isActivity) {
-          log.warn('Insider Entry Stage 2: Tx #2 detected - TRIGGERING BUY', { insiderWallet, positionMint, signature });
-          
-          const seq = this.preBuySequence;
-          this.preBuySequence = null;
+        this.telegramBot?.sendDefault([
+          '<b>🔄 Insider Sequence: [1/2] Tx #1 Detected</b>',
+          `Insider: <code>${html(insiderWallet)}</code>`,
+          `Token: <code>${html(positionMint)}</code>`,
+          activityLine,
+          sigLine,
+          '',
+          'Waiting for 1 more transaction before buying.',
+        ].join('\n')).catch(() => undefined);
+      } else if (previousState === 'WAITING_FOR_TX_2') {
+        log.warn('Insider Entry Stage 2: Tx #2 detected - TRIGGERING BUY', { insiderWallet, positionMint, signature });
 
-          this.telegramBot?.sendDefault([
-            '<b>🚀 Insider Sequence: [2/2] Tx #2 Detected - BUYING</b>',
-            `Insider: <code>${html(insiderWallet)}</code>`,
-            `Token: <code>${html(positionMint)}</code>`,
-            activityLine,
-            `Signature: <code>${html(signature)}</code>`,
-          ].join('\n')).catch(() => undefined);
+        const seq = this.preBuySequence;
+        this.preBuySequence = null;
 
-          this.emit('buyTrigger', {
-            followedWallet: seq.followedWallet,
-            insiderWallet: seq.insiderWallet,
-            mint: seq.mint,
-            signature: signature,
-            buySol: this.buySol,
-          });
-        }
+        this.telegramBot?.sendDefault([
+          '<b>🚀 Insider Sequence: [2/2] Tx #2 Detected - BUYING</b>',
+          `Insider: <code>${html(insiderWallet)}</code>`,
+          `Token: <code>${html(positionMint)}</code>`,
+          activityLine,
+          `Signature: <code>${html(signature)}</code>`,
+        ].join('\n')).catch(() => undefined);
+
+        this.emit('buyTrigger', {
+          followedWallet: seq.followedWallet,
+          insiderWallet: seq.insiderWallet,
+          mint: seq.mint,
+          signature: signature,
+          buySol: this.buySol,
+        });
       }
     }
   }
