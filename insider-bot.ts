@@ -5,6 +5,9 @@ import type { ServiceConfig } from './types';
 
 const log = createLogger('INSIDER');
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const KNOWN_POOL_AUTHORITIES = new Set([
+  'FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM',
+]);
 
 type ParsedTokenBalance = {
   accountIndex: number;
@@ -213,9 +216,10 @@ export class InsiderBot extends EventEmitter {
 
     const deltas = this.getTokenDeltas(tx.meta?.preTokenBalances ?? [], tx.meta?.postTokenBalances ?? [])
       .filter((delta) => delta.mint === mint);
+    const signerAddresses = this.getSignerAddresses(tx);
 
     for (const delta of deltas) {
-      if (delta.rawDiff > 0n) {
+      if (delta.rawDiff > 0n && !this.isKnownPoolAuthority(delta.owner)) {
         this.mintBuyers.add(delta.owner);
       }
     }
@@ -223,6 +227,8 @@ export class InsiderBot extends EventEmitter {
     const insiderSell = deltas.find((delta) =>
       delta.rawDiff < 0n
       && delta.owner !== followedWallet
+      && !this.isKnownPoolAuthority(delta.owner)
+      && signerAddresses.has(delta.owner)
       && !this.mintBuyers.has(delta.owner)
     );
 
@@ -315,6 +321,12 @@ export class InsiderBot extends EventEmitter {
       insiderBuyMint: buy.mint,
       signature,
     });
+
+    if (this.insiderSubId !== null) {
+      const subId = this.insiderSubId;
+      this.insiderSubId = null;
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
   }
 
   private async fetchParsedTransaction(signature: string): Promise<NonNullable<Awaited<ReturnType<Connection['getParsedTransaction']>>> | null> {
@@ -336,10 +348,26 @@ export class InsiderBot extends EventEmitter {
     const deltas = this.getTokenDeltas(tx.meta?.preTokenBalances ?? [], tx.meta?.postTokenBalances ?? []);
     const buy = deltas.find((delta) =>
       delta.owner === wallet
+      && !this.isKnownPoolAuthority(delta.owner)
       && delta.rawDiff > 0n
       && delta.mint !== SOL_MINT
     );
     return buy ? { mint: buy.mint, amount: buy.amount } : null;
+  }
+
+  private isKnownPoolAuthority(address: string): boolean {
+    return KNOWN_POOL_AUTHORITIES.has(address);
+  }
+
+  private getSignerAddresses(
+    tx: NonNullable<Awaited<ReturnType<Connection['getParsedTransaction']>>>
+  ): Set<string> {
+    const signers = new Set<string>();
+    for (const key of tx.transaction.message.accountKeys) {
+      if (!key.signer) continue;
+      signers.add(key.pubkey.toBase58());
+    }
+    return signers;
   }
 
   private getTokenDeltas(

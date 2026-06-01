@@ -34,6 +34,8 @@ import { PublicKey } from '@solana/web3.js';
 import { randomBytes } from 'crypto';
 
 const log = createLogger('MAIN');
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -979,6 +981,21 @@ async function main(): Promise<void> {
     ].join('\n');
   }
 
+  async function getTokenRawBalance(owner: PublicKey, mint: PublicKey): Promise<bigint> {
+    const accounts = await gmgnClient.getParsedTokenAccountsForMint(owner, mint);
+    let total = 0n;
+    for (const account of accounts) {
+      const parsed = account.account.data.parsed as {
+        info?: { tokenAmount?: { amount?: string } };
+      };
+      const raw = parsed.info?.tokenAmount?.amount;
+      if (raw && /^\d+$/.test(raw)) {
+        total += BigInt(raw);
+      }
+    }
+    return total;
+  }
+
   async function executeSellAndNotify(
     chatId: string | null,
     sellId: string,
@@ -988,19 +1005,11 @@ async function main(): Promise<void> {
     if (!pending) return;
 
     try {
-      // Preliminary balance check to avoid entering profit gate if already sold
       const owner = new PublicKey(pending.event.walletAddress);
       const mintPk = new PublicKey(pending.event.mint);
-      
-      let accounts;
-      try {
-        accounts = await gmgnClient.getParsedTokenAccountsForMint(owner, mintPk);
-      } catch (err) {
-        // If we can't check balance, we'll let the profit gate try once
-        accounts = null;
-      }
 
-      if (accounts && accounts.length === 0) {
+      const startingBalance = await getTokenRawBalance(owner, mintPk).catch(() => null);
+      if (startingBalance !== null && startingBalance <= 0n) {
         log.info(`[SELL ABORT] No token accounts found for ${pending.event.mint}, assuming already sold.`);
         return;
       }
@@ -1008,26 +1017,71 @@ async function main(): Promise<void> {
       const currentPending = pendingSells.get(sellId);
       if (!currentPending) return;
 
-      const result = await gmgnClient.sellTokenForSol(
-        currentPending.event.walletAddress,
-        currentPending.event.mint,
-        {
-          percent: config.sellPercent,
-          slippage: config.sellSlippage,
-          autoSlippage: config.sellAutoSlippage,
-          priorityFeeSol: config.sellPriorityFeeSol,
-          antiMev: config.sellAntiMev,
+      let lastResult: SellResult | null = null;
+      let lastError: unknown = null;
+      let sold = false;
+
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          lastResult = await gmgnClient.sellTokenForSol(
+            currentPending.event.walletAddress,
+            currentPending.event.mint,
+            {
+              percent: config.sellPercent,
+              slippage: config.sellSlippage,
+              autoSlippage: config.sellAutoSlippage,
+              priorityFeeSol: config.sellPriorityFeeSol,
+              antiMev: config.sellAntiMev,
+            }
+          );
+          lastError = null;
+        } catch (err) {
+          lastError = err;
+          log.warn(`Sell attempt ${attempt}/5 failed`, {
+            mint: currentPending.event.mint,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
-      );
-      const receipt = sellReceipt(currentPending.event, result);
+
+        await sleep(1_500);
+        const remainingBalance = await getTokenRawBalance(owner, mintPk).catch(() => null);
+        if (remainingBalance !== null && remainingBalance <= 0n) {
+          sold = true;
+          break;
+        }
+
+        if (lastResult?.status === 'confirmed' && remainingBalance === null) {
+          sold = true;
+          break;
+        }
+      }
+
+      if (!sold) {
+        throw lastError ?? new Error(`Sell did not clear token balance after 5 attempts`);
+      }
+
+      const receiptResult = lastResult
+        ? { ...lastResult, status: lastResult.status === 'failed' ? 'confirmed' : lastResult.status }
+        : {
+            orderId: null,
+            hash: null,
+            status: 'confirmed',
+            inputToken: currentPending.event.mint,
+            outputToken: 'So11111111111111111111111111111111111111112',
+            soldPercent: config.sellPercent,
+            filledInputAmount: null,
+            filledOutputAmount: null,
+            raw: {},
+          };
+      const receipt = sellReceipt(currentPending.event, receiptResult);
       if (chatId && telegramBot) {
         await telegramBot.sendChat(chatId, receipt);
       } else {
         log.info('Sell completed without Telegram receipt chat', {
           mint: currentPending.event.mint,
-          status: result.status,
-          hash: result.hash,
-          orderId: result.orderId,
+          status: receiptResult.status,
+          hash: receiptResult.hash,
+          orderId: receiptResult.orderId,
         });
       }
     } catch (err) {
