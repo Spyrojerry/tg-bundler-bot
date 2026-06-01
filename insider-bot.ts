@@ -248,15 +248,17 @@ export class InsiderBot extends EventEmitter {
     while (this.mintScanActive) {
       attempt += 1;
       const txs = await this.fetchEarliestMintTransactions(mint);
-      this.mintScanCount = Math.min(txs.length, 20);
+      const swapTxs = txs
+        .filter((tx) => this.getHeliusPoolSwaps(tx, mint).length > 0)
+        .slice(0, 20);
+      this.mintScanCount = swapTxs.length;
       this.mintBuyers.clear();
 
-      const earliestTxs = txs.slice(0, 20);
-      for (let i = 0; i < earliestTxs.length; i++) {
-        const tx = earliestTxs[i];
+      for (let i = 0; i < swapTxs.length; i++) {
+        const tx = swapTxs[i];
         const insiderWallet = this.findEarlyHeliusInsider(
           tx,
-          earliestTxs.slice(0, i),
+          swapTxs.slice(0, i),
           followedWallet,
           mint
         );
@@ -268,7 +270,8 @@ export class InsiderBot extends EventEmitter {
           insiderWallet,
           mint,
           signature,
-          scannedTxs: this.mintScanCount,
+          scannedSwapTxs: this.mintScanCount,
+          fetchedTxs: txs.length,
         });
         await this.stopMintScanOnly();
         this.emit('buyTrigger', {
@@ -281,11 +284,12 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
-      if (txs.length >= 20) {
+      if (swapTxs.length >= 20) {
         log.info('Insider mint scan completed without insider signal', {
           followedWallet,
           mint,
-          scannedTxs: this.mintScanCount,
+          scannedSwapTxs: this.mintScanCount,
+          fetchedTxs: txs.length,
         });
         await this.stopMintScanOnly();
         return;
@@ -294,7 +298,8 @@ export class InsiderBot extends EventEmitter {
       log.info('Insider mint scan waiting for earliest 20 transactions', {
         followedWallet,
         mint,
-        receivedTxs: txs.length,
+        receivedSwapTxs: swapTxs.length,
+        fetchedTxs: txs.length,
         attempt,
       });
       await new Promise((resolve) => setTimeout(resolve, Math.min(1_000 + attempt * 500, 5_000)));
@@ -302,7 +307,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async fetchEarliestMintTransactions(mint: string): Promise<HeliusEnhancedTransaction[]> {
-    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}&limit=20`;
+    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}&limit=100`;
 
     for (let attempt = 1; attempt <= 5; attempt++) {
       const response = await fetch(url);
