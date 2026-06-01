@@ -121,6 +121,7 @@ export class InsiderBot extends EventEmitter {
   private mintScanActive = false;
   private mintBuyers = new Set<string>();
   private processedSignatures = new Set<string>();
+  private boughtMints = new Set<string>();
   private activePosition: {
     followedWallet: string;
     insiderWallet: string;
@@ -178,6 +179,9 @@ export class InsiderBot extends EventEmitter {
 
   async followWallet(address: string): Promise<void> {
     const normalized = new PublicKey(address).toBase58();
+    if (this.followedWallet !== normalized) {
+      this.boughtMints.clear();
+    }
     await this.stop();
     this.followedWallet = normalized;
     this.firstBuyHandled = false;
@@ -232,6 +236,7 @@ export class InsiderBot extends EventEmitter {
       insiderWallet: trigger.insiderWallet,
       mint: trigger.mint,
     };
+    this.boughtMints.add(trigger.mint);
     this.preBuySequence = null;
     this.startInsiderWalletWatch(trigger.insiderWallet, trigger.mint, trigger.signature).catch((err) => {
       log.error('Failed to restart insider watch after buy', err);
@@ -246,6 +251,14 @@ export class InsiderBot extends EventEmitter {
 
     const buy = this.findWalletBuy(tx, this.followedWallet);
     if (!buy) return;
+    if (this.boughtMints.has(buy.mint)) {
+      log.info('Skipping mint scan for previously bought mint', {
+        followedWallet: this.followedWallet,
+        mint: buy.mint,
+        signature,
+      });
+      return;
+    }
 
     this.firstBuyHandled = true;
     log.info('Followed wallet first buy detected', {
@@ -257,6 +270,11 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async startMintScan(followedWallet: string, mint: string): Promise<void> {
+    if (this.boughtMints.has(mint)) {
+      log.info('Skipping mint scan for previously bought mint', { followedWallet, mint });
+      return;
+    }
+
     if (this.mintSubId !== null) {
       await this.connection.removeOnLogsListener(this.mintSubId).catch(() => undefined);
       this.mintSubId = null;
@@ -326,6 +344,11 @@ export class InsiderBot extends EventEmitter {
         if (!insiderWallet) continue;
 
         const signature = tx.signature ?? '';
+        if (this.boughtMints.has(mint)) {
+          log.info('Skipping entry watch for previously bought mint', { followedWallet, insiderWallet, mint });
+          await this.stopMintScanOnly();
+          return;
+        }
         log.warn('Insider wallet detected; starting entry sequence watch (Waiting for Tx #1)', {
           followedWallet,
           insiderWallet,
@@ -656,6 +679,17 @@ export class InsiderBot extends EventEmitter {
     );
 
     if (insiderSell) {
+      if (this.boughtMints.has(mint)) {
+        log.info('Skipping entry watch for previously bought mint', {
+          followedWallet,
+          insiderWallet: insiderSell.owner,
+          mint,
+          signature,
+        });
+        await this.stopMintScanOnly();
+        return;
+      }
+
       log.warn('Insider wallet detected; starting entry sequence watch (Waiting for Tx #1)', {
         followedWallet,
         insiderWallet: insiderSell.owner,
@@ -696,6 +730,14 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  private async stopInsiderWatchOnly(): Promise<void> {
+    if (this.insiderSubId !== null) {
+      const subId = this.insiderSubId;
+      this.insiderSubId = null;
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+  }
+
   private async resetForNewToken(): Promise<void> {
     log.info('Resetting InsiderBot for new token detection');
     
@@ -704,8 +746,7 @@ export class InsiderBot extends EventEmitter {
 
     // 2. Stop any active insider wallet monitoring
     if (this.insiderSubId !== null) {
-      await this.connection.removeOnLogsListener(this.insiderSubId).catch(() => undefined);
-      this.insiderSubId = null;
+      await this.stopInsiderWatchOnly();
     }
 
     // 3. Clear all transient state except the followed wallet
@@ -935,6 +976,13 @@ export class InsiderBot extends EventEmitter {
 
     // Case 2: Pre-Buy Sequence (Entry Monitoring)
     if (this.preBuySequence && this.preBuySequence.insiderWallet === insiderWallet) {
+      if (this.boughtMints.has(positionMint)) {
+        log.info('Skipping entry sequence: Token already bought previously', { mint: positionMint });
+        this.preBuySequence = null;
+        await this.stopInsiderWatchOnly();
+        return;
+      }
+
       if (isHistorical) {
         log.warn('Skipping historical transaction for entry sequence counting', { signature });
         return;
@@ -1051,7 +1099,8 @@ export class InsiderBot extends EventEmitter {
                 if (!fromIsPool) result.isTransferIn = true;
               }
             } else if (!result.summary) {
-              result.summary = isToInsider ? `Received ${this.short(transfer.mint)}` : `Sent ${this.short(transfer.mint)}`;
+              const transferMint = transfer.mint ? this.short(transfer.mint) : 'unknown token';
+              result.summary = isToInsider ? `Received ${transferMint}` : `Sent ${transferMint}`;
             }
           }
         }
@@ -1246,5 +1295,9 @@ export class InsiderBot extends EventEmitter {
         };
       })
       .filter((delta) => delta.rawDiff !== 0n);
+  }
+
+  private short(value: string): string {
+    return `${value.slice(0, 4)}...${value.slice(-4)}`;
   }
 }
