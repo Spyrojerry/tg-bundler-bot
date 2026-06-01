@@ -149,6 +149,10 @@ export interface ServiceConfig {
   f1HeliusApiKey: string;
   f1SolanaRpcUrl: string;
   f1SolanaWsUrl: string;
+  insiderHeliusApiKey: string;
+  insiderSolanaRpcUrl: string;
+  insiderSolanaWsUrl: string;
+  insiderBuySol: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;
@@ -214,6 +218,13 @@ export interface SellOptions {
   autoSlippage: boolean;
   priorityFeeSol: number;
   antiMev: boolean;
+}
+
+export interface BuyOptions {
+  solAmount: number;
+  slippage: number;
+  autoSlippage: boolean;
+  priorityFeeSol: number;
 }
 
 export interface SellResult {

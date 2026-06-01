@@ -24,6 +24,7 @@ import {
   BundlerMetrics,
   FetchResult,
   GmgnSecurityResponse,
+  BuyOptions,
   SellOptions,
   SellQuote,
   SellResult,
@@ -136,6 +137,36 @@ export class GmgnClient {
     return this.submitJupiterSellWithRetry(wallet, walletAddress, mint, rawAmount, options);
   }
 
+  async buyTokenWithSol(
+    walletAddress: string,
+    mint: string,
+    options: BuyOptions
+  ): Promise<SellResult> {
+    this.validateSolAddress(walletAddress, 'wallet address');
+    this.validateSolAddress(mint, 'token mint');
+
+    const wallet = this.getJupiterWallet(walletAddress);
+    const rawAmount = BigInt(Math.max(1, Math.round(options.solAmount * 1_000_000_000)));
+
+    log.warn(`Submitting confirmed buy via Jupiter Swap V2`, {
+      wallet: walletAddress,
+      mint,
+      inputToken: SOL_MINT,
+      solAmount: options.solAmount,
+      rawAmount: rawAmount.toString(),
+    });
+
+    return this.submitJupiterSwapWithRetry(
+      wallet,
+      walletAddress,
+      SOL_MINT,
+      mint,
+      rawAmount,
+      options,
+      100
+    );
+  }
+
   private async submitJupiterSellWithRetry(
     wallet: Keypair,
     walletAddress: string,
@@ -143,16 +174,36 @@ export class GmgnClient {
     rawAmount: bigint,
     options: SellOptions
   ): Promise<SellResult> {
+    return this.submitJupiterSwapWithRetry(
+      wallet,
+      walletAddress,
+      mint,
+      SOL_MINT,
+      rawAmount,
+      options,
+      options.percent
+    );
+  }
+
+  private async submitJupiterSwapWithRetry(
+    wallet: Keypair,
+    walletAddress: string,
+    inputMint: string,
+    outputMint: string,
+    rawAmount: bigint,
+    options: BuyOptions | SellOptions,
+    soldPercent: number
+  ): Promise<SellResult> {
     let lastError: unknown = null;
 
     for (let attempt = 0; attempt <= JUPITER_SELL_RETRIES; attempt++) {
       const order = await this.getJupiterOrderWithRetry(
-        mint,
-        SOL_MINT,
-      rawAmount,
-      walletAddress,
-      options.priorityFeeSol,
-      options
+        inputMint,
+        outputMint,
+        rawAmount,
+        walletAddress,
+        options.priorityFeeSol,
+        options
       );
       const transactionBase64 = this.asString(order.transaction);
       const requestId = this.asString(order.requestId);
@@ -165,7 +216,7 @@ export class GmgnClient {
       transaction.sign([wallet]);
       const signedTransaction = Buffer.from(transaction.serialize()).toString('base64');
       const execute = await this.executeJupiterOrder(signedTransaction, requestId);
-      const result = this.parseJupiterSellResult(order, execute, mint, options.percent);
+      const result = this.parseJupiterSellResult(order, execute, inputMint, soldPercent);
 
       if (result.status !== 'failed') {
         return result;
@@ -178,8 +229,9 @@ export class GmgnClient {
       }
 
       const delay = BASE_RETRY_MS * 2 ** attempt;
-      log.warn('Jupiter execute failed; rebuilding order and retrying', {
-        mint,
+        log.warn('Jupiter execute failed; rebuilding order and retrying', {
+        inputMint,
+        outputMint,
         attempt: attempt + 1,
         retryInMs: delay,
         error: detail,
@@ -337,7 +389,7 @@ export class GmgnClient {
     amount: bigint,
     taker?: string,
     priorityFeeSol = 0,
-    options?: SellOptions
+    options?: BuyOptions | SellOptions
   ): Promise<Record<string, unknown>> {
     const url = new URL(`${this.jupiterSwapBaseUrl}/order`);
     url.searchParams.set('inputMint', inputMint);
@@ -364,7 +416,7 @@ export class GmgnClient {
     amount: bigint,
     taker?: string,
     priorityFeeSol = 0,
-    options?: SellOptions
+    options?: BuyOptions | SellOptions
   ): Promise<Record<string, unknown>> {
     let lastError: unknown = null;
     for (let attempt = 0; attempt <= JUPITER_ORDER_RETRIES; attempt++) {
@@ -410,7 +462,7 @@ export class GmgnClient {
       || lower.includes('failed to get quotes');
   }
 
-  private toJupiterSlippageBps(options?: SellOptions): number | null {
+  private toJupiterSlippageBps(options?: BuyOptions | SellOptions): number | null {
     if (!options || options.autoSlippage) return null;
     const bps = Math.round(options.slippage * 10_000);
     return Math.max(1, Math.min(10_000, bps));

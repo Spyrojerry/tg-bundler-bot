@@ -100,6 +100,15 @@ export function loadConfig(): ServiceConfig {
     'F1_SOLANA_WS_URL',
     deriveWsUrl(f1SolanaRpcUrl)
   );
+  const insiderHeliusApiKey = optional('INSIDER_HELIUS_API_KEY', '');
+  const insiderSolanaRpcUrl = optional(
+    'INSIDER_SOLANA_RPC_URL',
+    insiderHeliusApiKey ? heliusRpcUrl(insiderHeliusApiKey) : solanaRpcUrl
+  );
+  const insiderSolanaWsUrl = optional(
+    'INSIDER_SOLANA_WS_URL',
+    deriveWsUrl(insiderSolanaRpcUrl)
+  );
   const dbPath           = optional('DB_PATH', './data/monitor.db');
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
@@ -116,6 +125,7 @@ export function loadConfig(): ServiceConfig {
   const sellPercent            = optionalNumber('SELL_PERCENT', 100);
   const sellSlippage           = optionalNumber('SELL_SLIPPAGE', 0.3);
   const sellPriorityFeeSol     = optionalNumber('SELL_PRIORITY_FEE_SOL', 0.000012);
+  const insiderBuySol          = optionalNumber('INSIDER_BUY_SOL', 0.01);
   const port                   = optionalInt('PORT', 8080);
 
   if (!isValidLogLevel(rawLogLevel)) {
@@ -162,6 +172,10 @@ export function loadConfig(): ServiceConfig {
     f1HeliusApiKey,
     f1SolanaRpcUrl,
     f1SolanaWsUrl,
+    insiderHeliusApiKey,
+    insiderSolanaRpcUrl,
+    insiderSolanaWsUrl,
+    insiderBuySol,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,

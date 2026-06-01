@@ -29,6 +29,7 @@ import {
 import { HeliusClient, EarlyBundlerInfo } from './helius-client';
 import { BundlerMonitor, BundlerWallet, BundlerTransaction } from './bundler-monitor';
 import { EarlyBundlerOrchestrator, BundlerSellReason } from './early-bundler-orchestrator';
+import { InsiderBot } from './insider-bot';
 import { PublicKey } from '@solana/web3.js';
 import { randomBytes } from 'crypto';
 
@@ -72,6 +73,8 @@ async function main(): Promise<void> {
 
   // ── 4. Early Bundler Orchestrator ─────────────────────────────────────────
   let earlyBundlerOrchestrator: EarlyBundlerOrchestrator;
+  const insiderBot = new InsiderBot(config);
+  let botMode: 'insider' | 'bundler' = 'insider';
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
@@ -79,7 +82,8 @@ async function main(): Promise<void> {
   const pendingTradingBuys = new Map<string, NewTokenEvent>();
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
-    | { type: 'minSol'; walletAddress: string };
+    | { type: 'minSol'; walletAddress: string }
+    | { type: 'insiderFollowWallet' | 'insiderBuySol' };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
   const pausedWallets = new Set<string>();
@@ -115,6 +119,26 @@ async function main(): Promise<void> {
         if (data === 'menu:refresh') return homeReply(true);
         if (data === 'menu:wallets') return walletsReply(chatId);
         if (data === 'menu:status') return statusReply();
+        if (data === 'mode:insider') {
+          botMode = 'insider';
+          return homeReply(true);
+        }
+        if (data === 'mode:bundler') {
+          botMode = 'bundler';
+          return homeReply(true);
+        }
+        if (data === 'insider:follow') {
+          pendingTelegramActions.set(chatId, { type: 'insiderFollowWallet' });
+          return { text: 'Send the wallet address for Insider Bot to follow.', trackPrompt: true };
+        }
+        if (data === 'insider:buysol') {
+          pendingTelegramActions.set(chatId, { type: 'insiderBuySol' });
+          return { text: 'Send the SOL amount Insider Bot should buy with.', trackPrompt: true };
+        }
+        if (data === 'insider:stop') {
+          await insiderBot.stop();
+          return homeReply(true);
+        }
 
         if (callbackKind === 'sell' && callbackAction && callbackAddress) {
           const pending = pendingSells.get(callbackAddress);
@@ -234,6 +258,20 @@ async function main(): Promise<void> {
             if (!message.startsWith('Updated ')) return message;
             return settingsReply(pendingAction.walletAddress);
           }
+          if (pendingAction.type === 'insiderFollowWallet') {
+            await insiderBot.followWallet(text);
+            return homeReply();
+          }
+          if (pendingAction.type === 'insiderBuySol') {
+            const value = Number(text.trim());
+            if (!Number.isFinite(value) || value <= 0) return 'Send a SOL amount greater than 0.';
+            insiderBot.setBuySol(value);
+            return homeReply();
+          }
+        }
+        if (botMode === 'insider') {
+          await insiderBot.followWallet(text);
+          return homeReply();
         }
         return walletSummaryReply(text);
       }
@@ -302,6 +340,106 @@ async function main(): Promise<void> {
       sellId,
       reason,
     });
+
+    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+  });
+
+  insiderBot.on('buyTrigger', (trigger) => {
+    if (!config.tradingWalletAddress) {
+      log.warn('[INSIDER BUY SKIP] No trading wallet configured', trigger);
+      return;
+    }
+
+    log.warn('[INSIDER BUY TRIGGER]', trigger);
+    telegramBot?.sendDefault([
+      '<b>Insider Signal Detected</b>',
+      `Followed wallet: <code>${html(trigger.followedWallet)}</code>`,
+      `Insider wallet: <code>${html(trigger.insiderWallet)}</code>`,
+      `Token: <code>${html(trigger.mint)}</code>`,
+      `Buying: <b>${trigger.buySol} SOL</b>`,
+    ].join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
+
+    void (async () => {
+      try {
+        const result = await gmgnClient.buyTokenWithSol(
+          config.tradingWalletAddress!,
+          trigger.mint,
+          {
+            solAmount: trigger.buySol,
+            slippage: config.sellSlippage,
+            autoSlippage: config.sellAutoSlippage,
+            priorityFeeSol: config.sellPriorityFeeSol,
+          }
+        );
+        insiderBot.markPositionBought(trigger);
+        await telegramBot?.sendDefault([
+          '<b>Insider Buy Submitted</b>',
+          `Token: <code>${html(trigger.mint)}</code>`,
+          `Status: <b>${html(result.status)}</b>`,
+          result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
+          '',
+          'Watching insider wallet for its next buy. When it buys again, I will sell this position.',
+        ].filter(Boolean).join('\n'));
+      } catch (err) {
+        log.error('Insider buy failed', err);
+        await telegramBot?.sendDefault([
+          '<b>Insider Buy Failed</b>',
+          `Token: <code>${html(trigger.mint)}</code>`,
+          `Error: ${html(err instanceof Error ? err.message : String(err))}`,
+        ].join('\n'));
+      }
+    })();
+  });
+
+  insiderBot.on('sellTrigger', (trigger) => {
+    if (!config.tradingWalletAddress) {
+      log.warn('[INSIDER SELL SKIP] No trading wallet configured', trigger);
+      return;
+    }
+    if (hasPendingSellForMint(config.tradingWalletAddress, trigger.positionMint)) {
+      log.info(`[INSIDER SELL SKIP] Sell already pending for ${trigger.positionMint}`);
+      return;
+    }
+
+    const event: FilterFailEvent = {
+      walletAddress: config.tradingWalletAddress,
+      mint: trigger.positionMint,
+      sampleNumber: 0,
+      elapsedSec: 0,
+      reasons: [
+        `Insider wallet ${trigger.insiderWallet} made a new buy after our entry.`,
+        `Insider buy token: ${trigger.insiderBuyMint}`,
+        'Configured action triggered: sell immediately on insider next-buy signal.',
+      ],
+      settings: db.getWalletSettings(config.tradingWalletAddress),
+      metrics: {
+        mint: trigger.positionMint,
+        timestamp: new Date().toISOString(),
+        bundlersPercent: null,
+        bundlersCount: null,
+        initialBaseReserve: null,
+        topWallets: null,
+        top10HolderRate: null,
+        bundledAmountRate: null,
+      },
+      buySol: insiderBot.getBuySol(),
+      matchingWallets: [trigger.insiderWallet],
+    };
+
+    const sellId = randomBytes(5).toString('hex');
+    pendingSells.set(sellId, {
+      event,
+      createdAt: Date.now(),
+      executing: true,
+    });
+
+    telegramBot?.sendDefault([
+      '<b>Insider Sell Triggered</b>',
+      `Position token: <code>${html(trigger.positionMint)}</code>`,
+      `Insider wallet: <code>${html(trigger.insiderWallet)}</code>`,
+      `Insider bought: <code>${html(trigger.insiderBuyMint)}</code>`,
+      `Action: submit sell for <b>${config.sellPercent}%</b>.`,
+    ].join('\n')).catch((err) => log.warn('Telegram insider sell alert failed', err));
 
     void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
   });
@@ -624,6 +762,42 @@ async function main(): Promise<void> {
   }
 
   function homeReply(editCurrent = false): TelegramReply {
+    if (botMode === 'insider') {
+      const followedWallet = insiderBot.getFollowedWallet();
+      return {
+        text: [
+          '<b>Insider Bot</b>',
+          '',
+          `Mode: <b>Insider</b>`,
+          `Status: <b>${insiderBot.isRunning() ? 'Running' : 'Idle'}</b>`,
+          `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : '<b>Not set</b>'}`,
+          `Buy SOL: <b>${insiderBot.getBuySol()}</b>`,
+          '',
+          '<b>Flow</b>',
+          'Send a wallet address to follow it.',
+          'The first token buy from that wallet starts a 20-tx mint scan.',
+          'If an early wallet sells before a visible buy, I buy the token and then watch that insider wallet for its next buy.',
+        ].join('\n'),
+        replyMarkup: {
+          inline_keyboard: [
+            [
+              { text: 'Insider', callback_data: 'mode:insider' },
+              { text: 'Bundler', callback_data: 'mode:bundler' },
+            ],
+            [
+              { text: 'Follow wallet', callback_data: 'insider:follow' },
+              { text: 'Buy SOL', callback_data: 'insider:buysol' },
+            ],
+            [
+              { text: 'Stop', callback_data: 'insider:stop' },
+              { text: 'Refresh', callback_data: 'menu:refresh' },
+            ],
+          ],
+        },
+        editCurrent,
+      };
+    }
+
     const wallets = [...walletMonitors.keys()];
     const tradingWallet = config.tradingWalletAddress;
     
@@ -650,6 +824,8 @@ async function main(): Promise<void> {
       text: [
         '<b>Early Bundler Bot</b>',
         '',
+        `Mode: <b>Bundler</b>`,
+        '',
         `Wallets total: <b>${allWallets.length}</b>`,
         `Running: <b>${runningWallets}</b>`,
         `Paused: <b>${pausedWallets.size}</b>`,
@@ -666,6 +842,10 @@ async function main(): Promise<void> {
       ].join('\n'),
       replyMarkup: {
         inline_keyboard: [
+          [
+            { text: 'Insider', callback_data: 'mode:insider' },
+            { text: 'Bundler', callback_data: 'mode:bundler' },
+          ],
           [
             { text: 'Add wallet', callback_data: 'menu:addwallet' },
             { text: 'Remove wallet', callback_data: 'menu:removewallet' },
@@ -710,8 +890,19 @@ async function main(): Promise<void> {
   }
 
   function statusReply(): string {
+    if (botMode === 'insider') {
+      return [
+        '<b>Bot Status</b>',
+        'Mode: Insider',
+        `Status: ${insiderBot.isRunning() ? 'Running' : 'Idle'}`,
+        `Follow wallet: ${insiderBot.getFollowedWallet() ?? 'not set'}`,
+        `Buy SOL: ${insiderBot.getBuySol()}`,
+      ].join('\n');
+    }
+
     return [
       '<b>Bot Status</b>',
+      'Mode: Bundler',
       `Wallets: ${walletMonitors.size}`,
       'Filter: early bundler & reverse-buy',
       `Interval: ${config.monitorInterval}ms`,
