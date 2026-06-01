@@ -129,7 +129,7 @@ export class InsiderBot extends EventEmitter {
     followedWallet: string;
     insiderWallet: string;
     mint: string;
-    state: 'WAITING_FOR_TRANSFER' | 'WAITING_FOR_TX_1' | 'WAITING_FOR_TX_2';
+    state: 'WAITING_FOR_TX_1' | 'WAITING_FOR_TX_2';
     entrySignature: string;
   } | null = null;
 
@@ -325,7 +325,7 @@ export class InsiderBot extends EventEmitter {
         if (!insiderWallet) continue;
 
         const signature = tx.signature ?? '';
-        log.warn('Insider wallet detected; starting entry sequence watch (Waiting for Transfer)', {
+        log.warn('Insider wallet detected; starting entry sequence watch (Waiting for Tx #1)', {
           followedWallet,
           insiderWallet,
           mint,
@@ -339,7 +339,7 @@ export class InsiderBot extends EventEmitter {
           followedWallet,
           insiderWallet,
           mint,
-          state: 'WAITING_FOR_TRANSFER',
+          state: 'WAITING_FOR_TX_1',
           entrySignature: signature,
         };
 
@@ -655,7 +655,7 @@ export class InsiderBot extends EventEmitter {
     );
 
     if (insiderSell) {
-      log.warn('Insider wallet detected; starting entry sequence watch (Waiting for Transfer)', {
+      log.warn('Insider wallet detected; starting entry sequence watch (Waiting for Tx #1)', {
         followedWallet,
         insiderWallet: insiderSell.owner,
         mint,
@@ -668,7 +668,7 @@ export class InsiderBot extends EventEmitter {
         followedWallet,
         insiderWallet: insiderSell.owner,
         mint,
-        state: 'WAITING_FOR_TRANSFER',
+        state: 'WAITING_FOR_TX_1',
         entrySignature: signature,
       };
 
@@ -929,29 +929,16 @@ export class InsiderBot extends EventEmitter {
       const analysis = await this.analyzeInsiderTransaction(signature, insiderWallet, positionMint, historicalTx);
       if (!analysis) return;
 
-      const { isTransferIn, isActivity, mint } = analysis;
+      const { isActivity, mint } = analysis;
       const html = (value: string): string => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-      if (this.preBuySequence.state === 'WAITING_FOR_TRANSFER') {
-        if (isTransferIn && mint === positionMint) {
-          log.warn('Insider Entry Stage 1: Transfer In detected', { insiderWallet, positionMint, signature });
-          this.preBuySequence.state = 'WAITING_FOR_TX_1';
-          
-          this.telegramBot?.sendDefault([
-            '<b>🔄 Insider Sequence: [1/3] Transfer In Detected</b>',
-            `Insider: <code>${html(insiderWallet)}</code>`,
-            `Token: <code>${html(positionMint)}</code>`,
-            '',
-            'Waiting for 2 subsequent transactions (Any activity) before buying.',
-          ].join('\n')).catch(() => undefined);
-        }
-      } else if (this.preBuySequence.state === 'WAITING_FOR_TX_1') {
+      if (this.preBuySequence.state === 'WAITING_FOR_TX_1') {
         if (isActivity && mint === positionMint) {
-          log.warn('Insider Entry Stage 2: Tx #1 detected', { insiderWallet, positionMint, signature });
+          log.warn('Insider Entry Stage 1: Tx #1 detected', { insiderWallet, positionMint, signature });
           this.preBuySequence.state = 'WAITING_FOR_TX_2';
 
           this.telegramBot?.sendDefault([
-            '<b>🔄 Insider Sequence: [2/3] Tx #1 Detected</b>',
+            '<b>🔄 Insider Sequence: [1/2] Tx #1 Detected</b>',
             `Insider: <code>${html(insiderWallet)}</code>`,
             `Token: <code>${html(positionMint)}</code>`,
             '',
@@ -960,13 +947,13 @@ export class InsiderBot extends EventEmitter {
         }
       } else if (this.preBuySequence.state === 'WAITING_FOR_TX_2') {
         if (isActivity && mint === positionMint) {
-          log.warn('Insider Entry Stage 3: Tx #2 detected - TRIGGERING BUY', { insiderWallet, positionMint, signature });
+          log.warn('Insider Entry Stage 2: Tx #2 detected - TRIGGERING BUY', { insiderWallet, positionMint, signature });
           
           const seq = this.preBuySequence;
           this.preBuySequence = null;
 
           this.telegramBot?.sendDefault([
-            '<b>🚀 Insider Sequence: [3/3] Tx #2 Detected - BUYING</b>',
+            '<b>🚀 Insider Sequence: [2/2] Tx #2 Detected - BUYING</b>',
             `Insider: <code>${html(insiderWallet)}</code>`,
             `Token: <code>${html(positionMint)}</code>`,
             `Signature: <code>${html(signature)}</code>`,
