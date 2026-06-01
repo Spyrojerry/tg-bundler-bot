@@ -121,6 +121,38 @@ async function main(): Promise<void> {
           return { text: 'Send the Solana wallet address to remove.', trackPrompt: true };
         }
         if (data === 'menu:refresh') return homeReply(true);
+        if (data.startsWith('refresh:mcap:')) {
+          const [, , mint, context] = parts;
+          const currentMarketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(mint);
+          const currentPrice = await gmgnClient.quoteTokenSellForSol(config.tradingWalletAddress!, mint, 100).catch(() => null);
+          
+          let buySol = 0;
+          if (context === 'insider') {
+            buySol = insiderBot.getBuySol();
+          } else if (context === 'bundler') {
+            buySol = earlyBundlerOrchestrator.getActivePosition()?.buySol ?? 0;
+          }
+
+          const profitSol = currentPrice ? currentPrice.estimatedOutputSol - buySol : null;
+          const profitPct = profitSol !== null && buySol > 0 ? (profitSol / buySol) * 100 : null;
+
+          const lines = [
+            context === 'insider' ? '<b>Insider Position Update</b>' : '<b>Bundler Position Update</b>',
+            `Token: <code>${html(mint)}</code>`,
+            `Market Cap: <b>$${currentMarketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
+            profitSol !== null ? `Profit/Loss: <b>${profitSol.toFixed(4)} SOL</b> (${profitPct?.toFixed(2)}%)` : 'Profit/Loss: <b>Calculating...</b>',
+            '',
+            `Last Updated: ${new Date().toLocaleTimeString()}`,
+          ];
+
+          return {
+            text: lines.join('\n'),
+            replyMarkup: {
+              inline_keyboard: [[{ text: '🔄 Refresh', callback_data: `refresh:mcap:${mint}:${context}` }]],
+            },
+            editCurrent: true,
+          };
+        }
         if (data === 'menu:wallets') return walletsReply(chatId);
         if (data === 'menu:status') return statusReply();
         if (data === 'mode:insider') {
@@ -305,26 +337,30 @@ async function main(): Promise<void> {
     telegramBot.start();
   }
 
-  earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot);
+  earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot, gmgnClient);
 
   earlyBundlerOrchestrator.on('sellTrigger', (trigger) => {
-    if (botMode !== 'bundler') {
-      log.info('[EARLY BUNDLER SELL SKIP] Ignoring sell trigger because Bundler mode is inactive', {
-        mint: trigger.position.mint,
-        mode: botMode,
-      });
-      return;
-    }
+      if (botMode !== 'bundler') {
+        log.info('[EARLY BUNDLER SELL SKIP] Ignoring sell trigger because Bundler mode is inactive', {
+          mint: trigger.position.mint,
+          mode: botMode,
+        });
+        return;
+      }
 
-    const { position, type, walletAddress, soldPercentage, reason } = trigger;
-    
-    // Check if sell already pending
-    if (hasPendingSellForMint(position.tradingWallet, position.mint)) {
-      log.info(`[EARLY BUNDLER SELL SKIP] Sell already pending for ${position.mint}`);
-      return;
-    }
+      const { position, type, walletAddress, soldPercentage, reason } = trigger;
+      
+      // Check if sell already pending
+      if (hasPendingSellForMint(position.tradingWallet, position.mint)) {
+        log.info(`[EARLY BUNDLER SELL SKIP] Sell already pending for ${position.mint}`);
+        return;
+      }
 
-    const sellReasons = [
+      // Clear active position immediately on sell trigger to prevent checker from firing
+      earlyBundlerOrchestrator.clearActivePosition();
+      pendingTradingBuys.delete(position.mint);
+
+      const sellReasons = [
       `Early bundler activity detected for token ${position.mint}`,
       reason || `Trigger type: ${type}`,
     ];
@@ -417,14 +453,21 @@ async function main(): Promise<void> {
           }
         );
         insiderBot.markPositionBought(trigger);
+        const initialMarketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(trigger.mint);
+
         await telegramBot?.sendDefault([
           '<b>Insider Buy Submitted</b>',
           `Token: <code>${html(trigger.mint)}</code>`,
           `Status: <b>${html(result.status)}</b>`,
+          `Market Cap: <b>$${initialMarketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
           result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
           '',
           'Watching insider wallet for its next buy. When it buys again, I will sell this position.',
-        ].filter(Boolean).join('\n'));
+        ].filter(Boolean).join('\n'), {
+          replyMarkup: {
+            inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `refresh:mcap:${trigger.mint}:insider` }]],
+          },
+        });
       } catch (err) {
         log.error('Insider buy failed', err);
         await telegramBot?.sendDefault([
@@ -437,16 +480,19 @@ async function main(): Promise<void> {
   });
 
   insiderBot.on('sellTrigger', (trigger) => {
-    if (!config.tradingWalletAddress) {
-      log.warn('[INSIDER SELL SKIP] No trading wallet configured', trigger);
-      return;
-    }
-    if (hasPendingSellForMint(config.tradingWalletAddress, trigger.positionMint)) {
-      log.info(`[INSIDER SELL SKIP] Sell already pending for ${trigger.positionMint}`);
-      return;
-    }
+      if (!config.tradingWalletAddress) {
+        log.warn('[INSIDER SELL SKIP] No trading wallet configured', trigger);
+        return;
+      }
+      if (hasPendingSellForMint(config.tradingWalletAddress, trigger.positionMint)) {
+        log.info(`[INSIDER SELL SKIP] Sell already pending for ${trigger.positionMint}`);
+        return;
+      }
 
-    const event: FilterFailEvent = {
+      // Clear active position immediately on sell trigger to prevent checker from firing
+      insiderBot.clearActivePosition();
+
+      const event: FilterFailEvent = {
       walletAddress: config.tradingWalletAddress,
       mint: trigger.positionMint,
       sampleNumber: 0,
@@ -606,9 +652,9 @@ async function main(): Promise<void> {
     if (hasPendingSellForMint(config.tradingWalletAddress, mint)) return;
 
     try {
-      const marketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(mint);
-      if (marketCapUsd !== null && marketCapUsd < INSIDER_MIN_MARKET_CAP_USD) {
-        log.warn(`[MCAP SELL TRIGGER] Market cap $${marketCapUsd.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}`, { context });
+      const currentMc = await gmgnClient.fetchTokenMarketCapUsd(mint);
+      if (currentMc !== null && currentMc < INSIDER_MIN_MARKET_CAP_USD) {
+        log.warn(`[MCAP SELL TRIGGER] Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}`, { context });
 
         const event: FilterFailEvent = {
           walletAddress: config.tradingWalletAddress,
@@ -616,7 +662,7 @@ async function main(): Promise<void> {
           sampleNumber: 0,
           elapsedSec: 0,
           reasons: [
-            `Market cap $${marketCapUsd.toLocaleString()} fell below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
+            `Market cap $${currentMc.toLocaleString()} fell below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
             `Context: ${context} position.`,
             'Periodic market cap checker triggered automatic sell.',
           ],
@@ -645,12 +691,21 @@ async function main(): Promise<void> {
         telegramBot?.sendDefault([
           '<b>🚨 Market Cap Sell Triggered</b>',
           `Token: <code>${html(mint)}</code>`,
-          `Market Cap: <b>$${marketCapUsd.toLocaleString()}</b>`,
+          `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
           `Threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
           `Action: submit sell for <b>${config.sellPercent}%</b>.`,
         ].join('\n')).catch((err) => log.warn('Telegram mcap sell alert failed', err));
 
-        void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+        void (async () => {
+          await executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+          // After sell finishes (or fails but we're done trying), clear the positions to stop repeated triggers
+          if (context === 'insider') {
+            insiderBot.clearActivePosition();
+          } else if (context === 'bundler') {
+            earlyBundlerOrchestrator.clearActivePosition();
+            pendingTradingBuys.delete(mint);
+          }
+        })();
       }
     } catch (err) {
       log.error(`Failed to check market cap for ${mint}`, err);

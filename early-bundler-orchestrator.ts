@@ -20,6 +20,7 @@ import { BundlerMonitor, BundlerWallet, BundlerTransaction } from './bundler-mon
 import { MonitorDatabase } from './database';
 import type { ServiceConfig, NewTokenEvent, TokenExitEvent } from './types';
 import { TelegramBot } from './telegram-bot';
+import { GmgnClient } from './gmgn-client';
 
 const log = createLogger('EARLY-BUNDLER');
 
@@ -55,6 +56,7 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
   private readonly config: ServiceConfig;
   private readonly db: MonitorDatabase;
   private readonly telegramBot: TelegramBot | null;
+  private readonly gmgnClient: GmgnClient | null;
   private readonly heliusClient: HeliusClient;
   private readonly connection: Connection;
   private bundlerMonitor: BundlerMonitor | null = null;
@@ -62,11 +64,12 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
   private isEnabled = true;
   private isShuttingDown = false;
 
-  constructor(config: ServiceConfig, db: MonitorDatabase, telegramBot: TelegramBot | null = null) {
+  constructor(config: ServiceConfig, db: MonitorDatabase, telegramBot: TelegramBot | null = null, gmgnClient: GmgnClient | null = null) {
     super();
     this.config = config;
     this.db = db;
     this.telegramBot = telegramBot;
+    this.gmgnClient = gmgnClient;
     
     // Initialize Helius client with API key from config
     if (!config.heliusApiKey) {
@@ -428,6 +431,15 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     this.activePosition = null;
   }
 
+  clearActivePosition(): void {
+    this.activePosition = null;
+    if (this.bundlerMonitor) {
+      this.bundlerMonitor.stopMonitoring().catch(() => undefined);
+      this.bundlerMonitor = null;
+    }
+    log.info('Early bundler active position cleared');
+  }
+
   setEnabled(enabled: boolean): void {
     this.isEnabled = enabled;
   }
@@ -447,17 +459,24 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       .filter(b => !b.isMint)
       .map((b, i) => `${i + 1}. <code>${html(b.walletAddress)}</code> (${b.tokenAmount.toLocaleString()} tokens)`);
 
+    const marketCapUsd = this.gmgnClient ? await this.gmgnClient.fetchTokenMarketCapUsd(position.mint).catch(() => null) : null;
+
     await this.telegramBot.sendDefault([
       '<b>🚨 Early Bundler Detected</b>',
       `Token: <code>${html(position.mint)}</code>`,
       `Trading Wallet: <code>${html(position.tradingWallet)}</code>`,
+      `Market Cap: <b>$${marketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
       position.creatorVaultAddress ? `Creator Vault: <code>${html(position.creatorVaultAddress)}</code>` : '',
       '',
       '<b>Detected Bundler Wallets:</b>',
       ...bundlerLines,
       '',
       'I am now monitoring these wallets. If any of them buy more or sell 40% of their holdings, I will trigger an immediate sell.',
-    ].filter(Boolean).join('\n')).catch(err => log.warn('Failed to send bundler detected notification', err));
+    ].filter(Boolean).join('\n'), {
+      replyMarkup: {
+        inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `refresh:mcap:${position.mint}:bundler` }]],
+      },
+    }).catch(err => log.warn('Failed to send bundler detected notification', err));
   }
 
   private async sendBundlerSellNotification(

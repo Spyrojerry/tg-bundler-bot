@@ -110,6 +110,16 @@ export class InsiderBot extends EventEmitter {
     return this.activePosition;
   }
 
+  clearActivePosition(): void {
+    this.activePosition = null;
+    if (this.insiderSubId !== null) {
+      const subId = this.insiderSubId;
+      this.insiderSubId = null;
+      this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+    log.info('Insider active position cleared');
+  }
+
   setBuySol(value: number): void {
     if (!Number.isFinite(value) || value <= 0) {
       throw new Error('Insider buy SOL must be greater than 0');
