@@ -245,19 +245,21 @@ async function main(): Promise<void> {
             editCurrent: true,
           };
         }
-        if (callbackKind === 'reverse' && callbackAction && callbackAddress) {
+        if (callbackKind === 'reverse' && callbackAction) {
           if (callbackAction === 'set_target') {
             pendingTelegramActions.set(chatId, { type: 'reverseTargetWallet' });
             return { text: 'Send the Solana wallet address for Reverse CopySell to watch.', trackPrompt: true, editCurrent: true };
           }
-          const normalized = new PublicKey(callbackAddress).toBase58();
-          if (callbackAction === 'add') {
-            db.addReverseBuyWallet(normalized);
-            return settingsReply(normalized, true);
-          }
-          if (callbackAction === 'remove') {
-            db.removeReverseBuyWallet(normalized);
-            return settingsReply(normalized, true);
+          if (callbackAddress) {
+            const normalized = new PublicKey(callbackAddress).toBase58();
+            if (callbackAction === 'add') {
+              db.addReverseBuyWallet(normalized);
+              return settingsReply(normalized, true);
+            }
+            if (callbackAction === 'remove') {
+              db.removeReverseBuyWallet(normalized);
+              return settingsReply(normalized, true);
+            }
           }
           return 'Invalid reverse-buy action.';
         }
