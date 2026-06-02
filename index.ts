@@ -503,26 +503,21 @@ async function main(): Promise<void> {
       try {
         const marketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(trigger.mint);
         if (marketCapUsd !== null && marketCapUsd < INSIDER_MIN_MARKET_CAP_USD) {
-          log.warn('[INSIDER BUY SKIP] Market cap below minimum', {
+          log.warn('[INSIDER BUY SKIP] Market cap below minimum (Rug Protection)', {
             mint: trigger.mint,
             marketCapUsd,
             minMarketCapUsd: INSIDER_MIN_MARKET_CAP_USD,
           });
           await telegramBot?.sendDefault([
-            '<b>⚠️ Insider Buy Skipped</b>',
+            '<b>⚠️ Insider Buy Skipped (Rug Protection)</b>',
             `Token: <code>${html(trigger.mint)}</code>`,
             `Market cap: <b>$${marketCapUsd.toLocaleString()}</b>`,
             `Minimum required: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
             '',
-            'Reason: Market cap is too low to enter.',
+            'Reason: Market cap is too low (potential rug). I will wait for the next token.',
           ].join('\n'));
+          insiderBot.clearActivePosition();
           return;
-        }
-
-        if (marketCapUsd === null) {
-          log.warn('[INSIDER BUY MC UNKNOWN] Could not determine market cap; continuing with buy', {
-            mint: trigger.mint,
-          });
         }
 
         telegramBot?.sendDefault([
@@ -530,10 +525,10 @@ async function main(): Promise<void> {
           `Insider: <code>${html(trigger.insiderWallet)}</code>`,
           `Token: <code>${html(trigger.mint)}</code>`,
           `Buying: <b>${trigger.buySol} SOL</b>`,
-          `Market Cap: <b>$${marketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
+          marketCapUsd ? `Market Cap: <b>$${marketCapUsd.toLocaleString()}</b>` : '',
           '',
           'Submitting swap...',
-        ].join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
+        ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
 
         const result = await gmgnClient.buyTokenWithSol(
           config.tradingWalletAddress!,
@@ -546,16 +541,14 @@ async function main(): Promise<void> {
           }
         );
         insiderBot.markPositionBought(trigger);
-        const initialMarketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(trigger.mint);
 
         await telegramBot?.sendDefault([
           '<b>✅ Insider Buy Completed</b>',
           `Token: <code>${html(trigger.mint)}</code>`,
           `Status: <b>${html(result.status)}</b>`,
-          `Market Cap: <b>$${initialMarketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
           result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
           '',
-          '<b>Exit Strategy Active</b>',
+          '<b>Strategy: Buy on First Sell, Sell on Next Buy</b>',
           'Watching insider wallet for its NEXT buy transaction. I will sell this position immediately when detected.',
         ].filter(Boolean).join('\n'), {
           replyMarkup: {
@@ -836,11 +829,11 @@ async function main(): Promise<void> {
         insiderBot.clearActivePosition();
 
         telegramBot?.sendDefault([
-          '<b>⚠️ Insider Monitoring Stopped</b>',
+          '<b>⚠️ Insider Monitoring Stopped (Rug Protection)</b>',
           `Token: <code>${html(mint)}</code>`,
           `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
           `Threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
-          'Reason: Market cap fell below minimum requirement. Entry sequence aborted.',
+          'Reason: Market cap fell below minimum requirement. This token is likely a rug; entry sequence aborted.',
         ].join('\n')).catch((err) => log.warn('Telegram mcap monitor stop alert failed', err));
       }
     } catch (err) {
@@ -860,6 +853,7 @@ async function main(): Promise<void> {
       if (!config.tradingWalletAddress) return;
 
       // 2. Check InsiderBot active position
+      // Insider mode re-enabled market cap check for rug protection.
       const insiderPos = insiderBot.getActivePosition();
       if (insiderPos) {
         await checkAndSellIfLowMcap(insiderPos.mint, 'insider');
@@ -1197,9 +1191,10 @@ async function main(): Promise<void> {
           `Buy SOL: <b>${insiderBot.getBuySol()}</b>`,
           '',
           '<b>Flow</b>',
-          'Send a wallet address to follow it.',
-          'When that wallet makes its <b>first sell</b> transaction for a token, I will buy it.',
-          'When it makes its <b>next buy</b> transaction, I will sell your position immediately.',
+          '1. Follow a wallet address.',
+          '2. When that wallet buys a new token, I identify the <b>insider wallet</b>.',
+          '3. When the insider makes their <b>first sell</b>, I buy.',
+          '4. When the insider makes their <b>next buy</b>, I sell.',
         ].join('\n'),
         replyMarkup: {
           inline_keyboard: [

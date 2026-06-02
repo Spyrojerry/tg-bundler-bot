@@ -82,6 +82,7 @@ export class InsiderBot extends EventEmitter {
   private followSubId: number | null = null;
   private insiderSubId: number | null = null;
   private mintScanActive = false;
+  private watchingMint: string | null = null;
   private activePosition: {
     followedWallet: string;
     insiderWallet: string;
@@ -106,7 +107,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   getPreBuyMint(): string | null {
-    return null;
+    return this.watchingMint;
   }
 
   clearActivePosition(): void {
@@ -172,6 +173,7 @@ export class InsiderBot extends EventEmitter {
     await Promise.allSettled(removals);
     this.mintScanActive = false;
     this.activePosition = null;
+    this.watchingMint = null;
     this.processedSignatures.clear();
   }
 
@@ -210,36 +212,29 @@ export class InsiderBot extends EventEmitter {
 
   private async scanEarliestMintTransactions(followedWallet: string, mint: string): Promise<void> {
     this.mintScanActive = true;
-    let attempt = 0;
+    
+    // Simplification: only scan once for the insider based on the earliest transactions.
+    // "scrap out the buy flow after tx 1 and so on"
+    const { swapTxs } = await this.fetchEarliestMintSwapTransactions(mint);
 
-    while (this.mintScanActive) {
-      attempt += 1;
-      const { swapTxs } = await this.fetchEarliestMintSwapTransactions(mint);
-
-      for (let i = 0; i < swapTxs.length; i++) {
-        const tx = swapTxs[i];
-        const insiderWallet = this.findEarlyHeliusInsider(tx, swapTxs.slice(0, i), followedWallet, mint);
-        
-        if (insiderWallet) {
-          log.warn('Insider wallet detected for mint - starting reverse watch', {
-            followedWallet,
-            insiderWallet,
-            mint,
-          });
-          this.mintScanActive = false;
-          await this.startInsiderWalletWatch(insiderWallet, mint);
-          return;
-        }
-      }
-
-      if (swapTxs.length >= 20 || attempt >= 5) {
-        log.info('Mint scan finished without finding insider', { mint, txsScanned: swapTxs.length });
+    for (let i = 0; i < swapTxs.length; i++) {
+      const tx = swapTxs[i];
+      const insiderWallet = this.findEarlyHeliusInsider(tx, swapTxs.slice(0, i), followedWallet, mint);
+      
+      if (insiderWallet) {
+        log.warn('Insider wallet detected for mint - starting watch', {
+          followedWallet,
+          insiderWallet,
+          mint,
+        });
         this.mintScanActive = false;
+        await this.startInsiderWalletWatch(insiderWallet, mint);
         return;
       }
-
-      await new Promise(r => setTimeout(r, 2000));
     }
+
+    log.info('Mint scan finished without finding insider', { mint, txsScanned: swapTxs.length });
+    this.mintScanActive = false;
   }
 
   private async fetchEarliestMintSwapTransactions(mint: string): Promise<{ swapTxs: HeliusEnhancedTransaction[] }> {
@@ -293,6 +288,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     log.info('Starting watch on insider wallet', { insiderWallet, positionMint });
+    this.watchingMint = positionMint;
 
     this.insiderSubId = this.connection.onLogs(
       new PublicKey(insiderWallet),
@@ -353,6 +349,7 @@ export class InsiderBot extends EventEmitter {
       this.insiderSubId = null;
     }
     this.activePosition = null;
+    this.watchingMint = null;
     this.mintScanActive = false;
     log.info('InsiderBot reset; waiting for next followed wallet buy');
   }
