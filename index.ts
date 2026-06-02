@@ -1198,8 +1198,8 @@ async function main(): Promise<void> {
           '',
           '<b>Flow</b>',
           'Send a wallet address to follow it.',
-          'The first token buy from that wallet starts a 20-tx mint scan.',
-          'If an early wallet sells before a visible buy, I buy the token and then watch that insider wallet for its next buy.',
+          'When that wallet makes its <b>first sell</b> transaction for a token, I will buy it.',
+          'When it makes its <b>next buy</b> transaction, I will sell your position immediately.',
         ].join('\n'),
         replyMarkup: {
           inline_keyboard: [
