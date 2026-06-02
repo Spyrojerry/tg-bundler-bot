@@ -75,6 +75,7 @@ export interface InsiderBuyTrigger {
   mint: string;
   signature: string;
   buySol: number;
+  entryWindowBuySignatures?: string[];
 }
 
 export interface InsiderSellTrigger {
@@ -125,10 +126,12 @@ export class InsiderBot extends EventEmitter {
   private insiderCatchupCursorSignature: string | null = null;
   private insiderRealtimeCatchupInFlight = false;
   private insiderRealtimeCatchupPending = false;
+  private insiderWatchGeneration = 0;
   private activePosition: {
     followedWallet: string;
     insiderWallet: string;
     mint: string;
+    ignoredExitBuySignatures: Set<string>;
   } | null = null;
   private preBuySequence: {
     followedWallet: string;
@@ -139,6 +142,7 @@ export class InsiderBot extends EventEmitter {
     skippedInitialTransferIn: boolean;
     countedActivityTxs: number;
     sawBuyTx: boolean;
+    entryWindowBuySignatures: string[];
   } | null = null;
 
   constructor(config: ServiceConfig, telegramBot: TelegramBot | null = null) {
@@ -235,6 +239,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderCatchupCursorSignature = null;
     this.insiderRealtimeCatchupInFlight = false;
     this.insiderRealtimeCatchupPending = false;
+    this.insiderWatchGeneration += 1;
     this.activePosition = null;
     this.preBuySequence = null;
   }
@@ -244,6 +249,7 @@ export class InsiderBot extends EventEmitter {
       followedWallet: trigger.followedWallet,
       insiderWallet: trigger.insiderWallet,
       mint: trigger.mint,
+      ignoredExitBuySignatures: new Set(trigger.entryWindowBuySignatures ?? []),
     };
     this.boughtMints.add(trigger.mint);
     this.preBuySequence = null;
@@ -377,6 +383,7 @@ export class InsiderBot extends EventEmitter {
           skippedInitialTransferIn: false,
           countedActivityTxs: 0,
           sawBuyTx: false,
+          entryWindowBuySignatures: [],
         };
 
         await this.startInsiderWalletWatch(insiderWallet, mint, signature);
@@ -720,6 +727,7 @@ export class InsiderBot extends EventEmitter {
         skippedInitialTransferIn: false,
         countedActivityTxs: 0,
         sawBuyTx: false,
+        entryWindowBuySignatures: [],
       };
 
       await this.startInsiderWalletWatch(insiderSell.owner, mint, signature);
@@ -754,6 +762,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderCatchupCursorSignature = null;
     this.insiderRealtimeCatchupInFlight = false;
     this.insiderRealtimeCatchupPending = false;
+    this.insiderWatchGeneration += 1;
   }
 
   private async resetForNewToken(): Promise<void> {
@@ -794,6 +803,8 @@ export class InsiderBot extends EventEmitter {
     this.insiderCatchupCursorSignature = startSignature ?? null;
     this.insiderRealtimeCatchupInFlight = false;
     this.insiderRealtimeCatchupPending = false;
+    this.insiderWatchGeneration += 1;
+    const watchGeneration = this.insiderWatchGeneration;
 
     // 1. If we have a start signature, catch up on all transactions since then
     if (startSignature && this.config.insiderHeliusApiKey) {
@@ -802,11 +813,23 @@ export class InsiderBot extends EventEmitter {
         // Process the start signature itself first as historical (skip entry)
         await this.processInsiderWalletSignature(insiderWallet, positionMint, startSignature, undefined, true);
         // Then catch up on everything after it as historical
-        await this.catchupInsiderWallet(insiderWallet, positionMint, startSignature);
+        await this.catchupInsiderWallet(insiderWallet, positionMint, startSignature, false, watchGeneration);
+        if (!this.shouldContinueInsiderWatch(insiderWallet, positionMint)) {
+          log.info('Insider watch ended during catch-up', { insiderWallet, positionMint });
+          return;
+        }
         log.info('Insider catch-up complete');
       } catch (err) {
         log.error('Insider catch-up failed; proceeding with real-time only', err);
       }
+    }
+
+    if (!this.shouldContinueInsiderWatch(insiderWallet, positionMint)) {
+      log.info('Skipping real-time insider watch because monitoring is no longer active', {
+        insiderWallet,
+        positionMint,
+      });
+      return;
     }
 
     // 2. Start real-time monitoring
@@ -816,7 +839,7 @@ export class InsiderBot extends EventEmitter {
         if (logInfo.err) return;
 
         // Use address-history catch-up so we read every tx after the last processed cursor.
-        void this.catchupInsiderWallet(insiderWallet, positionMint, logInfo.signature, true);
+        void this.catchupInsiderWallet(insiderWallet, positionMint, logInfo.signature, true, watchGeneration);
       },
       'processed'
     );
@@ -831,8 +854,13 @@ export class InsiderBot extends EventEmitter {
     insiderWallet: string,
     positionMint: string,
     afterSignature: string,
-    isRealtimeUpdate = false
+    isRealtimeUpdate = false,
+    watchGeneration = this.insiderWatchGeneration
   ): Promise<void> {
+    if (watchGeneration !== this.insiderWatchGeneration || !this.shouldContinueInsiderWatch(insiderWallet, positionMint)) {
+      return;
+    }
+
     if (isRealtimeUpdate) {
       this.insiderRealtimeCatchupPending = true;
       if (this.insiderRealtimeCatchupInFlight) {
@@ -850,15 +878,23 @@ export class InsiderBot extends EventEmitter {
           this.insiderRealtimeCatchupPending = false;
         }
 
+        if (watchGeneration !== this.insiderWatchGeneration || !this.shouldContinueInsiderWatch(insiderWallet, positionMint)) {
+          return;
+        }
+
         const cursorSignature = isRealtimeUpdate
           ? this.insiderCatchupCursorSignature ?? afterSignature
           : afterSignature;
         const txs = await this.fetchHeliusTransactionsAfterCursor(insiderWallet, cursorSignature, isRealtimeUpdate ? afterSignature : undefined);
 
+        if (watchGeneration !== this.insiderWatchGeneration || !this.shouldContinueInsiderWatch(insiderWallet, positionMint)) {
+          return;
+        }
+
         if (txs.length > 0) {
           log.info(`Processing ${txs.length} transactions for insider ${insiderWallet}`, {
             isRealtimeUpdate,
-            afterSignature: cursorSignature,
+            cursorSignature,
           });
           for (const tx of txs) {
             if (!tx.signature) continue;
@@ -940,6 +976,9 @@ export class InsiderBot extends EventEmitter {
     seq.countedActivityTxs += 1;
     if (analysis.isBuy) {
       seq.sawBuyTx = true;
+      if (!seq.entryWindowBuySignatures.includes(signature)) {
+        seq.entryWindowBuySignatures.push(signature);
+      }
     }
     if (seq.state === 'WAITING_FOR_TX_1') {
       seq.state = 'WAITING_FOR_TX_2';
@@ -967,8 +1006,25 @@ export class InsiderBot extends EventEmitter {
 
     // Case 1: Active Position (Exit Monitoring)
     if (this.activePosition) {
+      if (this.activePosition.ignoredExitBuySignatures.has(signature)) {
+        this.activePosition.ignoredExitBuySignatures.delete(signature);
+        log.info('Ignoring insider buy from entry window during exit monitoring', {
+          insiderWallet,
+          positionMint,
+          signature,
+        });
+        return;
+      }
+
       const buy = await this.findInsiderWalletBuy(signature, insiderWallet, historicalTx);
       if (!buy) return;
+      const sellTrigger = {
+        followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
+        insiderWallet,
+        positionMint,
+        insiderBuyMint: buy.mint,
+        signature,
+      };
 
       log.warn('🚨🚨 [INSIDER EXIT SIGNAL] 🚨🚨', {
         insiderWallet,
@@ -989,19 +1045,8 @@ export class InsiderBot extends EventEmitter {
         '<b>Triggering immediate sell...</b>',
       ].join('\n')).catch(() => undefined);
 
-      this.emit('sellTrigger', {
-        followedWallet: this.activePosition?.followedWallet ?? this.followedWallet ?? '',
-        insiderWallet,
-        positionMint,
-        insiderBuyMint: buy.mint,
-        signature,
-      });
-
-      if (this.insiderSubId !== null) {
-        const subId = this.insiderSubId;
-        this.insiderSubId = null;
-        await this.connection.removeOnLogsListener(subId).catch(() => undefined);
-      }
+      await this.resetForNewToken();
+      this.emit('sellTrigger', sellTrigger);
       return;
     }
 
@@ -1073,9 +1118,22 @@ export class InsiderBot extends EventEmitter {
           mint: seq.mint,
           signature: signature,
           buySol: this.buySol,
+          entryWindowBuySignatures: [...seq.entryWindowBuySignatures],
         });
       }
     }
+  }
+
+  private shouldContinueInsiderWatch(insiderWallet: string, positionMint: string): boolean {
+    if (this.activePosition) {
+      return this.activePosition.insiderWallet === insiderWallet
+        && this.activePosition.mint === positionMint;
+    }
+    if (this.preBuySequence) {
+      return this.preBuySequence.insiderWallet === insiderWallet
+        && this.preBuySequence.mint === positionMint;
+    }
+    return false;
   }
 
   private async analyzeInsiderTransaction(
