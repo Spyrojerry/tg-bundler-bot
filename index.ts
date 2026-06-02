@@ -29,6 +29,7 @@ import {
 import { HeliusClient, EarlyBundlerInfo } from './helius-client';
 import { BundlerMonitor, BundlerWallet, BundlerTransaction } from './bundler-monitor';
 import { EarlyBundlerOrchestrator, BundlerSellReason } from './early-bundler-orchestrator';
+import { ReverseCopySellOrchestrator } from './reverse-copysell-orchestrator';
 import { InsiderBot } from './insider-bot';
 import { PublicKey } from '@solana/web3.js';
 import { randomBytes } from 'crypto';
@@ -78,7 +79,8 @@ async function main(): Promise<void> {
 
   // ── 4. Early Bundler Orchestrator ─────────────────────────────────────────
   let earlyBundlerOrchestrator: EarlyBundlerOrchestrator;
-  let botMode: 'insider' | 'bundler' = 'insider';
+  let reverseCopySellOrchestrator: ReverseCopySellOrchestrator;
+  let botMode: 'insider' | 'bundler' | 'reverse_copysell' = 'insider';
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
@@ -87,7 +89,8 @@ async function main(): Promise<void> {
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
     | { type: 'minSol'; walletAddress: string }
-    | { type: 'insiderFollowWallet' | 'insiderBuySol' };
+    | { type: 'insiderFollowWallet' | 'insiderBuySol' }
+    | { type: 'reverseTargetWallet' };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
   const pausedWallets = new Set<string>();
@@ -123,7 +126,7 @@ async function main(): Promise<void> {
         if (data === 'menu:refresh') return homeReply(true);
         if (data.startsWith('r:m:')) {
           const [, , mint, contextCode] = parts;
-          const context = contextCode === 'i' ? 'insider' : 'bundler';
+          const context = contextCode === 'i' ? 'insider' : (contextCode === 'r' ? 'reverse_copysell' : 'bundler');
           const currentMarketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(mint);
           const currentPrice = await gmgnClient.quoteTokenSellForSol(config.tradingWalletAddress!, mint, 100).catch(() => null);
           
@@ -132,13 +135,15 @@ async function main(): Promise<void> {
             buySol = insiderBot.getBuySol();
           } else if (context === 'bundler') {
             buySol = earlyBundlerOrchestrator.getActivePosition()?.buySol ?? 0;
+          } else if (context === 'reverse_copysell') {
+            buySol = reverseCopySellOrchestrator.getActivePosition()?.buySol ?? 0;
           }
 
           const profitSol = currentPrice ? currentPrice.estimatedOutputSol - buySol : null;
           const profitPct = profitSol !== null && buySol > 0 ? (profitSol / buySol) * 100 : null;
 
           const lines = [
-            context === 'insider' ? '<b>Insider Position Update</b>' : '<b>Bundler Position Update</b>',
+            context === 'insider' ? '<b>Insider Position Update</b>' : (context === 'reverse_copysell' ? '<b>Reverse CopySell Update</b>' : '<b>Bundler Position Update</b>'),
             `Token: <code>${html(mint)}</code>`,
             `Market Cap: <b>$${currentMarketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
             profitSol !== null ? `Profit/Loss: <b>${profitSol.toFixed(4)} SOL</b> (${profitPct?.toFixed(2)}%)` : 'Profit/Loss: <b>Calculating...</b>',
@@ -158,12 +163,22 @@ async function main(): Promise<void> {
         if (data === 'menu:status') return statusReply(true);
         if (data === 'mode:insider') {
           await stopBundlerModeServices('Switched to Insider mode');
+          await stopReverseCopySellModeServices('Switched to Insider mode');
           botMode = 'insider';
           return homeReply(true);
         }
         if (data === 'mode:bundler') {
+          await insiderBot.stop();
+          await stopReverseCopySellModeServices('Switched to Bundler mode');
           botMode = 'bundler';
           await startBundlerModeServices();
+          return homeReply(true);
+        }
+        if (data === 'mode:reverse_copysell') {
+          await insiderBot.stop();
+          await stopBundlerModeServices('Switched to Reverse CopySell mode');
+          botMode = 'reverse_copysell';
+          await startReverseCopySellModeServices();
           return homeReply(true);
         }
         if (data === 'insider:follow') {
@@ -231,6 +246,10 @@ async function main(): Promise<void> {
           };
         }
         if (callbackKind === 'reverse' && callbackAction && callbackAddress) {
+          if (callbackAction === 'set_target') {
+            pendingTelegramActions.set(chatId, { type: 'reverseTargetWallet' });
+            return { text: 'Send the Solana wallet address for Reverse CopySell to watch.', trackPrompt: true, editCurrent: true };
+          }
           const normalized = new PublicKey(callbackAddress).toBase58();
           if (callbackAction === 'add') {
             db.addReverseBuyWallet(normalized);
@@ -317,6 +336,20 @@ async function main(): Promise<void> {
             insiderBot.setBuySol(value);
             return homeReply();
           }
+          if (pendingAction.type === 'reverseTargetWallet') {
+            const trimmed = text.trim().toLowerCase();
+            if (trimmed === 'off' || trimmed === 'none' || trimmed === 'clear') {
+              config.reverseCopySellTargetWallet = null;
+              return homeReply();
+            }
+            try {
+              const pubkey = new PublicKey(text.trim());
+              config.reverseCopySellTargetWallet = pubkey.toBase58();
+              return homeReply();
+            } catch {
+              return 'Invalid Solana wallet address. Send a valid address, or "off" to clear.';
+            }
+          }
         }
         if (botMode === 'insider') {
           await insiderBot.followWallet(text);
@@ -342,6 +375,7 @@ async function main(): Promise<void> {
   }
 
   earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot, gmgnClient);
+  reverseCopySellOrchestrator = new ReverseCopySellOrchestrator(config, db, telegramBot);
 
   earlyBundlerOrchestrator.on('sellTrigger', (trigger) => {
       if (botMode !== 'bundler') {
@@ -402,6 +436,54 @@ async function main(): Promise<void> {
     log.info(`[EARLY BUNDLER SELL TRIGGER] ${type} for ${position.mint}`, {
       sellId,
       reason,
+    });
+
+    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+  });
+
+  reverseCopySellOrchestrator.on('sellTrigger', (data) => {
+    if (botMode !== 'reverse_copysell') return;
+    
+    const { position, targetWallet } = data;
+
+    // Check if sell already pending
+    if (hasPendingSellForMint(position.tradingWallet, position.mint)) {
+      log.info(`[REVERSE-COPYSELL SELL SKIP] Sell already pending for ${position.mint}`);
+      return;
+    }
+
+    pendingTradingBuys.delete(position.mint);
+
+    const event: FilterFailEvent = {
+      walletAddress: position.tradingWallet,
+      mint: position.mint,
+      sampleNumber: 0,
+      elapsedSec: 0,
+      reasons: [`Reverse CopySell trigger: Target wallet ${targetWallet} bought the token`],
+      settings: db.getWalletSettings(position.tradingWallet),
+      metrics: {
+        mint: position.mint,
+        timestamp: new Date().toISOString(),
+        bundlersPercent: null,
+        bundlersCount: null,
+        initialBaseReserve: null,
+        topWallets: null,
+        top10HolderRate: null,
+        bundledAmountRate: null,
+      },
+      buySol: position.buySol,
+      matchingWallets: [targetWallet],
+    };
+
+    const sellId = randomBytes(5).toString('hex');
+    pendingSells.set(sellId, {
+      event,
+      createdAt: Date.now(),
+      executing: true,
+    });
+
+    log.info(`[REVERSE-COPYSELL SELL TRIGGER] Target ${targetWallet} for ${position.mint}`, {
+      sellId,
     });
 
     void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
@@ -601,46 +683,58 @@ async function main(): Promise<void> {
 
   function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
-      if (botMode !== 'bundler') return;
-      pendingTradingBuys.set(event.mint, event);
-      log.info(`[TRADING POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
-      
-      // Also trigger early bundler detection
-      earlyBundlerOrchestrator.handleTradingWalletBuy(event).catch((err) => {
-        log.error('Failed to trigger early bundler detection', err);
-      });
+      if (botMode === 'bundler') {
+        pendingTradingBuys.set(event.mint, event);
+        log.info(`[TRADING POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+        
+        // Also trigger early bundler detection
+        earlyBundlerOrchestrator.handleTradingWalletBuy(event).catch((err) => {
+          log.error('Failed to trigger early bundler detection', err);
+        });
 
-      telegramBot?.sendDefault([
-        '<b>Trading Wallet Position Opened</b>',
-        `Wallet: <code>${html(event.walletAddress)}</code>`,
-        `Token: <code>${html(event.mint)}</code>`,
-        `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
-        'Watching this token for buys from wallets explicitly added to reverse-buy trigger list in settings.',
-        'If one of those wallets buys it while this position is still open, sell submits immediately.',
-        '',
-        '<b>Early Bundler Bot</b>: Detection started. I will notify you if early bundler activity is detected.',
-      ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
+        telegramBot?.sendDefault([
+          '<b>Trading Wallet Position Opened</b>',
+          `Wallet: <code>${html(event.walletAddress)}</code>`,
+          `Token: <code>${html(event.mint)}</code>`,
+          `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
+          'Watching this token for buys from wallets explicitly added to reverse-buy trigger list in settings.',
+          'If one of those wallets buys it while this position is still open, sell submits immediately.',
+          '',
+          '<b>Early Bundler Bot</b>: Detection started. I will notify you if early bundler activity is detected.',
+        ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
+      } else if (botMode === 'reverse_copysell') {
+        log.info(`[REVERSE-COPYSELL POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+        reverseCopySellOrchestrator.handleTradingWalletBuy(event).catch((err) => {
+          log.error('Failed to trigger reverse-copysell detection', err);
+        });
+      }
     });
 
     walletMonitor.on('tokenExited', (event: TokenExitEvent) => {
-      if (botMode !== 'bundler') return;
-      if (!pendingTradingBuys.has(event.mint)) return;
-      pendingTradingBuys.delete(event.mint);
-      log.info(`[TRADING POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint} — stopped watched-wallet trigger watch`);
-      
-      // Also notify orchestrator
-      earlyBundlerOrchestrator.handleTradingWalletExit(event).catch((err) => {
-        log.error('Failed to notify early bundler orchestrator of exit', err);
-      });
+      if (botMode === 'bundler') {
+        if (!pendingTradingBuys.has(event.mint)) return;
+        pendingTradingBuys.delete(event.mint);
+        log.info(`[TRADING POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint} — stopped watched-wallet trigger watch`);
+        
+        // Also notify orchestrator
+        earlyBundlerOrchestrator.handleTradingWalletExit(event).catch((err) => {
+          log.error('Failed to notify early bundler orchestrator of exit', err);
+        });
 
-      telegramBot?.sendDefault([
-        '<b>Trading Wallet Position Closed</b>',
-        `Wallet: <code>${html(event.walletAddress)}</code>`,
-        `Token: <code>${html(event.mint)}</code>`,
-        'Stopped waiting for watched-wallet buy triggers for this token.',
-        '',
-        '<b>Early Bundler Bot</b>: Monitoring stopped for this token.',
-      ].join('\n')).catch((err) => log.warn('Telegram trading exit alert failed', err));
+        telegramBot?.sendDefault([
+          '<b>Trading Wallet Position Closed</b>',
+          `Wallet: <code>${html(event.walletAddress)}</code>`,
+          `Token: <code>${html(event.mint)}</code>`,
+          'Stopped waiting for watched-wallet buy triggers for this token.',
+          '',
+          '<b>Early Bundler Bot</b>: Monitoring stopped for this token.',
+        ].join('\n')).catch((err) => log.warn('Telegram trading exit alert failed', err));
+      } else if (botMode === 'reverse_copysell') {
+        log.info(`[REVERSE-COPYSELL POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
+        reverseCopySellOrchestrator.handleTradingWalletExit(event).catch((err) => {
+          log.error('Failed to notify reverse-copysell orchestrator of exit', err);
+        });
+      }
     });
   }
 
@@ -661,7 +755,7 @@ async function main(): Promise<void> {
     });
   }
 
-  async function checkAndSellIfLowMcap(mint: string, context: 'insider' | 'bundler'): Promise<void> {
+  async function checkAndSellIfLowMcap(mint: string, context: 'insider' | 'bundler' | 'reverse_copysell'): Promise<void> {
     if (!config.tradingWalletAddress) return;
     if (hasPendingSellForMint(config.tradingWalletAddress, mint)) return;
 
@@ -691,7 +785,11 @@ async function main(): Promise<void> {
             top10HolderRate: null,
             bundledAmountRate: null,
           },
-          buySol: context === 'insider' ? insiderBot.getBuySol() : null,
+          buySol: context === 'insider'
+            ? insiderBot.getBuySol()
+            : (context === 'reverse_copysell'
+              ? (reverseCopySellOrchestrator.getActivePosition()?.buySol ?? null)
+              : (earlyBundlerOrchestrator.getActivePosition()?.buySol ?? null)),
           matchingWallets: [],
         };
 
@@ -708,6 +806,8 @@ async function main(): Promise<void> {
         } else if (context === 'bundler') {
           earlyBundlerOrchestrator.clearActivePosition();
           pendingTradingBuys.delete(mint);
+        } else if (context === 'reverse_copysell') {
+          reverseCopySellOrchestrator.stopActiveMonitoring('Market cap fell below minimum');
         }
 
         telegramBot?.sendDefault([
@@ -769,7 +869,13 @@ async function main(): Promise<void> {
         await checkAndSellIfLowMcap(bundlerPos.mint, 'bundler');
       }
 
-      // 4. Check pendingTradingBuys (if not already checked)
+      // 4. Check ReverseCopySellOrchestrator active position
+      const revPos = reverseCopySellOrchestrator.getActivePosition();
+      if (revPos) {
+        await checkAndSellIfLowMcap(revPos.mint, 'reverse_copysell');
+      }
+
+      // 5. Check pendingTradingBuys (if not already checked)
       if (botMode === 'bundler') {
         for (const mint of pendingTradingBuys.keys()) {
           if (bundlerPos?.mint === mint) continue;
@@ -926,6 +1032,34 @@ async function main(): Promise<void> {
     log.info('Bundler mode services stopped', { reason });
   }
 
+  async function startReverseCopySellModeServices(): Promise<void> {
+    reverseCopySellOrchestrator.setEnabled(true);
+
+    if (config.tradingWalletAddress && !tradingWalletMonitor) {
+      tradingWalletMonitor = new WalletMonitor(config, config.tradingWalletAddress, { enforceMinBuySol: false });
+      wireTradingWalletMonitor(tradingWalletMonitor);
+      await tradingWalletMonitor.start();
+    } else if (!config.tradingWalletAddress) {
+      log.warn('No TRADING_WALLET_ADDRESS configured; reverse-copysell flow cannot detect your buys.');
+    }
+
+    log.info('Reverse CopySell mode services started', {
+      tradingWalletActive: !!tradingWalletMonitor,
+    });
+  }
+
+  async function stopReverseCopySellModeServices(reason = 'Reverse CopySell mode stopped'): Promise<void> {
+    tradingWalletMonitor?.stop();
+    tradingWalletMonitor = null;
+    pendingTradingBuys.clear();
+    pausedWallets.clear();
+
+    await reverseCopySellOrchestrator.stopActiveMonitoring(reason);
+    reverseCopySellOrchestrator.setEnabled(false);
+
+    log.info('Reverse CopySell mode services stopped', { reason });
+  }
+
   const html = (value: string): string =>
     value
       .replace(/&/g, '&amp;')
@@ -1070,6 +1204,7 @@ async function main(): Promise<void> {
             [
               { text: 'Insider', callback_data: 'mode:insider' },
               { text: 'Bundler', callback_data: 'mode:bundler' },
+              { text: 'Rev CopySell', callback_data: 'mode:reverse_copysell' },
             ],
             [
               { text: 'Follow wallet', callback_data: 'insider:follow' },
@@ -1077,6 +1212,39 @@ async function main(): Promise<void> {
             ],
             [
               stopResumeButton,
+              { text: 'Refresh', callback_data: 'menu:refresh' },
+            ],
+          ],
+        },
+        editCurrent,
+      };
+    }
+
+    if (botMode === 'reverse_copysell') {
+      const targetWallet = config.reverseCopySellTargetWallet;
+      const activePosition = reverseCopySellOrchestrator.getActivePosition();
+      return {
+        text: [
+          '<b>Reverse CopySell Bot</b>',
+          '',
+          `Mode: <b>Reverse CopySell</b>`,
+          `Target: ${targetWallet ? `<code>${html(targetWallet)}</code>` : '<b>Not set</b>'}`,
+          activePosition ? `Monitoring: <code>${html(activePosition.mint)}</code>` : 'Status: <b>Waiting for buy...</b>',
+          '',
+          '<b>Flow</b>',
+          '• Watches your trading wallet for new buys.',
+          '• Once you buy, I watch the target wallet for the same token.',
+          '• When the target wallet buys, I sell 100% of your position.',
+        ].join('\n'),
+        replyMarkup: {
+          inline_keyboard: [
+            [
+              { text: 'Insider', callback_data: 'mode:insider' },
+              { text: 'Bundler', callback_data: 'mode:bundler' },
+              { text: 'Rev CopySell', callback_data: 'mode:reverse_copysell' },
+            ],
+            [
+              { text: 'Set Target Wallet', callback_data: 'reverse:set_target' },
               { text: 'Refresh', callback_data: 'menu:refresh' },
             ],
           ],
@@ -1132,6 +1300,7 @@ async function main(): Promise<void> {
           [
             { text: 'Insider', callback_data: 'mode:insider' },
             { text: 'Bundler', callback_data: 'mode:bundler' },
+            { text: 'Rev CopySell', callback_data: 'mode:reverse_copysell' },
           ],
           [
             { text: 'Add wallet', callback_data: 'menu:addwallet' },
@@ -1188,6 +1357,15 @@ async function main(): Promise<void> {
         `Status: ${insiderStatus}`,
         `Follow wallet: ${followedWallet ?? 'not set'}`,
         `Buy SOL: ${insiderBot.getBuySol()}`,
+      ].join('\n');
+    } else if (botMode === 'reverse_copysell') {
+      const targetWallet = config.reverseCopySellTargetWallet;
+      const activePosition = reverseCopySellOrchestrator.getActivePosition();
+      text = [
+        '<b>Bot Status</b>',
+        'Mode: Reverse CopySell',
+        `Target: ${targetWallet ?? 'not set'}`,
+        `Monitoring: ${activePosition ? activePosition.mint : 'none'}`,
       ].join('\n');
     } else {
       text = [
@@ -1415,6 +1593,7 @@ async function main(): Promise<void> {
     healthServer.close();
 
     await earlyBundlerOrchestrator.shutdown();
+    await reverseCopySellOrchestrator.shutdown();
 
     await limiter.drain().catch((e) => log.warn('Limiter drain error', e));
     db.close();

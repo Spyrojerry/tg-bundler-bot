@@ -238,6 +238,16 @@ export class WalletMonitor extends EventEmitter {
 
       for (const buy of boughtMints) {
         log.info(`[WS BUY] ${signature} -> ${buy.mint}`, { buySol: buy.buySol });
+        
+        // Emit general buy event for any detected balance increase
+        this.emit('buyDetected', {
+          walletAddress: this.walletPubkey.toBase58(),
+          mint: buy.mint,
+          detectedAt: Date.now(),
+          buySol: buy.buySol,
+          signature,
+        });
+
         this.emitNewToken(buy.mint, Date.now(), 'tx-detected', source, buy.buySol);
       }
     } finally {

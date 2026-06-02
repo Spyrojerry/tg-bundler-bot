@@ -110,6 +110,7 @@ export function loadConfig(): ServiceConfig {
     deriveWsUrl(insiderSolanaRpcUrl)
   );
   const dbPath           = optional('DB_PATH', './data/monitor.db');
+  const reverseCopySellTargetWallet = optionalNullable('REVERSE_COPYSELL_TARGET_WALLET');
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
@@ -176,6 +177,7 @@ export function loadConfig(): ServiceConfig {
     insiderSolanaRpcUrl,
     insiderSolanaWsUrl,
     insiderBuySol,
+    reverseCopySellTargetWallet,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,

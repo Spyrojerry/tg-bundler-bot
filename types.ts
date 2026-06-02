@@ -153,6 +153,7 @@ export interface ServiceConfig {
   insiderSolanaRpcUrl: string;
   insiderSolanaWsUrl: string;
   insiderBuySol: number;
+  reverseCopySellTargetWallet: string | null;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;
