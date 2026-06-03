@@ -53,6 +53,8 @@ export class WalletMonitor extends EventEmitter {
 
   private pollTimer: NodeJS.Timeout | null = null;
   private running = false;
+  private activeProcessingCount = 0;
+  private readonly MAX_CONCURRENT_PROCESSING = 3;
 
   constructor(
     config: ServiceConfig,
@@ -155,6 +157,24 @@ export class WalletMonitor extends EventEmitter {
           return;
         }
 
+        // --- PRE-FILTER LOGS ---
+        // Only process transactions that look like token swaps or transfers.
+        // This drastically reduces RPC calls for highly active wallets.
+        const logs = logInfo.logs || [];
+        const isLikelyTokenTx = logs.some(l => 
+          l.includes('Transfer') || 
+          l.includes('Swap') || 
+          l.includes('Buy') || 
+          l.includes('Sell') || 
+          l.includes('Route') ||
+          l.includes('Token')
+        );
+
+        if (!isLikelyTokenTx) {
+          log.debug(`[WS SKIP] ${logInfo.signature} (non-token tx)`);
+          return;
+        }
+
         log.info(`[WS TX] ${logInfo.signature}`);
         this.processSignature(logInfo.signature, 'logsSubscribe').catch((err) =>
           log.error(`Failed to process logs signature ${logInfo.signature}`, err)
@@ -227,7 +247,15 @@ export class WalletMonitor extends EventEmitter {
   private async processSignature(signature: string, source: string): Promise<void> {
     if (!this.running || this.pendingSignatures.has(signature)) return;
 
+    // Concurrency limit to avoid hitting RPC rate limits (429)
+    while (this.activeProcessingCount >= this.MAX_CONCURRENT_PROCESSING) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (!this.running) return;
+    }
+
     this.pendingSignatures.add(signature);
+    this.activeProcessingCount++;
+
     try {
       const boughtMints = await this.fetchBoughtMintsFromSignature(signature);
       if (!boughtMints) return;
@@ -237,6 +265,13 @@ export class WalletMonitor extends EventEmitter {
       }
 
       for (const buy of boughtMints) {
+        if (this.knownMints.has(buy.mint)) {
+          // Update held status but don't emit as new
+          this.heldMints.add(buy.mint);
+          continue;
+        }
+
+        // New token detected!
         log.info(`[WS BUY] ${signature} -> ${buy.mint}`, { buySol: buy.buySol });
         
         // Emit general buy event for any detected balance increase
@@ -252,6 +287,7 @@ export class WalletMonitor extends EventEmitter {
       }
     } finally {
       this.pendingSignatures.delete(signature);
+      this.activeProcessingCount--;
     }
   }
 

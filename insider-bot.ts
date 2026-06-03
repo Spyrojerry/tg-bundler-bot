@@ -170,10 +170,17 @@ export class InsiderBot extends EventEmitter {
         });
         return;
       }
-      log.info('Followed wallet buy detected - starting MC monitoring for entry', {
+      log.info('Followed wallet buy detected - pausing monitor and starting MC monitoring for entry', {
         followedWallet: this.followedWallet,
         mint: event.mint,
       });
+
+      // Pause the monitor to focus entirely on the current token and avoid RPC overhead
+      if (this.followMonitor) {
+        this.followMonitor.stop();
+        this.followMonitor = null;
+      }
+
       this.boughtMints.add(event.mint);
       this.watchingMint = event.mint;
     });
@@ -209,7 +216,12 @@ export class InsiderBot extends EventEmitter {
   private async resetForNewToken(): Promise<void> {
     this.activePosition = null;
     this.watchingMint = null;
-    log.info('InsiderBot reset; waiting for next followed wallet buy');
+    log.info('InsiderBot reset; resuming followed wallet monitoring');
+    
+    // Resume monitoring the followed wallet if one was set
+    if (this.followedWallet && !this.followMonitor) {
+      await this.followWallet(this.followedWallet);
+    }
   }
 }
 
