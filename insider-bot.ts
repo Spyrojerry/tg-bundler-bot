@@ -214,15 +214,15 @@ export class InsiderBot extends EventEmitter {
     this.mintScanActive = true;
     
     // Simplification: only scan once for the insider based on the earliest transactions.
-    // "scrap out the buy flow after tx 1 and so on"
-    const { swapTxs } = await this.fetchEarliestMintSwapTransactions(mint);
+    const txs = await this.fetchEarliestMintTransactions(mint);
 
-    for (let i = 0; i < swapTxs.length; i++) {
-      const tx = swapTxs[i];
-      const insiderWallet = this.findEarlyHeliusInsider(tx, swapTxs.slice(0, i), followedWallet, mint);
+    // Skip the first transaction (usually the mint transaction)
+    for (let i = 1; i < txs.length; i++) {
+      const tx = txs[i];
+      const insiderWallet = this.findEarlyHeliusInsider(tx, followedWallet, mint);
       
       if (insiderWallet) {
-        log.warn('Insider wallet detected for mint - starting watch', {
+        log.warn('First insider wallet detected for mint - starting watch', {
           followedWallet,
           insiderWallet,
           mint,
@@ -233,50 +233,42 @@ export class InsiderBot extends EventEmitter {
       }
     }
 
-    log.info('Mint scan finished without finding insider', { mint, txsScanned: swapTxs.length });
+    log.info('Mint scan finished without finding insider', { mint, txsScanned: txs.length });
     this.mintScanActive = false;
   }
 
-  private async fetchEarliestMintSwapTransactions(mint: string): Promise<{ swapTxs: HeliusEnhancedTransaction[] }> {
-    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}&limit=50`;
-    const swapTxs: HeliusEnhancedTransaction[] = [];
-
+  private async fetchEarliestMintTransactions(mint: string): Promise<HeliusEnhancedTransaction[]> {
+    const url = `https://api-mainnet.helius-rpc.com/v0/addresses/${mint}/transactions?token-accounts=none&sort-order=asc&api-key=${this.config.insiderHeliusApiKey}&limit=20`;
+    
     try {
       const response = await fetch(url);
       if (response.ok) {
-        const data = await response.json() as HeliusEnhancedTransaction[];
-        for (const tx of data) {
-          if (this.getHeliusPoolSwaps(tx, mint).length > 0) {
-            swapTxs.push(tx);
-            if (swapTxs.length >= 20) break;
-          }
-        }
+        return await response.json() as HeliusEnhancedTransaction[];
       }
     } catch (err) {
       log.error('Failed to fetch earliest mint transactions', err);
     }
 
-    return { swapTxs };
+    return [];
   }
 
   private findEarlyHeliusInsider(
     tx: HeliusEnhancedTransaction,
-    priorTxs: HeliusEnhancedTransaction[],
     followedWallet: string,
     mint: string
   ): string | null {
-    const sellers = new Set(this.getHeliusPoolSwaps(tx, mint).filter(s => s.direction === 'sell').map(s => s.wallet));
-    
-    for (const seller of sellers) {
-      if (seller === followedWallet) continue;
-      if (this.isKnownPoolAuthority(seller)) continue;
+    // Look for the first recipient of the token who isn't the followed wallet or a pool
+    const transfers = tx.tokenTransfers ?? [];
+    for (const t of transfers) {
+      if (t.mint !== mint) continue;
+      const recipient = t.toUserAccount;
+      if (!recipient) continue;
 
-      // Insider is someone who sells early without a prior buy in the first 20 txs
-      const hasPriorBuy = priorTxs.some(ptx => 
-        this.getHeliusPoolSwaps(ptx, mint).some(s => s.wallet === seller && s.direction === 'buy')
-      );
+      if (recipient === followedWallet) continue;
+      if (this.isKnownPoolAuthority(recipient)) continue;
 
-      if (!hasPriorBuy) return seller;
+      // This is our first insider
+      return recipient;
     }
 
     return null;
