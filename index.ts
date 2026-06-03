@@ -1241,8 +1241,8 @@ async function main(): Promise<void> {
       
       let status = 'Idle';
       if (insiderRunning) {
-        if (activePos) status = `Holding <code>${html(activePos.mint.slice(0, 8))}...</code>`;
-        else if (preBuyMint) status = `Watching <code>${html(preBuyMint.slice(0, 8))}...</code>`;
+        if (activePos) status = `Holding token ${html(activePos.mint.slice(0, 8))}...`;
+        else if (preBuyMint) status = `Watching token ${html(preBuyMint.slice(0, 8))}...`;
         else status = 'Running';
       } else if (followedWallet) {
         status = 'Paused';
@@ -1266,9 +1266,9 @@ async function main(): Promise<void> {
           '1. Set follow wallet, entry MC, and exit MC.',
           '2. Bot waits for the followed wallet to buy a new token.',
           '3. Once detected, bot watches that token\'s Market Cap.',
-          '4. Bot buys when MC ≥ Entry MC.',
-          '5. Bot sells when MC ≥ Exit MC.',
-          '• <i>Rug Protection: Bot resets if MC < $1,000.</i>',
+          '4. Bot buys when MC >= Entry MC.',
+          '5. Bot sells when MC >= Exit MC.',
+          '• Rug Protection: Bot resets if MC is below $1,000.',
         ].join('\n'),
         replyMarkup: {
           inline_keyboard: [
