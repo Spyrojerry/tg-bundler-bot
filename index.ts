@@ -38,7 +38,7 @@ const log = createLogger('MAIN');
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const INSIDER_MIN_MARKET_CAP_USD = 1_000;
-const MCAP_CHECK_INTERVAL_MS = 30_000;
+const MCAP_CHECK_INTERVAL_MS = 5_000;
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -62,6 +62,8 @@ async function main(): Promise<void> {
     monitorInterval: config.monitorInterval,
     rateLimitMinTime: config.rateLimitMinTime,
     dbPath:          config.dbPath,
+    insiderEntryMc:  config.insiderEntryMc,
+    insiderExitMc:   config.insiderExitMc,
   });
 
   // ── 2. Database ────────────────────────────────────────────────────────────
@@ -89,7 +91,7 @@ async function main(): Promise<void> {
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
     | { type: 'minSol'; walletAddress: string }
-    | { type: 'insiderFollowWallet' | 'insiderBuySol' }
+    | { type: 'insiderFollowWallet' | 'insiderBuySol' | 'insiderEntryMc' | 'insiderExitMc' }
     | { type: 'reverseTargetWallet' };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
@@ -188,6 +190,14 @@ async function main(): Promise<void> {
         if (data === 'insider:buysol') {
           pendingTelegramActions.set(chatId, { type: 'insiderBuySol' });
           return { text: 'Send the SOL amount Insider Bot should buy with.', trackPrompt: true, editCurrent: true };
+        }
+        if (data === 'insider:entrymc') {
+          pendingTelegramActions.set(chatId, { type: 'insiderEntryMc' });
+          return { text: 'Send the Entry Market Cap in <b>thousands (k)</b>.\nExample: <code>50</code> for $50,000.', trackPrompt: true, editCurrent: true };
+        }
+        if (data === 'insider:exitmc') {
+          pendingTelegramActions.set(chatId, { type: 'insiderExitMc' });
+          return { text: 'Send the Exit Market Cap in <b>thousands (k)</b>.\nExample: <code>150</code> for $150,000.', trackPrompt: true, editCurrent: true };
         }
         if (data === 'insider:stop') {
           await insiderBot.stop();
@@ -336,6 +346,18 @@ async function main(): Promise<void> {
             const value = Number(text.trim());
             if (!Number.isFinite(value) || value <= 0) return 'Send a SOL amount greater than 0.';
             insiderBot.setBuySol(value);
+            return homeReply();
+          }
+          if (pendingAction.type === 'insiderEntryMc') {
+            const value = Number(text.trim().replace(/,/g, ''));
+            if (!Number.isFinite(value) || value < 0) return 'Send a valid number in thousands (k).';
+            insiderBot.setEntryMc(value * 1000);
+            return homeReply();
+          }
+          if (pendingAction.type === 'insiderExitMc') {
+            const value = Number(text.trim().replace(/,/g, ''));
+            if (!Number.isFinite(value) || value < 0) return 'Send a valid number in thousands (k).';
+            insiderBot.setExitMc(value * 1000);
             return homeReply();
           }
           if (pendingAction.type === 'reverseTargetWallet') {
@@ -501,34 +523,14 @@ async function main(): Promise<void> {
 
     void (async () => {
       try {
-        const marketCapUsd = await gmgnClient.fetchTokenMarketCapUsd(trigger.mint);
-        if (marketCapUsd !== null && marketCapUsd < INSIDER_MIN_MARKET_CAP_USD) {
-          log.warn('[INSIDER BUY SKIP] Market cap below minimum (Rug Protection)', {
-            mint: trigger.mint,
-            marketCapUsd,
-            minMarketCapUsd: INSIDER_MIN_MARKET_CAP_USD,
-          });
-          await telegramBot?.sendDefault([
-            '<b>⚠️ Insider Buy Skipped (Rug Protection)</b>',
-            `Token: <code>${html(trigger.mint)}</code>`,
-            `Market cap: <b>$${marketCapUsd.toLocaleString()}</b>`,
-            `Minimum required: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
-            '',
-            'Reason: Market cap is too low (potential rug). I will wait for the next token.',
-          ].join('\n'));
-          insiderBot.clearActivePosition();
-          return;
-        }
-
         telegramBot?.sendDefault([
           '<b>🚀 Insider Entry Triggered</b>',
-          `Insider: <code>${html(trigger.insiderWallet)}</code>`,
           `Token: <code>${html(trigger.mint)}</code>`,
           `Buying: <b>${trigger.buySol} SOL</b>`,
-          marketCapUsd ? `Market Cap: <b>$${marketCapUsd.toLocaleString()}</b>` : '',
+          `Trigger: <b>Market Cap Reached</b>`,
           '',
           'Submitting swap...',
-        ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
+        ].join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
 
         const result = await gmgnClient.buyTokenWithSol(
           config.tradingWalletAddress!,
@@ -548,8 +550,8 @@ async function main(): Promise<void> {
           `Status: <b>${html(result.status)}</b>`,
           result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
           '',
-          '<b>Strategy: Buy on First Sell, Sell on Next Buy</b>',
-          'Watching insider wallet for its NEXT buy transaction. I will sell this position immediately when detected.',
+          '<b>Strategy: MC-Based Exit</b>',
+          `Watching for Exit MC: <b>$${insiderBot.getExitMc().toLocaleString()}</b>`,
         ].filter(Boolean).join('\n'), {
           replyMarkup: {
             inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${trigger.mint}:i` }]],
@@ -567,28 +569,24 @@ async function main(): Promise<void> {
   });
 
   insiderBot.on('sellTrigger', (trigger) => {
-      if (!config.tradingWalletAddress) {
-        log.warn('[INSIDER SELL SKIP] No trading wallet configured', trigger);
-        return;
-      }
-      if (hasPendingSellForMint(config.tradingWalletAddress, trigger.positionMint)) {
-        log.info(`[INSIDER SELL SKIP] Sell already pending for ${trigger.positionMint}`);
-        return;
-      }
+    if (!config.tradingWalletAddress) {
+      log.warn('[INSIDER SELL SKIP] No trading wallet configured', trigger);
+      return;
+    }
+    if (hasPendingSellForMint(config.tradingWalletAddress, trigger.positionMint)) {
+      log.info(`[INSIDER SELL SKIP] Sell already pending for ${trigger.positionMint}`);
+      return;
+    }
 
-      // Clear active position immediately on sell trigger to prevent checker from firing
-      insiderBot.clearActivePosition();
+    // Clear active position immediately on sell trigger to prevent checker from firing
+    insiderBot.clearActivePosition();
 
-      const event: FilterFailEvent = {
+    const event: FilterFailEvent = {
       walletAddress: config.tradingWalletAddress,
       mint: trigger.positionMint,
       sampleNumber: 0,
       elapsedSec: 0,
-      reasons: [
-        `Insider wallet ${trigger.insiderWallet} made a new buy after our entry.`,
-        `Insider buy token: ${trigger.insiderBuyMint}`,
-        'Configured action triggered: sell immediately on insider next-buy signal.',
-      ],
+      reasons: [trigger.reason],
       settings: db.getWalletSettings(config.tradingWalletAddress),
       metrics: {
         mint: trigger.positionMint,
@@ -601,7 +599,7 @@ async function main(): Promise<void> {
         bundledAmountRate: null,
       },
       buySol: insiderBot.getBuySol(),
-      matchingWallets: [trigger.insiderWallet],
+      matchingWallets: [],
     };
 
     const sellId = randomBytes(5).toString('hex');
@@ -613,9 +611,8 @@ async function main(): Promise<void> {
 
     telegramBot?.sendDefault([
       '<b>🚨 Insider Sell Triggered</b>',
-      `Position token: <code>${html(trigger.positionMint)}</code>`,
-      `Insider wallet: <code>${html(trigger.insiderWallet)}</code>`,
-      `Insider bought: <code>${html(trigger.insiderBuyMint)}</code>`,
+      `Token: <code>${html(trigger.positionMint)}</code>`,
+      `Reason: <b>${trigger.reason}</b>`,
       `Action: submit sell for <b>${config.sellPercent}%</b>.`,
     ].join('\n'), {
       replyMarkup: {
@@ -820,63 +817,125 @@ async function main(): Promise<void> {
     }
   }
 
-  async function checkAndStopIfLowMcap(mint: string): Promise<void> {
+  async function checkInsiderMcapFlow(): Promise<void> {
+    const preBuyMint = insiderBot.getPreBuyMint();
+    const activePos = insiderBot.getActivePosition();
+
+    if (!preBuyMint && !activePos) return;
+
+    const mint = preBuyMint || activePos!.mint;
     try {
       const currentMc = await gmgnClient.fetchTokenMarketCapUsd(mint);
-      if (currentMc !== null && currentMc < INSIDER_MIN_MARKET_CAP_USD) {
-        log.warn(`[MCAP MONITOR STOP] Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}. Stopping monitoring.`);
+      if (currentMc === null) return;
+
+      log.debug(`[INSIDER MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()}`);
+
+      // 1. Rug protection: MC < $1k
+      if (currentMc < 1000) {
+        log.warn(`[INSIDER RUG] Market cap $${currentMc.toLocaleString()} below $1,000 for ${mint}. Resetting.`);
+        
+        if (activePos) {
+          // Trigger immediate sell if we have a position
+          const event: FilterFailEvent = {
+            walletAddress: config.tradingWalletAddress!,
+            mint,
+            sampleNumber: 0,
+            elapsedSec: 0,
+            reasons: [`Market cap $${currentMc.toLocaleString()} fell below $1,000 (Rug).`],
+            settings: db.getWalletSettings(config.tradingWalletAddress!),
+            metrics: { mint, timestamp: new Date().toISOString(), bundlersPercent: null, bundlersCount: null, initialBaseReserve: null, topWallets: null, top10HolderRate: null, bundledAmountRate: null },
+            buySol: insiderBot.getBuySol(),
+            matchingWallets: [],
+          };
+          const sellId = randomBytes(5).toString('hex');
+          pendingSells.set(sellId, { event, createdAt: Date.now(), executing: true });
+          void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+          
+          telegramBot?.sendDefault([
+            '<b>🚨 Insider Rug Protection Triggered</b>',
+            `Token: <code>${html(mint)}</code>`,
+            `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
+            'Action: Selling immediately and resetting.',
+          ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
+        } else {
+          telegramBot?.sendDefault([
+            '<b>⚠️ Insider Watch Reset (Rug)</b>',
+            `Token: <code>${html(mint)}</code>`,
+            `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
+            'Reason: Market cap fell below $1,000. Aborting entry sequence.',
+          ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
+        }
         
         insiderBot.clearActivePosition();
+        return;
+      }
 
-        telegramBot?.sendDefault([
-          '<b>⚠️ Insider Monitoring Stopped (Rug Protection)</b>',
-          `Token: <code>${html(mint)}</code>`,
-          `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
-          `Threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
-          'Reason: Market cap fell below minimum requirement. This token is likely a rug; entry sequence aborted.',
-        ].join('\n')).catch((err) => log.warn('Telegram mcap monitor stop alert failed', err));
+      // 2. Entry Check
+      if (preBuyMint) {
+        const entryMc = insiderBot.getEntryMc();
+        if (currentMc >= entryMc) {
+          log.warn(`[INSIDER ENTRY] MC $${currentMc.toLocaleString()} reached Entry MC $${entryMc.toLocaleString()}. Triggering BUY.`);
+          insiderBot.emit('buyTrigger', {
+            followedWallet: insiderBot.getFollowedWallet()!,
+            mint: preBuyMint,
+            signature: 'MC_TRIGGER',
+            buySol: insiderBot.getBuySol(),
+          });
+        }
+      } 
+      // 3. Exit Check
+      else if (activePos) {
+        const exitMc = insiderBot.getExitMc();
+        if (currentMc >= exitMc) {
+          log.warn(`[INSIDER EXIT] MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`);
+          insiderBot.emit('sellTrigger', {
+            followedWallet: insiderBot.getFollowedWallet()!,
+            positionMint: activePos.mint,
+            signature: 'MC_TRIGGER',
+            reason: `Target Exit MC $${exitMc.toLocaleString()} reached`,
+          });
+        }
       }
     } catch (err) {
-      log.error(`Failed to check market cap for monitoring stop: ${mint}`, err);
+      log.error(`Failed to check Insider MC flow for ${mint}`, err);
     }
   }
 
   function startMarketCapChecker(): void {
     log.info(`Starting periodic market cap checker (interval: ${MCAP_CHECK_INTERVAL_MS}ms)`);
+    let isChecking = false;
     setInterval(async () => {
-      // 1. Check InsiderBot pre-buy sequence (NEW)
-      const preBuyMint = insiderBot.getPreBuyMint();
-      if (preBuyMint) {
-        await checkAndStopIfLowMcap(preBuyMint);
-      }
-
-      if (!config.tradingWalletAddress) return;
-
-      // 2. Check InsiderBot active position
-      // Insider mode re-enabled market cap check for rug protection.
-      const insiderPos = insiderBot.getActivePosition();
-      if (insiderPos) {
-        await checkAndSellIfLowMcap(insiderPos.mint, 'insider');
-      }
-
-      // 3. Check EarlyBundlerOrchestrator active position
-      const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
-      if (bundlerPos) {
-        await checkAndSellIfLowMcap(bundlerPos.mint, 'bundler');
-      }
-
-      // 4. Check ReverseCopySellOrchestrator active position
-      const revPos = reverseCopySellOrchestrator.getActivePosition();
-      if (revPos) {
-        await checkAndSellIfLowMcap(revPos.mint, 'reverse_copysell');
-      }
-
-      // 5. Check pendingTradingBuys (if not already checked)
-      if (botMode === 'bundler') {
-        for (const mint of pendingTradingBuys.keys()) {
-          if (bundlerPos?.mint === mint) continue;
-          await checkAndSellIfLowMcap(mint, 'bundler');
+      if (isChecking) return;
+      isChecking = true;
+      try {
+        // 1. Insider Mode MC Flow
+        if (botMode === 'insider') {
+          await checkInsiderMcapFlow();
         }
+
+        if (!config.tradingWalletAddress) return;
+
+        // 2. Bundler Mode positions
+        if (botMode === 'bundler') {
+          const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
+          if (bundlerPos) {
+            await checkAndSellIfLowMcap(bundlerPos.mint, 'bundler');
+          }
+          for (const mint of pendingTradingBuys.keys()) {
+            if (bundlerPos?.mint === mint) continue;
+            await checkAndSellIfLowMcap(mint, 'bundler');
+          }
+        }
+
+        // 3. Reverse CopySell positions
+        if (botMode === 'reverse_copysell') {
+          const revPos = reverseCopySellOrchestrator.getActivePosition();
+          if (revPos) {
+            await checkAndSellIfLowMcap(revPos.mint, 'reverse_copysell');
+          }
+        }
+      } finally {
+        isChecking = false;
       }
     }, MCAP_CHECK_INTERVAL_MS);
   }
@@ -1177,7 +1236,18 @@ async function main(): Promise<void> {
     if (botMode === 'insider') {
       const followedWallet = insiderBot.getFollowedWallet();
       const insiderRunning = insiderBot.isRunning();
-      const insiderStatus = insiderRunning ? 'Running' : followedWallet ? 'Paused' : 'Idle';
+      const preBuyMint = insiderBot.getPreBuyMint();
+      const activePos = insiderBot.getActivePosition();
+      
+      let status = 'Idle';
+      if (insiderRunning) {
+        if (activePos) status = `Holding <code>${activePos.mint.slice(0, 8)}...</code>`;
+        else if (preBuyMint) status = `Watching <code>${preBuyMint.slice(0, 8)}...</code>`;
+        else status = 'Running';
+      } else if (followedWallet) {
+        status = 'Paused';
+      }
+
       const stopResumeButton = followedWallet && !insiderRunning
         ? { text: 'Resume', callback_data: 'insider:resume' }
         : { text: 'Stop', callback_data: 'insider:stop' };
@@ -1186,15 +1256,19 @@ async function main(): Promise<void> {
           '<b>Insider Bot</b>',
           '',
           `Mode: <b>Insider</b>`,
-          `Status: <b>${insiderStatus}</b>`,
+          `Status: <b>${status}</b>`,
           `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : '<b>Not set</b>'}`,
           `Buy SOL: <b>${insiderBot.getBuySol()}</b>`,
+          `Entry MC: <b>$${insiderBot.getEntryMc().toLocaleString()}</b>`,
+          `Exit MC: <b>$${insiderBot.getExitMc().toLocaleString()}</b>`,
           '',
           '<b>Flow</b>',
-          '1. Follow a wallet address.',
-          '2. When that wallet buys a new token, I identify the <b>insider wallet</b>.',
-          '3. When the insider makes their <b>first sell</b>, I buy.',
-          '4. When the insider makes their <b>next buy</b>, I sell.',
+          '1. Set follow wallet, entry MC, and exit MC.',
+          '2. Bot waits for the followed wallet to buy a new token.',
+          '3. Once detected, bot watches that token\'s Market Cap.',
+          '4. Bot buys when MC ≥ Entry MC.',
+          '5. Bot sells when MC ≥ Exit MC.',
+          '• <i>Rug Protection: Bot resets if MC < $1,000.</i>',
         ].join('\n'),
         replyMarkup: {
           inline_keyboard: [
@@ -1206,6 +1280,10 @@ async function main(): Promise<void> {
             [
               { text: 'Follow wallet', callback_data: 'insider:follow' },
               { text: 'Buy SOL', callback_data: 'insider:buysol' },
+            ],
+            [
+              { text: 'Set Entry MC', callback_data: 'insider:entrymc' },
+              { text: 'Set Exit MC', callback_data: 'insider:exitmc' },
             ],
             [
               stopResumeButton,

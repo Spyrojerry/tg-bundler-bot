@@ -127,6 +127,8 @@ export function loadConfig(): ServiceConfig {
   const sellSlippage           = optionalNumber('SELL_SLIPPAGE', 0.3);
   const sellPriorityFeeSol     = optionalNumber('SELL_PRIORITY_FEE_SOL', 0.000012);
   const insiderBuySol          = optionalNumber('INSIDER_BUY_SOL', 0.01);
+  const insiderEntryMc         = optionalNumber('INSIDER_ENTRY_MC', 15_000);
+  const insiderExitMc          = optionalNumber('INSIDER_EXIT_MC', 30_000);
   const port                   = optionalInt('PORT', 8080);
 
   if (!isValidLogLevel(rawLogLevel)) {
@@ -177,6 +179,8 @@ export function loadConfig(): ServiceConfig {
     insiderSolanaRpcUrl,
     insiderSolanaWsUrl,
     insiderBuySol,
+    insiderEntryMc,
+    insiderExitMc,
     reverseCopySellTargetWallet,
     logLevel: rawLogLevel,
     telegramBotToken,
