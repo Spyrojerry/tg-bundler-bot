@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { createLogger } from './logger';
 import type { ServiceConfig } from './types';
 import { TelegramBot } from './telegram-bot';
+import { WalletMonitor } from './wallet-monitor';
 
 const log = createLogger('INSIDER');
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -79,7 +80,7 @@ export class InsiderBot extends EventEmitter {
   private readonly telegramBot: TelegramBot | null;
   private followedWallet: string | null = null;
   private buySol: number;
-  private followSubId: number | null = null;
+  private followMonitor: WalletMonitor | null = null;
   private insiderSubId: number | null = null;
   private mintScanActive = false;
   private watchingMint: string | null = null;
@@ -130,7 +131,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   isRunning(): boolean {
-    return this.followSubId !== null || this.insiderSubId !== null || this.mintScanActive;
+    return this.followMonitor !== null || this.insiderSubId !== null || this.mintScanActive;
   }
 
   async followWallet(address: string): Promise<void> {
@@ -141,36 +142,35 @@ export class InsiderBot extends EventEmitter {
     await this.stop();
     this.followedWallet = normalized;
 
-    const subId = this.connection.onLogs(
-      new PublicKey(normalized),
-      (logInfo) => {
-        if (logInfo.err) return;
-        this.processFollowWalletSignature(logInfo.signature).catch((err) => {
-          log.error(`Failed to process followed wallet signature ${logInfo.signature}`, err);
-          this.emit('error', err instanceof Error ? err : new Error(String(err)));
-        });
-      },
-      'processed'
-    );
+    this.followMonitor = new WalletMonitor(this.config, normalized, { enforceMinBuySol: false });
+    this.followMonitor.on('newToken', (event) => {
+      if (this.boughtMints.has(event.mint)) return;
+      log.info('Followed wallet buy detected via monitor - starting mint scan to find insider', {
+        followedWallet: this.followedWallet,
+        mint: event.mint,
+        signature: event.signature,
+      });
+      this.boughtMints.add(event.mint);
+      void this.scanEarliestMintTransactions(this.followedWallet!, event.mint);
+    });
 
-    this.followSubId = subId;
-    log.info('Insider follow wallet monitoring started', {
+    await this.followMonitor.start();
+
+    log.info('Insider follow wallet monitoring started (using WalletMonitor)', {
       followedWallet: normalized,
       buySol: this.buySol,
     });
   }
 
   async stop(): Promise<void> {
-    const removals: Array<Promise<void>> = [];
-    if (this.followSubId !== null) {
-      removals.push(this.connection.removeOnLogsListener(this.followSubId));
-      this.followSubId = null;
+    if (this.followMonitor) {
+      this.followMonitor.stop();
+      this.followMonitor = null;
     }
     if (this.insiderSubId !== null) {
-      removals.push(this.connection.removeOnLogsListener(this.insiderSubId));
+      await this.connection.removeOnLogsListener(this.insiderSubId).catch(() => undefined);
       this.insiderSubId = null;
     }
-    await Promise.allSettled(removals);
     this.mintScanActive = false;
     this.activePosition = null;
     this.watchingMint = null;
@@ -187,27 +187,6 @@ export class InsiderBot extends EventEmitter {
     this.startInsiderWalletWatch(trigger.insiderWallet, trigger.mint).catch((err) => {
       log.error('Failed to start insider watch after buy', err);
     });
-  }
-
-  private async processFollowWalletSignature(signature: string): Promise<void> {
-    if (!this.followedWallet || this.processedSignatures.has(signature)) return;
-    this.processedSignatures.add(signature);
-
-    const tx = await this.fetchHeliusTransaction(signature);
-    if (!tx) return;
-
-    const swaps = this.getHeliusPoolSwaps(tx);
-    const followedBuy = swaps.find(s => s.wallet === this.followedWallet && s.direction === 'buy');
-
-    if (followedBuy) {
-      if (this.boughtMints.has(followedBuy.mint)) return;
-      log.info('Followed wallet buy detected - starting mint scan to find insider', {
-        followedWallet: this.followedWallet,
-        mint: followedBuy.mint,
-        signature,
-      });
-      void this.scanEarliestMintTransactions(this.followedWallet, followedBuy.mint);
-    }
   }
 
   private async scanEarliestMintTransactions(followedWallet: string, mint: string): Promise<void> {
@@ -285,6 +264,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderSubId = this.connection.onLogs(
       new PublicKey(insiderWallet),
       (logInfo) => {
+        log.debug(`Log received for insider wallet ${insiderWallet}`, { signature: logInfo.signature });
         if (logInfo.err) return;
         this.processInsiderWalletSignature(insiderWallet, positionMint, logInfo.signature).catch((err) => {
           log.error('Failed to process insider signature', err);
@@ -298,10 +278,16 @@ export class InsiderBot extends EventEmitter {
     if (this.processedSignatures.has(signature)) return;
     this.processedSignatures.add(signature);
 
+    log.debug(`Processing signature for insider wallet: ${signature}`);
     const tx = await this.fetchHeliusTransaction(signature);
-    if (!tx) return;
+    if (!tx) {
+      log.debug(`Failed to fetch Helius transaction for insider signature: ${signature}`);
+      return;
+    }
 
     const swaps = this.getHeliusPoolSwaps(tx);
+    log.debug(`Detected ${swaps.length} swaps in insider transaction ${signature}`, { swaps });
+
     const insiderSwaps = swaps.filter(s => s.wallet === insiderWallet);
 
     for (const swap of insiderSwaps) {
@@ -361,8 +347,12 @@ export class InsiderBot extends EventEmitter {
       if (response.ok) {
         const data = await response.json() as HeliusEnhancedTransaction[];
         return data[0] || null;
+      } else {
+        log.error(`Helius API error: ${response.status} ${response.statusText}`);
       }
-    } catch {}
+    } catch (err) {
+      log.error(`Failed to fetch Helius transaction: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return null;
   }
 
