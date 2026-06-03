@@ -685,7 +685,7 @@ export class GmgnClient {
         return { success: false, error: 'Empty data payload' };
       }
 
-      return { success: true, metrics: this.parseMetrics(mint, data) };
+      return { success: true, metrics: this.parseMetrics(mint, data), raw: data };
 
     } catch (err: unknown) {
       if (err instanceof Error && err.name === 'AbortError') {

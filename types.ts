@@ -254,7 +254,7 @@ export interface SellQuote {
 
 /** Result of a single GMGN fetch attempt */
 export type FetchResult =
-  | { success: true;  metrics: BundlerMetrics }
+  | { success: true;  metrics: BundlerMetrics; raw?: any }
   | {
       success: false;
       error: string;

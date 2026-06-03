@@ -875,6 +875,19 @@ async function main(): Promise<void> {
         const entryMc = insiderBot.getEntryMc();
         if (currentMc >= entryMc) {
           log.warn(`[INSIDER ENTRY] MC $${currentMc.toLocaleString()} reached Entry MC $${entryMc.toLocaleString()}. Triggering BUY.`);
+          
+          // Log raw GMGN data to backend logs on entry
+          void (async () => {
+            try {
+              const res = await gmgnClient.fetchBundlerMetrics(preBuyMint);
+              if (res.success && res.raw) {
+                log.warn(`gmgn-client logs for token ${preBuyMint}:`, JSON.stringify(res.raw, null, 2));
+              }
+            } catch (err) {
+              log.error(`Failed to fetch raw GMGN data for logging on entry`, err);
+            }
+          })();
+
           insiderBot.emit('buyTrigger', {
             followedWallet: insiderBot.getFollowedWallet()!,
             mint: preBuyMint,
