@@ -523,36 +523,36 @@ async function main(): Promise<void> {
 
     void (async () => {
       try {
-        telegramBot?.sendDefault([
-          '<b>🚀 Insider Entry Triggered</b>',
-          `Token: <code>${html(trigger.mint)}</code>`,
-          `Buying: <b>${trigger.buySol} SOL</b>`,
-          `Trigger: <b>Market Cap Reached</b>`,
-          '',
-          'Submitting swap...',
-        ].join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
+          telegramBot?.sendDefault([
+            '<b>🚀 Insider Entry Triggered</b>',
+            `Token: <code>${html(trigger.mint)}</code>`,
+            `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
+            `Trigger: <b>Market Cap Reached</b>`,
+            '',
+            'Submitting swap...',
+          ].join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
 
-        const result = await gmgnClient.buyTokenWithSol(
-          config.tradingWalletAddress!,
-          trigger.mint,
-          {
-            solAmount: trigger.buySol,
-            slippage: config.sellSlippage,
-            autoSlippage: config.sellAutoSlippage,
-            priorityFeeSol: config.sellPriorityFeeSol,
-          }
-        );
-        insiderBot.markPositionBought(trigger);
+          const result = await gmgnClient.buyTokenWithSol(
+            config.tradingWalletAddress!,
+            trigger.mint,
+            {
+              solAmount: trigger.buySol,
+              slippage: config.sellSlippage,
+              autoSlippage: config.sellAutoSlippage,
+              priorityFeeSol: config.sellPriorityFeeSol,
+            }
+          );
+          insiderBot.markPositionBought(trigger);
 
-        await telegramBot?.sendDefault([
-          '<b>✅ Insider Buy Completed</b>',
-          `Token: <code>${html(trigger.mint)}</code>`,
-          `Status: <b>${html(result.status)}</b>`,
-          result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
-          '',
-          '<b>Strategy: MC-Based Exit</b>',
-          `Watching for Exit MC: <b>$${insiderBot.getExitMc().toLocaleString()}</b>`,
-        ].filter(Boolean).join('\n'), {
+          await telegramBot?.sendDefault([
+            '<b>✅ Insider Buy Completed</b>',
+            `Token: <code>${html(trigger.mint)}</code>`,
+            `Status: <b>${html(result.status)}</b>`,
+            result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
+            '',
+            '<b>Strategy: MC-Based Exit</b>',
+            `Watching for Exit MC: <b>$${html(insiderBot.getExitMc().toLocaleString())}</b>`,
+          ].filter(Boolean).join('\n'), {
           replyMarkup: {
             inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${trigger.mint}:i` }]],
           },
@@ -854,14 +854,14 @@ async function main(): Promise<void> {
           telegramBot?.sendDefault([
             '<b>🚨 Insider Rug Protection Triggered</b>',
             `Token: <code>${html(mint)}</code>`,
-            `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
+            `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
             'Action: Selling immediately and resetting.',
           ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
         } else {
           telegramBot?.sendDefault([
             '<b>⚠️ Insider Watch Reset (Rug)</b>',
             `Token: <code>${html(mint)}</code>`,
-            `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
+            `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
             'Reason: Market cap fell below $1,000. Aborting entry sequence.',
           ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
         }
@@ -1241,8 +1241,8 @@ async function main(): Promise<void> {
       
       let status = 'Idle';
       if (insiderRunning) {
-        if (activePos) status = `Holding <code>${activePos.mint.slice(0, 8)}...</code>`;
-        else if (preBuyMint) status = `Watching <code>${preBuyMint.slice(0, 8)}...</code>`;
+        if (activePos) status = `Holding <code>${html(activePos.mint.slice(0, 8))}...</code>`;
+        else if (preBuyMint) status = `Watching <code>${html(preBuyMint.slice(0, 8))}...</code>`;
         else status = 'Running';
       } else if (followedWallet) {
         status = 'Paused';
@@ -1258,9 +1258,9 @@ async function main(): Promise<void> {
           `Mode: <b>Insider</b>`,
           `Status: <b>${status}</b>`,
           `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : '<b>Not set</b>'}`,
-          `Buy SOL: <b>${insiderBot.getBuySol()}</b>`,
-          `Entry MC: <b>$${insiderBot.getEntryMc().toLocaleString()}</b>`,
-          `Exit MC: <b>$${insiderBot.getExitMc().toLocaleString()}</b>`,
+          `Buy SOL: <b>${html(String(insiderBot.getBuySol()))}</b>`,
+          `Entry MC: <b>$${html(insiderBot.getEntryMc().toLocaleString())}</b>`,
+          `Exit MC: <b>$${html(insiderBot.getExitMc().toLocaleString())}</b>`,
           '',
           '<b>Flow</b>',
           '1. Set follow wallet, entry MC, and exit MC.',
