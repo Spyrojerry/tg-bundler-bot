@@ -38,7 +38,7 @@ const log = createLogger('MAIN');
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const INSIDER_MIN_MARKET_CAP_USD = 1_000;
-const MCAP_CHECK_INTERVAL_MS = 5_000;
+const MCAP_CHECK_INTERVAL_MS = 2_000;
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
