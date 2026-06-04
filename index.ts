@@ -953,7 +953,7 @@ async function main(): Promise<void> {
               log.warn(`Top 5 profitable wallets for ${preBuyMint}:\n${logTraders.join('\n')}`);
             }
 
-            if (maxTransferProfit > 75) {
+            if (maxTransferProfit > 70) {
               log.warn(`[INSIDER ENTRY] Top transfer wallet profit: $${maxTransferProfit.toLocaleString()} (> $75). Triggering BUY.`);
               
               // Set Exit MC to 50% increase from current entry MC
