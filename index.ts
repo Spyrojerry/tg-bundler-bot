@@ -953,8 +953,8 @@ async function main(): Promise<void> {
               log.warn(`Top 5 profitable wallets for ${preBuyMint}:\n${logTraders.join('\n')}`);
             }
 
-            if (maxTransferProfit > 50) {
-              log.warn(`[INSIDER ENTRY] Top transfer wallet profit: $${maxTransferProfit.toLocaleString()} (> $50). Triggering BUY.`);
+            if (maxTransferProfit > 75) {
+              log.warn(`[INSIDER ENTRY] Top transfer wallet profit: $${maxTransferProfit.toLocaleString()} (> $75). Triggering BUY.`);
               
               // Set Exit MC to 50% increase from current entry MC
               const newExitMc = currentMc * 1.5;
@@ -971,7 +971,7 @@ async function main(): Promise<void> {
             } else {
               const reason = maxTransferProfit === -1 
                 ? "No transfer wallets found in top 5 profitable traders."
-                : `Highest transfer wallet profit is $${maxTransferProfit.toLocaleString()}, which is not > $50.`;
+                : `Highest transfer wallet profit is $${maxTransferProfit.toLocaleString()}, which is not > $75.`;
               
               log.info(`[INSIDER NO-BUY] MC $${currentMc.toLocaleString()} reached but ${reason}`);
               
