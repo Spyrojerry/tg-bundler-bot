@@ -523,39 +523,41 @@ async function main(): Promise<void> {
 
     void (async () => {
       try {
-          // Fetch top 5 profitable traders
-          let tradersListStr = '';
-          try {
-            const followedWallet = insiderBot.getFollowedWallet();
-            const traders = await gmgnClient.fetchTokenTraders(trigger.mint, 5);
-            if (traders && Array.isArray(traders.list)) {
-              const formattedTraders = traders.list.map((t: any, i: number) => {
-                const isFollowed = followedWallet && t.address === followedWallet;
-                const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
+          // Fetch top 5 profitable traders (only if not already provided)
+          let tradersListStr = trigger.tradersListStr || '';
+          if (!tradersListStr) {
+            try {
+              const followedWallet = insiderBot.getFollowedWallet();
+              const traders = await gmgnClient.fetchTokenTraders(trigger.mint, 5);
+              if (traders && Array.isArray(traders.list)) {
+                const formattedTraders = traders.list.map((t: any, i: number) => {
+                  const isFollowed = followedWallet && t.address === followedWallet;
+                  const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
+                  
+                  let tags = [];
+                  if (isFollowed) tags.push('👤 <b>FOLLOWED</b>');
+                  if (hasTransfer) tags.push('🟢 <b>Transfer</b>');
+                  
+                  const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
+                  return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(t.profit?.toLocaleString() ?? '0')}</b>${tagsStr}`;
+                });
+                tradersListStr = '\n' + formattedTraders.join('\n');
                 
-                let tags = [];
-                if (isFollowed) tags.push('👤 <b>FOLLOWED</b>');
-                if (hasTransfer) tags.push('🟢 <b>Transfer</b>');
-                
-                const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
-                return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(t.profit?.toLocaleString() ?? '0')}</b>${tagsStr}`;
-              });
-              tradersListStr = '\n' + formattedTraders.join('\n');
-              
-              // Backend log as well
-              const logTraders = traders.list.map((t: any, i: number) => {
-                const isFollowed = followedWallet && t.address === followedWallet;
-                const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
-                let tags = [];
-                if (isFollowed) tags.push('FOLLOWED');
-                if (hasTransfer) tags.push('Transfer');
-                const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
-                return `${i + 1}. ${t.address}: $${t.profit?.toLocaleString() ?? '0'}${tagsStr}`;
-              });
-              log.warn(`Top 5 profitable wallets for ${trigger.mint}:\n${logTraders.join('\n')}`);
+                // Backend log as well
+                const logTraders = traders.list.map((t: any, i: number) => {
+                  const isFollowed = followedWallet && t.address === followedWallet;
+                  const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
+                  let tags = [];
+                  if (isFollowed) tags.push('FOLLOWED');
+                  if (hasTransfer) tags.push('Transfer');
+                  const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
+                  return `${i + 1}. ${t.address}: $${t.profit?.toLocaleString() ?? '0'}${tagsStr}`;
+                });
+                log.warn(`Top 5 profitable wallets for ${trigger.mint}:\n${logTraders.join('\n')}`);
+              }
+            } catch (err) {
+              log.error(`Failed to fetch top traders for message`, err);
             }
-          } catch (err) {
-            log.error(`Failed to fetch top traders for message`, err);
           }
 
           telegramBot?.sendDefault([
@@ -910,36 +912,84 @@ async function main(): Promise<void> {
       if (preBuyMint) {
         const entryMc = insiderBot.getEntryMc();
         if (currentMc >= entryMc) {
-          log.warn(`[INSIDER ENTRY] MC $${currentMc.toLocaleString()} reached Entry MC $${entryMc.toLocaleString()}. Triggering BUY.`);
+          log.warn(`[INSIDER ENTRY] MC $${currentMc.toLocaleString()} reached Entry MC $${entryMc.toLocaleString()}. Checking transfer wallet profitability...`);
           
-          // Log top 5 profitable traders to backend logs on entry
-          void (async () => {
-            try {
-              const followedWallet = insiderBot.getFollowedWallet();
-              const traders = await gmgnClient.fetchTokenTraders(preBuyMint, 5);
-              if (traders && Array.isArray(traders.list)) {
-                const logTraders = traders.list.map((t: any, i: number) => {
-                  const isFollowed = followedWallet && t.address === followedWallet;
-                  const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
-                  let tags = [];
-                  if (isFollowed) tags.push('FOLLOWED');
-                  if (hasTransfer) tags.push('Transfer');
-                  const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
-                  return `${i + 1}. ${t.address}: $${t.profit?.toLocaleString() ?? '0'}${tagsStr}`;
-                });
-                log.warn(`Top 5 profitable wallets for ${preBuyMint}:\n${logTraders.join('\n')}`);
-              }
-            } catch (err) {
-              log.error(`Failed to fetch top traders for logging on entry`, err);
-            }
-          })();
+          try {
+            const followedWallet = insiderBot.getFollowedWallet();
+            const traders = await gmgnClient.fetchTokenTraders(preBuyMint, 5);
+            
+            let maxTransferProfit = -1;
+            let topTransferWallet = null;
+            let tradersListStr = '';
+            let logTraders: string[] = [];
 
-          insiderBot.emit('buyTrigger', {
-            followedWallet: insiderBot.getFollowedWallet()!,
-            mint: preBuyMint,
-            signature: 'MC_TRIGGER',
-            buySol: insiderBot.getBuySol(),
-          });
+            if (traders && Array.isArray(traders.list)) {
+              const formattedTraders = traders.list.map((t: any, i: number) => {
+                const isFollowed = followedWallet && t.address === followedWallet;
+                const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
+                
+                const profit = t.profit ?? 0;
+                if (hasTransfer && profit > maxTransferProfit) {
+                  maxTransferProfit = profit;
+                  topTransferWallet = t.address;
+                }
+
+                let tags = [];
+                if (isFollowed) tags.push('👤 <b>FOLLOWED</b>');
+                if (hasTransfer) tags.push('🟢 <b>Transfer</b>');
+                
+                const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
+                
+                // For backend logs
+                let logTags = [];
+                if (isFollowed) logTags.push('FOLLOWED');
+                if (hasTransfer) logTags.push('Transfer');
+                const logTagsStr = logTags.length > 0 ? ` [${logTags.join(', ')}]` : '';
+                logTraders.push(`${i + 1}. ${t.address}: $${profit.toLocaleString()}${logTagsStr}`);
+
+                return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(profit.toLocaleString())}</b>${tagsStr}`;
+              });
+              tradersListStr = '\n' + formattedTraders.join('\n');
+              log.warn(`Top 5 profitable wallets for ${preBuyMint}:\n${logTraders.join('\n')}`);
+            }
+
+            if (maxTransferProfit > 50) {
+              log.warn(`[INSIDER ENTRY] Top transfer wallet profit: $${maxTransferProfit.toLocaleString()} (> $50). Triggering BUY.`);
+              
+              // Set Exit MC to 50% increase from current entry MC
+              const newExitMc = currentMc * 1.5;
+              insiderBot.setExitMc(newExitMc);
+              log.warn(`[INSIDER EXIT SET] Exit MC set to $${newExitMc.toLocaleString()} (50% increase from $${currentMc.toLocaleString()})`);
+
+              insiderBot.emit('buyTrigger', {
+                followedWallet: insiderBot.getFollowedWallet()!,
+                mint: preBuyMint,
+                signature: 'MC_TRIGGER',
+                buySol: insiderBot.getBuySol(),
+                tradersListStr,
+              });
+            } else {
+              const reason = maxTransferProfit === -1 
+                ? "No transfer wallets found in top 5 profitable traders."
+                : `Highest transfer wallet profit is $${maxTransferProfit.toLocaleString()}, which is not > $50.`;
+              
+              log.info(`[INSIDER NO-BUY] MC $${currentMc.toLocaleString()} reached but ${reason}`);
+              
+              telegramBot?.sendDefault([
+                '<b>⚠️ Insider Entry Condition Not Met</b>',
+                `Token: <code>${html(preBuyMint)}</code>`,
+                `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
+                `Reason: <b>${html(reason)}</b>`,
+                '',
+                tradersListStr ? `<b>Top 5 profitable wallets:</b>${tradersListStr}` : '',
+              ].join('\n')).catch((err) => log.warn('Telegram no-buy alert failed', err));
+              
+              insiderBot.clearPreBuyMint();
+            }
+          } catch (err) {
+            log.error(`Failed to fetch top traders for entry check`, err);
+            log.warn(`[INSIDER SKIP] Skipping buy for ${preBuyMint} due to trader fetch error.`);
+          }
         }
       } 
       // 3. Exit Check

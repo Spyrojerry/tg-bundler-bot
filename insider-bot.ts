@@ -49,6 +49,7 @@ export interface InsiderBuyTrigger {
   mint: string;
   signature: string;
   buySol: number;
+  tradersListStr?: string;
 }
 
 export interface InsiderSellTrigger {
@@ -69,6 +70,12 @@ export interface InsiderBot {
   getPreBuyMint(): string | null;
   markPositionBought(trigger: InsiderBuyTrigger): void;
   clearActivePosition(): void;
+  clearPreBuyMint(): void;
+  getEntryMc(): number;
+  getExitMc(): number;
+  setExitMc(value: number): void;
+  getFollowedWallet(): string | null;
+  getBuySol(): number;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -109,6 +116,10 @@ export class InsiderBot extends EventEmitter {
   }
 
   clearActivePosition(): void {
+    void this.resetForNewToken();
+  }
+
+  clearPreBuyMint(): void {
     void this.resetForNewToken();
   }
 
