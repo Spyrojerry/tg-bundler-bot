@@ -1052,7 +1052,7 @@ async function main(): Promise<void> {
                   'Reason: <b>Auto Buy is currently DISABLED in settings.</b>',
                   '',
                   tradersListStr ? tradersListStr : '',
-                ].join('\n')).catch((err) => log.warn('Telegram skip-buy alert failed', err));
+                ].join('\n'), { pin: true }).catch((err) => log.warn('Telegram skip-buy alert failed', err));
                 
                 return;
               }
@@ -1087,7 +1087,7 @@ async function main(): Promise<void> {
                 `Reason: <b>${html(reason)}</b>`,
                 '',
                 tradersListStr ? tradersListStr : '',
-              ].join('\n')).catch((err) => log.warn('Telegram no-buy alert failed', err));
+              ].join('\n'), { pin: true }).catch((err) => log.warn('Telegram no-buy alert failed', err));
               
               bot.clearPreBuyMint();
             }

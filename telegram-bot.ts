@@ -81,7 +81,7 @@ export class TelegramBot {
   }
 
   async sendSummaryCard(summary: TokenSummary): Promise<void> {
-    await this.sendDefault(this.formatSummaryCard(summary), { pin: true });
+    await this.sendDefault(this.formatSummaryCard(summary));
   }
 
   async sendFilterFailCard(
@@ -89,13 +89,12 @@ export class TelegramBot {
     replyMarkup?: InlineKeyboardMarkup
   ): Promise<void> {
     await this.sendDefault(this.formatFilterFailCard(event), {
-      pin: true,
       replyMarkup,
     });
   }
 
   async sendFilterPassCard(event: FilterPassEvent): Promise<void> {
-    await this.sendDefault(this.formatFilterPassCard(event), { pin: true });
+    await this.sendDefault(this.formatFilterPassCard(event));
   }
 
   async sendDefault(
