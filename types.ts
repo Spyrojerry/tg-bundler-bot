@@ -133,6 +133,7 @@ export interface ServiceConfig {
   walletPollInterval: number;
   minBuySol: number;
   gmgnApiKey: string;
+  gmgnApiKey2: string;
   gmgnApiBaseUrl: string;
   gmgnFetchMode: 'auto' | 'direct' | 'cli';
   jupiterSwapBaseUrl: string;
@@ -150,8 +151,11 @@ export interface ServiceConfig {
   f1SolanaRpcUrl: string;
   f1SolanaWsUrl: string;
   insiderHeliusApiKey: string;
+  insiderHeliusApiKey2: string;
   insiderSolanaRpcUrl: string;
   insiderSolanaWsUrl: string;
+  insiderSolanaRpcUrl2: string;
+  insiderSolanaWsUrl2: string;
   insiderBuySol: number;
   insiderEntryMc: number;
   insiderExitMc: number;

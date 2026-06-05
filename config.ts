@@ -75,6 +75,7 @@ export function loadConfig(): ServiceConfig {
   const walletAddress    = optionalNullable('WALLET_ADDRESS');
   const tradingWalletAddress = optionalNullable('TRADING_WALLET_ADDRESS');
   const gmgnApiKey       = required('GMGN_API_KEY');
+  const gmgnApiKey2      = optional('GMGN_API_KEY_2', gmgnApiKey);
   const solanaRpcUrl     = optional('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com');
   const solanaWsUrl      = optional('SOLANA_WS_URL', deriveWsUrl(solanaRpcUrl));
   const gmgnApiBaseUrl   = optional('GMGN_API_BASE_URL', 'https://gmgn.ai');
@@ -101,6 +102,7 @@ export function loadConfig(): ServiceConfig {
     deriveWsUrl(f1SolanaRpcUrl)
   );
   const insiderHeliusApiKey = optional('INSIDER_HELIUS_API_KEY', '');
+  const insiderHeliusApiKey2 = optional('INSIDER_HELIUS_API_KEY_2', '');
   const insiderSolanaRpcUrl = optional(
     'INSIDER_SOLANA_RPC_URL',
     insiderHeliusApiKey ? heliusRpcUrl(insiderHeliusApiKey) : solanaRpcUrl
@@ -108,6 +110,14 @@ export function loadConfig(): ServiceConfig {
   const insiderSolanaWsUrl = optional(
     'INSIDER_SOLANA_WS_URL',
     deriveWsUrl(insiderSolanaRpcUrl)
+  );
+  const insiderSolanaRpcUrl2 = optional(
+    'INSIDER_SOLANA_RPC_URL_2',
+    insiderHeliusApiKey2 ? heliusRpcUrl(insiderHeliusApiKey2) : solanaRpcUrl
+  );
+  const insiderSolanaWsUrl2 = optional(
+    'INSIDER_SOLANA_WS_URL_2',
+    deriveWsUrl(insiderSolanaRpcUrl2)
   );
   const dbPath           = optional('DB_PATH', './data/monitor.db');
   const reverseCopySellTargetWallet = optionalNullable('REVERSE_COPYSELL_TARGET_WALLET');
@@ -159,6 +169,7 @@ export function loadConfig(): ServiceConfig {
     walletPollInterval,
     minBuySol,
     gmgnApiKey,
+    gmgnApiKey2,
     gmgnApiBaseUrl,
     gmgnFetchMode,
     jupiterSwapBaseUrl,
@@ -176,8 +187,11 @@ export function loadConfig(): ServiceConfig {
     f1SolanaRpcUrl,
     f1SolanaWsUrl,
     insiderHeliusApiKey,
+    insiderHeliusApiKey2,
     insiderSolanaRpcUrl,
     insiderSolanaWsUrl,
+    insiderSolanaRpcUrl2,
+    insiderSolanaWsUrl2,
     insiderBuySol,
     insiderEntryMc,
     insiderExitMc,

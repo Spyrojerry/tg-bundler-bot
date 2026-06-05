@@ -101,14 +101,15 @@ export class TelegramBot {
   async sendDefault(
     text: string,
     options: { pin?: boolean; replyMarkup?: InlineKeyboardMarkup } = {}
-  ): Promise<void> {
-    if (!this.defaultChatId) return;
+  ): Promise<TelegramMessageResponse | null> {
+    if (!this.defaultChatId) return null;
     const message = await this.sendMessage(this.defaultChatId, text, options.replyMarkup);
     if (options.pin) {
       await this.pinMessage(this.defaultChatId, message.message_id).catch((err) =>
         log.warn('Telegram summary pin failed', this.describeError(err))
       );
     }
+    return message;
   }
 
   async sendChat(
@@ -254,7 +255,7 @@ export class TelegramBot {
     }
   }
 
-  private async pinMessage(chatId: string, messageId: number): Promise<void> {
+  public async pinMessage(chatId: string, messageId: number): Promise<void> {
     await this.api('pinChatMessage', {
       chat_id: chatId,
       message_id: messageId,

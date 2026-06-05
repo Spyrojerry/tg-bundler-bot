@@ -49,6 +49,7 @@ export interface InsiderBuyTrigger {
   mint: string;
   signature: string;
   buySol: number;
+  entryMc?: number;
   tradersListStr?: string;
 }
 
@@ -106,16 +107,21 @@ export class InsiderBot extends EventEmitter {
   } | null = null;
   private boughtMints = new Set<string>();
 
-  constructor(config: ServiceConfig, telegramBot: TelegramBot | null = null) {
+  constructor(
+    config: ServiceConfig,
+    rpcUrl: string,
+    wsUrl: string,
+    telegramBot: TelegramBot | null = null
+  ) {
     super();
     this.config = config;
     this.telegramBot = telegramBot;
     this.buySol = config.insiderBuySol;
     this.entryMc = config.insiderEntryMc;
     this.exitMc = config.insiderExitMc;
-    this.connection = new Connection(config.insiderSolanaRpcUrl, {
+    this.connection = new Connection(rpcUrl, {
       commitment: 'processed',
-      wsEndpoint: config.insiderSolanaWsUrl,
+      wsEndpoint: wsUrl,
     });
   }
 
