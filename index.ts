@@ -209,7 +209,11 @@ async function main(): Promise<void> {
         }
         if (data === 'insider:toggleprofit') {
           const current = insiderBot.getProfitType();
-          insiderBot.setProfitType(current === 'realized' ? 'total' : 'realized');
+          let next: 'both' | 'total' | 'realized';
+          if (current === 'both') next = 'total';
+          else if (current === 'total') next = 'realized';
+          else next = 'both';
+          insiderBot.setProfitType(next);
           return homeReply(true);
         }
         if (data === 'insider:stop') {
@@ -546,36 +550,10 @@ async function main(): Promise<void> {
           let tradersListStr = trigger.tradersListStr || '';
           if (!tradersListStr) {
             try {
-              const followedWallet = insiderBot.getFollowedWallet();
-              const traders = await getTopTradersBySetting(trigger.mint, 5);
-              const profitType = insiderBot.getProfitType();
-              if (traders && Array.isArray(traders.list)) {
-                const formattedTraders = traders.list.map((t: any, i: number) => {
-                  const isFollowed = followedWallet && t.address === followedWallet;
-                  const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
-                  
-                  let tags = [];
-                  if (isFollowed) tags.push('👤 <b>FOLLOWED</b>');
-                  if (hasTransfer) tags.push('🟢 <b>Transfer</b>');
-                  
-                  const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
-                  const profit = profitType === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
-                  return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(profit.toLocaleString() ?? '0')}</b>${tagsStr}`;
-                });
-                tradersListStr = '\n' + formattedTraders.join('\n');
-                
-                // Backend log as well
-                const logTraders = traders.list.map((t: any, i: number) => {
-                  const isFollowed = followedWallet && t.address === followedWallet;
-                  const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
-                  let tags = [];
-                  if (isFollowed) tags.push('FOLLOWED');
-                  if (hasTransfer) tags.push('Transfer');
-                  const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
-                  const profit = profitType === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
-                  return `${i + 1}. ${t.address}: $${profit.toLocaleString() ?? '0'}${tagsStr}`;
-                });
-                log.warn(`Top 5 ${profitType}-profitable wallets for ${trigger.mint}:\n${logTraders.join('\n')}`);
+              const summary = await getTraderSummary(trigger.mint, 5);
+              tradersListStr = summary.tradersListStr;
+              if (tradersListStr) {
+                log.warn(`Top 5 ${summary.profitType}-profitable wallets for ${trigger.mint}:\n${summary.logTraders.join('\n')}`);
               }
             } catch (err) {
               log.error(`Failed to fetch top traders for message`, err);
@@ -588,7 +566,8 @@ async function main(): Promise<void> {
             `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
             `Trigger: <b>Market Cap Reached</b>`,
             '',
-            tradersListStr ? `<b>Top 5 ${insiderBot.getProfitType()}-profitable wallets for ${html(trigger.mint)}:</b>${tradersListStr}\n` : '',
+            tradersListStr ? tradersListStr : '',
+            '',
             'Submitting swap...',
           ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
 
@@ -877,22 +856,88 @@ async function main(): Promise<void> {
     }
   }
 
-  async function getTopTradersBySetting(mint: string, limit: number = 5): Promise<any> {
+  async function getTraderSummary(mint: string, limit: number = 5): Promise<{
+    maxTransferProfit: number;
+    tradersListStr: string;
+    logTraders: string[];
+    profitLabel: string;
+    profitType: string;
+  }> {
     const profitType = insiderBot.getProfitType();
+    const followedWallet = insiderBot.getFollowedWallet();
     const traders = await gmgnClient.fetchTokenTraders(mint, 50, 'profit');
-    if (!traders || !Array.isArray(traders.list)) return traders;
+    
+    if (!traders || !Array.isArray(traders.list)) {
+      return { maxTransferProfit: -1, tradersListStr: '', logTraders: [], profitLabel: '', profitType };
+    }
 
-    // Sort by selected profit type descending
-    const sortedList = [...traders.list].sort((a, b) => {
-      const valA = profitType === 'realized' ? (a.realized_profit ?? 0) : (a.profit ?? 0);
-      const valB = profitType === 'realized' ? (b.realized_profit ?? 0) : (b.profit ?? 0);
-      return valB - valA;
-    });
+    const formatTraders = (list: any[], type: 'realized' | 'total') => {
+      const sorted = [...list].sort((a, b) => {
+        const valA = type === 'realized' ? (a.realized_profit ?? 0) : (a.profit ?? 0);
+        const valB = type === 'realized' ? (b.realized_profit ?? 0) : (b.profit ?? 0);
+        return valB - valA;
+      }).slice(0, limit);
 
-    return {
-      ...traders,
-      list: sortedList.slice(0, limit)
+      let maxTP = -1;
+      const formatted = sorted.map((t: any, i: number) => {
+        const isFollowed = followedWallet && t.address === followedWallet;
+        const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
+        const profit = type === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
+        
+        if (hasTransfer && profit > maxTP) maxTP = profit;
+
+        let tags = [];
+        if (isFollowed) tags.push('👤 <b>FOLLOWED</b>');
+        if (hasTransfer) tags.push('🟢 <b>Transfer</b>');
+        const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
+
+        return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(profit.toLocaleString())}</b>${tagsStr}`;
+      });
+
+      const logLines = sorted.map((t: any, i: number) => {
+        const isFollowed = followedWallet && t.address === followedWallet;
+        const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
+        const profit = type === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
+        let logTags = [];
+        if (isFollowed) logTags.push('FOLLOWED');
+        if (hasTransfer) logTags.push('Transfer');
+        const logTagsStr = logTags.length > 0 ? ` [${logTags.join(', ')}]` : '';
+        return `${i + 1}. ${t.address}: $${profit.toLocaleString()}${logTagsStr}`;
+      });
+
+      return { maxTP, formatted, logLines };
     };
+
+    if (profitType === 'both') {
+      const total = formatTraders(traders.list, 'total');
+      const realized = formatTraders(traders.list, 'realized');
+      
+      const tradersListStr = [
+        '<b>Top 5 Total-Profitable:</b>',
+        ...total.formatted,
+        '',
+        '<b>Top 5 Realized-Profitable:</b>',
+        ...realized.formatted
+      ].join('\n');
+
+      return {
+        maxTransferProfit: Math.max(total.maxTP, realized.maxTP),
+        tradersListStr,
+        logTraders: [...total.logLines, '---', ...realized.logLines],
+        profitLabel: 'Combined (Total/Realized)',
+        profitType
+      };
+    } else {
+      const result = formatTraders(traders.list, profitType);
+      const label = profitType === 'realized' ? 'Realized' : 'Total';
+      return {
+        maxTransferProfit: result.maxTP,
+        tradersListStr: `<b>Top 5 ${label}-Profitable:</b>\n` + result.formatted.join('\n'),
+        logTraders: result.logLines,
+        profitLabel: `${label} Profit`,
+        profitType
+      };
+    }
   }
 
   async function checkInsiderMcapFlow(): Promise<void> {
@@ -955,43 +1000,10 @@ async function main(): Promise<void> {
           log.warn(`[INSIDER ENTRY] MC $${currentMc.toLocaleString()} reached Entry MC $${entryMc.toLocaleString()}. Checking transfer wallet profitability...`);
           
           try {
-            const followedWallet = insiderBot.getFollowedWallet();
-            const traders = await getTopTradersBySetting(preBuyMint, 5);
-            
-            let maxTransferProfit = -1;
-            let topTransferWallet = null;
-            let tradersListStr = '';
-            let logTraders: string[] = [];
-            const profitType = insiderBot.getProfitType();
-            const profitLabel = profitType === 'realized' ? 'Realized Profit' : 'Total Profit';
+            const summary = await getTraderSummary(preBuyMint, 5);
+            const { maxTransferProfit, tradersListStr, logTraders, profitLabel, profitType } = summary;
 
-            if (traders && Array.isArray(traders.list)) {
-              const formattedTraders = traders.list.map((t: any, i: number) => {
-                const isFollowed = followedWallet && t.address === followedWallet;
-                const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
-                
-                const profit = profitType === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
-                if (hasTransfer && profit > maxTransferProfit) {
-                  maxTransferProfit = profit;
-                  topTransferWallet = t.address;
-                }
-
-                let tags = [];
-                if (isFollowed) tags.push('👤 <b>FOLLOWED</b>');
-                if (hasTransfer) tags.push('🟢 <b>Transfer</b>');
-                
-                const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
-                
-                // For backend logs
-                let logTags = [];
-                if (isFollowed) logTags.push('FOLLOWED');
-                if (hasTransfer) logTags.push('Transfer');
-                const logTagsStr = logTags.length > 0 ? ` [${logTags.join(', ')}]` : '';
-                logTraders.push(`${i + 1}. ${t.address}: $${profit.toLocaleString()}${logTagsStr}`);
-
-                return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(profit.toLocaleString())}</b>${tagsStr}`;
-              });
-              tradersListStr = '\n' + formattedTraders.join('\n');
+            if (tradersListStr) {
               log.warn(`Top 5 ${profitType}-profitable wallets for ${preBuyMint}:\n${logTraders.join('\n')}`);
             }
 
@@ -1008,16 +1020,13 @@ async function main(): Promise<void> {
                   `Profit (${profitLabel}): <b>$${html(maxTransferProfit.toLocaleString())}</b> (> $${minProfit})`,
                   'Reason: <b>Auto Buy is currently DISABLED in settings.</b>',
                   '',
-                  tradersListStr ? `<b>Top 5 ${profitType}-profitable wallets:</b>${tradersListStr}` : '',
+                  tradersListStr ? tradersListStr : '',
                 ].join('\n')).catch((err) => log.warn('Telegram skip-buy alert failed', err));
                 
-                // We keep preBuyMint so user can manually enable buy or we keep watching?
-                // Usually if requirements are met but we skip, we should probably reset or wait for next interval.
-                // Let's keep it watching for now so if they enable it, it buys.
                 return;
               }
 
-              log.warn(`[INSIDER ENTRY] Top transfer wallet ${profitType} profit: $${maxTransferProfit.toLocaleString()} (> $${minProfit}). Triggering BUY.`);
+              log.warn(`[INSIDER ENTRY] Top transfer wallet ${profitLabel} profit: $${maxTransferProfit.toLocaleString()} (> $${minProfit}). Triggering BUY.`);
               
               // Set Exit MC to chosen percentage increase from current entry MC
               const exitPercent = insiderBot.getExitPercent();
@@ -1035,7 +1044,7 @@ async function main(): Promise<void> {
             } else {
               const reason = maxTransferProfit === -1 
                 ? "No transfer wallets found in top 5 profitable traders."
-                : `Highest transfer wallet ${profitType} profit is $${maxTransferProfit.toLocaleString()}, which is not > $${minProfit}.`;
+                : `Highest transfer wallet ${profitLabel} profit is $${maxTransferProfit.toLocaleString()}, which is not > $${minProfit}.`;
               
               log.info(`[INSIDER NO-BUY] MC $${currentMc.toLocaleString()} reached but ${reason}`);
               
@@ -1045,7 +1054,7 @@ async function main(): Promise<void> {
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
                 `Reason: <b>${html(reason)}</b>`,
                 '',
-                tradersListStr ? `<b>Top 5 ${profitType}-profitable wallets:</b>${tradersListStr}` : '',
+                tradersListStr ? tradersListStr : '',
               ].join('\n')).catch((err) => log.warn('Telegram no-buy alert failed', err));
               
               insiderBot.clearPreBuyMint();
@@ -1432,8 +1441,12 @@ async function main(): Promise<void> {
       };
 
       const profitType = insiderBot.getProfitType();
+      let profitLabel = 'Both (Total + Realized)';
+      if (profitType === 'total') profitLabel = 'Total Profit';
+      else if (profitType === 'realized') profitLabel = 'Realized Profit';
+
       const toggleProfitButton = {
-        text: profitType === 'realized' ? '📊 Mode: Realized' : '📈 Mode: Total Profit',
+        text: profitType === 'both' ? '📈📊 Mode: Both' : (profitType === 'realized' ? '📊 Mode: Realized' : '📈 Mode: Total'),
         callback_data: 'insider:toggleprofit',
       };
 
@@ -1448,7 +1461,7 @@ async function main(): Promise<void> {
           `Entry MC: <b>$${html(insiderBot.getEntryMc().toLocaleString())}</b>`,
           `Exit Strategy: <b>+${html(String(insiderBot.getExitPercent()))}% from Entry</b>`,
           `Min Transfer Profit: <b>$${html(insiderBot.getMinTransferProfit().toLocaleString())}</b>`,
-          `Ranking: <b>${profitType === 'realized' ? 'Realized Profit' : 'Total Profit'}</b>`,
+          `Ranking: <b>${profitLabel}</b>`,
           `Auto Buy: <b>${buyDisabled ? 'Disabled ❌' : 'Enabled ✅'}</b>`,
           '',
           '<b>Flow</b>',

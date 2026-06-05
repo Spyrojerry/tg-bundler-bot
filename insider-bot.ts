@@ -82,8 +82,8 @@ export interface InsiderBot {
   setBuyDisabled(value: boolean): void;
   getMinTransferProfit(): number;
   setMinTransferProfit(value: number): void;
-  getProfitType(): 'realized' | 'total';
-  setProfitType(value: 'realized' | 'total'): void;
+  getProfitType(): 'realized' | 'total' | 'both';
+  setProfitType(value: 'realized' | 'total' | 'both'): void;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -97,7 +97,7 @@ export class InsiderBot extends EventEmitter {
   private exitPercent: number = 50;
   private buyDisabled: boolean = false;
   private minTransferProfit: number = 70;
-  private profitType: 'realized' | 'total' = 'total';
+  private profitType: 'realized' | 'total' | 'both' = 'both';
   private followMonitor: WalletMonitor | null = null;
   private watchingMint: string | null = null;
   private activePosition: {
@@ -198,11 +198,11 @@ export class InsiderBot extends EventEmitter {
     this.minTransferProfit = value;
   }
 
-  getProfitType(): 'realized' | 'total' {
+  getProfitType(): 'realized' | 'total' | 'both' {
     return this.profitType;
   }
 
-  setProfitType(value: 'realized' | 'total'): void {
+  setProfitType(value: 'realized' | 'total' | 'both'): void {
     this.profitType = value;
   }
 
