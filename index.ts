@@ -91,7 +91,7 @@ async function main(): Promise<void> {
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
     | { type: 'minSol'; walletAddress: string }
-    | { type: 'insiderFollowWallet' | 'insiderBuySol' | 'insiderEntryMc' | 'insiderExitMc' }
+    | { type: 'insiderFollowWallet' | 'insiderBuySol' | 'insiderEntryMc' | 'insiderExitMc' | 'insiderMinProfit' }
     | { type: 'reverseTargetWallet' };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
@@ -198,6 +198,14 @@ async function main(): Promise<void> {
         if (data === 'insider:exitmc') {
           pendingTelegramActions.set(chatId, { type: 'insiderExitMc' });
           return { text: 'Send the Exit Market Cap in <b>thousands (k)</b>.\nExample: <code>150</code> for $150,000.', trackPrompt: true, editCurrent: true };
+        }
+        if (data === 'insider:minprofit') {
+          pendingTelegramActions.set(chatId, { type: 'insiderMinProfit' });
+          return { text: 'Send the minimum profit threshold for transfer wallets (USD).\nExample: <code>70</code> for $70.', trackPrompt: true, editCurrent: true };
+        }
+        if (data === 'insider:togglebuy') {
+          insiderBot.setBuyDisabled(!insiderBot.isBuyDisabled());
+          return homeReply(true);
         }
         if (data === 'insider:stop') {
           await insiderBot.stop();
@@ -358,6 +366,12 @@ async function main(): Promise<void> {
             const value = Number(text.trim().replace(/,/g, ''));
             if (!Number.isFinite(value) || value < 0) return 'Send a valid number in thousands (k).';
             insiderBot.setExitMc(value * 1000);
+            return homeReply();
+          }
+          if (pendingAction.type === 'insiderMinProfit') {
+            const value = Number(text.trim().replace(/,/g, ''));
+            if (!Number.isFinite(value) || value < 0) return 'Send a valid number.';
+            insiderBot.setMinTransferProfit(value);
             return homeReply();
           }
           if (pendingAction.type === 'reverseTargetWallet') {
@@ -528,7 +542,7 @@ async function main(): Promise<void> {
           if (!tradersListStr) {
             try {
               const followedWallet = insiderBot.getFollowedWallet();
-              const traders = await gmgnClient.fetchTokenTraders(trigger.mint, 5);
+              const traders = await getTopRealizedTraders(trigger.mint, 5);
               if (traders && Array.isArray(traders.list)) {
                 const formattedTraders = traders.list.map((t: any, i: number) => {
                   const isFollowed = followedWallet && t.address === followedWallet;
@@ -539,7 +553,7 @@ async function main(): Promise<void> {
                   if (hasTransfer) tags.push('🟢 <b>Transfer</b>');
                   
                   const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
-                  return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(t.profit?.toLocaleString() ?? '0')}</b>${tagsStr}`;
+                  return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(t.realized_profit?.toLocaleString() ?? '0')}</b>${tagsStr}`;
                 });
                 tradersListStr = '\n' + formattedTraders.join('\n');
                 
@@ -551,9 +565,9 @@ async function main(): Promise<void> {
                   if (isFollowed) tags.push('FOLLOWED');
                   if (hasTransfer) tags.push('Transfer');
                   const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
-                  return `${i + 1}. ${t.address}: $${t.profit?.toLocaleString() ?? '0'}${tagsStr}`;
+                  return `${i + 1}. ${t.address}: $${t.realized_profit?.toLocaleString() ?? '0'}${tagsStr}`;
                 });
-                log.warn(`Top 5 profitable wallets for ${trigger.mint}:\n${logTraders.join('\n')}`);
+                log.warn(`Top 5 realized-profitable wallets for ${trigger.mint}:\n${logTraders.join('\n')}`);
               }
             } catch (err) {
               log.error(`Failed to fetch top traders for message`, err);
@@ -566,7 +580,7 @@ async function main(): Promise<void> {
             `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
             `Trigger: <b>Market Cap Reached</b>`,
             '',
-            tradersListStr ? `<b>Top 5 profitable wallets for ${html(trigger.mint)}:</b>${tradersListStr}\n` : '',
+            tradersListStr ? `<b>Top 5 realized-profitable wallets for ${html(trigger.mint)}:</b>${tradersListStr}\n` : '',
             'Submitting swap...',
           ].filter(Boolean).join('\n')).catch((err) => log.warn('Telegram insider buy alert failed', err));
 
@@ -855,6 +869,23 @@ async function main(): Promise<void> {
     }
   }
 
+  async function getTopRealizedTraders(mint: string, limit: number = 5): Promise<any> {
+    const traders = await gmgnClient.fetchTokenTraders(mint, 50, 'profit');
+    if (!traders || !Array.isArray(traders.list)) return traders;
+
+    // Sort by realized_profit descending
+    const sortedList = [...traders.list].sort((a, b) => {
+      const profitA = a.realized_profit ?? 0;
+      const profitB = b.realized_profit ?? 0;
+      return profitB - profitA;
+    });
+
+    return {
+      ...traders,
+      list: sortedList.slice(0, limit)
+    };
+  }
+
   async function checkInsiderMcapFlow(): Promise<void> {
     const preBuyMint = insiderBot.getPreBuyMint();
     const activePos = insiderBot.getActivePosition();
@@ -916,7 +947,7 @@ async function main(): Promise<void> {
           
           try {
             const followedWallet = insiderBot.getFollowedWallet();
-            const traders = await gmgnClient.fetchTokenTraders(preBuyMint, 5);
+            const traders = await getTopRealizedTraders(preBuyMint, 5);
             
             let maxTransferProfit = -1;
             let topTransferWallet = null;
@@ -928,7 +959,7 @@ async function main(): Promise<void> {
                 const isFollowed = followedWallet && t.address === followedWallet;
                 const hasTransfer = t.token_transfer_in?.tx_hash || t.token_transfer?.type === 'transfer_in' || (t.maker_token_tags && t.maker_token_tags.includes('transfer_in'));
                 
-                const profit = t.profit ?? 0;
+                const profit = t.realized_profit ?? 0;
                 if (hasTransfer && profit > maxTransferProfit) {
                   maxTransferProfit = profit;
                   topTransferWallet = t.address;
@@ -950,11 +981,32 @@ async function main(): Promise<void> {
                 return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(profit.toLocaleString())}</b>${tagsStr}`;
               });
               tradersListStr = '\n' + formattedTraders.join('\n');
-              log.warn(`Top 5 profitable wallets for ${preBuyMint}:\n${logTraders.join('\n')}`);
+              log.warn(`Top 5 realized-profitable wallets for ${preBuyMint}:\n${logTraders.join('\n')}`);
             }
 
-            if (maxTransferProfit > 70) {
-              log.warn(`[INSIDER ENTRY] Top transfer wallet profit: $${maxTransferProfit.toLocaleString()} (> $75). Triggering BUY.`);
+            const minProfit = insiderBot.getMinTransferProfit();
+            const isBuyDisabled = insiderBot.isBuyDisabled();
+
+            if (maxTransferProfit > minProfit) {
+              if (isBuyDisabled) {
+                log.info(`[INSIDER SKIP] Buy requirements met (Profit: $${maxTransferProfit.toLocaleString()} > $${minProfit}), but Auto Buy is DISABLED.`);
+                telegramBot?.sendDefault([
+                  '<b>⚠️ Insider Buy Requirements Met (SKIP)</b>',
+                  `Token: <code>${html(preBuyMint)}</code>`,
+                  `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
+                  `Profit: <b>$${html(maxTransferProfit.toLocaleString())}</b> (> $${minProfit})`,
+                  'Reason: <b>Auto Buy is currently DISABLED in settings.</b>',
+                  '',
+                  tradersListStr ? `<b>Top 5 realized-profitable wallets:</b>${tradersListStr}` : '',
+                ].join('\n')).catch((err) => log.warn('Telegram skip-buy alert failed', err));
+                
+                // We keep preBuyMint so user can manually enable buy or we keep watching?
+                // Usually if requirements are met but we skip, we should probably reset or wait for next interval.
+                // Let's keep it watching for now so if they enable it, it buys.
+                return;
+              }
+
+              log.warn(`[INSIDER ENTRY] Top transfer wallet profit: $${maxTransferProfit.toLocaleString()} (> $${minProfit}). Triggering BUY.`);
               
               // Set Exit MC to 50% increase from current entry MC
               const newExitMc = currentMc * 1.5;
@@ -971,7 +1023,7 @@ async function main(): Promise<void> {
             } else {
               const reason = maxTransferProfit === -1 
                 ? "No transfer wallets found in top 5 profitable traders."
-                : `Highest transfer wallet profit is $${maxTransferProfit.toLocaleString()}, which is not > $75.`;
+                : `Highest transfer wallet profit is $${maxTransferProfit.toLocaleString()}, which is not > $${minProfit}.`;
               
               log.info(`[INSIDER NO-BUY] MC $${currentMc.toLocaleString()} reached but ${reason}`);
               
@@ -981,7 +1033,7 @@ async function main(): Promise<void> {
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
                 `Reason: <b>${html(reason)}</b>`,
                 '',
-                tradersListStr ? `<b>Top 5 profitable wallets:</b>${tradersListStr}` : '',
+                tradersListStr ? `<b>Top 5 realized-profitable wallets:</b>${tradersListStr}` : '',
               ].join('\n')).catch((err) => log.warn('Telegram no-buy alert failed', err));
               
               insiderBot.clearPreBuyMint();
@@ -1360,6 +1412,13 @@ async function main(): Promise<void> {
       const stopResumeButton = followedWallet && !insiderRunning
         ? { text: 'Resume', callback_data: 'insider:resume' }
         : { text: 'Stop', callback_data: 'insider:stop' };
+
+      const buyDisabled = insiderBot.isBuyDisabled();
+      const disableBuyButton = {
+        text: buyDisabled ? '✅ Enable Buy' : '❌ Disable Buy',
+        callback_data: 'insider:togglebuy',
+      };
+
       return {
         text: [
           '<b>Insider Bot</b>',
@@ -1370,6 +1429,8 @@ async function main(): Promise<void> {
           `Buy SOL: <b>${html(String(insiderBot.getBuySol()))}</b>`,
           `Entry MC: <b>$${html(insiderBot.getEntryMc().toLocaleString())}</b>`,
           `Exit MC: <b>$${html(insiderBot.getExitMc().toLocaleString())}</b>`,
+          `Min Transfer Profit: <b>$${html(insiderBot.getMinTransferProfit().toLocaleString())}</b>`,
+          `Auto Buy: <b>${buyDisabled ? 'Disabled ❌' : 'Enabled ✅'}</b>`,
           '',
           '<b>Flow</b>',
           '1. Set follow wallet, entry MC, and exit MC.',
@@ -1393,6 +1454,10 @@ async function main(): Promise<void> {
             [
               { text: 'Set Entry MC', callback_data: 'insider:entrymc' },
               { text: 'Set Exit MC', callback_data: 'insider:exitmc' },
+            ],
+            [
+              { text: 'Set Min Profit', callback_data: 'insider:minprofit' },
+              disableBuyButton,
             ],
             [
               stopResumeButton,

@@ -584,7 +584,7 @@ export class GmgnClient {
 
   // ── Public: fetch top profitable traders for a token ──────────────────────
 
-  async fetchTokenTraders(mint: string, limit: number = 5): Promise<any> {
+  async fetchTokenTraders(mint: string, limit: number = 5, orderBy: string = 'profit'): Promise<any> {
     try {
       this.validateSolAddress(mint, 'mint');
       const stdout = await this.execGmgnCli([
@@ -595,7 +595,7 @@ export class GmgnClient {
         '--address',
         mint,
         '--order-by',
-        'profit',
+        orderBy,
         '--limit',
         String(limit),
       ]);
