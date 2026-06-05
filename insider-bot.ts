@@ -74,6 +74,8 @@ export interface InsiderBot {
   getEntryMc(): number;
   getExitMc(): number;
   setExitMc(value: number): void;
+  getExitPercent(): number;
+  setExitPercent(value: number): void;
   getFollowedWallet(): string | null;
   getBuySol(): number;
   isBuyDisabled(): boolean;
@@ -92,6 +94,7 @@ export class InsiderBot extends EventEmitter {
   private buySol: number;
   private entryMc: number;
   private exitMc: number;
+  private exitPercent: number = 50;
   private buyDisabled: boolean = false;
   private minTransferProfit: number = 70;
   private profitType: 'realized' | 'total' = 'total';
@@ -163,6 +166,17 @@ export class InsiderBot extends EventEmitter {
 
   getExitMc(): number {
     return this.exitMc;
+  }
+
+  setExitPercent(value: number): void {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error('Exit percent must be a non-negative number');
+    }
+    this.exitPercent = value;
+  }
+
+  getExitPercent(): number {
+    return this.exitPercent;
   }
 
   isBuyDisabled(): boolean {

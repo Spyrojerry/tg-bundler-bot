@@ -91,7 +91,7 @@ async function main(): Promise<void> {
   type PendingTelegramAction =
     | { type: 'addwallet' | 'removewallet' }
     | { type: 'minSol'; walletAddress: string }
-    | { type: 'insiderFollowWallet' | 'insiderBuySol' | 'insiderEntryMc' | 'insiderExitMc' | 'insiderMinProfit' }
+    | { type: 'insiderFollowWallet' | 'insiderBuySol' | 'insiderEntryMc' | 'insiderExitPercent' | 'insiderMinProfit' }
     | { type: 'reverseTargetWallet' };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
@@ -195,9 +195,9 @@ async function main(): Promise<void> {
           pendingTelegramActions.set(chatId, { type: 'insiderEntryMc' });
           return { text: 'Send the Entry Market Cap in <b>thousands (k)</b>.\nExample: <code>50</code> for $50,000.', trackPrompt: true, editCurrent: true };
         }
-        if (data === 'insider:exitmc') {
-          pendingTelegramActions.set(chatId, { type: 'insiderExitMc' });
-          return { text: 'Send the Exit Market Cap in <b>thousands (k)</b>.\nExample: <code>150</code> for $150,000.', trackPrompt: true, editCurrent: true };
+        if (data === 'insider:exitpercent') {
+          pendingTelegramActions.set(chatId, { type: 'insiderExitPercent' });
+          return { text: 'Send the Exit profit percentage increase.\nExample: <code>50</code> for a 50% increase from your entry point.', trackPrompt: true, editCurrent: true };
         }
         if (data === 'insider:minprofit') {
           pendingTelegramActions.set(chatId, { type: 'insiderMinProfit' });
@@ -367,10 +367,10 @@ async function main(): Promise<void> {
             insiderBot.setEntryMc(value * 1000);
             return homeReply();
           }
-          if (pendingAction.type === 'insiderExitMc') {
-            const value = Number(text.trim().replace(/,/g, ''));
-            if (!Number.isFinite(value) || value < 0) return 'Send a valid number in thousands (k).';
-            insiderBot.setExitMc(value * 1000);
+          if (pendingAction.type === 'insiderExitPercent') {
+            const value = Number(text.trim());
+            if (!Number.isFinite(value) || value < 0) return 'Send a valid percentage.';
+            insiderBot.setExitPercent(value);
             return homeReply();
           }
           if (pendingAction.type === 'insiderMinProfit') {
@@ -1019,10 +1019,11 @@ async function main(): Promise<void> {
 
               log.warn(`[INSIDER ENTRY] Top transfer wallet ${profitType} profit: $${maxTransferProfit.toLocaleString()} (> $${minProfit}). Triggering BUY.`);
               
-              // Set Exit MC to 50% increase from current entry MC
-              const newExitMc = currentMc * 1.5;
+              // Set Exit MC to chosen percentage increase from current entry MC
+              const exitPercent = insiderBot.getExitPercent();
+              const newExitMc = currentMc * (1 + exitPercent / 100);
               insiderBot.setExitMc(newExitMc);
-              log.warn(`[INSIDER EXIT SET] Exit MC set to $${newExitMc.toLocaleString()} (50% increase from $${currentMc.toLocaleString()})`);
+              log.warn(`[INSIDER EXIT SET] Exit MC set to $${newExitMc.toLocaleString()} (${exitPercent}% increase from $${currentMc.toLocaleString()})`);
 
               insiderBot.emit('buyTrigger', {
                 followedWallet: insiderBot.getFollowedWallet()!,
@@ -1445,17 +1446,18 @@ async function main(): Promise<void> {
           `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : '<b>Not set</b>'}`,
           `Buy SOL: <b>${html(String(insiderBot.getBuySol()))}</b>`,
           `Entry MC: <b>$${html(insiderBot.getEntryMc().toLocaleString())}</b>`,
-          `Exit MC: <b>$${html(insiderBot.getExitMc().toLocaleString())}</b>`,
+          `Exit Strategy: <b>+${html(String(insiderBot.getExitPercent()))}% from Entry</b>`,
           `Min Transfer Profit: <b>$${html(insiderBot.getMinTransferProfit().toLocaleString())}</b>`,
           `Ranking: <b>${profitType === 'realized' ? 'Realized Profit' : 'Total Profit'}</b>`,
           `Auto Buy: <b>${buyDisabled ? 'Disabled ❌' : 'Enabled ✅'}</b>`,
           '',
           '<b>Flow</b>',
-          '1. Set follow wallet, entry MC, and exit MC.',
+          '1. Set follow wallet, entry MC, and exit % increase.',
           '2. Bot waits for the followed wallet to buy a new token.',
           '3. Once detected, bot watches that token\'s Market Cap.',
           '4. Bot buys when MC >= Entry MC.',
-          '5. Bot sells when MC >= Exit MC.',
+          '5. Bot sets Exit MC at your chosen % increase from entry MC.',
+          '6. Bot sells when MC >= Exit MC.',
           '• Rug Protection: Bot resets if MC is below $1,000.',
         ].join('\n'),
         replyMarkup: {
@@ -1471,7 +1473,7 @@ async function main(): Promise<void> {
             ],
             [
               { text: 'Set Entry MC', callback_data: 'insider:entrymc' },
-              { text: 'Set Exit MC', callback_data: 'insider:exitmc' },
+              { text: 'Set Exit %', callback_data: 'insider:exitpercent' },
             ],
             [
               { text: 'Set Min Profit', callback_data: 'insider:minprofit' },
