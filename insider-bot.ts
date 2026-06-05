@@ -80,6 +80,8 @@ export interface InsiderBot {
   setBuyDisabled(value: boolean): void;
   getMinTransferProfit(): number;
   setMinTransferProfit(value: number): void;
+  getProfitType(): 'realized' | 'total';
+  setProfitType(value: 'realized' | 'total'): void;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -92,6 +94,7 @@ export class InsiderBot extends EventEmitter {
   private exitMc: number;
   private buyDisabled: boolean = false;
   private minTransferProfit: number = 70;
+  private profitType: 'realized' | 'total' = 'total';
   private followMonitor: WalletMonitor | null = null;
   private watchingMint: string | null = null;
   private activePosition: {
@@ -179,6 +182,14 @@ export class InsiderBot extends EventEmitter {
       throw new Error('Min transfer profit must be a non-negative number');
     }
     this.minTransferProfit = value;
+  }
+
+  getProfitType(): 'realized' | 'total' {
+    return this.profitType;
+  }
+
+  setProfitType(value: 'realized' | 'total'): void {
+    this.profitType = value;
   }
 
   getFollowedWallet(): string | null {
