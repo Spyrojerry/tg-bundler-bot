@@ -582,6 +582,25 @@ export class GmgnClient {
     return { success: false, error: lastError || 'GMGN direct endpoints failed' };
   }
 
+  async fetchTokenSecurity(mint: string): Promise<any> {
+    try {
+      this.validateSolAddress(mint, 'mint');
+      const stdout = await this.execGmgnCli([
+        'token',
+        'security',
+        '--chain',
+        this.chain,
+        '--address',
+        mint,
+        '--raw',
+      ]);
+      return this.parseCliJson(stdout);
+    } catch (err: unknown) {
+      log.error(`Failed to fetch token security via CLI`, err);
+      return null;
+    }
+  }
+
   // ── Public: fetch top profitable traders for a token ──────────────────────
 
   async fetchTokenTraders(mint: string, limit: number = 5, orderBy: string = 'profit'): Promise<any> {

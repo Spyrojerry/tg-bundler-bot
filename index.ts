@@ -160,13 +160,17 @@ async function main(): Promise<void> {
           ];
 
           const buttons = [];
-          if (context === 'insider') {
-            const botIndex = insiderBots.findIndex(b => b.getActivePosition()?.mint === mint);
-            if (botIndex !== -1) {
-              buttons.push({ text: '🔴 Sell Position', callback_data: `sell:insider:${mint}:${botIndex}` });
-            }
+          const botIndex = insiderBots.findIndex(b => b.getActivePosition()?.mint === mint);
+          
+          if (context === 'insider' && botIndex !== -1) {
+            buttons.push({ text: '🔴 Sell Position', callback_data: `sell:insider:${mint}:${botIndex}` });
+            buttons.push({ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` });
+          } else {
+            // If it's not insider context, or we can't find the active position anymore,
+            // we still want to show the refresh button.
+            // But we should also check other contexts if needed.
+            buttons.push({ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` });
           }
-          buttons.push({ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` });
 
           return {
             text: lines.join('\n'),
@@ -1029,14 +1033,27 @@ async function main(): Promise<void> {
     const checkCount = insiderCheckState.get(checkKey) || 0;
 
     try {
-      const currentMc = await gmgnClients[0].fetchTokenMarketCapUsd(mint);
+      // 1. Rug protection: check for rug (honeypot, burn, etc.) if possible, 
+      // but primarily we check Market Cap as a proxy for "rug" (price tanking)
+      const [currentMc, securityInfo] = await Promise.all([
+        gmgnClients[0].fetchTokenMarketCapUsd(mint),
+        gmgnClients[0].fetchTokenSecurity(mint).catch(() => null)
+      ]);
+
       if (currentMc === null) return;
 
       log.debug(`[INSIDER ${index + 1} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()}`);
 
-      // 1. Rug protection: MC < $1k
-      if (currentMc < 1000) {
-        log.warn(`[INSIDER ${index + 1} RUG] Market cap $${currentMc.toLocaleString()} below $1,000 for ${mint}. Resetting.`);
+      // Rug detection via security info (honeypot or extremely high tax if detectable)
+      const isRugged = securityInfo && (
+        securityInfo.is_honeypot === true || 
+        (securityInfo.sell_tax !== null && securityInfo.sell_tax > 50)
+      );
+
+      // 2. Rug protection: MC < $1k OR security rug detected
+      if (currentMc < 1000 || isRugged) {
+        const reason = isRugged ? 'Security rug detected (honeypot/tax)' : `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
+        log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Resetting.`);
         
         if (activePos) {
           // Trigger immediate sell if we have a position
@@ -1045,7 +1062,7 @@ async function main(): Promise<void> {
             mint,
             sampleNumber: 0,
             elapsedSec: 0,
-            reasons: [`Market cap $${currentMc.toLocaleString()} fell below $1,000 (Rug).`],
+            reasons: [reason],
             settings: db.getWalletSettings(config.tradingWalletAddress!),
             metrics: { mint, timestamp: new Date().toISOString(), bundlersPercent: null, bundlersCount: null, initialBaseReserve: null, topWallets: null, top10HolderRate: null, bundledAmountRate: null },
             buySol: bot.getBuySol(),
@@ -1059,6 +1076,7 @@ async function main(): Promise<void> {
             `<b>🚨 Insider ${index + 1} Rug Protection Triggered</b>`,
             `Token: <code>${html(mint)}</code>`,
             `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
+            `Reason: <b>${reason}</b>`,
             'Action: Selling immediately and resetting.',
           ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
         } else {
@@ -1066,7 +1084,7 @@ async function main(): Promise<void> {
             `<b>⚠️ Insider ${index + 1} Watch Reset (Rug)</b>`,
             `Token: <code>${html(mint)}</code>`,
             `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
-            'Reason: Market cap fell below $1,000. Aborting entry sequence.',
+            `Reason: ${reason}. Aborting entry sequence.`,
           ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
         }
         
