@@ -39,7 +39,7 @@ const log = createLogger('MAIN');
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const INSIDER_MIN_MARKET_CAP_USD = 1_000;
-const MCAP_CHECK_INTERVAL_MS = 2_000;
+const MCAP_CHECK_INTERVAL_MS = 1000;
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -659,6 +659,7 @@ async function main(): Promise<void> {
               `Token: <code>${html(trigger.mint)}</code>`,
               `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
               `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? 'Unknown')}</b>`,
+              `Exit MC: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
               '',
               tradersListStr ? tradersListStr : '',
               '',
@@ -1062,26 +1063,16 @@ async function main(): Promise<void> {
     const checkCount = insiderCheckState.get(checkKey) || 0;
 
     try {
-      // 1. Rug protection: check for rug (honeypot, burn, etc.) if possible, 
-      // but primarily we check Market Cap as a proxy for "rug" (price tanking)
-      const [currentMc, securityInfo] = await Promise.all([
-        client.fetchTokenMarketCapUsd(mint),
-        client.fetchTokenSecurity(mint).catch(() => null)
-      ]);
+      // 1. Fetch current Market Cap
+      const currentMc = await client.fetchTokenMarketCapUsd(mint);
 
       if (currentMc === null) return;
 
       log.debug(`[INSIDER ${index + 1} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()}`);
 
-      // Rug detection via security info (honeypot or extremely high tax if detectable)
-      const isRugged = securityInfo && (
-        securityInfo.is_honeypot === true || 
-        (securityInfo.sell_tax !== null && securityInfo.sell_tax > 50)
-      );
-
-      // 2. Rug protection: MC < $1k OR security rug detected
-      if (currentMc < 1000 || isRugged) {
-        const reason = isRugged ? 'Security rug detected (honeypot/tax)' : `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
+      // 2. Rug protection: MC < $1k
+      if (currentMc < 1000) {
+        const reason = `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
         log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Resetting.`);
         
         if (activePos && config.tradingWalletAddress) {
@@ -1187,6 +1178,7 @@ async function main(): Promise<void> {
                 `Token: <code>${html(mint)}</code>`,
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
                 `Threshold MC: <b>$${html(entryMc.toLocaleString())}</b>`,
+                `Exit MC: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
                 `Buy SOL: <b>${html(String(bot.getBuySol()))} SOL</b>`,
                 '',
                 tradersListStr ? tradersListStr : '',
@@ -1205,6 +1197,7 @@ async function main(): Promise<void> {
                 `<b>🚀 Insider ${index + 1} Flow v2</b>`,
                 `Token: <code>${html(mint)}</code>`,
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
+                `Exit MC: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
                 '',
                 tradersListStr ? tradersListStr : '',
               ].filter(Boolean).join('\n')).catch((err) => log.warn(`Telegram insider ${index + 1} v2 alert failed`, err));

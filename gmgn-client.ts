@@ -117,35 +117,58 @@ export class GmgnClient {
   async fetchTokenMarketCapUsd(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, 'mint');
 
-    const endpoints = ['v1/token/info', 'v1/token/security'];
-    for (const endpoint of endpoints) {
-      try {
-        const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
-        if (!data) continue;
-
-        const marketCap = this.extractMarketCapUsd(data);
-        if (marketCap !== null) {
-          this.limiter.onSuccess(this.baselineMinTime);
-          return marketCap;
-        }
-      } catch (err) {
-        log.debug(`Failed to fetch market cap from ${endpoint}`, { mint, error: String(err) });
-      }
-    }
-
-    // Fallback to CLI
     try {
-      const cliResult = await this.fetchWithCli(mint);
-      if (cliResult.success && cliResult.metrics.rawData) {
-        const data = JSON.parse(cliResult.metrics.rawData) as Record<string, unknown>;
-        const marketCap = this.extractMarketCapUsd(data);
-        if (marketCap !== null) return marketCap;
+      // 1. Fetch Supply from RPC
+      const supplyResp = await this.connection.getTokenSupply(new PublicKey(mint), 'confirmed');
+      const supply = supplyResp.value.uiAmount;
+      if (supply === null) {
+        log.warn('Failed to fetch supply from RPC', { mint });
+        return null;
       }
-    } catch (err) {
-      log.debug(`Failed to fetch market cap from CLI fallback`, { mint, error: String(err) });
-    }
 
-    return null;
+      // 2. Fetch Price from DexScreener
+      const url = `https://api.dexscreener.com/tokens/v1/solana/${mint}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000); // 5s timeout for DexScreener
+
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+
+      if (!resp.ok) {
+        log.warn(`DexScreener API failed: HTTP ${resp.status}`, { mint });
+        return null;
+      }
+
+      const data = await resp.json() as any[];
+      if (!Array.isArray(data) || data.length === 0) {
+        log.warn('DexScreener returned no pairs for mint', { mint });
+        return null;
+      }
+
+      // We take the price from the first pair (usually the most active one)
+      const priceUsd = parseFloat(data[0].priceUsd);
+      if (isNaN(priceUsd)) {
+        log.warn('DexScreener price is not a number', { mint, rawPrice: data[0].priceUsd });
+        return null;
+      }
+
+      // 3. Calculate MC
+      const marketCap = supply * priceUsd;
+      log.debug(`Calculated MC via DexScreener + RPC: $${marketCap.toLocaleString()}`, {
+        mint,
+        supply,
+        priceUsd
+      });
+
+      return marketCap;
+    } catch (err) {
+      log.error(`Failed to calculate Market Cap for ${mint}`, err);
+      return null;
+    }
   }
 
   async sellTokenForSol(
@@ -922,6 +945,13 @@ export class GmgnClient {
       }, (err, stdout, stderr) => {
         if (err) {
           const detail = stderr.trim() || err.message;
+          log.error(`GMGN CLI process error`, {
+            args: args.join(' '),
+            code: err.code,
+            signal: err.signal,
+            stderr: stderr.trim(),
+            stdout: stdout.trim().slice(0, 200),
+          });
           reject(new Error(detail));
           return;
         }
