@@ -23,6 +23,7 @@ import {
   FilterFailEvent,
   NewTokenEvent,
   SellResult,
+  SellQuote,
   TokenExitEvent,
   WalletFilterSettings,
 } from './types';
@@ -134,8 +135,28 @@ async function main(): Promise<void> {
         if (data.startsWith('r:m:')) {
           const [, , mint, contextCode] = parts;
           const context = contextCode === 'i' ? 'insider' : (contextCode === 'r' ? 'reverse_copysell' : 'bundler');
-          const currentMarketCapUsd = await gmgnClients[0].fetchTokenMarketCapUsd(mint);
-          const currentPrice = await gmgnClients[0].quoteTokenSellForSol(config.tradingWalletAddress!, mint, 100).catch(() => null);
+          
+          let currentMarketCapUsd: number | null = null;
+          let currentPrice: SellQuote | null = null;
+          let balanceIsZero = false;
+
+          try {
+            const quotePromise = config.tradingWalletAddress 
+              ? gmgnClients[0].quoteTokenSellForSol(config.tradingWalletAddress, mint, 100).catch(async (err) => {
+                  if (err.message.includes('No token balance found')) {
+                    balanceIsZero = true;
+                  }
+                  return null;
+                })
+              : Promise.resolve(null);
+
+            [currentMarketCapUsd, currentPrice] = await Promise.all([
+              gmgnClients[0].fetchTokenMarketCapUsd(mint),
+              quotePromise
+            ]);
+          } catch (err) {
+            log.error(`Failed to refresh position data for ${mint}`, err);
+          }
           
           let buySol = 0;
           if (context === 'insider') {
@@ -147,14 +168,31 @@ async function main(): Promise<void> {
             buySol = reverseCopySellOrchestrator.getActivePosition()?.buySol ?? 0;
           }
 
+          // Fallback to DB if buySol is 0
+          if (buySol === 0 && config.tradingWalletAddress) {
+            const dbToken = db.getToken(config.tradingWalletAddress, mint);
+            if (dbToken && dbToken.buySol) {
+              buySol = dbToken.buySol;
+            }
+          }
+
           const profitSol = currentPrice ? currentPrice.estimatedOutputSol - buySol : null;
           const profitPct = profitSol !== null && buySol > 0 ? (profitSol / buySol) * 100 : null;
+
+          let profitDisplay = 'Profit/Loss: <b>Calculating...</b>';
+          if (profitSol !== null) {
+            profitDisplay = `Profit/Loss: <b>${profitSol.toFixed(4)} SOL</b> (${profitPct?.toFixed(2)}%)`;
+          } else if (balanceIsZero) {
+            profitDisplay = 'Profit/Loss: <b>Position Closed (0 balance)</b>';
+          } else if (!config.tradingWalletAddress) {
+            profitDisplay = 'Profit/Loss: <b>N/A (No trading wallet)</b>';
+          }
 
           const lines = [
             context === 'insider' ? '<b>Insider Position Update</b>' : (context === 'reverse_copysell' ? '<b>Reverse CopySell Update</b>' : '<b>Bundler Position Update</b>'),
             `Token: <code>${html(mint)}</code>`,
             `Market Cap: <b>$${currentMarketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
-            profitSol !== null ? `Profit/Loss: <b>${profitSol.toFixed(4)} SOL</b> (${profitPct?.toFixed(2)}%)` : 'Profit/Loss: <b>Calculating...</b>',
+            profitDisplay,
             '',
             `Last Updated: ${new Date().toLocaleTimeString()}`,
           ];
@@ -168,7 +206,6 @@ async function main(): Promise<void> {
           } else {
             // If it's not insider context, or we can't find the active position anymore,
             // we still want to show the refresh button.
-            // But we should also check other contexts if needed.
             buttons.push({ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` });
           }
 
@@ -626,7 +663,7 @@ async function main(): Promise<void> {
               tradersListStr ? tradersListStr : '',
               '',
               'Submitting swap...',
-            ].filter(Boolean).join('\n'), { pin: true });
+            ].filter(Boolean).join('\n'));
 
             const result = await client.buyTokenWithSol(
               config.tradingWalletAddress!,
@@ -1036,8 +1073,8 @@ async function main(): Promise<void> {
       // 1. Rug protection: check for rug (honeypot, burn, etc.) if possible, 
       // but primarily we check Market Cap as a proxy for "rug" (price tanking)
       const [currentMc, securityInfo] = await Promise.all([
-        gmgnClients[0].fetchTokenMarketCapUsd(mint),
-        gmgnClients[0].fetchTokenSecurity(mint).catch(() => null)
+        client.fetchTokenMarketCapUsd(mint),
+        client.fetchTokenSecurity(mint).catch(() => null)
       ]);
 
       if (currentMc === null) return;
@@ -1055,15 +1092,15 @@ async function main(): Promise<void> {
         const reason = isRugged ? 'Security rug detected (honeypot/tax)' : `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
         log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Resetting.`);
         
-        if (activePos) {
+        if (activePos && config.tradingWalletAddress) {
           // Trigger immediate sell if we have a position
           const event: FilterFailEvent = {
-            walletAddress: config.tradingWalletAddress!,
+            walletAddress: config.tradingWalletAddress,
             mint,
             sampleNumber: 0,
             elapsedSec: 0,
             reasons: [reason],
-            settings: db.getWalletSettings(config.tradingWalletAddress!),
+            settings: db.getWalletSettings(config.tradingWalletAddress),
             metrics: { mint, timestamp: new Date().toISOString(), bundlersPercent: null, bundlersCount: null, initialBaseReserve: null, topWallets: null, top10HolderRate: null, bundledAmountRate: null },
             buySol: bot.getBuySol(),
             matchingWallets: [],
@@ -1078,6 +1115,13 @@ async function main(): Promise<void> {
             `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
             `Reason: <b>${reason}</b>`,
             'Action: Selling immediately and resetting.',
+          ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
+        } else if (activePos && !config.tradingWalletAddress) {
+          log.warn(`[INSIDER ${index + 1} RUG SKIP SELL] Cannot sell rugged token ${mint} because no TRADING_WALLET_ADDRESS is configured.`);
+          telegramBot?.sendDefault([
+            `<b>⚠️ Insider ${index + 1} Rug Detected</b>`,
+            `Token: <code>${html(mint)}</code>`,
+            'Reason: Rug detected, but no trading wallet configured to sell.',
           ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
         } else {
           telegramBot?.sendDefault([
@@ -1174,7 +1218,7 @@ async function main(): Promise<void> {
                 holdersStr ? holdersStr : '',
                 '',
                 tradersListStr ? tradersListStr : '',
-              ].filter(Boolean).join('\n'), { pin: true }).catch((err) => log.warn(`Telegram insider ${index + 1} v2 alert failed`, err));
+              ].filter(Boolean).join('\n')).catch((err) => log.warn(`Telegram insider ${index + 1} v2 alert failed`, err));
 
               if (tradersListStr) {
                 log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v2):\n${logTraders.join('\n')}${top10HoldersPercent !== null ? `\nTop 10 Holders: ${top10HoldersPercent.toFixed(2)}%` : ''}`);

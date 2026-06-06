@@ -585,7 +585,7 @@ export class GmgnClient {
   async fetchTokenSecurity(mint: string): Promise<any> {
     try {
       this.validateSolAddress(mint, 'mint');
-      const stdout = await this.execGmgnCli([
+      const stdout = await this.execGmgnCliWithRetry([
         'token',
         'security',
         '--chain',
@@ -596,7 +596,7 @@ export class GmgnClient {
       ]);
       return this.parseCliJson(stdout);
     } catch (err: unknown) {
-      log.error(`Failed to fetch token security via CLI`, err);
+      log.error(`Failed to fetch token security via CLI after retries`, err);
       return null;
     }
   }
@@ -606,7 +606,7 @@ export class GmgnClient {
   async fetchTokenTraders(mint: string, limit: number = 5, orderBy: string = 'profit'): Promise<any> {
     try {
       this.validateSolAddress(mint, 'mint');
-      const stdout = await this.execGmgnCli([
+      const stdout = await this.execGmgnCliWithRetry([
         'token',
         'traders',
         '--chain',
@@ -620,9 +620,29 @@ export class GmgnClient {
       ]);
       return this.parseCliJson(stdout);
     } catch (err: unknown) {
-      log.error(`Failed to fetch token traders via CLI`, err);
+      log.error(`Failed to fetch token traders via CLI after retries`, err);
       return null;
     }
+  }
+
+  private async execGmgnCliWithRetry(args: string[], maxRetries = 3): Promise<string> {
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.execGmgnCli(args);
+      } catch (err) {
+        lastError = err;
+        if (attempt < maxRetries) {
+          const delay = BASE_RETRY_MS * attempt;
+          log.warn(`GMGN CLI attempt ${attempt} failed, retrying in ${delay}ms...`, {
+            args: args.slice(0, 2).join(' '),
+            error: err instanceof Error ? err.message : String(err)
+          });
+          await sleep(delay);
+        }
+      }
+    }
+    throw lastError;
   }
 
   // ── Internal: fetch with retry ────────────────────────────────────────────
@@ -816,7 +836,7 @@ export class GmgnClient {
     log.debug(`gmgn-cli token ${command} ${mint}`);
 
     try {
-      const stdout = await this.execGmgnCli([
+      const stdout = await this.execGmgnCliWithRetry([
         'token',
         command,
         '--chain',
