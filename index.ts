@@ -99,6 +99,7 @@ async function main(): Promise<void> {
     | { type: 'reverseTargetWallet' };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
+  const insiderCheckState = new Map<string, number>(); // key: "botIndex:mint", value: checkCount
   const pausedWallets = new Set<string>();
   const walletAliasesByChat = new Map<string, string[]>();
 
@@ -158,13 +159,43 @@ async function main(): Promise<void> {
             `Last Updated: ${new Date().toLocaleTimeString()}`,
           ];
 
+          const buttons = [];
+          if (context === 'insider') {
+            const botIndex = insiderBots.findIndex(b => b.getActivePosition()?.mint === mint);
+            if (botIndex !== -1) {
+              buttons.push({ text: '🔴 Sell Position', callback_data: `sell:insider:${mint}:${botIndex}` });
+            }
+          }
+          buttons.push({ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` });
+
           return {
             text: lines.join('\n'),
             replyMarkup: {
-              inline_keyboard: [[{ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` }]],
+              inline_keyboard: [buttons],
             },
             editCurrent: true,
           };
+        }
+        if (data.startsWith('sell:insider:')) {
+          const [, , mint, botIndexStr] = parts;
+          const botIndex = parseInt(botIndexStr);
+          const bot = insiderBots[botIndex];
+          if (!bot) return 'Invalid bot index.';
+
+          const activePos = bot.getActivePosition();
+          if (!activePos || activePos.mint !== mint) {
+            return 'Position not found or already closed.';
+          }
+
+          // Trigger manual sell
+          bot.emit('sellTrigger', {
+            followedWallet: bot.getFollowedWallet()!,
+            positionMint: mint,
+            signature: 'MANUAL',
+            reason: 'Manual sell requested via Telegram button',
+          });
+
+          return 'Sell signal sent.';
         }
         if (data === 'menu:wallets') return walletsReply(chatId, true);
         if (data === 'menu:status') return statusReply(true);
@@ -582,7 +613,7 @@ async function main(): Promise<void> {
             }
 
             await telegramBot?.sendDefault([
-              `<b>🚀 Insider ${index + 1} Entry Triggered</b>`,
+              `<b>🚀 Insider ${index + 1} Buy Executing</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
               `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
               `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? 'Unknown')}</b>`,
@@ -615,7 +646,12 @@ async function main(): Promise<void> {
               `Watching for Exit MC: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
             ].filter(Boolean).join('\n'), {
             replyMarkup: {
-              inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${trigger.mint}:i` }]],
+              inline_keyboard: [
+                [
+                  { text: '🔴 Sell Position', callback_data: `sell:insider:${trigger.mint}:${index}` },
+                  { text: '🔄 Refresh P/L & MC', callback_data: `r:m:${trigger.mint}:i` }
+                ]
+              ],
             },
           });
         } catch (err) {
@@ -978,6 +1014,9 @@ async function main(): Promise<void> {
     if (!preBuyMint && !activePos) return;
 
     const mint = preBuyMint || activePos!.mint;
+    const checkKey = `${index}:${mint}`;
+    const checkCount = insiderCheckState.get(checkKey) || 0;
+
     try {
       const currentMc = await gmgnClients[0].fetchTokenMarketCapUsd(mint);
       if (currentMc === null) return;
@@ -1021,84 +1060,109 @@ async function main(): Promise<void> {
         }
         
         bot.clearActivePosition();
+        insiderCheckState.delete(checkKey);
         return;
       }
 
-      // 2. Entry Check
-      if (preBuyMint) {
+      // 2. Entry / Flow Check
+      // We check entry conditions if we have a pre-buy mint, OR if we just bought (checkCount 1) and want the v2 flow card.
+      if (preBuyMint || (activePos && checkCount === 1)) {
         const entryMc = bot.getEntryMc();
-        if (currentMc >= entryMc) {
-          log.warn(`[INSIDER ${index + 1} ENTRY] MC $${currentMc.toLocaleString()} reached Entry MC $${entryMc.toLocaleString()}. Checking transfer wallet profitability...`);
+        if (currentMc >= entryMc || activePos) {
+          const nextCount = checkCount + 1;
+          insiderCheckState.set(checkKey, nextCount);
+
+          log.warn(`[INSIDER ${index + 1} FLOW] Token: ${mint} MC: $${currentMc.toLocaleString()} Check: ${nextCount}/2`);
           
           try {
-            const summary = await getTraderSummary(preBuyMint, bot, client, 5);
+            const summary = await getTraderSummary(mint, bot, client, 5);
             const { maxTransferProfit, tradersListStr, logTraders, profitLabel, profitType } = summary;
 
-            if (tradersListStr) {
-              log.warn(`Top 5 ${profitType}-profitable wallets for ${preBuyMint} (Bot ${index + 1}):\n${logTraders.join('\n')}`);
-            }
+            if (nextCount === 1) {
+              log.info(`[INSIDER ${index + 1} v1] First threshold hit for ${mint}. Evaluating action.`);
+              
+              const minProfit = bot.getMinTransferProfit();
+              const isBuyDisabled = bot.isBuyDisabled();
+              let actionTitle = "Entry v1";
 
-            const minProfit = bot.getMinTransferProfit();
-            const isBuyDisabled = bot.isBuyDisabled();
+              if (maxTransferProfit > minProfit) {
+                if (isBuyDisabled) {
+                  actionTitle = "Buy Requirements Met (SKIP v1)";
+                  log.info(`[INSIDER ${index + 1} SKIP v1] Buy requirements met (${profitLabel}: $${maxTransferProfit.toLocaleString()} > $${minProfit}), but Auto Buy is DISABLED.`);
+                } else {
+                  actionTitle = "Entry Triggered (BUY v1)";
+                  log.warn(`[INSIDER ${index + 1} ENTRY v1] Top transfer wallet ${profitLabel} profit: $${maxTransferProfit.toLocaleString()} (> $${minProfit}). Triggering BUY.`);
+                  
+                  // Set Exit MC
+                  const exitPercent = bot.getExitPercent();
+                  const newExitMc = currentMc * (1 + exitPercent / 100);
+                  bot.setExitMc(newExitMc);
+                  log.warn(`[INSIDER ${index + 1} EXIT SET] Exit MC set to $${newExitMc.toLocaleString()} (${exitPercent}% increase from $${currentMc.toLocaleString()})`);
 
-            if (maxTransferProfit > minProfit) {
-              if (isBuyDisabled) {
-                log.info(`[INSIDER ${index + 1} SKIP] Buy requirements met (${profitLabel}: $${maxTransferProfit.toLocaleString()} > $${minProfit}), but Auto Buy is DISABLED.`);
-                telegramBot?.sendDefault([
-                  `<b>⚠️ Insider ${index + 1} Buy Requirements Met (SKIP)</b>`,
-                  `Token: <code>${html(preBuyMint)}</code>`,
-                  `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
-                  `Profit (${profitLabel}): <b>$${html(maxTransferProfit.toLocaleString())}</b> (> $${minProfit})`,
-                  'Reason: <b>Auto Buy is currently DISABLED in settings.</b>',
-                  '',
-                  tradersListStr ? tradersListStr : '',
-                ].join('\n'), { pin: true }).catch((err) => log.warn('Telegram skip-buy alert failed', err));
-                
-                return;
+                  bot.emit('buyTrigger', {
+                    followedWallet: bot.getFollowedWallet()!,
+                    mint: mint,
+                    signature: 'MC_TRIGGER',
+                    buySol: bot.getBuySol(),
+                    entryMc: currentMc,
+                    tradersListStr,
+                  });
+                  // Note: preBuyMint will be cleared by the bot's internal markPositionBought
+                }
+              } else {
+                actionTitle = "Entry Condition Not Met (v1)";
+                const reason = maxTransferProfit === -1 
+                  ? "No transfer wallets found."
+                  : `Highest transfer wallet ${profitLabel} profit is $${maxTransferProfit.toLocaleString()} (<= $${minProfit}).`;
+                log.info(`[INSIDER ${index + 1} NO-BUY v1] MC reached but ${reason}`);
               }
 
-              log.warn(`[INSIDER ${index + 1} ENTRY] Top transfer wallet ${profitLabel} profit: $${maxTransferProfit.toLocaleString()} (> $${minProfit}). Triggering BUY.`);
-              
-              // Set Exit MC to chosen percentage increase from current entry MC
-              const exitPercent = bot.getExitPercent();
-              const newExitMc = currentMc * (1 + exitPercent / 100);
-              bot.setExitMc(newExitMc);
-              log.warn(`[INSIDER ${index + 1} EXIT SET] Exit MC set to $${newExitMc.toLocaleString()} (${exitPercent}% increase from $${currentMc.toLocaleString()})`);
-
-              bot.emit('buyTrigger', {
-                followedWallet: bot.getFollowedWallet()!,
-                mint: preBuyMint,
-                signature: 'MC_TRIGGER',
-                buySol: bot.getBuySol(),
-                entryMc: currentMc,
-                tradersListStr,
-              });
-            } else {
-              const reason = maxTransferProfit === -1 
-                ? "No transfer wallets found in top 5 profitable traders."
-                : `Highest transfer wallet ${profitLabel} profit is $${maxTransferProfit.toLocaleString()}, which is not > $${minProfit}.`;
-              
-              log.info(`[INSIDER ${index + 1} NO-BUY] MC $${currentMc.toLocaleString()} reached but ${reason}`);
-              
               telegramBot?.sendDefault([
-                `<b>⚠️ Insider ${index + 1} Entry Condition Not Met</b>`,
-                `Token: <code>${html(preBuyMint)}</code>`,
+                `<b>🚀 Insider ${index + 1} ${actionTitle}</b>`,
+                `Token: <code>${html(mint)}</code>`,
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
-                `Reason: <b>${html(reason)}</b>`,
+                `Threshold MC: <b>$${html(entryMc.toLocaleString())}</b>`,
+                `Buy SOL: <b>${html(String(bot.getBuySol()))} SOL</b>`,
                 '',
                 tradersListStr ? tradersListStr : '',
-              ].join('\n'), { pin: true }).catch((err) => log.warn('Telegram no-buy alert failed', err));
+              ].join('\n'), { pin: true }).catch((err) => log.warn(`Telegram insider ${index + 1} v1 alert failed`, err));
               
-              bot.clearPreBuyMint();
+              if (tradersListStr) {
+                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v1):\n${logTraders.join('\n')}`);
+              }
+              return; // Wait for next check interval (v2)
+            }
+
+            if (nextCount === 2) {
+              log.info(`[INSIDER ${index + 1} v2] Second check for ${mint}. Sending flow card.`);
+              
+              telegramBot?.sendDefault([
+                `<b>🚀 Insider ${index + 1} Flow v2</b>`,
+                `Token: <code>${html(mint)}</code>`,
+                `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
+                '',
+                tradersListStr ? tradersListStr : '',
+              ].join('\n'), { pin: true }).catch((err) => log.warn(`Telegram insider ${index + 1} v2 alert failed`, err));
+
+              if (tradersListStr) {
+                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v2):\n${logTraders.join('\n')}`);
+              }
+
+              insiderCheckState.delete(checkKey);
+              if (preBuyMint) {
+                // If it wasn't bought at v1, clear it now after v2 flow msg
+                bot.clearPreBuyMint();
+              }
+              return;
             }
           } catch (err) {
-            log.error(`Failed to fetch top traders for entry check (Bot ${index + 1})`, err);
-            log.warn(`[INSIDER ${index + 1} SKIP] Skipping buy for ${preBuyMint} due to trader fetch error.`);
+            log.error(`Failed to fetch top traders for entry flow (Bot ${index + 1})`, err);
           }
         }
       } 
       // 3. Exit Check
-      else if (activePos) {
+      // Only run if we are not in the middle of the 2-step flow
+      else if (activePos && (checkCount === 0 || checkCount >= 2)) {
         const exitMc = bot.getExitMc();
         if (currentMc >= exitMc) {
           log.warn(`[INSIDER ${index + 1} EXIT] MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`);
