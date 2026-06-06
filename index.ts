@@ -198,14 +198,15 @@ async function main(): Promise<void> {
           ];
 
           const buttons = [];
-          const botIndex = insiderBots.findIndex(b => b.getActivePosition()?.mint === mint);
+          let botIndex = insiderBots.findIndex(b => b.getActivePosition()?.mint === mint);
           
-          if (context === 'insider' && botIndex !== -1) {
-            buttons.push({ text: '🔴 Sell Position', callback_data: `sell:insider:${mint}:${botIndex}` });
+          if (context === 'insider' && !balanceIsZero) {
+            // If we can't find the bot that bought it (e.g. state reset), fallback to bot 0
+            const effectiveBotIndex = botIndex !== -1 ? botIndex : 0;
+            buttons.push({ text: '🔴 Sell Position', callback_data: `sell:insider:${mint}:${effectiveBotIndex}` });
             buttons.push({ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` });
           } else {
-            // If it's not insider context, or we can't find the active position anymore,
-            // we still want to show the refresh button.
+            // If it's not insider context, or position is closed, just show refresh
             buttons.push({ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` });
           }
 
@@ -224,13 +225,13 @@ async function main(): Promise<void> {
           if (!bot) return 'Invalid bot index.';
 
           const activePos = bot.getActivePosition();
-          if (!activePos || activePos.mint !== mint) {
-            return 'Position not found or already closed.';
-          }
+          // Even if activePos is missing (state reset), we allow manual sell if it's the right mint
+          // or if the user is forcing a sell from an insider card.
+          const followedWallet = activePos?.followedWallet || bot.getFollowedWallet() || 'UNKNOWN';
 
           // Trigger manual sell
           bot.emit('sellTrigger', {
-            followedWallet: bot.getFollowedWallet()!,
+            followedWallet,
             positionMint: mint,
             signature: 'MANUAL',
             reason: 'Manual sell requested via Telegram button',
@@ -644,10 +645,9 @@ async function main(): Promise<void> {
             if (!tradersListStr) {
               try {
                 const summary = await getTraderSummary(trigger.mint, bot, client, 5);
-                const holdersStr = summary.top10HoldersPercent !== null ? `Top 10 Holders: <b>${summary.top10HoldersPercent.toFixed(2)}%</b>\n` : '';
-                tradersListStr = holdersStr + summary.tradersListStr;
+                tradersListStr = summary.tradersListStr;
                 if (summary.tradersListStr) {
-                  log.warn(`Top 5 ${summary.profitType}-profitable wallets for ${trigger.mint} (Bot ${index + 1}):\n${summary.logTraders.join('\n')}${summary.top10HoldersPercent !== null ? `\nTop 10 Holders: ${summary.top10HoldersPercent.toFixed(2)}%` : ''}`);
+                  log.warn(`Top 5 ${summary.profitType}-profitable wallets for ${trigger.mint} (Bot ${index + 1}):\n${summary.logTraders.join('\n')}`);
                 }
               } catch (err) {
                 log.error(`Failed to fetch top traders for message (Bot ${index + 1})`, err);
@@ -969,21 +969,15 @@ async function main(): Promise<void> {
     logTraders: string[];
     profitLabel: string;
     profitType: string;
-    top10HoldersPercent: number | null;
   }> {
     const profitType = bot.getProfitType();
     const followedWallet = bot.getFollowedWallet();
     
-    // Fetch traders and metrics in parallel
-    const [traders, metricsResult] = await Promise.all([
-      client.fetchTokenTraders(mint, 50, 'profit'),
-      client.fetchBundlerMetrics(mint)
-    ]);
-    
-    const top10HoldersPercent = metricsResult.success ? metricsResult.metrics.top10HolderRate : null;
+    // Fetch traders only (removed metrics call for holders %)
+    const traders = await client.fetchTokenTraders(mint, 50, 'profit');
 
     if (!traders || !Array.isArray(traders.list)) {
-      return { maxTransferProfit: -1, tradersListStr: '', logTraders: [], profitLabel: '', profitType, top10HoldersPercent };
+      return { maxTransferProfit: -1, tradersListStr: '', logTraders: [], profitLabel: '', profitType };
     }
 
     const formatTraders = (list: any[], type: 'realized' | 'total') => {
@@ -1036,26 +1030,24 @@ async function main(): Promise<void> {
       ].join('\n');
 
       return {
-        maxTransferProfit: Math.max(total.maxTP, realized.maxTP),
-        tradersListStr,
-        logTraders: [...total.logLines, '---', ...realized.logLines],
-        profitLabel: 'Combined (Total/Realized)',
-        profitType,
-        top10HoldersPercent
-      };
-    } else {
-      const result = formatTraders(traders.list, profitType);
-      const label = profitType === 'realized' ? 'Realized' : 'Total';
-      return {
-        maxTransferProfit: result.maxTP,
-        tradersListStr: `<b>Top 5 ${label}-Profitable:</b>\n` + result.formatted.join('\n'),
-        logTraders: result.logLines,
-        profitLabel: `${label} Profit`,
-        profitType,
-        top10HoldersPercent
-      };
+          maxTransferProfit: Math.max(total.maxTP, realized.maxTP),
+          tradersListStr,
+          logTraders: [...total.logLines, '---', ...realized.logLines],
+          profitLabel: 'Combined (Total/Realized)',
+          profitType,
+        };
+      } else {
+        const result = formatTraders(traders.list, profitType);
+        const label = profitType === 'realized' ? 'Realized' : 'Total';
+        return {
+          maxTransferProfit: result.maxTP,
+          tradersListStr: `<b>Top 5 ${label}-Profitable:</b>\n` + result.formatted.join('\n'),
+          logTraders: result.logLines,
+          profitLabel: `${label} Profit`,
+          profitType,
+        };
+      }
     }
-  }
 
   async function checkInsiderMcapFlow(index: number): Promise<void> {
     const bot = insiderBots[index];
@@ -1149,8 +1141,7 @@ async function main(): Promise<void> {
           
           try {
             const summary = await getTraderSummary(mint, bot, client, 5);
-            const { maxTransferProfit, tradersListStr, logTraders, profitLabel, profitType, top10HoldersPercent } = summary;
-            const holdersStr = top10HoldersPercent !== null ? `Top 10 Holders: <b>${top10HoldersPercent.toFixed(2)}%</b>` : '';
+            const { maxTransferProfit, tradersListStr, logTraders, profitLabel, profitType } = summary;
 
             if (nextCount === 1) {
               log.info(`[INSIDER ${index + 1} v1] First threshold hit for ${mint}. Evaluating action.`);
@@ -1179,7 +1170,7 @@ async function main(): Promise<void> {
                     signature: 'MC_TRIGGER',
                     buySol: bot.getBuySol(),
                     entryMc: currentMc,
-                    tradersListStr: (holdersStr ? holdersStr + '\n' : '') + tradersListStr,
+                    tradersListStr: tradersListStr,
                   });
                   // Note: preBuyMint will be cleared by the bot's internal markPositionBought
                 }
@@ -1196,14 +1187,13 @@ async function main(): Promise<void> {
                 `Token: <code>${html(mint)}</code>`,
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
                 `Threshold MC: <b>$${html(entryMc.toLocaleString())}</b>`,
-                holdersStr ? holdersStr : '',
                 `Buy SOL: <b>${html(String(bot.getBuySol()))} SOL</b>`,
                 '',
                 tradersListStr ? tradersListStr : '',
               ].filter(Boolean).join('\n'), { pin: true }).catch((err) => log.warn(`Telegram insider ${index + 1} v1 alert failed`, err));
               
               if (tradersListStr) {
-                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v1):\n${logTraders.join('\n')}${top10HoldersPercent !== null ? `\nTop 10 Holders: ${top10HoldersPercent.toFixed(2)}%` : ''}`);
+                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v1):\n${logTraders.join('\n')}`);
               }
               return; // Wait for next check interval (v2)
             }
@@ -1215,13 +1205,12 @@ async function main(): Promise<void> {
                 `<b>🚀 Insider ${index + 1} Flow v2</b>`,
                 `Token: <code>${html(mint)}</code>`,
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
-                holdersStr ? holdersStr : '',
                 '',
                 tradersListStr ? tradersListStr : '',
               ].filter(Boolean).join('\n')).catch((err) => log.warn(`Telegram insider ${index + 1} v2 alert failed`, err));
 
               if (tradersListStr) {
-                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v2):\n${logTraders.join('\n')}${top10HoldersPercent !== null ? `\nTop 10 Holders: ${top10HoldersPercent.toFixed(2)}%` : ''}`);
+                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v2):\n${logTraders.join('\n')}`);
               }
 
               insiderCheckState.delete(checkKey);
