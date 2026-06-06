@@ -603,9 +603,10 @@ async function main(): Promise<void> {
             if (!tradersListStr) {
               try {
                 const summary = await getTraderSummary(trigger.mint, bot, client, 5);
-                tradersListStr = summary.tradersListStr;
-                if (tradersListStr) {
-                  log.warn(`Top 5 ${summary.profitType}-profitable wallets for ${trigger.mint} (Bot ${index + 1}):\n${summary.logTraders.join('\n')}`);
+                const holdersStr = summary.top10HoldersPercent !== null ? `Top 10 Holders: <b>${summary.top10HoldersPercent.toFixed(2)}%</b>\n` : '';
+                tradersListStr = holdersStr + summary.tradersListStr;
+                if (summary.tradersListStr) {
+                  log.warn(`Top 5 ${summary.profitType}-profitable wallets for ${trigger.mint} (Bot ${index + 1}):\n${summary.logTraders.join('\n')}${summary.top10HoldersPercent !== null ? `\nTop 10 Holders: ${summary.top10HoldersPercent.toFixed(2)}%` : ''}`);
                 }
               } catch (err) {
                 log.error(`Failed to fetch top traders for message (Bot ${index + 1})`, err);
@@ -927,13 +928,21 @@ async function main(): Promise<void> {
     logTraders: string[];
     profitLabel: string;
     profitType: string;
+    top10HoldersPercent: number | null;
   }> {
     const profitType = bot.getProfitType();
     const followedWallet = bot.getFollowedWallet();
-    const traders = await client.fetchTokenTraders(mint, 50, 'profit');
     
+    // Fetch traders and metrics in parallel
+    const [traders, metricsResult] = await Promise.all([
+      client.fetchTokenTraders(mint, 50, 'profit'),
+      client.fetchBundlerMetrics(mint)
+    ]);
+    
+    const top10HoldersPercent = metricsResult.success ? metricsResult.metrics.top10HolderRate : null;
+
     if (!traders || !Array.isArray(traders.list)) {
-      return { maxTransferProfit: -1, tradersListStr: '', logTraders: [], profitLabel: '', profitType };
+      return { maxTransferProfit: -1, tradersListStr: '', logTraders: [], profitLabel: '', profitType, top10HoldersPercent };
     }
 
     const formatTraders = (list: any[], type: 'realized' | 'total') => {
@@ -990,7 +999,8 @@ async function main(): Promise<void> {
         tradersListStr,
         logTraders: [...total.logLines, '---', ...realized.logLines],
         profitLabel: 'Combined (Total/Realized)',
-        profitType
+        profitType,
+        top10HoldersPercent
       };
     } else {
       const result = formatTraders(traders.list, profitType);
@@ -1000,7 +1010,8 @@ async function main(): Promise<void> {
         tradersListStr: `<b>Top 5 ${label}-Profitable:</b>\n` + result.formatted.join('\n'),
         logTraders: result.logLines,
         profitLabel: `${label} Profit`,
-        profitType
+        profitType,
+        top10HoldersPercent
       };
     }
   }
@@ -1076,7 +1087,8 @@ async function main(): Promise<void> {
           
           try {
             const summary = await getTraderSummary(mint, bot, client, 5);
-            const { maxTransferProfit, tradersListStr, logTraders, profitLabel, profitType } = summary;
+            const { maxTransferProfit, tradersListStr, logTraders, profitLabel, profitType, top10HoldersPercent } = summary;
+            const holdersStr = top10HoldersPercent !== null ? `Top 10 Holders: <b>${top10HoldersPercent.toFixed(2)}%</b>` : '';
 
             if (nextCount === 1) {
               log.info(`[INSIDER ${index + 1} v1] First threshold hit for ${mint}. Evaluating action.`);
@@ -1105,7 +1117,7 @@ async function main(): Promise<void> {
                     signature: 'MC_TRIGGER',
                     buySol: bot.getBuySol(),
                     entryMc: currentMc,
-                    tradersListStr,
+                    tradersListStr: (holdersStr ? holdersStr + '\n' : '') + tradersListStr,
                   });
                   // Note: preBuyMint will be cleared by the bot's internal markPositionBought
                 }
@@ -1122,13 +1134,14 @@ async function main(): Promise<void> {
                 `Token: <code>${html(mint)}</code>`,
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
                 `Threshold MC: <b>$${html(entryMc.toLocaleString())}</b>`,
+                holdersStr ? holdersStr : '',
                 `Buy SOL: <b>${html(String(bot.getBuySol()))} SOL</b>`,
                 '',
                 tradersListStr ? tradersListStr : '',
-              ].join('\n'), { pin: true }).catch((err) => log.warn(`Telegram insider ${index + 1} v1 alert failed`, err));
+              ].filter(Boolean).join('\n'), { pin: true }).catch((err) => log.warn(`Telegram insider ${index + 1} v1 alert failed`, err));
               
               if (tradersListStr) {
-                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v1):\n${logTraders.join('\n')}`);
+                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v1):\n${logTraders.join('\n')}${top10HoldersPercent !== null ? `\nTop 10 Holders: ${top10HoldersPercent.toFixed(2)}%` : ''}`);
               }
               return; // Wait for next check interval (v2)
             }
@@ -1140,12 +1153,13 @@ async function main(): Promise<void> {
                 `<b>🚀 Insider ${index + 1} Flow v2</b>`,
                 `Token: <code>${html(mint)}</code>`,
                 `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
+                holdersStr ? holdersStr : '',
                 '',
                 tradersListStr ? tradersListStr : '',
-              ].join('\n'), { pin: true }).catch((err) => log.warn(`Telegram insider ${index + 1} v2 alert failed`, err));
+              ].filter(Boolean).join('\n'), { pin: true }).catch((err) => log.warn(`Telegram insider ${index + 1} v2 alert failed`, err));
 
               if (tradersListStr) {
-                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v2):\n${logTraders.join('\n')}`);
+                log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v2):\n${logTraders.join('\n')}${top10HoldersPercent !== null ? `\nTop 10 Holders: ${top10HoldersPercent.toFixed(2)}%` : ''}`);
               }
 
               insiderCheckState.delete(checkKey);
