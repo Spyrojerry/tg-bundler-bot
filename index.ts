@@ -76,8 +76,8 @@ async function main(): Promise<void> {
     config.rateLimitMaxConcurrent
   );
   const gmgnClients = [
-    new GmgnClient(config, limiter),
-    new GmgnClient({ ...config, gmgnApiKey: config.gmgnApiKey2 }, limiter),
+    new GmgnClient(config, limiter, config.insiderSolanaRpcUrl),
+    new GmgnClient({ ...config, gmgnApiKey: config.gmgnApiKey2 }, limiter, config.insiderSolanaRpcUrl2),
   ];
 
   let telegramBot: TelegramBot | null = null;
@@ -893,12 +893,13 @@ async function main(): Promise<void> {
     });
   }
 
-  async function checkAndSellIfLowMcap(mint: string, context: 'insider' | 'bundler' | 'reverse_copysell'): Promise<void> {
+  async function checkAndSellIfLowMcap(mint: string, context: 'insider' | 'bundler' | 'reverse_copysell', botIndex?: number): Promise<void> {
     if (!config.tradingWalletAddress) return;
     if (hasPendingSellForMint(config.tradingWalletAddress, mint)) return;
 
     try {
-      const currentMc = await gmgnClients[0].fetchTokenMarketCapUsd(mint);
+      const client = (context === 'insider' && botIndex !== undefined) ? gmgnClients[botIndex] : gmgnClients[0];
+      const currentMc = await client.fetchTokenMarketCapUsd(mint);
       if (currentMc !== null && currentMc < INSIDER_MIN_MARKET_CAP_USD) {
         log.warn(`[MCAP SELL TRIGGER] Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}`, { context });
 
@@ -1248,6 +1249,10 @@ async function main(): Promise<void> {
         if (botMode === 'insider') {
           for (let i = 0; i < insiderBots.length; i++) {
             await checkInsiderMcapFlow(i);
+            const pos = insiderBots[i].getActivePosition();
+            if (pos) {
+              await checkAndSellIfLowMcap(pos.mint, 'insider', i);
+            }
           }
         }
 

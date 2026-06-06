@@ -74,13 +74,13 @@ export class GmgnClient {
   private readonly limiter: RateLimiter;
   private readonly baselineMinTime: number;
 
-  constructor(config: ServiceConfig, limiter: RateLimiter) {
+  constructor(config: ServiceConfig, limiter: RateLimiter, rpcUrlOverride?: string) {
     this.baseUrl          = config.gmgnApiBaseUrl.replace(/\/$/, '');
     this.apiKey           = config.gmgnApiKey;
     this.fetchMode        = config.gmgnFetchMode;
     this.jupiterSwapBaseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '');
     this.jupiterApiKey    = config.jupiterApiKey;
-    this.connection       = new Connection(config.solanaRpcUrl, 'confirmed');
+    this.connection       = new Connection(rpcUrlOverride || config.solanaRpcUrl, 'confirmed');
     this.limiter          = limiter;
     this.baselineMinTime  = config.rateLimitMinTime;
   }
