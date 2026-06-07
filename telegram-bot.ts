@@ -179,8 +179,14 @@ export class TelegramBot {
           await this.sendReply(chatIdString, reply);
         }
       } catch (err) {
-        log.warn('Telegram polling error', this.describeError(err));
-        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        const desc = this.describeError(err);
+        if (desc.message === 'fetch failed') {
+          log.warn('Telegram polling: network connection failed, retrying in 5s...');
+          await new Promise((resolve) => setTimeout(resolve, 5_000));
+        } else {
+          log.warn('Telegram polling error', desc);
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+        }
       }
     }
   }
@@ -270,25 +276,33 @@ export class TelegramBot {
   }
 
   private async api<T = unknown>(method: string, body: Record<string, unknown>): Promise<T> {
-    const resp = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 35_000); // 35s timeout (must be > getUpdates timeout of 25s)
 
-    const json = await resp.json() as {
-      ok: boolean;
-      result?: T;
-      description?: string;
-      error_code?: number;
-    };
-    if (!json.ok) {
-      throw new Error(
-        `Telegram ${method} failed (${json.error_code ?? resp.status}): ` +
-        `${json.description ?? 'unknown error'}`
-      );
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+
+      const json = await resp.json() as {
+        ok: boolean;
+        result?: T;
+        description?: string;
+        error_code?: number;
+      };
+      if (!json.ok) {
+        throw new Error(
+          `Telegram ${method} failed (${json.error_code ?? resp.status}): ` +
+          `${json.description ?? 'unknown error'}`
+        );
+      }
+      return json.result as T;
+    } finally {
+      clearTimeout(timer);
     }
-    return json.result as T;
   }
 
   private describeError(err: unknown): Record<string, unknown> {
