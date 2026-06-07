@@ -167,7 +167,7 @@ export class GmgnClient {
     
     try {
       if (this.fetchMode !== 'direct') {
-        const data = await this.limiter.schedule(() => this.fetchCliData('traders', mint));
+        const data = await this.limiter.schedule(() => this.fetchCliData('traders', mint, { limit, orderBy }));
         if (data) return data;
         log.debug(`GMGN CLI traders returned no data for ${mint}, falling back to API`);
       }
@@ -225,16 +225,58 @@ export class GmgnClient {
 
   private async fetchCliData(
     type: 'token' | 'traders' | 'security',
-    mint: string
+    mint: string,
+    options: { limit?: number; orderBy?: string } = {}
   ): Promise<Record<string, unknown> | null> {
-    const cmd = `gmgn-cli ${type} ${mint} --raw`;
+    // Map internal types to CLI subcommands
+    let subcommand = '';
+    switch (type) {
+      case 'token': subcommand = 'info'; break;
+      case 'traders': subcommand = 'traders'; break;
+      case 'security': subcommand = 'security'; break;
+    }
+
+    let cmd = `gmgn-cli token ${subcommand} --chain ${this.chain} --address ${mint} --raw`;
+
+    // Add extra options if provided
+    if (options.limit) {
+      cmd += ` --limit ${options.limit}`;
+    }
+    if (options.orderBy) {
+      // Map 'profit_change' or others to CLI supported 'profit' if needed, 
+      // but 'profit' is requested and supported.
+      cmd += ` --order-by ${options.orderBy}`;
+    }
+
     try {
-      const { stdout } = await execAsync(cmd, { timeout: REQUEST_TIMEOUT });
-      const json = JSON.parse(stdout);
-      const unwrapped = this.unwrapResponseData(json);
-      if (unwrapped) {
-        unwrapped.source = 'cli';
+      log.debug(`Executing CLI: ${cmd}`);
+      const { stdout, stderr } = await execAsync(cmd, { timeout: REQUEST_TIMEOUT });
+      if (stderr) {
+        log.debug(`GMGN CLI ${type} stderr for ${mint}: ${stderr}`);
       }
+      
+      if (!stdout || stdout.trim() === '') {
+        log.warn(`GMGN CLI ${type} returned empty stdout for ${mint}`);
+        return null;
+      }
+
+      // Find the first '{' and last '}' to extract the JSON part in case there's log noise
+      const start = stdout.indexOf('{');
+      const end = stdout.lastIndexOf('}');
+      if (start === -1 || end === -1 || end < start) {
+        log.warn(`GMGN CLI ${type} output does not contain valid JSON for ${mint}. Raw: ${stdout.substring(0, 200)}`);
+        return null;
+      }
+      const jsonStr = stdout.substring(start, end + 1);
+      const json = JSON.parse(jsonStr);
+      const unwrapped = this.unwrapResponseData(json);
+      
+      if (!unwrapped) {
+        log.warn(`GMGN CLI ${type} could not unwrap data for ${mint}. Raw: ${stdout.substring(0, 200)}`);
+        return null;
+      }
+
+      unwrapped.source = 'cli';
       return unwrapped;
     } catch (err) {
       log.debug(`GMGN CLI ${type} failed for ${mint}`, { error: String(err) });

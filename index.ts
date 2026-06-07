@@ -999,18 +999,26 @@ async function main(): Promise<void> {
     // Fetch traders only (removed metrics call for holders %)
     const traders = await client.fetchTokenTraders(mint, 50, 'profit');
 
-    if (!traders || !Array.isArray(traders.list)) {
-      log.debug(`[INSIDER DEBUG] fetchTokenTraders returned null or non-array list for ${mint}`, { 
-        tradersNull: !traders,
-        listType: traders ? typeof traders.list : 'n/a'
-      });
-      return { maxTransferProfit: -1, tradersListStr: '', logTraders: [], profitLabel: '', profitType };
+    if (!traders) {
+      log.warn(`[INSIDER DEBUG] fetchTokenTraders returned null for ${mint}`);
+      return { maxTransferProfit: -2, tradersListStr: '', logTraders: [], profitLabel: '', profitType };
     }
 
-    log.debug(`[INSIDER DEBUG] Fetched ${traders.list.length} traders for ${mint}`);
+    let list = traders.list;
+    if (!Array.isArray(list)) {
+      // Try common alternative field names for the trader list
+      list = traders.traders || traders.data?.list || traders.data?.traders || traders.items;
+    }
 
-    const formatTraders = (list: any[], type: 'realized' | 'total') => {
-      const fullSorted = [...list].sort((a, b) => {
+    if (!Array.isArray(list)) {
+      log.warn(`[INSIDER DEBUG] No trader list found in response for ${mint}. Fields: ${Object.keys(traders).join(', ')}`);
+      return { maxTransferProfit: -2, tradersListStr: '', logTraders: [], profitLabel: '', profitType };
+    }
+
+    log.debug(`[INSIDER DEBUG] Fetched ${list.length} traders for ${mint} (Source: ${traders.source || 'unknown'})`);
+
+    const formatTraders = (traderList: any[], type: 'realized' | 'total') => {
+      const fullSorted = [...traderList].sort((a, b) => {
         const valA = type === 'realized' ? (a.realized_profit ?? 0) : (a.profit ?? 0);
         const valB = type === 'realized' ? (b.realized_profit ?? 0) : (b.profit ?? 0);
         return valB - valA;
@@ -1039,6 +1047,15 @@ async function main(): Promise<void> {
 
       log.debug(`[INSIDER DEBUG] ${type} list: found ${transferFoundCount} transfer wallets. Max profit: ${maxTP}`);
 
+      if (transferFoundCount === 0 && traderList.length > 0) {
+        const sample = traderList.slice(0, 3).map(t => ({
+          address: t.address,
+          tags: t.maker_token_tags,
+          transferIn: !!t.token_transfer_in,
+          transfer: t.token_transfer?.type
+        }));
+        log.debug(`[INSIDER DEBUG] No transfers found in top 3 traders: ${JSON.stringify(sample)}`);
+      }
 
       const topLimit = fullSorted.slice(0, limit);
       const formatted = topLimit.map((t: any, i: number) => {
@@ -1198,6 +1215,12 @@ async function main(): Promise<void> {
             const summary = await getTraderSummary(mint, bot, client, 5);
             const { maxTransferProfit, tradersListStr, logTraders, profitLabel, profitType } = summary;
 
+            if (maxTransferProfit === -2) {
+              log.warn(`[INSIDER ${index + 1} FETCH ERROR] Failed to retrieve trader data for ${mint}. Skipping flow evaluation.`);
+              insiderCheckState.set(checkKey, checkCount); // Revert check count
+              return;
+            }
+
             if (nextCount === 1) {
               log.info(`[INSIDER ${index + 1} v1] First threshold hit for ${mint}. Evaluating action.`);
               
@@ -1231,7 +1254,7 @@ async function main(): Promise<void> {
               } else {
                 actionTitle = "Entry Condition Not Met (v1)";
                 const reason = maxTransferProfit === -1 
-                  ? "No transfer wallets found."
+                  ? "No transfer wallets found among fetched traders."
                   : `Highest transfer wallet ${profitLabel} profit is $${maxTransferProfit.toLocaleString()} (<= $${minProfit}).`;
                 log.info(`[INSIDER ${index + 1} NO-BUY v1] MC reached but ${reason}`);
               }
