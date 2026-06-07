@@ -401,16 +401,25 @@ export class GmgnClient {
     const amountLamports = Math.round(options.solAmount * 1e9);
     const slippageBps = this.toJupiterSlippageBps(options);
     
-    const quoteUrl = `${this.jupiterSwapBaseUrl}/quote?inputMint=${SOL_MINT}&outputMint=${mint}&amount=${amountLamports}${slippageBps ? `&slippageBps=${slippageBps}` : ''}`;
+    let quoteUrl = `${this.jupiterSwapBaseUrl}/quote?inputMint=${SOL_MINT}&outputMint=${mint}&amount=${amountLamports}`;
+    if (slippageBps !== null) {
+      quoteUrl += `&slippageBps=${slippageBps}`;
+    } else {
+      quoteUrl += `&autoSlippage=true`; // Some Jupiter-compatible APIs use this
+    }
+    
     const quote = await this.fetchJupiterJson(quoteUrl, 'GET');
 
     const swapResp = await this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/swap`, 'POST', {
       quoteResponse: quote,
       userPublicKey: walletAddress,
       wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true, // Recommended for Jupiter v6
+      prioritizationFeeLamports: options.priorityFeeSol ? Math.round(options.priorityFeeSol * 1e9) : 'auto',
     });
 
-    const execute = await this.executeJupiterOrder(swapResp.swapTransaction as string, (quote as any).requestId as string);
+    const requestId = (quote as any).requestId;
+    const execute = await this.executeJupiterOrder(swapResp.swapTransaction as string, requestId as string);
     return this.parseJupiterSellResult(quote, execute, mint, 100);
   }
 
@@ -424,9 +433,12 @@ export class GmgnClient {
       quoteResponse: quote.raw,
       userPublicKey: walletAddress,
       wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: options.priorityFeeSol ? Math.round(options.priorityFeeSol * 1e9) : 'auto',
     });
 
-    const execute = await this.executeJupiterOrder(swapResp.swapTransaction as string, (quote.raw as any).requestId);
+    const requestId = (quote.raw as any).requestId;
+    const execute = await this.executeJupiterOrder(swapResp.swapTransaction as string, requestId as string);
     return this.parseJupiterSellResult(quote.raw as any, execute, mint, options.percent);
   }
 
@@ -477,7 +489,14 @@ export class GmgnClient {
 
   private toJupiterSlippageBps(options: BuyOptions | SellOptions): number | null {
     if (options.autoSlippage) return null;
-    return Math.round(options.slippage * 10_000);
+    // If slippage is >= 1, assume it's already a percentage (e.g. 10 for 10%)
+    // If slippage is < 1, assume it's a decimal (e.g. 0.1 for 10%)
+    let bps = options.slippage >= 1 
+      ? Math.round(options.slippage * 100) 
+      : Math.round(options.slippage * 10_000);
+    
+    // Cap at 50% (5000 bps) for safety, Jupiter max is 10000 but 50% is a reasonable extreme
+    return Math.min(Math.max(bps, 0), 5000);
   }
 
   // ── Utils ─────────────────────────────────────────────────────────────────

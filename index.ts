@@ -1242,6 +1242,7 @@ async function main(): Promise<void> {
                   bot.setExitMc(newExitMc);
                   log.warn(`[INSIDER ${index + 1} EXIT SET] Exit MC set to $${newExitMc.toLocaleString()} (${exitPercent}% increase from $${currentMc.toLocaleString()})`);
 
+                  bot.setBuyExecuting(true);
                   bot.emit('buyTrigger', {
                     followedWallet: bot.getFollowedWallet()!,
                     mint: mint,
