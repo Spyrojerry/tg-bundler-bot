@@ -1129,9 +1129,12 @@ async function main(): Promise<void> {
       // 1. Fetch current Market Cap
       const currentMc = preFetchedMc !== undefined ? preFetchedMc : await client.fetchTokenMarketCapUsd(mint);
 
-      if (currentMc === null) return;
+      if (currentMc === null) {
+        log.debug(`[INSIDER ${index + 1} MC SKIP] Could not fetch market cap for ${mint}`);
+        return;
+      }
 
-      log.debug(`[INSIDER ${index + 1} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()}`);
+      log.info(`[INSIDER ${index + 1} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${preFetchedMc !== undefined ? 'Prefetched' : 'Client'})`);
 
       // 2. IMMEDIATE POSITION CHECKS (If bought)
       if (activePos) {
@@ -1280,9 +1283,15 @@ async function main(): Promise<void> {
   function startMarketCapChecker(): void {
     log.info(`Starting periodic market cap checker (interval: ${MCAP_CHECK_INTERVAL_MS}ms)`);
     let isChecking = false;
+    let loopCount = 0;
     setInterval(async () => {
       if (isChecking) return;
       isChecking = true;
+      loopCount++;
+      if (loopCount % 20 === 0) {
+        log.debug(`[HEARTBEAT] MC checker loop #${loopCount} is alive`);
+      }
+
       try {
         const checkPromises: Promise<void>[] = [];
 
@@ -1295,12 +1304,18 @@ async function main(): Promise<void> {
             const mint = preBuyMint || activePos?.mint;
 
             if (mint) {
+              log.debug(`[INSIDER ${i + 1} LOOP] Monitoring: ${mint} (Pre-buy: ${!!preBuyMint}, Active: ${!!activePos})`);
               checkPromises.push((async () => {
                 const client = gmgnClients[i];
                 const currentMc = await client.fetchTokenMarketCapUsd(mint);
-                await checkInsiderMcapFlow(i, currentMc);
-                if (activePos) {
-                  await checkAndSellIfLowMcap(activePos.mint, 'insider', i, currentMc);
+                
+                if (currentMc !== null) {
+                  await checkInsiderMcapFlow(i, currentMc);
+                  if (activePos) {
+                    await checkAndSellIfLowMcap(activePos.mint, 'insider', i, currentMc);
+                  }
+                } else {
+                  log.debug(`[INSIDER ${i + 1} LOOP] MC fetch returned null for ${mint}`);
                 }
               })());
             }

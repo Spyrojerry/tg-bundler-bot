@@ -76,29 +76,43 @@ export class GmgnClient {
   async fetchTokenMarketCapUsd(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, 'mint');
 
-    // 1. PRIMARY: GMGN API (v1/token/info)
+    // 1. PRIMARY: GMGN (CLI or API)
     try {
-      const data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/info', mint));
+      let data: Record<string, unknown> | null = null;
+      if (this.fetchMode !== 'direct') {
+        log.debug(`Attempting MC fetch via GMGN CLI: ${mint}`);
+        data = await this.limiter.schedule(() => this.fetchCliData('token', mint));
+      }
+      
+      if (!data) {
+        log.debug(`Attempting MC fetch via GMGN API: ${mint}`);
+        data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/info', mint));
+      }
 
       if (data) {
         const marketCap = this.extractMarketCapUsd(data);
         if (marketCap !== null) {
-          log.debug(`Calculated MC via GMGN API primary: $${marketCap.toLocaleString()}`, { mint });
+          log.debug(`Calculated MC via GMGN ${data.source === 'cli' ? 'CLI' : 'API'} primary: $${marketCap.toLocaleString()}`, { mint });
           return marketCap;
+        } else {
+          log.debug(`Extracted MC was null from GMGN ${data.source === 'cli' ? 'CLI' : 'API'} data`, { mint });
         }
       }
     } catch (err) {
-      log.debug(`GMGN API primary MC fetch failed for ${mint}`, { error: String(err) });
+      log.debug(`GMGN primary MC fetch failed for ${mint}`, { error: String(err) });
     }
 
     // 2. SECONDARY: Jupiter Price API + RPC Supply
     try {
-      log.debug(`Using Jupiter + RPC secondary for MC: ${mint}`);
+      log.info(`Using Jupiter + RPC secondary for MC: ${mint}`);
       
       // Fetch Supply from RPC
       const supplyResp = await this.connection.getTokenSupply(new PublicKey(mint), 'confirmed');
       const supply = supplyResp.value.uiAmount;
-      if (supply === null) return null;
+      if (supply === null) {
+        log.warn(`RPC Supply was null for ${mint}`);
+        return null;
+      }
 
       // Fetch Price from Jupiter
       const url = `https://api.jup.ag/price/v3?ids=${mint}`;
@@ -122,14 +136,18 @@ export class GmgnClient {
           const priceUsd = parseFloat(priceData.usdPrice);
           if (!isNaN(priceUsd)) {
             const marketCap = supply * priceUsd;
-            log.debug(`Calculated MC via Jupiter + RPC secondary: $${marketCap.toLocaleString()}`, {
+            log.info(`Calculated MC via Jupiter + RPC secondary: $${marketCap.toLocaleString()}`, {
               mint,
               supply,
               priceUsd
             });
             return marketCap;
           }
+        } else {
+          log.warn(`Jupiter Price API returned no data for ${mint}`);
         }
+      } else {
+        log.warn(`Jupiter Price API failed: ${resp.status} ${resp.statusText}`);
       }
     } catch (err) {
       log.error(`Both MC fetch methods failed for ${mint}`, err);
@@ -213,8 +231,11 @@ export class GmgnClient {
     try {
       const { stdout } = await execAsync(cmd, { timeout: REQUEST_TIMEOUT });
       const json = JSON.parse(stdout);
-      // CLI --raw usually returns the 'data' field directly if successful
-      return this.unwrapResponseData(json);
+      const unwrapped = this.unwrapResponseData(json);
+      if (unwrapped) {
+        unwrapped.source = 'cli';
+      }
+      return unwrapped;
     } catch (err) {
       log.debug(`GMGN CLI ${type} failed for ${mint}`, { error: String(err) });
       return null;
@@ -252,7 +273,11 @@ export class GmgnClient {
       const json = (await resp.json()) as GmgnSecurityResponse;
       if (json.code !== undefined && json.code !== 0) return null;
 
-      return this.unwrapResponseData(json);
+      const unwrapped = this.unwrapResponseData(json);
+      if (unwrapped) {
+        unwrapped.source = 'api';
+      }
+      return unwrapped;
     } catch {
       return null;
     }
@@ -269,24 +294,33 @@ export class GmgnClient {
       data.fdv,
       data.fdv_usd,
       data.fully_diluted_valuation,
+      data.mc,
+      data.usd_market_cap,
       this.asRecord(data.pool).market_cap,
       this.asRecord(data.pool).market_cap_usd,
+      this.asRecord(data.pool).fdv,
       this.asRecord(data.stat).market_cap,
       this.asRecord(data.stat).market_cap_usd,
+      this.asRecord(data.token).market_cap,
+      this.asRecord(data.token).fdv,
     ];
 
     for (const candidate of candidates) {
       const parsed = this.parseNullableNumber(candidate);
-      if (parsed !== null && parsed >= 0) return parsed;
+      if (parsed !== null && parsed > 0) return parsed;
     }
 
     // Fallback: Calculate MC = Price * Supply
-    const price = this.parseNullableNumber(this.asRecord(data.price).price);
-    const supply = this.parseNullableNumber(data.circulating_supply ?? data.total_supply);
+    const price = this.parseNullableNumber(this.asRecord(data.price).price) ?? 
+                  this.parseNullableNumber(data.price) ??
+                  this.parseNullableNumber(this.asRecord(data.token).price);
+                  
+    const supply = this.parseNullableNumber(data.circulating_supply ?? data.total_supply) ??
+                   this.parseNullableNumber(this.asRecord(data.token).circulating_supply ?? this.asRecord(data.token).total_supply);
 
     if (price !== null && supply !== null) {
       const calculatedMc = price * supply;
-      if (calculatedMc >= 0) return calculatedMc;
+      if (calculatedMc > 0) return calculatedMc;
     }
 
     return null;
