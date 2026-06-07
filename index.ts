@@ -140,9 +140,13 @@ async function main(): Promise<void> {
           let currentPrice: SellQuote | null = null;
           let balanceIsZero = false;
 
+          const botIndex = insiderBots.findIndex(b => b.getActivePosition()?.mint === mint);
+          const effectiveBotIndex = botIndex !== -1 ? botIndex : 0;
+          const client = context === 'insider' ? gmgnClients[effectiveBotIndex] : gmgnClients[0];
+
           try {
             const quotePromise = config.tradingWalletAddress 
-              ? gmgnClients[0].quoteTokenSellForSol(config.tradingWalletAddress, mint, 100).catch(async (err) => {
+              ? client.quoteTokenSellForSol(config.tradingWalletAddress, mint, 100).catch(async (err) => {
                   if (err.message.includes('No token balance found')) {
                     balanceIsZero = true;
                   }
@@ -151,7 +155,7 @@ async function main(): Promise<void> {
               : Promise.resolve(null);
 
             [currentMarketCapUsd, currentPrice] = await Promise.all([
-              gmgnClients[0].fetchTokenMarketCapUsd(mint),
+              client.fetchTokenMarketCapUsd(mint),
               quotePromise
             ]);
           } catch (err) {
@@ -160,7 +164,7 @@ async function main(): Promise<void> {
           
           let buySol = 0;
           if (context === 'insider') {
-            const bot = insiderBots.find(b => b.getActivePosition()?.mint === mint) || insiderBots[0];
+            const bot = botIndex !== -1 ? insiderBots[botIndex] : insiderBots[0];
             buySol = bot.getBuySol();
           } else if (context === 'bundler') {
             buySol = earlyBundlerOrchestrator.getActivePosition()?.buySol ?? 0;
@@ -198,11 +202,8 @@ async function main(): Promise<void> {
           ];
 
           const buttons = [];
-          let botIndex = insiderBots.findIndex(b => b.getActivePosition()?.mint === mint);
           
           if (context === 'insider' && !balanceIsZero) {
-            // If we can't find the bot that bought it (e.g. state reset), fallback to bot 0
-            const effectiveBotIndex = botIndex !== -1 ? botIndex : 0;
             buttons.push({ text: '🔴 Sell Position', callback_data: `sell:insider:${mint}:${effectiveBotIndex}` });
             buttons.push({ text: '🔄 Refresh', callback_data: `r:m:${mint}:${contextCode}` });
           } else {

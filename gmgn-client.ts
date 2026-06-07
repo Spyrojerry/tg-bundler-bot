@@ -69,6 +69,7 @@ export class GmgnClient {
   private readonly fetchMode: ServiceConfig['gmgnFetchMode'];
   private readonly jupiterSwapBaseUrl: string;
   private readonly jupiterApiKey: string;
+  private readonly jupiterPriceApiKey: string;
   private readonly connection: Connection;
   private readonly chain  = 'sol';
   private readonly limiter: RateLimiter;
@@ -80,6 +81,7 @@ export class GmgnClient {
     this.fetchMode        = config.gmgnFetchMode;
     this.jupiterSwapBaseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '');
     this.jupiterApiKey    = config.jupiterApiKey;
+    this.jupiterPriceApiKey = config.jupiterPriceApiKey;
     this.connection       = new Connection(rpcUrlOverride || config.solanaRpcUrl, 'confirmed');
     this.limiter          = limiter;
     this.baselineMinTime  = config.rateLimitMinTime;
@@ -126,39 +128,43 @@ export class GmgnClient {
         return null;
       }
 
-      // 2. Fetch Price from DexScreener
-      const url = `https://api.dexscreener.com/tokens/v1/solana/${mint}`;
+      // 2. Fetch Price from Jupiter Price API (v3)
+      const url = `https://api.jup.ag/price/v3?ids=${mint}`;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000); // 5s timeout for DexScreener
+      const timer = setTimeout(() => controller.abort(), 5000); // 5s timeout
 
       const resp = await fetch(url, {
         method: 'GET',
-        headers: { 'Accept': 'application/json' },
+        headers: { 
+          'Accept': 'application/json',
+          'x-api-key': this.jupiterPriceApiKey 
+        },
         signal: controller.signal
       });
       clearTimeout(timer);
 
       if (!resp.ok) {
-        log.warn(`DexScreener API failed: HTTP ${resp.status}`, { mint });
+        log.warn(`Jupiter Price API failed: HTTP ${resp.status}`, { mint });
         return null;
       }
 
-      const data = await resp.json() as any[];
-      if (!Array.isArray(data) || data.length === 0) {
-        log.warn('DexScreener returned no pairs for mint', { mint });
+      const json = await resp.json() as Record<string, any>;
+      const priceData = json[mint];
+      
+      if (!priceData || !priceData.usdPrice) {
+        log.warn('Jupiter Price API returned no data for mint', { mint });
         return null;
       }
 
-      // We take the price from the first pair (usually the most active one)
-      const priceUsd = parseFloat(data[0].priceUsd);
+      const priceUsd = parseFloat(priceData.usdPrice);
       if (isNaN(priceUsd)) {
-        log.warn('DexScreener price is not a number', { mint, rawPrice: data[0].priceUsd });
+        log.warn('Jupiter price is not a number', { mint, rawPrice: priceData.usdPrice });
         return null;
       }
 
       // 3. Calculate MC
       const marketCap = supply * priceUsd;
-      log.debug(`Calculated MC via DexScreener + RPC: $${marketCap.toLocaleString()}`, {
+      log.debug(`Calculated MC via Jupiter + RPC: $${marketCap.toLocaleString()}`, {
         mint,
         supply,
         priceUsd

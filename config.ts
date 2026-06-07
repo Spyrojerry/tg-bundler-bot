@@ -82,6 +82,7 @@ export function loadConfig(): ServiceConfig {
   const gmgnFetchMode    = optional('GMGN_FETCH_MODE', 'cli');
   const jupiterSwapBaseUrl = optional('JUPITER_SWAP_BASE_URL', 'https://api.jup.ag/swap/v2');
   const jupiterApiKey    = required('JUPITER_API_KEY');
+  const jupiterPriceApiKey = optional('JUPITER_PRICE_API_KEY', jupiterApiKey);
   const heliusApiKey     = optional('HELIUS_API_KEY', '');
   const receiverHeliusApiKey = optional('RECEIVER_HELIUS_API_KEY', '');
   const receiverSolanaRpcUrl = optional(
@@ -174,6 +175,7 @@ export function loadConfig(): ServiceConfig {
     gmgnFetchMode,
     jupiterSwapBaseUrl,
     jupiterApiKey,
+    jupiterPriceApiKey,
     monitorInterval,
     monitoringWindowMs,
     rateLimitMinTime,
