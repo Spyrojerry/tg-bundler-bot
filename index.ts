@@ -1024,9 +1024,10 @@ async function main(): Promise<void> {
                             t.token_transfer?.type === 'transfer_in' || 
                             t.token_transfer?.type === 'move_in' ||
                             t.is_calc_transfer ||
+                            t.is_contract ||
                             (t.maker_token_tags && (
-                              (Array.isArray(t.maker_token_tags) && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in'))) ||
-                              (typeof t.maker_token_tags === 'string' && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in')))
+                              (Array.isArray(t.maker_token_tags) && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in') || t.maker_token_tags.includes('contract'))) ||
+                              (typeof t.maker_token_tags === 'string' && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in') || t.maker_token_tags.includes('contract')))
                             ));
         const profit = type === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
         
@@ -1046,15 +1047,17 @@ async function main(): Promise<void> {
                             t.token_transfer?.type === 'transfer_in' || 
                             t.token_transfer?.type === 'move_in' ||
                             t.is_calc_transfer ||
+                            t.is_contract ||
                             (t.maker_token_tags && (
-                              (Array.isArray(t.maker_token_tags) && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in'))) ||
-                              (typeof t.maker_token_tags === 'string' && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in')))
+                              (Array.isArray(t.maker_token_tags) && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in') || t.maker_token_tags.includes('contract'))) ||
+                              (typeof t.maker_token_tags === 'string' && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in') || t.maker_token_tags.includes('contract')))
                             ));
         const profit = type === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
 
         let tags = [];
         if (isFollowed) tags.push('👤 <b>FOLLOWED</b>');
         if (hasTransfer) tags.push('🟢 <b>Transfer</b>');
+        else tags.push('⚪️ <b>Normal</b>');
         const tagsStr = tags.length > 0 ? ` [${tags.join(', ')}]` : '';
 
         return `${i + 1}. <code>${html(t.address)}</code>: <b>$${html(profit.toLocaleString())}</b>${tagsStr}`;
@@ -1066,14 +1069,16 @@ async function main(): Promise<void> {
                             t.token_transfer?.type === 'transfer_in' || 
                             t.token_transfer?.type === 'move_in' ||
                             t.is_calc_transfer ||
+                            t.is_contract ||
                             (t.maker_token_tags && (
-                              (Array.isArray(t.maker_token_tags) && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in'))) ||
-                              (typeof t.maker_token_tags === 'string' && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in')))
+                              (Array.isArray(t.maker_token_tags) && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in') || t.maker_token_tags.includes('contract'))) ||
+                              (typeof t.maker_token_tags === 'string' && (t.maker_token_tags.includes('transfer_in') || t.maker_token_tags.includes('move_in') || t.maker_token_tags.includes('contract')))
                             ));
         const profit = type === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
         let logTags = [];
         if (isFollowed) logTags.push('FOLLOWED');
         if (hasTransfer) logTags.push('Transfer');
+        else logTags.push('Normal');
         const logTagsStr = logTags.length > 0 ? ` [${logTags.join(', ')}]` : '';
         return `${i + 1}. ${t.address}: $${profit.toLocaleString()}${logTagsStr}`;
       });
