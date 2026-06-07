@@ -1136,7 +1136,35 @@ async function main(): Promise<void> {
 
       log.info(`[INSIDER ${index + 1} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${preFetchedMc !== undefined ? 'Prefetched' : 'Client'})`);
 
-      // 2. IMMEDIATE POSITION CHECKS (If bought)
+      // 2. IMMEDIATE GLOBAL CHECKS (Rug / Reset)
+      if (currentMc < 1000) {
+        const reason = `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
+        log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Cleaning up.`);
+
+        // Check if we somehow have a balance to sell
+        if (config.tradingWalletAddress) {
+          const owner = new PublicKey(config.tradingWalletAddress);
+          const mintPk = new PublicKey(mint);
+          const balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
+          
+          if (balance > 0n) {
+            log.warn(`[INSIDER ${index + 1} RUG SELL] Found balance despite state. Triggering sell.`);
+            bot.emit('sellTrigger', {
+              followedWallet: bot.getFollowedWallet()!,
+              positionMint: mint,
+              signature: 'MC_TRIGGER',
+              reason: `Rug protection (Balance check): ${reason}`,
+            });
+          }
+        }
+        
+        bot.clearActivePosition();
+        bot.clearPreBuyMint();
+        insiderCheckState.delete(checkKey);
+        return;
+      }
+
+      // 3. POSITION CHECKS (If bought)
       if (activePos) {
         // Exit Check
         const exitMc = bot.getExitMc();
@@ -1150,33 +1178,9 @@ async function main(): Promise<void> {
           });
           return;
         }
-
-        // Rug Protection (< $1k)
-        if (currentMc < 1000) {
-          const reason = `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
-          log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Triggering SELL.`);
-          
-          if (config.tradingWalletAddress) {
-            bot.emit('sellTrigger', {
-              followedWallet: bot.getFollowedWallet()!,
-              positionMint: activePos.mint,
-              signature: 'MC_TRIGGER',
-              reason: `Rug protection: ${reason}`,
-            });
-          } else {
-            telegramBot?.sendDefault([
-              `<b>⚠️ Insider ${index + 1} Rug Detected</b>`,
-              `Token: <code>${html(mint)}</code>`,
-              'Reason: Rug detected, but no trading wallet configured to sell.',
-            ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
-          }
-          bot.clearActivePosition();
-          insiderCheckState.delete(checkKey);
-          return;
-        }
       }
 
-      // 3. Entry / Flow Check (If not bought or in Flow V2)
+      // 4. Entry / Flow Check (If not bought or in Flow V2)
       if (preBuyMint || (activePos && checkCount === 1)) {
         const entryMc = bot.getEntryMc();
         if (currentMc >= entryMc || activePos) {
