@@ -106,6 +106,7 @@ export class InsiderBot extends EventEmitter {
     mint: string;
   } | null = null;
   private boughtMints = new Set<string>();
+  private isBuyExecuting: boolean = false;
 
   constructor(
     config: ServiceConfig,
@@ -214,6 +215,14 @@ export class InsiderBot extends EventEmitter {
 
   getFollowedWallet(): string | null {
     return this.followedWallet;
+  }
+
+  setBuyExecuting(executing: boolean): void {
+    this.isBuyExecuting = executing;
+  }
+
+  isBuyInProgress(): boolean {
+    return this.isBuyExecuting;
   }
 
   isRunning(): boolean {

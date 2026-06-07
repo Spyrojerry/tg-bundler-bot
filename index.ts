@@ -667,6 +667,9 @@ async function main(): Promise<void> {
               'Submitting swap...',
             ].filter(Boolean).join('\n'));
 
+            // Mark that we are executing a buy to prevent cleanup logic from wiping state
+            bot.setBuyExecuting(true);
+
             const result = await client.buyTokenWithSol(
               config.tradingWalletAddress!,
               trigger.mint,
@@ -696,6 +699,7 @@ async function main(): Promise<void> {
             }
 
             bot.markPositionBought(trigger);
+            bot.setBuyExecuting(false); // Clear execution flag after state is saved
 
             await telegramBot?.sendDefault([
               `<b>✅ Insider ${index + 1} Buy Completed</b>`,
@@ -717,6 +721,7 @@ async function main(): Promise<void> {
             },
           });
         } catch (err) {
+          bot.setBuyExecuting(false); // Ensure flag is cleared on failure
           log.error(`Insider ${index + 1} buy failed`, err);
           await telegramBot?.sendDefault([
             `<b>❌ Insider ${index + 1} Buy Failed</b>`,
@@ -1090,58 +1095,47 @@ async function main(): Promise<void> {
 
       log.debug(`[INSIDER ${index + 1} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()}`);
 
-      // 2. Rug protection: MC < $1k
-      if (currentMc < 1000) {
-        const reason = `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
-        log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Resetting.`);
-        
-        if (activePos && config.tradingWalletAddress) {
-          // Trigger immediate sell if we have a position
-          const event: FilterFailEvent = {
-            walletAddress: config.tradingWalletAddress,
-            mint,
-            sampleNumber: 0,
-            elapsedSec: 0,
-            reasons: [reason],
-            settings: db.getWalletSettings(config.tradingWalletAddress),
-            metrics: { mint, timestamp: new Date().toISOString(), bundlersPercent: null, bundlersCount: null, initialBaseReserve: null, topWallets: null, top10HolderRate: null, bundledAmountRate: null },
-            buySol: bot.getBuySol(),
-            matchingWallets: [],
-          };
-          const sellId = randomBytes(5).toString('hex');
-          pendingSells.set(sellId, { event, createdAt: Date.now(), executing: true });
-          void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
-          
-          telegramBot?.sendDefault([
-            `<b>🚨 Insider ${index + 1} Rug Protection Triggered</b>`,
-            `Token: <code>${html(mint)}</code>`,
-            `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
-            `Reason: <b>${reason}</b>`,
-            'Action: Selling immediately and resetting.',
-          ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
-        } else if (activePos && !config.tradingWalletAddress) {
-          log.warn(`[INSIDER ${index + 1} RUG SKIP SELL] Cannot sell rugged token ${mint} because no TRADING_WALLET_ADDRESS is configured.`);
-          telegramBot?.sendDefault([
-            `<b>⚠️ Insider ${index + 1} Rug Detected</b>`,
-            `Token: <code>${html(mint)}</code>`,
-            'Reason: Rug detected, but no trading wallet configured to sell.',
-          ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
-        } else {
-          telegramBot?.sendDefault([
-            `<b>⚠️ Insider ${index + 1} Watch Reset (Rug)</b>`,
-            `Token: <code>${html(mint)}</code>`,
-            `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
-            `Reason: ${reason}. Aborting entry sequence.`,
-          ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
+      // 2. IMMEDIATE POSITION CHECKS (If bought)
+      if (activePos) {
+        // Exit Check
+        const exitMc = bot.getExitMc();
+        if (currentMc >= exitMc) {
+          log.warn(`[INSIDER ${index + 1} EXIT] MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`);
+          bot.emit('sellTrigger', {
+            followedWallet: bot.getFollowedWallet()!,
+            positionMint: activePos.mint,
+            signature: 'MC_TRIGGER',
+            reason: `Target Exit MC $${exitMc.toLocaleString()} reached`,
+          });
+          return;
         }
-        
-        bot.clearActivePosition();
-        insiderCheckState.delete(checkKey);
-        return;
+
+        // Rug Protection (< $1k)
+        if (currentMc < 1000) {
+          const reason = `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
+          log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Triggering SELL.`);
+          
+          if (config.tradingWalletAddress) {
+            bot.emit('sellTrigger', {
+              followedWallet: bot.getFollowedWallet()!,
+              positionMint: activePos.mint,
+              signature: 'MC_TRIGGER',
+              reason: `Rug protection: ${reason}`,
+            });
+          } else {
+            telegramBot?.sendDefault([
+              `<b>⚠️ Insider ${index + 1} Rug Detected</b>`,
+              `Token: <code>${html(mint)}</code>`,
+              'Reason: Rug detected, but no trading wallet configured to sell.',
+            ].join('\n')).catch((err) => log.warn('Telegram rug alert failed', err));
+          }
+          bot.clearActivePosition();
+          insiderCheckState.delete(checkKey);
+          return;
+        }
       }
 
-      // 2. Entry / Flow Check
-      // We check entry conditions if we have a pre-buy mint, OR if we just bought (checkCount 1) and want the v2 flow card.
+      // 3. Entry / Flow Check (If not bought or in Flow V2)
       if (preBuyMint || (activePos && checkCount === 1)) {
         const entryMc = bot.getEntryMc();
         if (currentMc >= entryMc || activePos) {
@@ -1169,7 +1163,7 @@ async function main(): Promise<void> {
                   actionTitle = "Entry Triggered (BUY v1)";
                   log.warn(`[INSIDER ${index + 1} ENTRY v1] Top transfer wallet ${profitLabel} profit: $${maxTransferProfit.toLocaleString()} (> $${minProfit}). Triggering BUY.`);
                   
-                  // Set Exit MC
+                  // Set Exit MC (Initial estimate)
                   const exitPercent = bot.getExitPercent();
                   const newExitMc = currentMc * (1 + exitPercent / 100);
                   bot.setExitMc(newExitMc);
@@ -1183,7 +1177,6 @@ async function main(): Promise<void> {
                     entryMc: currentMc,
                     tradersListStr: tradersListStr,
                   });
-                  // Note: preBuyMint will be cleared by the bot's internal markPositionBought
                 }
               } else {
                 actionTitle = "Entry Condition Not Met (v1)";
@@ -1207,7 +1200,7 @@ async function main(): Promise<void> {
               if (tradersListStr) {
                 log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v1):\n${logTraders.join('\n')}`);
               }
-              return; // Wait for next check interval (v2)
+              return;
             }
 
             if (nextCount === 2) {
@@ -1226,30 +1219,19 @@ async function main(): Promise<void> {
                 log.warn(`Top 5 ${profitType}-profitable wallets for ${mint} (Bot ${index + 1} v2):\n${logTraders.join('\n')}`);
               }
 
-              insiderCheckState.delete(checkKey);
-              if (preBuyMint) {
-                // If it wasn't bought at v1, clear it now after v2 flow msg
-                bot.clearPreBuyMint();
+              if (!bot.isBuyInProgress()) {
+                insiderCheckState.delete(checkKey);
+                if (preBuyMint) {
+                  bot.clearPreBuyMint();
+                }
+              } else {
+                log.info(`[INSIDER ${index + 1} SKIP RESET] Buy in progress for ${mint}; skipping v2 cleanup logic.`);
               }
               return;
             }
           } catch (err) {
             log.error(`Failed to fetch top traders for entry flow (Bot ${index + 1})`, err);
           }
-        }
-      } 
-      // 3. Exit Check
-      // Only run if we are not in the middle of the 2-step flow
-      else if (activePos && (checkCount === 0 || checkCount >= 2)) {
-        const exitMc = bot.getExitMc();
-        if (currentMc >= exitMc) {
-          log.warn(`[INSIDER ${index + 1} EXIT] MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`);
-          bot.emit('sellTrigger', {
-            followedWallet: bot.getFollowedWallet()!,
-            positionMint: activePos.mint,
-            signature: 'MC_TRIGGER',
-            reason: `Target Exit MC $${exitMc.toLocaleString()} reached`,
-          });
         }
       }
     } catch (err) {

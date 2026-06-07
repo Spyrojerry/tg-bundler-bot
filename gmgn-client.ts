@@ -119,19 +119,57 @@ export class GmgnClient {
   async fetchTokenMarketCapUsd(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, 'mint');
 
+    // 1. PRIMARY: GMGN CLI (Most reliable for new launches)
     try {
-      // 1. Fetch Supply from RPC
+      log.debug(`Fetching MC via GMGN CLI primary for ${mint}`);
+      const cliResult = await this.execGmgnCliWithRetry([
+        'token',
+        'info',
+        '--chain',
+        this.chain,
+        '--address',
+        mint,
+        '--raw',
+      ], 1);
+
+      const gmgnData = this.parseCliJson(cliResult);
+      const gmgnMc = this.extractMarketCapUsd(gmgnData);
+      
+      if (gmgnMc !== null) {
+        log.debug(`Calculated MC via GMGN CLI primary: $${gmgnMc.toLocaleString()}`, { mint });
+        return gmgnMc;
+      }
+    } catch (err) {
+      log.debug(`GMGN CLI primary MC fetch failed for ${mint}`, { error: String(err) });
+    }
+
+    // 2. SECONDARY: GMGN API (Faster than CLI if it works)
+    try {
+      const data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/info', mint));
+      if (data) {
+        const marketCap = this.extractMarketCapUsd(data);
+        if (marketCap !== null) {
+          log.debug(`Calculated MC via GMGN API: $${marketCap.toLocaleString()}`, { mint });
+          return marketCap;
+        }
+      }
+    } catch (err) {
+      log.debug(`GMGN API MC fetch failed for ${mint}`, { error: String(err) });
+    }
+
+    // 3. FALLBACK: Jupiter Price API + RPC Supply
+    try {
+      log.debug(`Using Jupiter + RPC fallback for MC: ${mint}`);
+      
+      // Fetch Supply from RPC
       const supplyResp = await this.connection.getTokenSupply(new PublicKey(mint), 'confirmed');
       const supply = supplyResp.value.uiAmount;
-      if (supply === null) {
-        log.warn('Failed to fetch supply from RPC', { mint });
-        return null;
-      }
+      if (supply === null) return null;
 
-      // 2. Fetch Price from Jupiter Price API (v3)
+      // Fetch Price from Jupiter
       const url = `https://api.jup.ag/price/v3?ids=${mint}`;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000); // 5s timeout
+      const timer = setTimeout(() => controller.abort(), 5000);
 
       const resp = await fetch(url, {
         method: 'GET',
@@ -143,38 +181,27 @@ export class GmgnClient {
       });
       clearTimeout(timer);
 
-      if (!resp.ok) {
-        log.warn(`Jupiter Price API failed: HTTP ${resp.status}`, { mint });
-        return null;
+      if (resp.ok) {
+        const json = await resp.json() as Record<string, any>;
+        const priceData = json[mint];
+        if (priceData && priceData.usdPrice) {
+          const priceUsd = parseFloat(priceData.usdPrice);
+          if (!isNaN(priceUsd)) {
+            const marketCap = supply * priceUsd;
+            log.debug(`Calculated MC via Jupiter + RPC fallback: $${marketCap.toLocaleString()}`, {
+              mint,
+              supply,
+              priceUsd
+            });
+            return marketCap;
+          }
+        }
       }
-
-      const json = await resp.json() as Record<string, any>;
-      const priceData = json[mint];
-      
-      if (!priceData || !priceData.usdPrice) {
-        log.warn('Jupiter Price API returned no data for mint', { mint });
-        return null;
-      }
-
-      const priceUsd = parseFloat(priceData.usdPrice);
-      if (isNaN(priceUsd)) {
-        log.warn('Jupiter price is not a number', { mint, rawPrice: priceData.usdPrice });
-        return null;
-      }
-
-      // 3. Calculate MC
-      const marketCap = supply * priceUsd;
-      log.debug(`Calculated MC via Jupiter + RPC: $${marketCap.toLocaleString()}`, {
-        mint,
-        supply,
-        priceUsd
-      });
-
-      return marketCap;
     } catch (err) {
-      log.error(`Failed to calculate Market Cap for ${mint}`, err);
-      return null;
+      log.error(`All MC fetch methods failed for ${mint}`, err);
     }
+
+    return null;
   }
 
   async sellTokenForSol(
