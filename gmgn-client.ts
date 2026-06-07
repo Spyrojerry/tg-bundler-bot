@@ -401,11 +401,9 @@ export class GmgnClient {
     const amountLamports = Math.round(options.solAmount * 1e9);
     const slippageBps = this.toJupiterSlippageBps(options);
     
-    let quoteUrl = `${this.jupiterSwapBaseUrl}/quote?inputMint=${SOL_MINT}&outputMint=${mint}&amount=${amountLamports}`;
+    let quoteUrl = `${this.jupiterSwapBaseUrl}/quote?inputMint=${SOL_MINT}&outputMint=${mint}&amount=${amountLamports}&onlyDirectRoutes=false`;
     if (slippageBps !== null) {
       quoteUrl += `&slippageBps=${slippageBps}`;
-    } else {
-      quoteUrl += `&autoSlippage=true`; // Some Jupiter-compatible APIs use this
     }
     
     const quote = await this.fetchJupiterJson(quoteUrl, 'GET');
@@ -414,8 +412,9 @@ export class GmgnClient {
       quoteResponse: quote,
       userPublicKey: walletAddress,
       wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true, // Recommended for Jupiter v6
-      prioritizationFeeLamports: options.priorityFeeSol ? Math.round(options.priorityFeeSol * 1e9) : 'auto',
+      dynamicComputeUnitLimit: true,
+      prioritizationFeeLamports: options.priorityFeeSol ? Math.round(options.priorityFeeSol * 1e9) : 0,
+      dynamicSlippage: options.autoSlippage ? true : false,
     });
 
     const requestId = (quote as any).requestId;
@@ -434,7 +433,8 @@ export class GmgnClient {
       userPublicKey: walletAddress,
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: options.priorityFeeSol ? Math.round(options.priorityFeeSol * 1e9) : 'auto',
+      prioritizationFeeLamports: options.priorityFeeSol ? Math.round(options.priorityFeeSol * 1e9) : 0,
+      dynamicSlippage: options.autoSlippage ? true : false,
     });
 
     const requestId = (quote.raw as any).requestId;
@@ -460,7 +460,10 @@ export class GmgnClient {
     try {
       const resp = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal });
       const json = await resp.json() as Record<string, unknown>;
-      if (!resp.ok) throw new Error(`Jupiter API failed: ${resp.status}`);
+      if (!resp.ok) {
+        log.error(`Jupiter API Error [${resp.status}]: ${JSON.stringify(json)}`, { url, method });
+        throw new Error(`Jupiter API failed: ${resp.status}${json.error ? ` - ${json.error}` : ''}${json.message ? ` - ${json.message}` : ''}`);
+      }
       return json;
     } finally {
       clearTimeout(timer);
@@ -489,13 +492,9 @@ export class GmgnClient {
 
   private toJupiterSlippageBps(options: BuyOptions | SellOptions): number | null {
     if (options.autoSlippage) return null;
-    // If slippage is >= 1, assume it's already a percentage (e.g. 10 for 10%)
-    // If slippage is < 1, assume it's a decimal (e.g. 0.1 for 10%)
-    let bps = options.slippage >= 1 
-      ? Math.round(options.slippage * 100) 
-      : Math.round(options.slippage * 10_000);
-    
-    // Cap at 50% (5000 bps) for safety, Jupiter max is 10000 but 50% is a reasonable extreme
+    // Treat slippage as a percentage (e.g., 0.3 means 0.3%, 10 means 10%)
+    const bps = Math.round(options.slippage * 100);
+    // Cap at 50% (5000 bps) for safety
     return Math.min(Math.max(bps, 0), 5000);
   }
 
