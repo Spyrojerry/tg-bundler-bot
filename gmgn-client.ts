@@ -1,15 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //  gmgn-client.ts  —  GMGN OpenAPI REST client
 //
-//  Bundler data comes from two endpoints:
-//    1.  GET /v1/token/security?chain=sol&address=<mint>
-//        Fields: bundler_trader_amount_rate, bundle_num / bundler_count
-//
-//    2.  GET /v1/token/info?chain=sol&address=<mint>   (fallback)
-//        Some GMGN plan tiers surface bundler fields here instead.
-//
 //  Authentication: GMGN_API_KEY sent as  X-API-KEY  header.
-//  (Ed25519 signing is only required for swap/order endpoints.)
 //
 //  Rate limits: Not published. Community observation ~2 req/s.
 //  We rely on RateLimiter for all throttling — this module just fires requests.
@@ -17,8 +9,6 @@
 
 import { createLogger } from './logger';
 import { RateLimiter } from './rate-limiter';
-import { execFile } from 'child_process';
-import * as path from 'path';
 import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import {
   BundlerMetrics,
@@ -52,21 +42,11 @@ const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const sleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
-function getSpawnEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (key === 'GMGN_PRIVATE_KEY' && value?.trim() === '') continue;
-    if (value !== undefined) env[key] = value;
-  }
-  return env;
-}
-
 // ── GmgnClient ────────────────────────────────────────────────────────────────
 
 export class GmgnClient {
   private readonly baseUrl: string;
   private readonly apiKey:  string;
-  private readonly fetchMode: ServiceConfig['gmgnFetchMode'];
   private readonly jupiterSwapBaseUrl: string;
   private readonly jupiterApiKey: string;
   private readonly jupiterPriceApiKey: string;
@@ -78,7 +58,6 @@ export class GmgnClient {
   constructor(config: ServiceConfig, limiter: RateLimiter, rpcUrlOverride?: string) {
     this.baseUrl          = config.gmgnApiBaseUrl.replace(/\/$/, '');
     this.apiKey           = config.gmgnApiKey;
-    this.fetchMode        = config.gmgnFetchMode;
     this.jupiterSwapBaseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '');
     this.jupiterApiKey    = config.jupiterApiKey;
     this.jupiterPriceApiKey = config.jupiterPriceApiKey;
@@ -87,79 +66,28 @@ export class GmgnClient {
     this.baselineMinTime  = config.rateLimitMinTime;
   }
 
-  // ── Public: fetch bundler metrics for one token ───────────────────────────
-
-  async fetchBundlerMetrics(mint: string): Promise<FetchResult> {
-    if (this.fetchMode === 'direct') {
-      return this.fetchDirect(mint);
-    }
-
-    if (this.fetchMode === 'cli') {
-      return this.fetchWithCli(mint);
-    }
-
-    const direct = await this.fetchDirect(mint);
-    if (direct.success && this.hasDecisionData(direct.metrics)) {
-      return direct;
-    }
-
-    const cli = await this.fetchWithCli(mint);
-    if (cli.success) return cli;
-
-    if (direct.success) return direct;
-
-    return {
-      success: false,
-      error: `direct failed: ${direct.error}; cli failed: ${cli.error}`,
-      retryAfterMs: direct.retryAfterMs ?? cli.retryAfterMs,
-      nonRetryable: direct.nonRetryable && cli.nonRetryable,
-    };
-  }
+  // ── Public: fetch Market Cap (Primary: GMGN API, Secondary: Jupiter + RPC) ──
 
   async fetchTokenMarketCapUsd(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, 'mint');
 
-    // 1. PRIMARY: GMGN CLI (Most reliable for new launches)
-    try {
-      log.debug(`Fetching MC via GMGN CLI primary for ${mint}`);
-      const cliResult = await this.execGmgnCliWithRetry([
-        'token',
-        'info',
-        '--chain',
-        this.chain,
-        '--address',
-        mint,
-        '--raw',
-      ], 1);
-
-      const gmgnData = this.parseCliJson(cliResult);
-      const gmgnMc = this.extractMarketCapUsd(gmgnData);
-      
-      if (gmgnMc !== null) {
-        log.debug(`Calculated MC via GMGN CLI primary: $${gmgnMc.toLocaleString()}`, { mint });
-        return gmgnMc;
-      }
-    } catch (err) {
-      log.debug(`GMGN CLI primary MC fetch failed for ${mint}`, { error: String(err) });
-    }
-
-    // 2. SECONDARY: GMGN API (Faster than CLI if it works)
+    // 1. PRIMARY: GMGN Web API (v1/token/info)
     try {
       const data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/info', mint));
       if (data) {
         const marketCap = this.extractMarketCapUsd(data);
         if (marketCap !== null) {
-          log.debug(`Calculated MC via GMGN API: $${marketCap.toLocaleString()}`, { mint });
+          log.debug(`Calculated MC via GMGN API primary: $${marketCap.toLocaleString()}`, { mint });
           return marketCap;
         }
       }
     } catch (err) {
-      log.debug(`GMGN API MC fetch failed for ${mint}`, { error: String(err) });
+      log.debug(`GMGN API primary MC fetch failed for ${mint}`, { error: String(err) });
     }
 
-    // 3. FALLBACK: Jupiter Price API + RPC Supply
+    // 2. SECONDARY: Jupiter Price API + RPC Supply
     try {
-      log.debug(`Using Jupiter + RPC fallback for MC: ${mint}`);
+      log.debug(`Using Jupiter + RPC secondary for MC: ${mint}`);
       
       // Fetch Supply from RPC
       const supplyResp = await this.connection.getTokenSupply(new PublicKey(mint), 'confirmed');
@@ -188,7 +116,7 @@ export class GmgnClient {
           const priceUsd = parseFloat(priceData.usdPrice);
           if (!isNaN(priceUsd)) {
             const marketCap = supply * priceUsd;
-            log.debug(`Calculated MC via Jupiter + RPC fallback: $${marketCap.toLocaleString()}`, {
+            log.debug(`Calculated MC via Jupiter + RPC secondary: $${marketCap.toLocaleString()}`, {
               mint,
               supply,
               priceUsd
@@ -198,621 +126,32 @@ export class GmgnClient {
         }
       }
     } catch (err) {
-      log.error(`All MC fetch methods failed for ${mint}`, err);
+      log.error(`Both MC fetch methods failed for ${mint}`, err);
     }
 
     return null;
   }
 
-  async sellTokenForSol(
-    walletAddress: string,
-    mint: string,
-    options: SellOptions
-  ): Promise<SellResult> {
-    this.validateSolAddress(walletAddress, 'wallet address');
-    this.validateSolAddress(mint, 'token mint');
-
-    const wallet = this.getJupiterWallet(walletAddress);
-    const mintPk = new PublicKey(mint);
-    const rawAmount = await this.getTokenSellAmount(wallet.publicKey, mintPk, options.percent);
-
-    log.warn(`Submitting confirmed sell via Jupiter Swap V2`, {
-      wallet: walletAddress,
-      mint,
-      percent: options.percent,
-      outputToken: SOL_MINT,
-      rawAmount: rawAmount.toString(),
-    });
-
-    return this.submitJupiterSellWithRetry(wallet, walletAddress, mint, rawAmount, options);
-  }
-
-  async buyTokenWithSol(
-    walletAddress: string,
-    mint: string,
-    options: BuyOptions
-  ): Promise<SellResult> {
-    this.validateSolAddress(walletAddress, 'wallet address');
-    this.validateSolAddress(mint, 'token mint');
-
-    const wallet = this.getJupiterWallet(walletAddress);
-    const rawAmount = BigInt(Math.max(1, Math.round(options.solAmount * 1_000_000_000)));
-
-    log.warn(`Submitting confirmed buy via Jupiter Swap V2`, {
-      wallet: walletAddress,
-      mint,
-      inputToken: SOL_MINT,
-      solAmount: options.solAmount,
-      rawAmount: rawAmount.toString(),
-    });
-
-    return this.submitJupiterSwapWithRetry(
-      wallet,
-      walletAddress,
-      SOL_MINT,
-      mint,
-      rawAmount,
-      options,
-      100
-    );
-  }
-
-  private async submitJupiterSellWithRetry(
-    wallet: Keypair,
-    walletAddress: string,
-    mint: string,
-    rawAmount: bigint,
-    options: SellOptions
-  ): Promise<SellResult> {
-    return this.submitJupiterSwapWithRetry(
-      wallet,
-      walletAddress,
-      mint,
-      SOL_MINT,
-      rawAmount,
-      options,
-      options.percent
-    );
-  }
-
-  private async submitJupiterSwapWithRetry(
-    wallet: Keypair,
-    walletAddress: string,
-    inputMint: string,
-    outputMint: string,
-    rawAmount: bigint,
-    options: BuyOptions | SellOptions,
-    soldPercent: number
-  ): Promise<SellResult> {
-    let lastError: unknown = null;
-
-    for (let attempt = 0; attempt <= JUPITER_SELL_RETRIES; attempt++) {
-      const order = await this.getJupiterOrderWithRetry(
-        inputMint,
-        outputMint,
-        rawAmount,
-        walletAddress,
-        options.priorityFeeSol,
-        options
-      );
-      const transactionBase64 = this.asString(order.transaction);
-      const requestId = this.asString(order.requestId);
-      if (!transactionBase64 || !requestId) {
-        const detail = this.asString(order.errorMessage) ?? this.asString(order.error) ?? 'order returned no transaction';
-        throw new Error(`Jupiter Swap V2 order failed: ${detail}`);
-      }
-
-      const transaction = VersionedTransaction.deserialize(Buffer.from(transactionBase64, 'base64'));
-      transaction.sign([wallet]);
-      const signedTransaction = Buffer.from(transaction.serialize()).toString('base64');
-      const execute = await this.executeJupiterOrder(signedTransaction, requestId);
-      const result = this.parseJupiterSellResult(order, execute, inputMint, soldPercent);
-
-      if (result.status !== 'failed') {
-        return result;
-      }
-
-      const detail = this.asString(execute.error) ?? this.asString(execute.message) ?? 'execution failed';
-      lastError = new Error(`Jupiter Swap V2 execute failed: ${detail}`);
-      if (attempt >= JUPITER_SELL_RETRIES || !this.isRetryableJupiterExecuteError(detail)) {
-        break;
-      }
-
-      const delay = BASE_RETRY_MS * 2 ** attempt;
-        log.warn('Jupiter execute failed; rebuilding order and retrying', {
-        inputMint,
-        outputMint,
-        attempt: attempt + 1,
-        retryInMs: delay,
-        error: detail,
-      });
-      await sleep(delay);
-    }
-
-    throw lastError;
-  }
-
-  async quoteTokenSellForSol(
-    walletAddress: string,
-    mint: string,
-    percent: number
-  ): Promise<SellQuote> {
-    this.validateSolAddress(walletAddress, 'wallet address');
-    this.validateSolAddress(mint, 'token mint');
-
-    const owner = new PublicKey(walletAddress);
-    const mintPk = new PublicKey(mint);
-    const rawAmount = await this.getTokenSellAmount(owner, mintPk, percent);
-    const order = await this.getJupiterOrderWithRetry(mint, SOL_MINT, rawAmount);
-    const outputAmount = this.asString(order.outAmount);
-    if (!outputAmount || !/^\d+$/.test(outputAmount)) {
-      const detail = this.asString(order.errorMessage) ?? this.asString(order.error) ?? 'quote returned no outAmount';
-      throw new Error(`Jupiter Swap V2 quote failed: ${detail}`);
-    }
-
-    return {
-      inputToken: this.asString(order.inputMint) ?? mint,
-      outputToken: this.asString(order.outputMint) ?? SOL_MINT,
-      soldPercent: percent,
-      inputAmount: this.asString(order.inAmount) ?? rawAmount.toString(),
-      outputAmount,
-      estimatedOutputSol: Number(BigInt(outputAmount)) / 1_000_000_000,
-      raw: order,
-    };
-  }
-
-  private getJupiterWallet(expectedAddress: string): Keypair {
-    const key = this.readJupiterPrivateKey();
-    const wallet = Keypair.fromSecretKey(key);
-    const actual = wallet.publicKey.toBase58();
-    if (actual !== expectedAddress) {
-      throw new Error(
-        `Jupiter sell key public address ${actual} does not match trading wallet ${expectedAddress}`
-      );
-    }
-    return wallet;
-  }
-
-  private readJupiterPrivateKey(): Uint8Array {
-    const candidates = [
-      'JUPITER_PRIVATE_KEY',
-      'SOLANA_PRIVATE_KEY',
-      'TRADING_PRIVATE_KEY',
-      'PRIVATE_KEY',
-    ];
-    const found = candidates
-      .map((name) => ({ name, value: process.env[name]?.trim() }))
-      .find((item) => item.value);
-
-    if (!found?.value) {
-      throw new Error(
-        'Missing JUPITER_PRIVATE_KEY. Jupiter Swap V2 sell needs the Solana trading wallet private key; GMGN_PRIVATE_KEY is not used for this.'
-      );
-    }
-
-    try {
-      if (found.value.startsWith('[')) {
-        const parsed = JSON.parse(found.value) as unknown;
-        if (!Array.isArray(parsed)) {
-          throw new Error('JSON value is not an array');
-        }
-        return Uint8Array.from(parsed.map((n) => {
-          if (typeof n !== 'number' || n < 0 || n > 255 || !Number.isInteger(n)) {
-            throw new Error('JSON array must contain byte values from 0 to 255');
-          }
-          return n;
-        }));
-      }
-
-      if (/^\d+(,\s*\d+)+$/.test(found.value)) {
-        return Uint8Array.from(found.value.split(',').map((part) => {
-          const n = Number(part.trim());
-          if (!Number.isInteger(n) || n < 0 || n > 255) {
-            throw new Error('comma-separated private key must contain byte values from 0 to 255');
-          }
-          return n;
-        }));
-      }
-
-      return bs58.decode(found.value);
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      throw new Error(`Invalid ${found.name}: expected base58 or JSON byte array Solana secret key (${detail})`);
-    }
-  }
-
-  private async getTokenSellAmount(
-    owner: PublicKey,
-    mint: PublicKey,
-    percent: number
-  ): Promise<bigint> {
-    const accounts = await this.getParsedTokenAccountsForMint(owner, mint);
-    let total = 0n;
-
-    for (const account of accounts) {
-      const parsed = account.account.data.parsed as {
-        info?: { tokenAmount?: { amount?: string } };
-      };
-      const raw = parsed.info?.tokenAmount?.amount;
-      if (raw && /^\d+$/.test(raw)) {
-        total += BigInt(raw);
-      }
-    }
-
-    if (total <= 0n) {
-      throw new Error(`No token balance found to sell for ${mint.toBase58()}`);
-    }
-
-    const bps = BigInt(Math.max(1, Math.min(10_000, Math.round(percent * 100))));
-    const sellAmount = (total * bps) / 10_000n;
-    if (sellAmount <= 0n) {
-      throw new Error(`Token balance is too small to sell ${percent}% of ${mint.toBase58()}`);
-    }
-    return sellAmount;
-  }
-
-  public async getParsedTokenAccountsForMint(
-    owner: PublicKey,
-    mint: PublicKey
-  ): Promise<Awaited<ReturnType<Connection['getParsedTokenAccountsByOwner']>>['value']> {
-    const [tokenAccounts, token2022Accounts] = await Promise.all([
-      this.connection.getParsedTokenAccountsByOwner(owner, {
-        programId: new PublicKey(TOKEN_PROGRAM_ID),
-      }),
-      this.connection.getParsedTokenAccountsByOwner(owner, {
-        programId: new PublicKey(TOKEN_2022_PROGRAM_ID),
-      }).then((result) => result.value).catch(() => []),
-    ]);
-
-    const targetMint = mint.toBase58();
-    return [...tokenAccounts.value, ...token2022Accounts].filter((account) => {
-      const parsed = account.account.data.parsed as {
-        info?: { mint?: string };
-      };
-      return parsed.info?.mint === targetMint;
-    });
-  }
-
-  private async getJupiterOrder(
-    inputMint: string,
-    outputMint: string,
-    amount: bigint,
-    taker?: string,
-    priorityFeeSol = 0,
-    options?: BuyOptions | SellOptions
-  ): Promise<Record<string, unknown>> {
-    const url = new URL(`${this.jupiterSwapBaseUrl}/order`);
-    url.searchParams.set('inputMint', inputMint);
-    url.searchParams.set('outputMint', outputMint);
-    url.searchParams.set('amount', amount.toString());
-    if (taker) {
-      url.searchParams.set('taker', taker);
-    }
-    const priorityFeeLamports = Math.round(priorityFeeSol * 1_000_000_000);
-    if (priorityFeeLamports > 0) {
-      url.searchParams.set('priorityFeeLamports', String(priorityFeeLamports));
-      url.searchParams.set('broadcastFeeType', 'exactFee');
-    }
-    const slippageBps = this.toJupiterSlippageBps(options);
-    if (slippageBps !== null) {
-      url.searchParams.set('slippageBps', String(slippageBps));
-    }
-    return this.fetchJupiterJson(url.toString(), 'GET');
-  }
-
-  private async getJupiterOrderWithRetry(
-    inputMint: string,
-    outputMint: string,
-    amount: bigint,
-    taker?: string,
-    priorityFeeSol = 0,
-    options?: BuyOptions | SellOptions
-  ): Promise<Record<string, unknown>> {
-    let lastError: unknown = null;
-    for (let attempt = 0; attempt <= JUPITER_ORDER_RETRIES; attempt++) {
-      try {
-        return await this.getJupiterOrder(inputMint, outputMint, amount, taker, priorityFeeSol, options);
-      } catch (err) {
-        lastError = err;
-        if (attempt >= JUPITER_ORDER_RETRIES || !this.isRetryableJupiterError(err)) {
-          break;
-        }
-        const delay = BASE_RETRY_MS * 2 ** attempt;
-        log.warn('Jupiter order failed; retrying', {
-          inputMint,
-          outputMint,
-          attempt: attempt + 1,
-          retryInMs: delay,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        await sleep(delay);
-      }
-    }
-    throw lastError;
-  }
-
-  private isRetryableJupiterError(err: unknown): boolean {
-    const message = err instanceof Error ? err.message : String(err);
-    return message.includes('Failed to get quotes')
-      || message.includes('timeout')
-      || message.includes('HTTP 429')
-      || message.includes('HTTP 500')
-      || message.includes('HTTP 502')
-      || message.includes('HTTP 503')
-      || message.includes('HTTP 504');
-  }
-
-  private isRetryableJupiterExecuteError(message: string): boolean {
-    const lower = message.toLowerCase();
-    return lower.includes('slippage tolerance exceeded')
-      || lower.includes('blockhash')
-      || lower.includes('expired')
-      || lower.includes('simulation')
-      || lower.includes('timeout')
-      || lower.includes('failed to get quotes');
-  }
-
-  private toJupiterSlippageBps(options?: BuyOptions | SellOptions): number | null {
-    if (!options || options.autoSlippage) return null;
-    const bps = Math.round(options.slippage * 10_000);
-    return Math.max(1, Math.min(10_000, bps));
-  }
-
-  private async executeJupiterOrder(
-    signedTransaction: string,
-    requestId: string
-  ): Promise<Record<string, unknown>> {
-    return this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/execute`, 'POST', {
-      signedTransaction,
-      requestId,
-    });
-  }
-
-  private async fetchJupiterJson(
-    url: string,
-    method: 'GET' | 'POST',
-    body?: Record<string, unknown>
-  ): Promise<Record<string, unknown>> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-    const headers: Record<string, string> = {
-      Accept: 'application/json',
-      'User-Agent': 'gmgn-monitor/1.0',
-    };
-    if (method === 'POST') {
-      headers['Content-Type'] = 'application/json';
-    }
-    headers['x-api-key'] = this.jupiterApiKey;
-
-    try {
-      const resp = await fetch(url, {
-        method,
-        headers,
-        body: body ? JSON.stringify(body) : undefined,
-        signal: controller.signal,
-      });
-      const text = await resp.text();
-      const json = text.trim() ? JSON.parse(text) as Record<string, unknown> : {};
-
-      if (!resp.ok) {
-        const message = this.asString(json.error)
-          ?? this.asString(json.message)
-          ?? this.asString(json.errorMessage)
-          ?? `HTTP ${resp.status}`;
-        throw new Error(`Jupiter Swap V2 ${method} failed: ${message}`);
-      }
-
-      return json;
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        throw new Error(`Jupiter Swap V2 ${method} timeout after ${REQUEST_TIMEOUT}ms`);
-      }
-      throw err;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  private async fetchDirect(mint: string): Promise<FetchResult> {
-    const endpoints = ['v1/token/security', 'v1/token/info'];
-    let firstSuccess: FetchResult | null = null;
-    let lastError = '';
-
-    for (const endpoint of endpoints) {
-      const result = await this.fetchWithRetry(endpoint, mint);
-
-      if (result.success) {
-        firstSuccess ??= result;
-        if (this.hasDecisionData(result.metrics)) return result;
-        continue;
-      }
-
-      lastError = result.error;
-
-      if (result.retryAfterMs !== undefined || result.nonRetryable) {
-        return result;
-      }
-    }
-
-    if (firstSuccess?.success) return firstSuccess;
-    return { success: false, error: lastError || 'GMGN direct endpoints failed' };
-  }
-
-  async fetchTokenSecurity(mint: string): Promise<any> {
-    try {
-      this.validateSolAddress(mint, 'mint');
-      const stdout = await this.execGmgnCliWithRetry([
-        'token',
-        'security',
-        '--chain',
-        this.chain,
-        '--address',
-        mint,
-        '--raw',
-      ]);
-      return this.parseCliJson(stdout);
-    } catch (err: unknown) {
-      log.error(`Failed to fetch token security via CLI after retries`, err);
-      return null;
-    }
-  }
-
   // ── Public: fetch top profitable traders for a token ──────────────────────
 
-  async fetchTokenTraders(mint: string, limit: number = 5, orderBy: string = 'profit'): Promise<any> {
+  async fetchTokenTraders(
+    mint: string,
+    limit: number = 50,
+    orderBy: 'profit' | 'profit_change' | 'last_active' = 'profit'
+  ): Promise<any> {
+    this.validateSolAddress(mint, 'mint');
+    
     try {
-      this.validateSolAddress(mint, 'mint');
-      const stdout = await this.execGmgnCliWithRetry([
-        'token',
-        'traders',
-        '--chain',
-        this.chain,
-        '--address',
-        mint,
-        '--order-by',
-        orderBy,
-        '--limit',
-        String(limit),
-      ]);
-      return this.parseCliJson(stdout);
-    } catch (err: unknown) {
-      log.error(`Failed to fetch token traders via CLI after retries`, err);
+      const endpoint = `v1/token/traders/sol/${mint}?limit=${limit}&tag=all&orderby=${orderBy}&direction=desc`;
+      const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
+      return data;
+    } catch (err) {
+      log.error(`Failed to fetch token traders via GMGN API for ${mint}`, err);
       return null;
     }
   }
 
-  private async execGmgnCliWithRetry(args: string[], maxRetries = 3): Promise<string> {
-    let lastError: unknown = null;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        return await this.execGmgnCli(args);
-      } catch (err) {
-        lastError = err;
-        if (attempt < maxRetries) {
-          const delay = BASE_RETRY_MS * attempt;
-          log.warn(`GMGN CLI attempt ${attempt} failed, retrying in ${delay}ms...`, {
-            args: args.slice(0, 2).join(' '),
-            error: err instanceof Error ? err.message : String(err)
-          });
-          await sleep(delay);
-        }
-      }
-    }
-    throw lastError;
-  }
-
-  // ── Internal: fetch with retry ────────────────────────────────────────────
-
-  private async fetchWithRetry(
-    endpoint: string,
-    mint: string
-  ): Promise<FetchResult> {
-    let lastError = '';
-
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (attempt > 0) {
-        const delay = BASE_RETRY_MS * 2 ** (attempt - 1);
-        log.debug(`Retry ${attempt}/${MAX_RETRIES} for ${mint} in ${delay}ms`);
-        await sleep(delay);
-      }
-
-      const result = await this.limiter.schedule(() =>
-        this.doRequest(endpoint, mint)
-      );
-
-      if (result.success) {
-        this.limiter.onSuccess(this.baselineMinTime);
-        return result;
-      }
-
-      lastError = result.error;
-
-      // 429 / blocked → activate backoff but don't retry here.
-      if (result.retryAfterMs !== undefined) {
-        this.limiter.onRateLimited(result.retryAfterMs);
-        return result;
-      }
-
-      if (result.nonRetryable) return result;
-    }
-
-    return { success: false, error: lastError };
-  }
-
-  // ── Internal: single HTTP request ─────────────────────────────────────────
-
-  private async doRequest(
-    endpoint: string,
-    mint: string
-  ): Promise<FetchResult> {
-    const url = `${this.baseUrl}/${endpoint}?chain=${this.chain}&address=${mint}`;
-
-    log.debug(`GET ${url}`);
-
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-
-      const resp = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'X-API-KEY': this.apiKey,
-          Accept: 'application/json',
-          'User-Agent': 'gmgn-monitor/1.0',
-        },
-        signal: controller.signal,
-      });
-
-      clearTimeout(timer);
-
-      // ── 429 Too Many Requests ─────────────────────────────────────────────
-      if (resp.status === 429) {
-        const retryMs = this.getRetryDelayMs(resp) ?? BLOCKED_RETRY_MS;
-        return {
-          success: false,
-          error: 'Rate limited (429)',
-          retryAfterMs: retryMs,
-        };
-      }
-
-      // ── Other HTTP errors ─────────────────────────────────────────────────
-      if (!resp.ok) {
-        const body = await resp.text().catch(() => '');
-        const isHtml = body.trimStart().startsWith('<');
-        const error = isHtml
-          ? `HTTP ${resp.status}: non-JSON response from GMGN host`
-          : `HTTP ${resp.status}`;
-        log.warn(`${error} from ${endpoint}`, { body: body.slice(0, 200) });
-
-        return {
-          success: false,
-          error,
-          retryAfterMs: resp.status === 403 ? BLOCKED_RETRY_MS : undefined,
-          nonRetryable: resp.status >= 400 && resp.status < 500,
-        };
-      }
-
-      // ── Parse JSON ────────────────────────────────────────────────────────
-      const json = (await resp.json()) as GmgnSecurityResponse;
-
-      if (json.code !== undefined && json.code !== 0) {
-        return { success: false, error: `GMGN error: ${json.msg}` };
-      }
-
-      const data = this.unwrapResponseData(json);
-      if (!data) {
-        return { success: false, error: 'Empty data payload' };
-      }
-
-      return { success: true, metrics: this.parseMetrics(mint, data), raw: data };
-
-    } catch (err: unknown) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        return { success: false, error: `Request timeout after ${REQUEST_TIMEOUT}ms` };
-      }
-      return { success: false, error: String(err) };
-    }
-  }
+  // ── Internal: raw data fetching ───────────────────────────────────────────
 
   private async fetchRawTokenData(
     endpoint: string,
@@ -850,225 +189,7 @@ export class GmgnClient {
     }
   }
 
-  private async fetchWithCli(mint: string): Promise<FetchResult> {
-    const commands = ['info'];
-    let firstSuccess: FetchResult | null = null;
-    let lastError = '';
-
-    for (const command of commands) {
-      const result = await this.limiter.schedule(() =>
-        this.doCliRequest(command, mint)
-      );
-
-      if (result.success) {
-        this.limiter.onSuccess(this.baselineMinTime);
-        firstSuccess ??= result;
-        if (this.hasDecisionData(result.metrics)) return result;
-        continue;
-      }
-
-      lastError = result.error;
-    }
-
-    if (firstSuccess?.success) return firstSuccess;
-    return { success: false, error: lastError || 'GMGN CLI endpoints failed' };
-  }
-
-  private hasBundlerData(metrics: BundlerMetrics): boolean {
-    return metrics.bundlersPercent !== null || metrics.bundlersCount !== null;
-  }
-
-  private hasDecisionData(metrics: BundlerMetrics): boolean {
-    return this.hasBundlerData(metrics) && metrics.initialBaseReserve !== null;
-  }
-
-  private async doCliRequest(command: string, mint: string): Promise<FetchResult> {
-    try {
-      this.validateSolAddress(mint, 'mint');
-    } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) };
-    }
-
-    log.debug(`gmgn-cli token ${command} ${mint}`);
-
-    try {
-      const stdout = await this.execGmgnCliWithRetry([
-        'token',
-        command,
-        '--chain',
-        this.chain,
-        '--address',
-        mint,
-        '--raw',
-      ]);
-
-      const data = this.parseCliJson(stdout);
-      return { success: true, metrics: this.parseMetrics(mint, data) };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return { success: false, error: `gmgn-cli ${command} failed: ${message}` };
-    }
-  }
-
-  private validateSolAddress(value: string, label: string): void {
-    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
-      throw new Error(`Invalid ${label} for gmgn-cli: ${value}`);
-    }
-  }
-
-  private parseCliJson(stdout: string): Record<string, unknown> {
-    const jsonStart = stdout.indexOf('{');
-    if (jsonStart === -1) {
-      throw new Error('gmgn-cli returned no JSON');
-    }
-    return JSON.parse(stdout.slice(jsonStart)) as Record<string, unknown>;
-  }
-
-  private parseJupiterSellResult(
-    order: Record<string, unknown>,
-    execute: Record<string, unknown>,
-    mint: string,
-    soldPercent: number
-  ): SellResult {
-    const status = this.normalizeJupiterStatus(this.asString(execute.status));
-    return {
-      orderId: this.asString(order.requestId),
-      hash: this.asString(execute.signature),
-      status,
-      inputToken: this.asString(order.inputMint) ?? mint,
-      outputToken: this.asString(order.outputMint) ?? SOL_MINT,
-      soldPercent,
-      filledInputAmount:
-        this.asString(execute.inputAmountResult) ??
-        this.asString(execute.totalInputAmount) ??
-        this.asString(order.inAmount),
-      filledOutputAmount:
-        this.asString(execute.outputAmountResult) ??
-        this.asString(execute.totalOutputAmount) ??
-        this.asString(order.outAmount),
-      raw: { order, execute },
-    };
-  }
-
-  private normalizeJupiterStatus(status: string | null): string {
-    if (!status) return 'unknown';
-    if (status.toLowerCase() === 'success') return 'confirmed';
-    if (status.toLowerCase() === 'failed') return 'failed';
-    return status.toLowerCase();
-  }
-
-  private asString(value: unknown): string | null {
-    if (typeof value === 'string' && value.trim() !== '') return value;
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-    return null;
-  }
-
-  private execGmgnCli(args: string[]): Promise<string> {
-    const env = getSpawnEnv();
-    const localBin = `${process.cwd()}/node_modules/.bin`;
-    const pathKey = Object.keys(env).find((key) => key.toLowerCase() === 'path') ?? 'PATH';
-    env[pathKey] = env[pathKey] ? `${localBin}${path.delimiter}${env[pathKey]}` : localBin;
-
-    return new Promise((resolve, reject) => {
-      execFile('gmgn-cli', args, {
-        timeout: REQUEST_TIMEOUT,
-        maxBuffer: 1024 * 1024,
-        env,
-        windowsHide: true,
-      }, (err, stdout, stderr) => {
-        if (err) {
-          const detail = stderr.trim() || err.message;
-          log.error(`GMGN CLI process error`, {
-            args: args.join(' '),
-            code: err.code,
-            signal: err.signal,
-            stderr: stderr.trim(),
-            stdout: stdout.trim().slice(0, 200),
-          });
-          reject(new Error(detail));
-          return;
-        }
-        resolve(stdout);
-      });
-    });
-  }
-
-  private getRetryDelayMs(resp: Response): number | undefined {
-    const retryAfter = resp.headers.get('Retry-After');
-    if (retryAfter) {
-      const seconds = parseInt(retryAfter, 10);
-      if (!Number.isNaN(seconds) && seconds > 0) return seconds * 1_000;
-    }
-
-    const reset = resp.headers.get('X-RateLimit-Reset');
-    if (reset) {
-      const resetSeconds = parseInt(reset, 10);
-      if (!Number.isNaN(resetSeconds) && resetSeconds > 0) {
-        return Math.max(resetSeconds * 1_000 - Date.now(), 1_000);
-      }
-    }
-
-    return undefined;
-  }
-
-  // ── Internal: extract bundler fields from raw API response ────────────────
-
-  private unwrapResponseData(json: GmgnSecurityResponse): Record<string, unknown> {
-    return (json.data ?? json) as Record<string, unknown>;
-  }
-
-  private parseMetrics(
-    mint: string,
-    d: Record<string, unknown>
-  ): BundlerMetrics {
-    const stat = this.asRecord(d.stat);
-    const dev = this.asRecord(d.dev);
-    const walletTagsStat = this.asRecord(d.wallet_tags_stat);
-    const pool = this.asRecord(d.pool);
-
-    // GMGN token info exposes this as a 0-1 fraction under stat.
-    const rawRate = this.parseNullableNumber(
-      stat.top_bundler_trader_percentage ??
-      d.top_bundler_trader_percentage ??
-      d.bundler_trader_amount_rate ??
-      d.bundled_amount_rate
-    );
-    const bundlersPercent =
-      rawRate !== null ? parseFloat((rawRate * 100).toFixed(4)) : null;
-
-    const bundlersCount = this.parseNullableNumber(
-      walletTagsStat.bundler_wallets ??
-      d.bundler_wallets ??
-      d.bundle_num ??
-      d.bundler_count
-    );
-    const initialBaseReserve = this.parseNullableNumber(
-      this.isAmmPool(pool.exchange) ? pool.initial_base_reserve : null
-    );
-    const topWallets = this.parseNullableNumber(
-      walletTagsStat.top_wallets ??
-      d.top_wallets
-    );
-    const top10HolderRateRaw = this.parseNullableNumber(
-      stat.top_10_holder_rate ??
-      dev.top_10_holder_rate ??
-      d.top_10_holder_rate
-    );
-    const top10HolderRate =
-      top10HolderRateRaw !== null ? parseFloat((top10HolderRateRaw * 100).toFixed(4)) : null;
-
-    return {
-      mint,
-      timestamp: new Date().toISOString(),
-      bundlersPercent,
-      bundlersCount: bundlersCount !== null ? Math.round(bundlersCount) : null,
-      initialBaseReserve,
-      topWallets: topWallets !== null ? Math.round(topWallets) : null,
-      top10HolderRate,
-      bundledAmountRate: rawRate,
-      rawData: JSON.stringify(d),
-    };
-  }
+  // ── Internal: extract MC from raw data ────────────────────────────────────
 
   private extractMarketCapUsd(data: Record<string, unknown>): number | null {
     const candidates = [
@@ -1096,31 +217,160 @@ export class GmgnClient {
 
     if (price !== null && supply !== null) {
       const calculatedMc = price * supply;
-      if (calculatedMc >= 0) {
-        log.debug('Calculated market cap from price and supply', { price, supply, calculatedMc });
-        return calculatedMc;
-      }
+      if (calculatedMc >= 0) return calculatedMc;
     }
 
     return null;
+  }
+
+  // ── Public: Swaps & Quotes (Jupiter) ──────────────────────────────────────
+
+  async quoteTokenSellForSol(
+    walletAddress: string,
+    mint: string,
+    percent: number
+  ): Promise<SellQuote> {
+    const balance = await this.getTokenBalance(walletAddress, mint);
+    if (balance === 0n) throw new Error(`No token balance found for ${mint}`);
+
+    const amount = (balance * BigInt(Math.round(percent))) / 100n;
+    const url = `${this.jupiterSwapBaseUrl}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=50`;
+    
+    const json = await this.fetchJupiterJson(url, 'GET');
+    return {
+      inputToken: mint,
+      outputToken: SOL_MINT,
+      soldPercent: percent,
+      inputAmount: String(amount),
+      outputAmount: String(json.outAmount),
+      estimatedOutputSol: Number(json.outAmount) / 1e9,
+      raw: json,
+    };
+  }
+
+  async buyTokenWithSol(
+    walletAddress: string,
+    mint: string,
+    options: BuyOptions
+  ): Promise<SellResult> {
+    const amountLamports = Math.round(options.solAmount * 1e9);
+    const slippageBps = this.toJupiterSlippageBps(options);
+    
+    const quoteUrl = `${this.jupiterSwapBaseUrl}/quote?inputMint=${SOL_MINT}&outputMint=${mint}&amount=${amountLamports}${slippageBps ? `&slippageBps=${slippageBps}` : ''}`;
+    const quote = await this.fetchJupiterJson(quoteUrl, 'GET');
+
+    const swapResp = await this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/swap`, 'POST', {
+      quoteResponse: quote,
+      userPublicKey: walletAddress,
+      wrapAndUnwrapSol: true,
+    });
+
+    const execute = await this.executeJupiterOrder(swapResp.swapTransaction as string, (quote as any).requestId as string);
+    return this.parseJupiterSellResult(quote, execute, mint, 100);
+  }
+
+  async sellTokenForSol(
+    walletAddress: string,
+    mint: string,
+    options: SellOptions
+  ): Promise<SellResult> {
+    const quote = await this.quoteTokenSellForSol(walletAddress, mint, options.percent);
+    const swapResp = await this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/swap`, 'POST', {
+      quoteResponse: quote.raw,
+      userPublicKey: walletAddress,
+      wrapAndUnwrapSol: true,
+    });
+
+    const execute = await this.executeJupiterOrder(swapResp.swapTransaction as string, (quote.raw as any).requestId);
+    return this.parseJupiterSellResult(quote.raw as any, execute, mint, options.percent);
+  }
+
+  // ── Jupiter Helpers ───────────────────────────────────────────────────────
+
+  private async executeJupiterOrder(signedTransaction: string, requestId: string): Promise<Record<string, unknown>> {
+    return this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/execute`, 'POST', { signedTransaction, requestId });
+  }
+
+  private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    const headers: Record<string, string> = { 
+      'Accept': 'application/json',
+      'x-api-key': this.jupiterApiKey 
+    };
+    if (method === 'POST') headers['Content-Type'] = 'application/json';
+
+    try {
+      const resp = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal });
+      const json = await resp.json() as Record<string, unknown>;
+      if (!resp.ok) throw new Error(`Jupiter API failed: ${resp.status}`);
+      return json;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private parseJupiterSellResult(order: Record<string, unknown>, execute: Record<string, unknown>, mint: string, soldPercent: number): SellResult {
+    const orderAny = order as any;
+    const executeAny = execute as any;
+    return {
+      orderId: String(orderAny.requestId),
+      hash: String(executeAny.signature),
+      status: this.normalizeJupiterStatus(String(executeAny.status)),
+      inputToken: mint,
+      outputToken: SOL_MINT,
+      soldPercent,
+      filledInputAmount: String(executeAny.inputAmountResult || orderAny.inAmount),
+      filledOutputAmount: String(executeAny.outputAmountResult || orderAny.outAmount),
+      raw: { order, execute }
+    };
+  }
+
+  private normalizeJupiterStatus(status: string): string {
+    return status.toLowerCase() === 'success' ? 'confirmed' : status.toLowerCase();
+  }
+
+  private toJupiterSlippageBps(options: BuyOptions | SellOptions): number | null {
+    if (options.autoSlippage) return null;
+    return Math.round(options.slippage * 10_000);
+  }
+
+  // ── Utils ─────────────────────────────────────────────────────────────────
+
+  async getParsedTokenAccountsForMint(owner: PublicKey, mint: PublicKey) {
+    const { value } = await this.connection.getParsedTokenAccountsByOwner(owner, { mint });
+    return value;
+  }
+
+  private async getTokenBalance(wallet: string, mint: string): Promise<bigint> {
+    const pubkey = new PublicKey(wallet);
+    const mintPubkey = new PublicKey(mint);
+    const accounts = await this.connection.getParsedTokenAccountsByOwner(pubkey, { mint: mintPubkey });
+    if (accounts.value.length === 0) return 0n;
+    return BigInt(accounts.value[0].account.data.parsed.info.tokenAmount.amount);
+  }
+
+  private validateSolAddress(value: string, label: string): void {
+    if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
+      throw new Error(`Invalid ${label}: ${value}`);
+    }
+  }
+
+  private unwrapResponseData(json: any): Record<string, unknown> {
+    return (json.data ?? json) as Record<string, unknown>;
+  }
+
+  private getRetryDelayMs(resp: Response): number | undefined {
+    const retryAfter = resp.headers.get('Retry-After');
+    return retryAfter ? parseInt(retryAfter, 10) * 1000 : undefined;
   }
 
   private asRecord(value: unknown): Record<string, unknown> {
-    return value && typeof value === 'object'
-      ? value as Record<string, unknown>
-      : {};
+    return (value && typeof value === 'object') ? value as Record<string, unknown> : {};
   }
 
   private parseNullableNumber(value: unknown): number | null {
-    if (typeof value === 'number' && Number.isFinite(value)) return value;
-    if (typeof value === 'string' && value.trim() !== '') {
-      const n = Number(value);
-      return Number.isFinite(n) ? n : null;
-    }
-    return null;
-  }
-
-  private isAmmPool(exchange: unknown): boolean {
-    return typeof exchange === 'string' && exchange.toLowerCase().includes('amm');
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
   }
 }
