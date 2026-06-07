@@ -58,6 +58,7 @@ export class GmgnClient {
   private readonly limiter: RateLimiter;
   private readonly baselineMinTime: number;
   private readonly fetchMode: 'auto' | 'direct' | 'cli';
+  private readonly tradingKeypair: Keypair | null = null;
 
   constructor(config: ServiceConfig, limiter: RateLimiter, rpcUrlOverride?: string) {
     this.baseUrl          = config.gmgnApiBaseUrl.replace(/\/$/, '');
@@ -69,6 +70,20 @@ export class GmgnClient {
     this.limiter          = limiter;
     this.baselineMinTime  = config.rateLimitMinTime;
     this.fetchMode        = config.gmgnFetchMode;
+
+    const jupPrivKey = process.env.JUPITER_PRIVATE_KEY;
+    if (jupPrivKey) {
+      try {
+        if (jupPrivKey.startsWith('[')) {
+          this.tradingKeypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(jupPrivKey)));
+        } else {
+          this.tradingKeypair = Keypair.fromSecretKey(bs58.decode(jupPrivKey));
+        }
+        log.info(`Trading keypair loaded for ${this.tradingKeypair.publicKey.toBase58()}`);
+      } catch (err) {
+        log.error('Failed to load JUPITER_PRIVATE_KEY', err);
+      }
+    }
   }
 
   // ── Public: fetch Market Cap (Primary: GMGN API, Secondary: Jupiter + RPC) ──
@@ -401,26 +416,36 @@ export class GmgnClient {
     const amountLamports = Math.round(options.solAmount * 1e9);
     const slippageBps = this.toJupiterSlippageBps(options);
     
+    // 1. GET QUOTE
     let quoteUrl = `${this.jupiterSwapBaseUrl}/quote?inputMint=${SOL_MINT}&outputMint=${mint}&amount=${amountLamports}&onlyDirectRoutes=false`;
-    if (slippageBps !== null) {
-      quoteUrl += `&slippageBps=${slippageBps}`;
-    }
+    if (slippageBps !== null) quoteUrl += `&slippageBps=${slippageBps}`;
     
     const quote = await this.fetchJupiterJson(quoteUrl, 'GET');
 
+    // 2. GET SWAP TRANSACTION
     const swapResp = await this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/swap`, 'POST', {
       quoteResponse: quote,
       userPublicKey: walletAddress,
-      taker: walletAddress, // Jupiter V6 requires 'taker' instead of just userPublicKey
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: 100_000, // Exact fee: ~$0.0001 (100,000 lamports)
+      prioritizationFeeLamports: 100_000, 
       dynamicSlippage: options.autoSlippage ? true : false,
     });
 
-    const requestId = (quote as any).requestId;
-    const execute = await this.executeJupiterOrder(swapResp.swapTransaction as string, requestId as string);
-    return this.parseJupiterSellResult(quote, execute, mint, 100);
+    // 3. EXECUTE
+    const signature = await this.executeSwapTransaction(swapResp.swapTransaction as string);
+    
+    return {
+      orderId: String(quote.requestId || 'jupiter-v6'),
+      hash: signature,
+      status: 'confirmed',
+      inputToken: mint,
+      outputToken: SOL_MINT,
+      soldPercent: 100,
+      filledInputAmount: String(quote.inAmount),
+      filledOutputAmount: String(quote.outAmount),
+      raw: { quote, swap: swapResp }
+    };
   }
 
   async sellTokenForSol(
@@ -428,26 +453,94 @@ export class GmgnClient {
     mint: string,
     options: SellOptions
   ): Promise<SellResult> {
-    const quote = await this.quoteTokenSellForSol(walletAddress, mint, options.percent);
+    const balance = await this.getTokenBalance(walletAddress, mint);
+    if (balance === 0n) throw new Error(`No token balance found for ${mint}`);
+
+    const amount = (balance * BigInt(Math.round(options.percent))) / 100n;
+    const slippageBps = this.toJupiterSlippageBps(options);
+
+    // 1. GET QUOTE
+    let quoteUrl = `${this.jupiterSwapBaseUrl}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amount}&slippageBps=${slippageBps || 50}`;
+    const quote = await this.fetchJupiterJson(quoteUrl, 'GET');
+
+    // 2. GET SWAP TRANSACTION
     const swapResp = await this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/swap`, 'POST', {
-      quoteResponse: quote.raw,
+      quoteResponse: quote,
       userPublicKey: walletAddress,
-      taker: walletAddress,
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
       prioritizationFeeLamports: 100_000,
       dynamicSlippage: options.autoSlippage ? true : false,
     });
 
-    const requestId = (quote.raw as any).requestId;
-    const execute = await this.executeJupiterOrder(swapResp.swapTransaction as string, requestId as string);
-    return this.parseJupiterSellResult(quote.raw as any, execute, mint, options.percent);
+    // 3. EXECUTE
+    const signature = await this.executeSwapTransaction(swapResp.swapTransaction as string);
+
+    return {
+      orderId: String(quote.requestId || 'jupiter-v6'),
+      hash: signature,
+      status: 'confirmed',
+      inputToken: mint,
+      outputToken: SOL_MINT,
+      soldPercent: options.percent,
+      filledInputAmount: String(quote.inAmount),
+      filledOutputAmount: String(quote.outAmount),
+      raw: { quote, swap: swapResp }
+    };
   }
 
   // ── Jupiter Helpers ───────────────────────────────────────────────────────
 
+  /**
+   * Modern Jupiter V6 Swap Execution
+   * In V6, the 'swap' endpoint returns the base64 transaction which we must sign and broadcast.
+   * However, if using the /execute endpoint, it expects the signed transaction and requestId.
+   * Given the previous errors, we will use a more robust direct broadcast approach if needed, 
+   * but first let's ensure we match the /swap and /execute interface correctly.
+   */
+  private async executeSwapTransaction(swapTransactionBase64: string): Promise<string> {
+    if (!this.tradingKeypair) {
+      throw new Error('No JUPITER_PRIVATE_KEY configured; cannot sign and execute swap.');
+    }
+
+    try {
+      // 1. Decode the transaction
+      const swapTransactionBuf = Buffer.from(swapTransactionBase64, 'base64');
+      const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+
+      // 2. Sign the transaction
+      transaction.sign([this.tradingKeypair]);
+
+      // 3. Send and Confirm
+      // We use the raw connection here for maximum control
+      const signature = await this.connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: true,
+        maxRetries: 2,
+      });
+
+      log.info(`Transaction submitted: https://solscan.io/tx/${signature}`);
+
+      // Wait for confirmation (optional but recommended for reliability)
+      const latestBlockhash = await this.connection.getLatestBlockhash();
+      await this.connection.confirmTransaction({
+        signature,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      }, 'confirmed');
+
+      log.info(`Transaction confirmed: ${signature}`);
+      return signature;
+    } catch (err) {
+      log.error('Failed to sign/execute swap transaction', err);
+      throw err;
+    }
+  }
+
   private async executeJupiterOrder(signedTransaction: string, requestId: string): Promise<Record<string, unknown>> {
-    return this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/execute`, 'POST', { signedTransaction, requestId });
+    return this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/execute`, 'POST', { 
+      signedTransaction, 
+      requestId 
+    });
   }
 
   private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Record<string, unknown>): Promise<Record<string, unknown>> {
