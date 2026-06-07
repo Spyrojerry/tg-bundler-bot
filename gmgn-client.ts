@@ -10,6 +10,8 @@
 import { createLogger } from './logger';
 import { RateLimiter } from './rate-limiter';
 import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import {
   BundlerMetrics,
   FetchResult,
@@ -21,6 +23,7 @@ import {
   ServiceConfig,
 } from './types';
 
+const execAsync = promisify(exec);
 const bs58 = require('bs58') as { decode(value: string): Buffer };
 
 const log = createLogger('GMGN');
@@ -54,6 +57,7 @@ export class GmgnClient {
   private readonly chain  = 'sol';
   private readonly limiter: RateLimiter;
   private readonly baselineMinTime: number;
+  private readonly fetchMode: 'auto' | 'direct' | 'cli';
 
   constructor(config: ServiceConfig, limiter: RateLimiter, rpcUrlOverride?: string) {
     this.baseUrl          = config.gmgnApiBaseUrl.replace(/\/$/, '');
@@ -64,6 +68,7 @@ export class GmgnClient {
     this.connection       = new Connection(rpcUrlOverride || config.solanaRpcUrl, 'confirmed');
     this.limiter          = limiter;
     this.baselineMinTime  = config.rateLimitMinTime;
+    this.fetchMode        = config.gmgnFetchMode;
   }
 
   // ── Public: fetch Market Cap (Primary: GMGN API, Secondary: Jupiter + RPC) ──
@@ -71,9 +76,10 @@ export class GmgnClient {
   async fetchTokenMarketCapUsd(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, 'mint');
 
-    // 1. PRIMARY: GMGN Web API (v1/token/info)
+    // 1. PRIMARY: GMGN API (v1/token/info)
     try {
       const data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/info', mint));
+
       if (data) {
         const marketCap = this.extractMarketCapUsd(data);
         if (marketCap !== null) {
@@ -142,11 +148,17 @@ export class GmgnClient {
     this.validateSolAddress(mint, 'mint');
     
     try {
+      if (this.fetchMode !== 'direct') {
+        const data = await this.limiter.schedule(() => this.fetchCliData('traders', mint));
+        if (data) return data;
+        log.debug(`GMGN CLI traders returned no data for ${mint}, falling back to API`);
+      }
+      
       const endpoint = `v1/token/traders/sol/${mint}?limit=${limit}&tag=all&orderby=${orderBy}&direction=desc`;
       const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
       return data;
     } catch (err) {
-      log.error(`Failed to fetch token traders via GMGN API for ${mint}`, err);
+      log.error(`Failed to fetch token traders via GMGN ${this.fetchMode.toUpperCase()} for ${mint}`, err);
       return null;
     }
   }
@@ -155,9 +167,17 @@ export class GmgnClient {
     this.validateSolAddress(mint, 'mint');
 
     try {
-      const data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/security', mint));
+      let data: Record<string, unknown> | null = null;
+      if (this.fetchMode !== 'direct') {
+        data = await this.limiter.schedule(() => this.fetchCliData('security', mint));
+      }
+      
       if (!data) {
-        return { success: false, error: 'Empty response or error from GMGN API' };
+        data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/security', mint));
+      }
+
+      if (!data) {
+        return { success: false, error: `Empty response or error from GMGN ${this.fetchMode.toUpperCase()}` };
       }
 
       const metrics: BundlerMetrics = {
@@ -185,11 +205,28 @@ export class GmgnClient {
 
   // ── Internal: raw data fetching ───────────────────────────────────────────
 
+  private async fetchCliData(
+    type: 'token' | 'traders' | 'security',
+    mint: string
+  ): Promise<Record<string, unknown> | null> {
+    const cmd = `gmgn-cli ${type} ${mint} --raw`;
+    try {
+      const { stdout } = await execAsync(cmd, { timeout: REQUEST_TIMEOUT });
+      const json = JSON.parse(stdout);
+      // CLI --raw usually returns the 'data' field directly if successful
+      return this.unwrapResponseData(json);
+    } catch (err) {
+      log.debug(`GMGN CLI ${type} failed for ${mint}`, { error: String(err) });
+      return null;
+    }
+  }
+
   private async fetchRawTokenData(
     endpoint: string,
     mint: string
   ): Promise<Record<string, unknown> | null> {
-    const url = `${this.baseUrl}/${endpoint}?chain=${this.chain}&address=${mint}`;
+    const separator = endpoint.includes('?') ? '&' : '?';
+    const url = `${this.baseUrl}/${endpoint}${separator}chain=${this.chain}&address=${mint}`;
 
     try {
       const controller = new AbortController();

@@ -1000,8 +1000,14 @@ async function main(): Promise<void> {
     const traders = await client.fetchTokenTraders(mint, 50, 'profit');
 
     if (!traders || !Array.isArray(traders.list)) {
+      log.debug(`[INSIDER DEBUG] fetchTokenTraders returned null or non-array list for ${mint}`, { 
+        tradersNull: !traders,
+        listType: traders ? typeof traders.list : 'n/a'
+      });
       return { maxTransferProfit: -1, tradersListStr: '', logTraders: [], profitLabel: '', profitType };
     }
+
+    log.debug(`[INSIDER DEBUG] Fetched ${traders.list.length} traders for ${mint}`);
 
     const formatTraders = (list: any[], type: 'realized' | 'total') => {
       const fullSorted = [...list].sort((a, b) => {
@@ -1011,6 +1017,8 @@ async function main(): Promise<void> {
       });
 
       let maxTP = -1;
+      let transferFoundCount = 0;
+
       for (const t of fullSorted) {
         const hasTransfer = t.token_transfer_in?.tx_hash || 
                             t.token_transfer?.type === 'transfer_in' || 
@@ -1022,10 +1030,14 @@ async function main(): Promise<void> {
                             ));
         const profit = type === 'realized' ? (t.realized_profit ?? 0) : (t.profit ?? 0);
         
-        if (hasTransfer && profit > maxTP) {
-          maxTP = profit;
+        if (hasTransfer) {
+          transferFoundCount++;
+          if (profit > maxTP) maxTP = profit;
         }
       }
+
+      log.debug(`[INSIDER DEBUG] ${type} list: found ${transferFoundCount} transfer wallets. Max profit: ${maxTP}`);
+
 
       const topLimit = fullSorted.slice(0, limit);
       const formatted = topLimit.map((t: any, i: number) => {
