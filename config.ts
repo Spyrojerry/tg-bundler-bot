@@ -80,7 +80,7 @@ export function loadConfig(): ServiceConfig {
   const solanaWsUrl      = optional('SOLANA_WS_URL', deriveWsUrl(solanaRpcUrl));
   const gmgnApiBaseUrl   = optional('GMGN_API_BASE_URL', 'https://gmgn.ai');
   const gmgnFetchMode    = optional('GMGN_FETCH_MODE', 'cli');
-  const jupiterSwapBaseUrl = optional('JUPITER_SWAP_BASE_URL', 'https://quote-api.jup.ag/v6');
+  const jupiterSwapBaseUrl = optional('JUPITER_SWAP_BASE_URL', 'https://api.jup.ag/swap/v1');
   const jupiterApiKey    = required('JUPITER_API_KEY');
   const jupiterPriceApiKey = optional('JUPITER_PRICE_API_KEY', jupiterApiKey);
   const heliusApiKey     = optional('HELIUS_API_KEY', '');

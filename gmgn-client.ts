@@ -411,9 +411,10 @@ export class GmgnClient {
     const swapResp = await this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/swap`, 'POST', {
       quoteResponse: quote,
       userPublicKey: walletAddress,
+      taker: walletAddress, // Jupiter V6 requires 'taker' instead of just userPublicKey
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: options.priorityFeeSol ? Math.round(options.priorityFeeSol * 1e9) : 0,
+      prioritizationFeeLamports: 100_000, // Exact fee: ~$0.0001 (100,000 lamports)
       dynamicSlippage: options.autoSlippage ? true : false,
     });
 
@@ -431,9 +432,10 @@ export class GmgnClient {
     const swapResp = await this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/swap`, 'POST', {
       quoteResponse: quote.raw,
       userPublicKey: walletAddress,
+      taker: walletAddress,
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: options.priorityFeeSol ? Math.round(options.priorityFeeSol * 1e9) : 0,
+      prioritizationFeeLamports: 100_000,
       dynamicSlippage: options.autoSlippage ? true : false,
     });
 
