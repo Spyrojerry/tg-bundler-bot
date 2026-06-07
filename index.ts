@@ -677,12 +677,30 @@ async function main(): Promise<void> {
                 priorityFeeSol: config.sellPriorityFeeSol,
               }
             );
+
+            // Fetch actual MC after purchase for accurate tracking
+            let actualEntryMc = trigger.entryMc;
+            try {
+              const freshMc = await client.fetchTokenMarketCapUsd(trigger.mint);
+              if (freshMc !== null) {
+                actualEntryMc = freshMc;
+                bot.setEntryMc(freshMc);
+                // Recalculate Exit MC based on actual entry point
+                const exitPercent = bot.getExitPercent();
+                const newExitMc = freshMc * (1 + exitPercent / 100);
+                bot.setExitMc(newExitMc);
+                log.warn(`[INSIDER ${index + 1} ACTUAL MC] Buy completed. Actual Entry MC: $${freshMc.toLocaleString()}. New Exit MC: $${newExitMc.toLocaleString()}`);
+              }
+            } catch (mcErr) {
+              log.error(`Failed to fetch actual entry MC for ${trigger.mint}`, mcErr);
+            }
+
             bot.markPositionBought(trigger);
 
             await telegramBot?.sendDefault([
               `<b>✅ Insider ${index + 1} Buy Completed</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
-              `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? 'Unknown')}</b>`,
+              `Actual Entry MC: <b>$${html(actualEntryMc?.toLocaleString() ?? 'Unknown')}</b>`,
               `Status: <b>${html(result.status)}</b>`,
               result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
               '',
@@ -894,13 +912,13 @@ async function main(): Promise<void> {
     });
   }
 
-  async function checkAndSellIfLowMcap(mint: string, context: 'insider' | 'bundler' | 'reverse_copysell', botIndex?: number): Promise<void> {
+  async function checkAndSellIfLowMcap(mint: string, context: 'insider' | 'bundler' | 'reverse_copysell', botIndex?: number, preFetchedMc?: number | null): Promise<void> {
     if (!config.tradingWalletAddress) return;
     if (hasPendingSellForMint(config.tradingWalletAddress, mint)) return;
 
     try {
       const client = (context === 'insider' && botIndex !== undefined) ? gmgnClients[botIndex] : gmgnClients[0];
-      const currentMc = await client.fetchTokenMarketCapUsd(mint);
+      const currentMc = preFetchedMc !== undefined ? preFetchedMc : await client.fetchTokenMarketCapUsd(mint);
       if (currentMc !== null && currentMc < INSIDER_MIN_MARKET_CAP_USD) {
         log.warn(`[MCAP SELL TRIGGER] Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}`, { context });
 
@@ -1052,7 +1070,7 @@ async function main(): Promise<void> {
       }
     }
 
-  async function checkInsiderMcapFlow(index: number): Promise<void> {
+  async function checkInsiderMcapFlow(index: number, preFetchedMc?: number | null): Promise<void> {
     const bot = insiderBots[index];
     const client = gmgnClients[index];
     const preBuyMint = bot.getPreBuyMint();
@@ -1066,7 +1084,7 @@ async function main(): Promise<void> {
 
     try {
       // 1. Fetch current Market Cap
-      const currentMc = await client.fetchTokenMarketCapUsd(mint);
+      const currentMc = preFetchedMc !== undefined ? preFetchedMc : await client.fetchTokenMarketCapUsd(mint);
 
       if (currentMc === null) return;
 
@@ -1246,38 +1264,54 @@ async function main(): Promise<void> {
       if (isChecking) return;
       isChecking = true;
       try {
+        const checkPromises: Promise<void>[] = [];
+
         // 1. Insider Mode MC Flow
         if (botMode === 'insider') {
           for (let i = 0; i < insiderBots.length; i++) {
-            await checkInsiderMcapFlow(i);
-            const pos = insiderBots[i].getActivePosition();
-            if (pos) {
-              await checkAndSellIfLowMcap(pos.mint, 'insider', i);
+            const bot = insiderBots[i];
+            const preBuyMint = bot.getPreBuyMint();
+            const activePos = bot.getActivePosition();
+            const mint = preBuyMint || activePos?.mint;
+
+            if (mint) {
+              checkPromises.push((async () => {
+                const client = gmgnClients[i];
+                const currentMc = await client.fetchTokenMarketCapUsd(mint);
+                await checkInsiderMcapFlow(i, currentMc);
+                if (activePos) {
+                  await checkAndSellIfLowMcap(activePos.mint, 'insider', i, currentMc);
+                }
+              })());
             }
           }
         }
 
-        if (!config.tradingWalletAddress) return;
-
-        // 2. Bundler Mode positions
-        if (botMode === 'bundler') {
-          const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
-          if (bundlerPos) {
-            await checkAndSellIfLowMcap(bundlerPos.mint, 'bundler');
+        if (config.tradingWalletAddress) {
+          // 2. Bundler Mode positions
+          if (botMode === 'bundler') {
+            const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
+            if (bundlerPos) {
+              checkPromises.push(checkAndSellIfLowMcap(bundlerPos.mint, 'bundler'));
+            }
+            for (const mint of pendingTradingBuys.keys()) {
+              if (bundlerPos?.mint === mint) continue;
+              checkPromises.push(checkAndSellIfLowMcap(mint, 'bundler'));
+            }
           }
-          for (const mint of pendingTradingBuys.keys()) {
-            if (bundlerPos?.mint === mint) continue;
-            await checkAndSellIfLowMcap(mint, 'bundler');
+
+          // 3. Reverse CopySell positions
+          if (botMode === 'reverse_copysell') {
+            const revPos = reverseCopySellOrchestrator.getActivePosition();
+            if (revPos) {
+              checkPromises.push(checkAndSellIfLowMcap(revPos.mint, 'reverse_copysell'));
+            }
           }
         }
 
-        // 3. Reverse CopySell positions
-        if (botMode === 'reverse_copysell') {
-          const revPos = reverseCopySellOrchestrator.getActivePosition();
-          if (revPos) {
-            await checkAndSellIfLowMcap(revPos.mint, 'reverse_copysell');
-          }
-        }
+        await Promise.all(checkPromises);
+      } catch (err) {
+        log.error('Error in startMarketCapChecker loop', err);
       } finally {
         isChecking = false;
       }
