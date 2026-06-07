@@ -151,6 +151,38 @@ export class GmgnClient {
     }
   }
 
+  async fetchBundlerMetrics(mint: string): Promise<FetchResult> {
+    this.validateSolAddress(mint, 'mint');
+
+    try {
+      const data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/security', mint));
+      if (!data) {
+        return { success: false, error: 'Empty response or error from GMGN API' };
+      }
+
+      const metrics: BundlerMetrics = {
+        mint,
+        timestamp: new Date().toISOString(),
+        bundlersPercent: this.parsePercentage(data.bundler_trader_amount_rate ?? data.bundled_amount_rate),
+        bundlersCount: this.parseNullableNumber(data.bundle_num ?? data.bundler_count),
+        initialBaseReserve: this.parseNullableNumber(data.initial_base_reserve),
+        topWallets: this.parseNullableNumber(data.top_wallets),
+        top10HolderRate: this.parsePercentage(data.top_10_holder_rate),
+        bundledAmountRate: this.parseNullableNumber(data.bundled_amount_rate ?? data.bundler_trader_amount_rate),
+        rawData: JSON.stringify(data),
+      };
+
+      return { success: true, metrics, raw: data };
+    } catch (err) {
+      return { success: false, error: String(err) };
+    }
+  }
+
+  private parsePercentage(value: unknown): number | null {
+    const n = this.parseNullableNumber(value);
+    return n !== null ? n * 100 : null;
+  }
+
   // ── Internal: raw data fetching ───────────────────────────────────────────
 
   private async fetchRawTokenData(

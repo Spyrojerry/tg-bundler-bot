@@ -25,11 +25,8 @@ import {
   SellResult,
   SellQuote,
   TokenExitEvent,
-  WalletFilterSettings,
 } from './types';
-import { HeliusClient, EarlyBundlerInfo } from './helius-client';
-import { BundlerMonitor, BundlerWallet, BundlerTransaction } from './bundler-monitor';
-import { EarlyBundlerOrchestrator, BundlerSellReason } from './early-bundler-orchestrator';
+import { EarlyBundlerOrchestrator } from './early-bundler-orchestrator';
 import { ReverseCopySellOrchestrator } from './reverse-copysell-orchestrator';
 import { InsiderBot } from './insider-bot';
 import { PublicKey } from '@solana/web3.js';
@@ -1481,10 +1478,6 @@ async function main(): Promise<void> {
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
 
-  const fmtSetting = (value: number | null): string =>
-    value === null ? 'Any' : String(value);
-  const enabledMark = (enabled: boolean): string => enabled ? '✅' : '❌';
-
   function updateMinSol(
     walletAddress: string,
     rawValue: string
@@ -1861,22 +1854,6 @@ async function main(): Promise<void> {
         inline_keyboard: [[{ text: 'Back', callback_data: 'menu:refresh' }]],
       },
       editCurrent,
-    };
-  }
-
-  function sellAlertMarkup(sellId: string): InlineKeyboardMarkup {
-    return {
-      inline_keyboard: [
-        [
-          {
-            text: `Sell ${config.sellPercent}% for SOL`,
-            callback_data: `sell:confirm:${sellId}`,
-          },
-        ],
-        [
-          { text: 'Ignore', callback_data: `sell:ignore:${sellId}` },
-        ],
-      ],
     };
   }
 
