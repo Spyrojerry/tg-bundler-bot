@@ -160,6 +160,10 @@ export interface ServiceConfig {
   insiderBuySol: number;
   insiderEntryMc: number;
   insiderExitMc: number;
+  insiderExitPercent: number;
+  insiderMinTransferProfit: number;
+  insiderFollowWallet: string | null;
+  insiderFollowWallet2: string | null;
   reverseCopySellTargetWallet: string | null;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;

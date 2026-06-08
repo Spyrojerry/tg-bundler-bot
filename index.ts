@@ -508,6 +508,16 @@ async function main(): Promise<void> {
   insiderBots.push(new InsiderBot(config, config.insiderSolanaRpcUrl, config.insiderSolanaWsUrl, telegramBot));
   insiderBots.push(new InsiderBot(config, config.insiderSolanaRpcUrl2, config.insiderSolanaWsUrl2, telegramBot));
 
+  // Auto-follow default wallets from config if provided
+  if (config.insiderFollowWallet) {
+    log.info(`[INSIDER 1] Auto-following default wallet: ${config.insiderFollowWallet}`);
+    insiderBots[0].followWallet(config.insiderFollowWallet).catch(err => log.error('[INSIDER 1] Failed to auto-follow default wallet', err));
+  }
+  if (config.insiderFollowWallet2) {
+    log.info(`[INSIDER 2] Auto-following default wallet: ${config.insiderFollowWallet2}`);
+    insiderBots[1].followWallet(config.insiderFollowWallet2).catch(err => log.error('[INSIDER 2] Failed to auto-follow default wallet', err));
+  }
+
   if (telegramBot) {
     telegramBot.start();
   }

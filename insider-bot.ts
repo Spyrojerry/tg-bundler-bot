@@ -95,9 +95,9 @@ export class InsiderBot extends EventEmitter {
   private buySol: number;
   private entryMc: number;
   private exitMc: number;
-  private exitPercent: number = 50;
+  private exitPercent: number;
   private buyDisabled: boolean = false;
-  private minTransferProfit: number = 70;
+  private minTransferProfit: number;
   private profitType: 'realized' | 'total' | 'both' = 'both';
   private followMonitor: WalletMonitor | null = null;
   private watchingMint: string | null = null;
@@ -120,6 +120,8 @@ export class InsiderBot extends EventEmitter {
     this.buySol = config.insiderBuySol;
     this.entryMc = config.insiderEntryMc;
     this.exitMc = config.insiderExitMc;
+    this.exitPercent = config.insiderExitPercent;
+    this.minTransferProfit = config.insiderMinTransferProfit;
     this.connection = new Connection(rpcUrl, {
       commitment: 'processed',
       wsEndpoint: wsUrl,

@@ -121,6 +121,8 @@ export function loadConfig(): ServiceConfig {
     deriveWsUrl(insiderSolanaRpcUrl2)
   );
   const dbPath           = optional('DB_PATH', './data/monitor.db');
+  const insiderFollowWallet = optionalNullable('INSIDER_FOLLOW_WALLET');
+  const insiderFollowWallet2 = optionalNullable('INSIDER_FOLLOW_WALLET_2');
   const reverseCopySellTargetWallet = optionalNullable('REVERSE_COPYSELL_TARGET_WALLET');
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
@@ -140,6 +142,8 @@ export function loadConfig(): ServiceConfig {
   const insiderBuySol          = optionalNumber('INSIDER_BUY_SOL', 0.01);
   const insiderEntryMc         = optionalNumber('INSIDER_ENTRY_MC', 15_000);
   const insiderExitMc          = optionalNumber('INSIDER_EXIT_MC', 30_000);
+  const insiderExitPercent     = optionalNumber('INSIDER_EXIT_PERCENT', 50);
+  const insiderMinTransferProfit = optionalNumber('INSIDER_MIN_TRANSFER_PROFIT', 70);
   const port                   = optionalInt('PORT', 8080);
 
   if (!isValidLogLevel(rawLogLevel)) {
@@ -197,6 +201,10 @@ export function loadConfig(): ServiceConfig {
     insiderBuySol,
     insiderEntryMc,
     insiderExitMc,
+    insiderExitPercent,
+    insiderMinTransferProfit,
+    insiderFollowWallet,
+    insiderFollowWallet2,
     reverseCopySellTargetWallet,
     logLevel: rawLogLevel,
     telegramBotToken,
