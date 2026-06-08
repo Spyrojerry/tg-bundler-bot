@@ -36,7 +36,7 @@ const log = createLogger('MAIN');
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const INSIDER_MIN_MARKET_CAP_USD = 1_000;
-const MCAP_CHECK_INTERVAL_MS = 1500;
+const MCAP_CHECK_INTERVAL_MS = 1000; // Increased frequency from 1500ms to 1000ms
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -100,6 +100,8 @@ async function main(): Promise<void> {
   const insiderCheckState = new Map<string, number>(); // key: "botIndex:mint", value: checkCount
   const pausedWallets = new Set<string>();
   const walletAliasesByChat = new Map<string, string[]>();
+  const traderSummaryCache = new Map<string, { summary: any; timestamp: number }>();
+  const activePositionCache = new Map<string, { balance: bigint; quote: SellQuote | null; timestamp: number }>();
 
   function hasPendingSellForMint(walletAddress: string, mint: string): boolean {
     for (const pending of pendingSells.values()) {
@@ -924,6 +926,21 @@ async function main(): Promise<void> {
       if (currentMc !== null && currentMc < INSIDER_MIN_MARKET_CAP_USD) {
         log.warn(`[MCAP SELL TRIGGER] Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}`, { context });
 
+        // Check Cache for balance first
+        const cached = activePositionCache.get(mint);
+        let balance: bigint | null = cached ? cached.balance : null;
+        
+        if (balance === null && config.tradingWalletAddress) {
+          const owner = new PublicKey(config.tradingWalletAddress);
+          const mintPk = new PublicKey(mint);
+          balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
+        }
+
+        if (balance !== null && balance <= 0n) {
+          log.info(`[MCAP SELL SKIP] No balance found for ${mint}`);
+          return;
+        }
+
         const event: FilterFailEvent = {
           walletAddress: config.tradingWalletAddress,
           mint,
@@ -1115,25 +1132,29 @@ async function main(): Promise<void> {
         ...realized.formatted
       ].join('\n');
 
-      return {
-          maxTransferProfit: Math.max(total.maxTP, realized.maxTP),
-          tradersListStr,
-          logTraders: [...total.logLines, '---', ...realized.logLines],
-          profitLabel: 'Combined (Total/Realized)',
-          profitType,
-        };
-      } else {
-        const result = formatTraders(traders.list, profitType);
-        const label = profitType === 'realized' ? 'Realized' : 'Total';
-        return {
-          maxTransferProfit: result.maxTP,
-          tradersListStr: `<b>Top 5 ${label}-Profitable:</b>\n` + result.formatted.join('\n'),
-          logTraders: result.logLines,
-          profitLabel: `${label} Profit`,
-          profitType,
-        };
-      }
+      const summaryResult = {
+        maxTransferProfit: Math.max(total.maxTP, realized.maxTP),
+        tradersListStr,
+        logTraders: [...total.logLines, '---', ...realized.logLines],
+        profitLabel: 'Combined (Total/Realized)',
+        profitType,
+      };
+      traderSummaryCache.set(mint, { summary: summaryResult, timestamp: Date.now() });
+      return summaryResult;
+    } else {
+      const result = formatTraders(traders.list, profitType);
+      const label = profitType === 'realized' ? 'Realized' : 'Total';
+      const summaryResult = {
+        maxTransferProfit: result.maxTP,
+        tradersListStr: `<b>Top 5 ${label}-Profitable:</b>\n` + result.formatted.join('\n'),
+        logTraders: result.logLines,
+        profitLabel: `${label} Profit`,
+        profitType,
+      };
+      traderSummaryCache.set(mint, { summary: summaryResult, timestamp: Date.now() });
+      return summaryResult;
     }
+  }
 
   async function checkInsiderMcapFlow(index: number, preFetchedMc?: number | null): Promise<void> {
     const bot = insiderBots[index];
@@ -1161,28 +1182,22 @@ async function main(): Promise<void> {
       // 2. IMMEDIATE GLOBAL CHECKS (Rug / Reset)
       if (currentMc < 1000) {
         const reason = `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
-        log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Cleaning up.`);
+        log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Resetting state.`);
 
-        // Check if we somehow have a balance to sell
-        if (config.tradingWalletAddress) {
-          const owner = new PublicKey(config.tradingWalletAddress);
-          const mintPk = new PublicKey(mint);
-          const balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
-          
-          if (balance > 0n) {
-            log.warn(`[INSIDER ${index + 1} RUG SELL] Found balance despite state. Triggering sell.`);
-            bot.emit('sellTrigger', {
-              followedWallet: bot.getFollowedWallet()!,
-              positionMint: mint,
-              signature: 'MC_TRIGGER',
-              reason: `Rug protection (Balance check): ${reason}`,
-            });
-          }
+        // If we have an active position, trigger a sell just in case there's salvageable balance
+        if (activePos) {
+          bot.emit('sellTrigger', {
+            followedWallet: bot.getFollowedWallet()!,
+            positionMint: mint,
+            signature: 'MC_TRIGGER',
+            reason: `Rug protection: ${reason}`,
+          });
         }
         
         bot.clearActivePosition();
         bot.clearPreBuyMint();
         insiderCheckState.delete(checkKey);
+        traderSummaryCache.delete(mint);
         return;
       }
 
@@ -1212,7 +1227,17 @@ async function main(): Promise<void> {
           log.warn(`[INSIDER ${index + 1} FLOW] Token: ${mint} MC: $${currentMc.toLocaleString()} Check: ${nextCount}/2`);
           
           try {
-            const summary = await getTraderSummary(mint, bot, client, 5);
+            // Use Cache for Trader Summary if available and fresh (< 2 mins)
+            let summary: any;
+            const cached = traderSummaryCache.get(mint);
+            if (cached && (Date.now() - cached.timestamp < 120_000)) {
+              summary = cached.summary;
+              log.debug(`[INSIDER ${index + 1} CACHE] Using cached trader summary for ${mint} (Age: ${Math.round((Date.now() - cached.timestamp) / 1000)}s)`);
+            } else {
+              log.info(`[INSIDER ${index + 1} FETCH] No fresh cache for ${mint}. Fetching trader summary now.`);
+              summary = await getTraderSummary(mint, bot, client, 5);
+            }
+
             const { maxTransferProfit, tradersListStr, logTraders, profitLabel, profitType } = summary;
 
             if (maxTransferProfit === -2) {
@@ -1295,6 +1320,7 @@ async function main(): Promise<void> {
 
               if (!bot.isBuyInProgress()) {
                 insiderCheckState.delete(checkKey);
+                traderSummaryCache.delete(mint);
                 if (preBuyMint) {
                   bot.clearPreBuyMint();
                 }
@@ -1314,49 +1340,90 @@ async function main(): Promise<void> {
   }
 
   function startMarketCapChecker(): void {
-    log.info(`Starting periodic market cap checker (interval: ${MCAP_CHECK_INTERVAL_MS}ms)`);
-    let isChecking = false;
-    let loopCount = 0;
+    log.info(`Starting independent market cap checkers (interval: ${MCAP_CHECK_INTERVAL_MS}ms)`);
+
+    // 1. Insider Mode MC Flow (Independent loops per bot)
+    if (botMode === 'insider') {
+      insiderBots.forEach((bot, i) => {
+        let isChecking = false;
+        setInterval(async () => {
+          if (isChecking) return;
+          isChecking = true;
+
+          try {
+            const preBuyMint = bot.getPreBuyMint();
+            const activePos = bot.getActivePosition();
+            
+            // Monitor both pre-buy and active position concurrently if they exist
+            const tasks: Promise<void>[] = [];
+
+            if (preBuyMint) {
+              // Background refresh trader summary if missing or old (> 30s)
+              const cached = traderSummaryCache.get(preBuyMint);
+              if (!cached || (Date.now() - cached.timestamp > 30_000)) {
+                const client = gmgnClients[i];
+                log.debug(`[INSIDER ${i + 1} BACKGROUND] Refreshing trader summary for ${preBuyMint}`);
+                getTraderSummary(preBuyMint, bot, client, 5).catch(e => log.error(`Background trader refresh failed for ${preBuyMint}`, e));
+              }
+
+              tasks.push((async () => {
+                const client = gmgnClients[i];
+                const currentMc = await client.fetchTokenMarketCapUsd(preBuyMint);
+                if (currentMc !== null) {
+                  await checkInsiderMcapFlow(i, currentMc);
+                }
+              })());
+            }
+
+            if (activePos) {
+              // Background refresh balance and quote if missing or old (> 30s)
+              const cached = activePositionCache.get(activePos.mint);
+              if (config.tradingWalletAddress && (!cached || (Date.now() - cached.timestamp > 30_000))) {
+                const client = gmgnClients[i];
+                const owner = new PublicKey(config.tradingWalletAddress);
+                const mintPk = new PublicKey(activePos.mint);
+                
+                log.debug(`[INSIDER ${i + 1} BACKGROUND] Refreshing balance/quote for ${activePos.mint}`);
+                Promise.all([
+                  getTokenRawBalance(owner, mintPk),
+                  client.quoteTokenSellForSol(config.tradingWalletAddress, activePos.mint, 100).catch(() => null)
+                ]).then(([balance, quote]) => {
+                  activePositionCache.set(activePos.mint, { balance, quote, timestamp: Date.now() });
+                }).catch(e => log.error(`Background balance/quote refresh failed for ${activePos.mint}`, e));
+              }
+
+              tasks.push((async () => {
+                const client = gmgnClients[i];
+                const currentMc = await client.fetchTokenMarketCapUsd(activePos.mint);
+                if (currentMc !== null) {
+                  // checkInsiderMcapFlow handles Exit MC and Flow v2 for active positions
+                  await checkInsiderMcapFlow(i, currentMc);
+                  await checkAndSellIfLowMcap(activePos.mint, 'insider', i, currentMc);
+                }
+              })());
+            }
+
+            await Promise.all(tasks);
+          } catch (err) {
+            log.error(`Error in Insider Bot ${i + 1} MC loop`, err);
+          } finally {
+            isChecking = false;
+          }
+        }, MCAP_CHECK_INTERVAL_MS);
+      });
+    }
+
+    // 2. Bundler / Reverse Mode loop
+    let isBundlerChecking = false;
     setInterval(async () => {
-      if (isChecking) return;
-      isChecking = true;
-      loopCount++;
-      if (loopCount % 20 === 0) {
-        log.debug(`[HEARTBEAT] MC checker loop #${loopCount} is alive`);
-      }
+      if (isBundlerChecking) return;
+      isBundlerChecking = true;
 
       try {
         const checkPromises: Promise<void>[] = [];
 
-        // 1. Insider Mode MC Flow
-        if (botMode === 'insider') {
-          for (let i = 0; i < insiderBots.length; i++) {
-            const bot = insiderBots[i];
-            const preBuyMint = bot.getPreBuyMint();
-            const activePos = bot.getActivePosition();
-            const mint = preBuyMint || activePos?.mint;
-
-            if (mint) {
-              log.debug(`[INSIDER ${i + 1} LOOP] Monitoring: ${mint} (Pre-buy: ${!!preBuyMint}, Active: ${!!activePos})`);
-              checkPromises.push((async () => {
-                const client = gmgnClients[i];
-                const currentMc = await client.fetchTokenMarketCapUsd(mint);
-                
-                if (currentMc !== null) {
-                  await checkInsiderMcapFlow(i, currentMc);
-                  if (activePos) {
-                    await checkAndSellIfLowMcap(activePos.mint, 'insider', i, currentMc);
-                  }
-                } else {
-                  log.debug(`[INSIDER ${i + 1} LOOP] MC fetch returned null for ${mint}`);
-                }
-              })());
-            }
-          }
-        }
-
         if (config.tradingWalletAddress) {
-          // 2. Bundler Mode positions
+          // Bundler Mode positions
           if (botMode === 'bundler') {
             const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
             if (bundlerPos) {
@@ -1368,7 +1435,7 @@ async function main(): Promise<void> {
             }
           }
 
-          // 3. Reverse CopySell positions
+          // Reverse CopySell positions
           if (botMode === 'reverse_copysell') {
             const revPos = reverseCopySellOrchestrator.getActivePosition();
             if (revPos) {
@@ -1379,9 +1446,9 @@ async function main(): Promise<void> {
 
         await Promise.all(checkPromises);
       } catch (err) {
-        log.error('Error in startMarketCapChecker loop', err);
+        log.error('Error in Bundler/Reverse MC loop', err);
       } finally {
-        isChecking = false;
+        isBundlerChecking = false;
       }
     }, MCAP_CHECK_INTERVAL_MS);
   }
@@ -2027,7 +2094,14 @@ async function main(): Promise<void> {
       const owner = new PublicKey(pending.event.walletAddress);
       const mintPk = new PublicKey(pending.event.mint);
 
-      const startingBalance = await getTokenRawBalance(owner, mintPk).catch(() => null);
+      // Check Cache for balance first
+      const cached = activePositionCache.get(pending.event.mint);
+      let startingBalance: bigint | null = cached ? cached.balance : null;
+      
+      if (startingBalance === null) {
+        startingBalance = await getTokenRawBalance(owner, mintPk).catch(() => null);
+      }
+
       if (startingBalance !== null && startingBalance <= 0n) {
         log.info(`[SELL ABORT] No token accounts found for ${pending.event.mint}, assuming already sold.`);
         return;
@@ -2040,6 +2114,8 @@ async function main(): Promise<void> {
       let lastError: unknown = null;
       let sold = false;
 
+      log.info(`[SELL EXECUTE] Starting sell for ${currentPending.event.mint} (Initial Balance: ${startingBalance ?? 'unknown'})`);
+
       for (let attempt = 1; attempt <= 5; attempt++) {
         try {
           lastResult = await gmgnClients[0].sellTokenForSol(
@@ -2051,33 +2127,40 @@ async function main(): Promise<void> {
               autoSlippage: config.sellAutoSlippage,
               priorityFeeSol: config.sellPriorityFeeSol,
               antiMev: config.sellAntiMev,
+              preFetchedBalance: startingBalance ?? undefined
             }
           );
           lastError = null;
+          
+          // If Jupiter returns success, we still verify balance quickly
+          if (lastResult.status === 'confirmed') {
+             sold = true;
+             break;
+          }
         } catch (err) {
           lastError = err;
-          log.warn(`Sell attempt ${attempt}/5 failed`, {
-            mint: currentPending.event.mint,
+          log.warn(`Sell attempt ${attempt}/5 failed for ${currentPending.event.mint}`, {
             error: err instanceof Error ? err.message : String(err),
           });
         }
 
-        await sleep(1_500);
-        const remainingBalance = await getTokenRawBalance(owner, mintPk).catch(() => null);
-        if (remainingBalance !== null && remainingBalance <= 0n) {
-          sold = true;
-          break;
-        }
-
-        if (lastResult?.status === 'confirmed' && remainingBalance === null) {
-          sold = true;
-          break;
+        if (attempt < 5) {
+          // Faster retry delay for sells (500ms instead of 1500ms)
+          await sleep(500);
+          const remainingBalance = await getTokenRawBalance(owner, mintPk).catch(() => null);
+          if (remainingBalance !== null && remainingBalance <= 0n) {
+            sold = true;
+            break;
+          }
         }
       }
 
       if (!sold) {
         throw lastError ?? new Error(`Sell did not clear token balance after 5 attempts`);
       }
+
+      // Cleanup cache
+      activePositionCache.delete(pending.event.mint);
 
       const receiptResult = lastResult
         ? { ...lastResult, status: lastResult.status === 'failed' ? 'confirmed' : lastResult.status }

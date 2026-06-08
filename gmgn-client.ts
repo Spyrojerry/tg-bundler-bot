@@ -96,7 +96,8 @@ export class GmgnClient {
       let data: Record<string, unknown> | null = null;
       if (this.fetchMode !== 'direct') {
         log.debug(`Attempting MC fetch via GMGN CLI: ${mint}`);
-        data = await this.limiter.schedule(() => this.fetchCliData('token', mint));
+        // CLI calls are local and shouldn't be bottlenecked by API rate limits
+        data = await this.fetchCliData('token', mint);
       }
       
       if (!data) {
@@ -182,7 +183,8 @@ export class GmgnClient {
     
     try {
       if (this.fetchMode !== 'direct') {
-        const data = await this.limiter.schedule(() => this.fetchCliData('traders', mint, { limit, orderBy }));
+        // CLI calls are local and shouldn't be bottlenecked by API rate limits
+        const data = await this.fetchCliData('traders', mint, { limit, orderBy });
         if (data) return data;
         log.debug(`GMGN CLI traders returned no data for ${mint}, falling back to API`);
       }
@@ -202,7 +204,8 @@ export class GmgnClient {
     try {
       let data: Record<string, unknown> | null = null;
       if (this.fetchMode !== 'direct') {
-        data = await this.limiter.schedule(() => this.fetchCliData('security', mint));
+        // CLI calls are local and shouldn't be bottlenecked by API rate limits
+        data = await this.fetchCliData('security', mint);
       }
       
       if (!data) {
@@ -450,11 +453,14 @@ export class GmgnClient {
   async sellTokenForSol(
     walletAddress: string,
     mint: string,
-    options: SellOptions
+    options: SellOptions & { preFetchedBalance?: bigint }
   ): Promise<SellResult> {
     if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
 
-    const balance = await this.getTokenBalance(walletAddress, mint);
+    const balance = options.preFetchedBalance !== undefined 
+      ? options.preFetchedBalance 
+      : await this.getTokenBalance(walletAddress, mint);
+
     if (balance === 0n) throw new Error(`No token balance found for ${mint}`);
 
     const amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
