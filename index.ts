@@ -84,7 +84,8 @@ async function main(): Promise<void> {
   // ── 4. Early Bundler Orchestrator ─────────────────────────────────────────
   let earlyBundlerOrchestrator: EarlyBundlerOrchestrator;
   let reverseCopySellOrchestrator: ReverseCopySellOrchestrator;
-  let botMode: 'insider' | 'bundler' | 'reverse_copysell' = 'insider';
+  let botMode: 'insider' | 'bundler' | 'reverse_copysell' = config.defaultBotMode;
+  let bundlerBuyInProgress = false;
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
@@ -94,6 +95,7 @@ async function main(): Promise<void> {
     | { type: 'addwallet' | 'removewallet' }
     | { type: 'minSol'; walletAddress: string }
     | { type: 'insiderFollowWallet' | 'insiderBuySol' | 'insiderEntryMc' | 'insiderExitPercent' | 'insiderMinProfit'; index: number }
+    | { type: 'bundlerFollowWallet' | 'bundlerBuySol' | 'bundlerExitPercent' }
     | { type: 'reverseTargetWallet' };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
   const pendingSells = new Map<string, { event: FilterFailEvent; createdAt: number; executing: boolean }>();
@@ -248,17 +250,36 @@ async function main(): Promise<void> {
           return homeReply(true);
         }
         if (data === 'mode:bundler') {
-          for (const bot of insiderBots) await bot.stop();
+          for (const bot of insiderBots) bot.pause();
           await stopReverseCopySellModeServices('Switched to Bundler mode');
           botMode = 'bundler';
           await startBundlerModeServices();
           return homeReply(true);
         }
-        if (data === 'mode:reverse_copysell') {
-          for (const bot of insiderBots) await bot.stop();
-          await stopBundlerModeServices('Switched to Reverse CopySell mode');
-          botMode = 'reverse_copysell';
-          await startReverseCopySellModeServices();
+        if (data === 'bundler:follow') {
+          pendingTelegramActions.set(chatId, { type: 'bundlerFollowWallet' });
+          return { text: 'Send the wallet address for Bundler mode to follow.', trackPrompt: true, editCurrent: true };
+        }
+        if (data === 'bundler:buysol') {
+          pendingTelegramActions.set(chatId, { type: 'bundlerBuySol' });
+          return { text: 'Send the SOL amount Bundler mode should buy with.', trackPrompt: true, editCurrent: true };
+        }
+        if (data === 'bundler:exitpercent') {
+          pendingTelegramActions.set(chatId, { type: 'bundlerExitPercent' });
+          return { text: 'Send the Bundler exit profit percentage increase.\nExample: <code>50</code> for a 50% increase from entry market cap.', trackPrompt: true, editCurrent: true };
+        }
+        if (data === 'bundler:stop') {
+          await earlyBundlerOrchestrator.stopActiveMonitoring('Stopped from Telegram');
+          return homeReply(true);
+        }
+        if (data === 'bundler:resume') {
+          const followedWallet = earlyBundlerOrchestrator.getFollowedWallet();
+          if (!followedWallet) {
+            pendingTelegramActions.set(chatId, { type: 'bundlerFollowWallet' });
+            return { text: 'Send the wallet address for Bundler mode to follow.', trackPrompt: true, editCurrent: true };
+          }
+          earlyBundlerOrchestrator.setEnabled(true);
+          await earlyBundlerOrchestrator.followWallet(followedWallet);
           return homeReply(true);
         }
         if (data.startsWith('insider:select:')) {
@@ -473,6 +494,22 @@ async function main(): Promise<void> {
             bot.setMinTransferProfit(value);
             return homeReply();
           }
+          if (pendingAction.type === 'bundlerFollowWallet') {
+            await earlyBundlerOrchestrator.followWallet(text);
+            return homeReply();
+          }
+          if (pendingAction.type === 'bundlerBuySol') {
+            const value = Number(text.trim());
+            if (!Number.isFinite(value) || value <= 0) return 'Send a SOL amount greater than 0.';
+            earlyBundlerOrchestrator.setBuySol(value);
+            return homeReply();
+          }
+          if (pendingAction.type === 'bundlerExitPercent') {
+            const value = Number(text.trim());
+            if (!Number.isFinite(value) || value < 0) return 'Send a valid percentage.';
+            earlyBundlerOrchestrator.setExitPercent(value);
+            return homeReply();
+          }
           if (pendingAction.type === 'reverseTargetWallet') {
             const trimmed = text.trim().toLowerCase();
             if (trimmed === 'off' || trimmed === 'none' || trimmed === 'clear') {
@@ -508,14 +545,23 @@ async function main(): Promise<void> {
   insiderBots.push(new InsiderBot(config, config.insiderSolanaRpcUrl, config.insiderSolanaWsUrl, telegramBot));
   insiderBots.push(new InsiderBot(config, config.insiderSolanaRpcUrl2, config.insiderSolanaWsUrl2, telegramBot));
 
-  // Auto-follow default wallets from config if provided
+  // Load default wallets from config as paused saved wallets. They do not start
+  // monitoring until the user resumes or switches into the active mode.
   if (config.insiderFollowWallet) {
-    log.info(`[INSIDER 1] Auto-following default wallet: ${config.insiderFollowWallet}`);
-    insiderBots[0].followWallet(config.insiderFollowWallet).catch(err => log.error('[INSIDER 1] Failed to auto-follow default wallet', err));
+    try {
+      insiderBots[0].configureFollowWallet(config.insiderFollowWallet);
+      log.info(`[INSIDER 1] Loaded default follow wallet in paused state: ${config.insiderFollowWallet}`);
+    } catch (err) {
+      log.error('[INSIDER 1] Failed to load default follow wallet', err);
+    }
   }
   if (config.insiderFollowWallet2) {
-    log.info(`[INSIDER 2] Auto-following default wallet: ${config.insiderFollowWallet2}`);
-    insiderBots[1].followWallet(config.insiderFollowWallet2).catch(err => log.error('[INSIDER 2] Failed to auto-follow default wallet', err));
+    try {
+      insiderBots[1].configureFollowWallet(config.insiderFollowWallet2);
+      log.info(`[INSIDER 2] Loaded default follow wallet in paused state: ${config.insiderFollowWallet2}`);
+    } catch (err) {
+      log.error('[INSIDER 2] Failed to load default follow wallet', err);
+    }
   }
 
   if (telegramBot) {
@@ -525,68 +571,75 @@ async function main(): Promise<void> {
   earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(config, db, telegramBot, gmgnClients[0]);
   reverseCopySellOrchestrator = new ReverseCopySellOrchestrator(config, db, telegramBot);
 
-  earlyBundlerOrchestrator.on('sellTrigger', (trigger) => {
+  earlyBundlerOrchestrator.on('buyTrigger', (trigger) => {
       if (botMode !== 'bundler') {
-        log.info('[EARLY BUNDLER SELL SKIP] Ignoring sell trigger because Bundler mode is inactive', {
+        log.info('[BUNDLER BUY SKIP] Ignoring buy trigger because Bundler mode is inactive', {
           mint: trigger.position.mint,
           mode: botMode,
         });
         return;
       }
 
-      const { position, type, walletAddress, soldPercentage, reason } = trigger;
-      
-      // Check if sell already pending
-      if (hasPendingSellForMint(position.tradingWallet, position.mint)) {
-        log.info(`[EARLY BUNDLER SELL SKIP] Sell already pending for ${position.mint}`);
+      if (!config.tradingWalletAddress) {
+        log.warn('[BUNDLER BUY SKIP] No trading wallet configured', trigger);
+        earlyBundlerOrchestrator.clearActivePosition();
         return;
       }
 
-      // Clear active position immediately on sell trigger to prevent checker from firing
-      earlyBundlerOrchestrator.clearActivePosition();
-      pendingTradingBuys.delete(position.mint);
+      void (async () => {
+        const { position, matchedWallet } = trigger;
+        bundlerBuyInProgress = true;
+        try {
+          const result = await gmgnClients[0].buyTokenWithSol(
+            config.tradingWalletAddress!,
+            position.mint,
+            {
+              solAmount: earlyBundlerOrchestrator.getBuySol(),
+              slippage: config.sellSlippage,
+              autoSlippage: config.sellAutoSlippage,
+              priorityFeeSol: config.sellPriorityFeeSol,
+            }
+          );
 
-      const sellReasons = [
-      `Early bundler activity detected for token ${position.mint}`,
-      reason || `Trigger type: ${type}`,
-    ];
-    if (walletAddress) sellReasons.push(`Bundler wallet: ${walletAddress}`);
-    if (soldPercentage) sellReasons.push(`Bundler sold: ${soldPercentage.toFixed(2)}%`);
+          const entryMc = await gmgnClients[0].fetchTokenMarketCapUsd(position.mint).catch(() => null);
+          earlyBundlerOrchestrator.markPositionBought(
+            {
+              ...position,
+              tradingWallet: config.tradingWalletAddress!,
+              buySol: earlyBundlerOrchestrator.getBuySol(),
+            },
+            entryMc
+          );
 
-    const event: FilterFailEvent = {
-      walletAddress: position.tradingWallet,
-      mint: position.mint,
-      sampleNumber: 0,
-      elapsedSec: 0,
-      reasons: sellReasons,
-      settings: db.getWalletSettings(position.tradingWallet),
-      metrics: {
-        mint: position.mint,
-        timestamp: new Date().toISOString(),
-        bundlersPercent: null,
-        bundlersCount: null,
-        initialBaseReserve: null,
-        topWallets: null,
-        top10HolderRate: null,
-        bundledAmountRate: null,
-      },
-      buySol: position.buySol,
-      matchingWallets: walletAddress ? [walletAddress] : [],
-    };
+          const exitMc = entryMc !== null
+            ? entryMc * (1 + earlyBundlerOrchestrator.getExitPercent() / 100)
+            : null;
 
-    const sellId = randomBytes(5).toString('hex');
-    pendingSells.set(sellId, {
-      event,
-      createdAt: Date.now(),
-      executing: true,
-    });
-
-    log.info(`[EARLY BUNDLER SELL TRIGGER] ${type} for ${position.mint}`, {
-      sellId,
-      reason,
-    });
-
-    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+          await telegramBot?.sendDefault([
+            '<b>✅ Bundler Buy Completed</b>',
+            `Token: <code>${html(position.mint)}</code>`,
+            `Repeated feePayer: <code>${html(matchedWallet)}</code>`,
+            `Actual Entry MC: <b>$${html(entryMc?.toLocaleString() ?? 'Unknown')}</b>`,
+            exitMc !== null ? `Exit MC: <b>$${html(exitMc.toLocaleString())}</b>` : `Exit: <b>+${html(String(earlyBundlerOrchestrator.getExitPercent()))}% after entry MC is known</b>`,
+            `Status: <b>${html(result.status)}</b>`,
+            result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : '',
+          ].filter(Boolean).join('\n'), {
+            replyMarkup: {
+              inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${position.mint}:b` }]],
+            },
+          });
+        } catch (err) {
+          log.error('Bundler buy failed', err);
+          earlyBundlerOrchestrator.clearActivePosition();
+          await telegramBot?.sendDefault([
+            '<b>❌ Bundler Buy Failed</b>',
+            `Token: <code>${html(position.mint)}</code>`,
+            `Error: ${html(err instanceof Error ? err.message : String(err))}`,
+          ].join('\n'));
+        } finally {
+          bundlerBuyInProgress = false;
+        }
+      })();
   });
 
   reverseCopySellOrchestrator.on('sellTrigger', (data) => {
@@ -854,26 +907,7 @@ async function main(): Promise<void> {
 
   function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on('newToken', (event: NewTokenEvent) => {
-      if (botMode === 'bundler') {
-        pendingTradingBuys.set(event.mint, event);
-        log.info(`[TRADING POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
-        
-        // Also trigger early bundler detection
-        earlyBundlerOrchestrator.handleTradingWalletBuy(event).catch((err) => {
-          log.error('Failed to trigger early bundler detection', err);
-        });
-
-        telegramBot?.sendDefault([
-          '<b>Trading Wallet Position Opened</b>',
-          `Wallet: <code>${html(event.walletAddress)}</code>`,
-          `Token: <code>${html(event.mint)}</code>`,
-          `Buy SOL: <b>${event.buySol ?? 'unknown'}</b>`,
-          'Watching this token for buys from wallets explicitly added to reverse-buy trigger list in settings.',
-          'If one of those wallets buys it while this position is still open, sell submits immediately.',
-          '',
-          '<b>Early Bundler Bot</b>: Detection started. I will notify you if early bundler activity is detected.',
-        ].join('\n')).catch((err) => log.warn('Telegram trading buy alert failed', err));
-      } else if (botMode === 'reverse_copysell') {
+      if (botMode === 'reverse_copysell') {
         log.info(`[REVERSE-COPYSELL POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
         reverseCopySellOrchestrator.handleTradingWalletBuy(event).catch((err) => {
           log.error('Failed to trigger reverse-copysell detection', err);
@@ -882,25 +916,7 @@ async function main(): Promise<void> {
     });
 
     walletMonitor.on('tokenExited', (event: TokenExitEvent) => {
-      if (botMode === 'bundler') {
-        if (!pendingTradingBuys.has(event.mint)) return;
-        pendingTradingBuys.delete(event.mint);
-        log.info(`[TRADING POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint} — stopped watched-wallet trigger watch`);
-        
-        // Also notify orchestrator
-        earlyBundlerOrchestrator.handleTradingWalletExit(event).catch((err) => {
-          log.error('Failed to notify early bundler orchestrator of exit', err);
-        });
-
-        telegramBot?.sendDefault([
-          '<b>Trading Wallet Position Closed</b>',
-          `Wallet: <code>${html(event.walletAddress)}</code>`,
-          `Token: <code>${html(event.mint)}</code>`,
-          'Stopped waiting for watched-wallet buy triggers for this token.',
-          '',
-          '<b>Early Bundler Bot</b>: Monitoring stopped for this token.',
-        ].join('\n')).catch((err) => log.warn('Telegram trading exit alert failed', err));
-      } else if (botMode === 'reverse_copysell') {
+      if (botMode === 'reverse_copysell') {
         log.info(`[REVERSE-COPYSELL POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint}`);
         reverseCopySellOrchestrator.handleTradingWalletExit(event).catch((err) => {
           log.error('Failed to notify reverse-copysell orchestrator of exit', err);
@@ -1010,6 +1026,77 @@ async function main(): Promise<void> {
       }
     } catch (err) {
       log.error(`Failed to check market cap for ${mint}`, err);
+    }
+  }
+
+  async function checkBundlerMcapFlow(preFetchedMc?: number | null): Promise<void> {
+    const position = earlyBundlerOrchestrator.getActivePosition();
+    if (bundlerBuyInProgress) return;
+    if (!position || !config.tradingWalletAddress) return;
+    if (hasPendingSellForMint(config.tradingWalletAddress, position.mint)) return;
+
+    try {
+      const currentMc = preFetchedMc !== undefined
+        ? preFetchedMc
+        : await gmgnClients[0].fetchTokenMarketCapUsd(position.mint);
+      if (currentMc === null) return;
+
+      await checkAndSellIfLowMcap(position.mint, 'bundler', undefined, currentMc);
+      if (!earlyBundlerOrchestrator.getActivePosition()) return;
+
+      let entryMc = position.entryMc ?? null;
+      if (entryMc === null) {
+        entryMc = currentMc;
+        earlyBundlerOrchestrator.markPositionBought(position, entryMc);
+      }
+
+      const exitMc = entryMc * (1 + earlyBundlerOrchestrator.getExitPercent() / 100);
+      if (currentMc < exitMc) return;
+
+      const event: FilterFailEvent = {
+        walletAddress: config.tradingWalletAddress,
+        mint: position.mint,
+        sampleNumber: 0,
+        elapsedSec: 0,
+        reasons: [
+          `Bundler exit market cap $${currentMc.toLocaleString()} reached target $${exitMc.toLocaleString()}.`,
+          `Exit percentage: ${earlyBundlerOrchestrator.getExitPercent()}% from entry MC $${entryMc.toLocaleString()}.`,
+        ],
+        settings: db.getWalletSettings(config.tradingWalletAddress),
+        metrics: {
+          mint: position.mint,
+          timestamp: new Date().toISOString(),
+          bundlersPercent: null,
+          bundlersCount: null,
+          initialBaseReserve: null,
+          topWallets: null,
+          top10HolderRate: null,
+          bundledAmountRate: null,
+        },
+        buySol: earlyBundlerOrchestrator.getBuySol(),
+        matchingWallets: position.matchedWallet ? [position.matchedWallet] : [],
+      };
+
+      const sellId = randomBytes(5).toString('hex');
+      pendingSells.set(sellId, {
+        event,
+        createdAt: Date.now(),
+        executing: true,
+      });
+
+      earlyBundlerOrchestrator.clearActivePosition();
+
+      telegramBot?.sendDefault([
+        '<b>🚨 Bundler Exit Triggered</b>',
+        `Token: <code>${html(position.mint)}</code>`,
+        `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
+        `Exit MC: <b>$${html(exitMc.toLocaleString())}</b>`,
+        `Action: submit sell for <b>${config.sellPercent}%</b>.`,
+      ].join('\n')).catch((err) => log.warn('Telegram bundler exit alert failed', err));
+
+      void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+    } catch (err) {
+      log.error(`Failed to check Bundler MC flow for ${position.mint}`, err);
     }
   }
 
@@ -1437,11 +1524,7 @@ async function main(): Promise<void> {
           if (botMode === 'bundler') {
             const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
             if (bundlerPos) {
-              checkPromises.push(checkAndSellIfLowMcap(bundlerPos.mint, 'bundler'));
-            }
-            for (const mint of pendingTradingBuys.keys()) {
-              if (bundlerPos?.mint === mint) continue;
-              checkPromises.push(checkAndSellIfLowMcap(mint, 'bundler'));
+              checkPromises.push(checkBundlerMcapFlow());
             }
           }
 
@@ -1556,41 +1639,16 @@ async function main(): Promise<void> {
 
   async function startBundlerModeServices(): Promise<void> {
     earlyBundlerOrchestrator.setEnabled(true);
-
-    if (config.tradingWalletAddress && !tradingWalletMonitor) {
-      tradingWalletMonitor = new WalletMonitor(config, config.tradingWalletAddress, { enforceMinBuySol: false });
-      wireTradingWalletMonitor(tradingWalletMonitor);
-      await tradingWalletMonitor.start();
-
-      for (const mint of tradingWalletMonitor.existingMints) {
-        pendingTradingBuys.set(mint, {
-          walletAddress: config.tradingWalletAddress,
-          mint,
-          detectedAt: Date.now(),
-          buySol: db.getToken(config.tradingWalletAddress, mint)?.buySol ?? null,
-        });
-      }
-
-      if (tradingWalletMonitor.existingMints.size > 0) {
-        telegramBot?.sendDefault([
-          '<b>Trading Wallet Positions Loaded</b>',
-          `Wallet: <code>${html(config.tradingWalletAddress)}</code>`,
-          `Positions watched for watched-wallet buy triggers: <b>${tradingWalletMonitor.existingMints.size}</b>`,
-        ].join('\n')).catch((err) => log.warn('Telegram trading positions bootstrap alert failed', err));
-      }
-    } else if (!config.tradingWalletAddress) {
-      log.warn('No TRADING_WALLET_ADDRESS configured; bundler sell flow cannot detect your buys.');
-    }
-
-    const wallets = db.getActiveWallets();
-    for (const wallet of wallets) {
-      if (wallet === config.tradingWalletAddress || walletMonitors.has(wallet)) continue;
-      await startWallet(wallet);
+    const followedWallet = earlyBundlerOrchestrator.getFollowedWallet();
+    if (followedWallet) {
+      await earlyBundlerOrchestrator.followWallet(followedWallet);
+    } else {
+      log.info('Bundler mode started without follow wallet; set one from Telegram.');
     }
 
     log.info('Bundler mode services started', {
-      watchedWallets: walletMonitors.size,
-      tradingWalletActive: !!tradingWalletMonitor,
+      followedWallet,
+      running: earlyBundlerOrchestrator.isRunning(),
     });
   }
 
@@ -1821,7 +1879,6 @@ async function main(): Promise<void> {
             [
               { text: 'Insider', callback_data: 'mode:insider' },
               { text: 'Bundler', callback_data: 'mode:bundler' },
-              { text: 'Rev CopySell', callback_data: 'mode:reverse_copysell' },
             ],
             botSelectionRow,
             [
@@ -1870,7 +1927,6 @@ async function main(): Promise<void> {
             [
               { text: 'Insider', callback_data: 'mode:insider' },
               { text: 'Bundler', callback_data: 'mode:bundler' },
-              { text: 'Rev CopySell', callback_data: 'mode:reverse_copysell' },
             ],
             [
               { text: 'Set Target Wallet', callback_data: 'reverse:set_target' },
@@ -1882,65 +1938,57 @@ async function main(): Promise<void> {
       };
     }
 
-    const wallets = [...walletMonitors.keys()];
-    const tradingWallet = config.tradingWalletAddress;
-    
-    // Add trading wallet to aliases so it can be navigated to via /w_T or similar
-    // Actually, let's just add it to the list if it exists
-    const allWallets = tradingWallet ? [tradingWallet, ...wallets] : wallets;
-    walletAliasesByChat.set('__default__', allWallets);
-    
-    const walletLines = allWallets.map((wallet, index) => {
-      const isTrading = wallet === tradingWallet;
-      const isPaused = pausedWallets.has(wallet);
-      const label = isTrading ? '💳 TRADING' : '✅ WATCHED';
-      const status = isPaused ? ' (PAUSED)' : '';
-      return `${label} /w_${index} <code>${html(wallet)}</code>${status}`;
-    });
+    const followedWallet = earlyBundlerOrchestrator.getFollowedWallet();
+    const activePosition = earlyBundlerOrchestrator.getActivePosition();
+    const watchingMint = earlyBundlerOrchestrator.getWatchingMint();
+    const bundlerRunning = earlyBundlerOrchestrator.isRunning();
 
-    if (walletLines.length === 0) {
-      walletLines.push('No wallets are currently monitored.');
-    }
+    let status = 'Idle';
+    if (activePosition) status = `Holding token ${html(activePosition.mint.slice(0, 8))}...`;
+    else if (watchingMint) status = `Checking token ${html(watchingMint.slice(0, 8))}...`;
+    else if (bundlerRunning) status = 'Running';
+    else if (followedWallet) status = 'Paused';
 
-    const runningWallets = allWallets.length - pausedWallets.size;
+    const stopResumeButton = followedWallet && !bundlerRunning && !activePosition && !watchingMint
+      ? { text: 'Resume', callback_data: 'bundler:resume' }
+      : { text: 'Stop', callback_data: 'bundler:stop' };
 
     return {
       text: [
-        '<b>Early Bundler Bot</b>',
+        '<b>Bundler Bot</b>',
         '',
         `Mode: <b>Bundler</b>`,
+        `Status: <b>${status}</b>`,
+        `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : '<b>Not set</b>'}`,
+        `Buy SOL: <b>${html(String(earlyBundlerOrchestrator.getBuySol()))}</b>`,
+        `Exit Strategy: <b>+${html(String(earlyBundlerOrchestrator.getExitPercent()))}% from Entry MC</b>`,
+        activePosition?.entryMc ? `Entry MC: <b>$${html(activePosition.entryMc.toLocaleString())}</b>` : '',
+        activePosition?.matchedWallet ? `Matched feePayer: <code>${html(activePosition.matchedWallet)}</code>` : '',
         '',
-        `Wallets total: <b>${allWallets.length}</b>`,
-        `Running: <b>${runningWallets}</b>`,
-        `Paused: <b>${pausedWallets.size}</b>`,
-        '',
-        '<b>Status</b>',
-        'Filter: early bundler & reverse-buy',
-        `Interval: ${config.monitorInterval}ms`,
-        `Min buy: ${config.minBuySol} SOL`,
-        '',
-        '<b>Wallets List</b>',
-        ...walletLines,
-        '',
-        'Send any Solana wallet address to preview it, then add or remove it with one tap.',
-      ].join('\n'),
+        '<b>Flow</b>',
+        '1. Set a follow wallet.',
+        '2. Bot waits for that wallet to buy a new token.',
+        '3. Bot checks Helius system transfers every 2s, up to the first 10 records.',
+        '4. As soon as a feePayer appears twice and its first two actions are buys, bot buys.',
+        '5. Bot exits at your % MC increase or sells on rug below $1,000.',
+      ].filter(Boolean).join('\n'),
       replyMarkup: {
         inline_keyboard: [
           [
             { text: 'Insider', callback_data: 'mode:insider' },
             { text: 'Bundler', callback_data: 'mode:bundler' },
-            { text: 'Rev CopySell', callback_data: 'mode:reverse_copysell' },
           ],
           [
-            { text: 'Add wallet', callback_data: 'menu:addwallet' },
-            { text: 'Remove wallet', callback_data: 'menu:removewallet' },
+            { text: 'Follow wallet', callback_data: 'bundler:follow' },
+            { text: 'Buy SOL', callback_data: 'bundler:buysol' },
           ],
           [
-            { text: 'Wallets', callback_data: 'menu:wallets' },
+            { text: 'Set Exit %', callback_data: 'bundler:exitpercent' },
             { text: 'Status', callback_data: 'menu:status' },
           ],
           [
             { text: 'Refresh', callback_data: 'menu:refresh' },
+            stopResumeButton,
           ],
         ],
       },
@@ -2005,12 +2053,16 @@ async function main(): Promise<void> {
         `Monitoring: ${activePosition ? activePosition.mint : 'none'}`,
       ].join('\n');
     } else {
+      const activePosition = earlyBundlerOrchestrator.getActivePosition();
       text = [
         '<b>Bot Status</b>',
         'Mode: Bundler',
-        `Wallets: ${walletMonitors.size}`,
-        'Filter: early bundler & reverse-buy',
-        `Interval: ${config.monitorInterval}ms`,
+        `Follow: ${earlyBundlerOrchestrator.getFollowedWallet() ?? 'not set'}`,
+        `Running: ${earlyBundlerOrchestrator.isRunning() ? 'yes' : 'no'}`,
+        `Watching: ${earlyBundlerOrchestrator.getWatchingMint() ?? 'none'}`,
+        `Holding: ${activePosition ? activePosition.mint : 'none'}`,
+        `Buy: ${earlyBundlerOrchestrator.getBuySol()} SOL`,
+        `Exit: +${earlyBundlerOrchestrator.getExitPercent()}%`,
       ].join('\n');
     }
 
@@ -2208,10 +2260,15 @@ async function main(): Promise<void> {
   }
 
   // ── 6. Start active mode ──────────────────────────────────────────────────
-  await stopBundlerModeServices('Service started in Insider mode');
+  if (botMode === 'bundler') {
+    for (const bot of insiderBots) bot.pause();
+    await startBundlerModeServices();
+  } else {
+    await stopBundlerModeServices('Service started in Insider mode');
+  }
   startMarketCapChecker();
 
-  log.info(`Service fully started — mode=${botMode}, bundler wallets active=${walletMonitors.size}`);
+  log.info(`Service fully started — mode=${botMode}, bundler running=${earlyBundlerOrchestrator.isRunning()}`);
 
   // ── 7. Graceful shutdown ──────────────────────────────────────────────────
   let shutting_down = false;

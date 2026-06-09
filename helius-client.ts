@@ -11,6 +11,9 @@ export interface HeliusTransaction {
   slot: number;
   timestamp: number;
   type?: string;
+  source?: string;
+  feePayer?: string;
+  description?: string;
   tokenTransfers?: Array<{
     fromUserAccount: string;
     toUserAccount: string;
@@ -83,6 +86,31 @@ export class HeliusClient {
     
     log.error('Failed to fetch early bundlers from Helius after all attempts', lastError);
     throw lastError;
+  }
+
+  async getTokenSystemTransfers(mintAddress: string, limit: number = 10): Promise<HeliusTransaction[]> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'asc',
+      'api-key': this.apiKey,
+      limit: String(limit),
+      type: 'TRANSFER',
+      source: 'SYSTEM_PROGRAM',
+    });
+    const url = `${this.baseUrl}/v0/addresses/${mintAddress}/transactions?${params.toString()}`;
+
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+      }
+
+      return await response.json() as HeliusTransaction[];
+    } catch (err) {
+      log.error(`Failed to fetch token system transfers for ${mintAddress}`, err);
+      throw err;
+    }
   }
 
   /**

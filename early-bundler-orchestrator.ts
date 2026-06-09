@@ -1,548 +1,349 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  early-bundler-orchestrator.ts  —  Orchestrates the early bundler bot flow
-//
-//  Flow:
-//    1. Trading wallet buys token → detect via WalletMonitor
-//    2. Fetch first 5 transactions from Helius (mint + 4 bundlers)
-//    3. Store position and 4 bundler wallets in database
-//    4. Start BundlerMonitor for each wallet
-//    5. On bundler BUY → sell 100% immediately
-//    6. On bundler SELL → track cumulative, sell 100% at 40% threshold
-//    7. Send Telegram notifications for all events
-//    8. When trading wallet exits → cleanup and stop monitoring
-// ─────────────────────────────────────────────────────────────────────────────
-
-import { Connection } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { createLogger } from './logger';
-import { HeliusClient, EarlyBundlerInfo } from './helius-client';
-import { BundlerMonitor, BundlerWallet, BundlerTransaction } from './bundler-monitor';
+import { HeliusClient, HeliusTransaction } from './helius-client';
 import { MonitorDatabase } from './database';
-import type { ServiceConfig, NewTokenEvent, TokenExitEvent } from './types';
+import type { ServiceConfig, NewTokenEvent } from './types';
 import { TelegramBot } from './telegram-bot';
 import { GmgnClient } from './gmgn-client';
+import { WalletMonitor } from './wallet-monitor';
 
-const log = createLogger('EARLY-BUNDLER');
+const log = createLogger('BUNDLER');
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+type TransferSide = 'buy' | 'sell' | 'unknown';
 
 export interface EarlyBundlerPosition {
   positionId: number;
   tradingWallet: string;
+  followedWallet: string;
   mint: string;
-  tokenAmount: number;
   buySol: number | null;
-  creatorVaultAddress?: string;
-  bundlerWallets: BundlerWallet[];
+  entryMc?: number | null;
+  matchedWallet?: string;
+}
+
+export interface BundlerBuyTrigger {
+  position: EarlyBundlerPosition;
+  signature: string;
+  matchedWallet: string;
 }
 
 export interface BundlerSellReason {
-  type: 'bundler_buy' | 'bundler_sell_40pct' | 'creator_vault_f1';
-  walletAddress?: string;
-  soldPercentage?: number;
+  type: 'mcap_exit' | 'rug' | 'manual';
   reason?: string;
 }
 
 export interface EarlyBundlerOrchestrator {
+  on(event: 'buyTrigger', listener: (trigger: BundlerBuyTrigger) => void): this;
   on(event: 'sellTrigger', listener: (trigger: BundlerSellReason & { position: EarlyBundlerPosition }) => void): this;
-  on(event: 'bundlerDetected', listener: (data: { position: EarlyBundlerPosition; bundlers: EarlyBundlerInfo[] }) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
+  emit(event: 'buyTrigger', trigger: BundlerBuyTrigger): boolean;
   emit(event: 'sellTrigger', trigger: BundlerSellReason & { position: EarlyBundlerPosition }): boolean;
-  emit(event: 'bundlerDetected', data: { position: EarlyBundlerPosition; bundlers: EarlyBundlerInfo[] }): boolean;
   emit(event: 'error', error: Error): boolean;
-  getActivePosition(): EarlyBundlerPosition | null;
-  setEnabled(enabled: boolean): void;
 }
 
 export class EarlyBundlerOrchestrator extends EventEmitter {
-  private readonly config: ServiceConfig;
-  private readonly db: MonitorDatabase;
-  private readonly telegramBot: TelegramBot | null;
-  private readonly gmgnClient: GmgnClient | null;
   private readonly heliusClient: HeliusClient;
-  private readonly connection: Connection;
-  private bundlerMonitor: BundlerMonitor | null = null;
+  private followMonitor: WalletMonitor | null = null;
+  private followedWallet: string | null = null;
   private activePosition: EarlyBundlerPosition | null = null;
-  private isEnabled = true;
+  private watchingMint: string | null = null;
+  private boughtMints = new Set<string>();
+  private isEnabled = false;
   private isShuttingDown = false;
+  private buySol: number;
+  private exitPercent: number;
+  private nextPositionId = 1;
 
-  constructor(config: ServiceConfig, db: MonitorDatabase, telegramBot: TelegramBot | null = null, gmgnClient: GmgnClient | null = null) {
+  constructor(
+    private readonly config: ServiceConfig,
+    private readonly db: MonitorDatabase,
+    private readonly telegramBot: TelegramBot | null = null,
+    private readonly gmgnClient: GmgnClient | null = null
+  ) {
     super();
-    this.config = config;
-    this.db = db;
-    this.telegramBot = telegramBot;
-    this.gmgnClient = gmgnClient;
-    
-    // Initialize Helius client with API key from config
-    if (!config.heliusApiKey) {
-      log.warn('HELIUS_API_KEY not configured - early bundler bot will not function');
-    }
-    this.heliusClient = new HeliusClient(config.heliusApiKey);
-    
-    this.connection = new Connection(config.solanaRpcUrl, {
-      commitment: 'confirmed',
-    });
-  }
+    this.heliusClient = new HeliusClient(config.heliusApiKey || config.insiderHeliusApiKey);
+    this.buySol = config.insiderBuySol;
+    this.exitPercent = config.insiderExitPercent;
+    void this.db;
 
-  /**
-   * Handle a new token buy from the trading wallet
-   * This triggers the early bundler detection flow
-   */
-  async handleTradingWalletBuy(event: NewTokenEvent): Promise<void> {
-    if (this.isShuttingDown || !this.isEnabled) {
-      log.warn('Early bundler orchestrator is inactive, ignoring trading wallet buy');
-      return;
-    }
-
-    // Check if we already have an active position
-    if (this.activePosition) {
-      log.warn('Already have an active position, skipping new position', {
-        existingMint: this.activePosition.mint,
-        newMint: event.mint,
-      });
-      return;
-    }
-
-    log.info(`[EARLY BUNDLER] Trading wallet bought token - fetching early bundlers`, {
-      tradingWallet: event.walletAddress,
-      mint: event.mint,
-      buySol: event.buySol,
-    });
-
-    try {
-      // Step 1: Fetch early bundlers from Helius
-      const earlyBundlers = await this.heliusClient.getEarlyBundlers(event.mint);
-
-      if (this.isShuttingDown || !this.isEnabled) {
-        log.info('Early bundler mode became inactive during fetch; skipping setup', {
-          mint: event.mint,
-        });
-        return;
-      }
-      
-      if (earlyBundlers.length === 0) {
-        log.warn('No early bundlers found for token', { mint: event.mint });
-        return;
-      }
-
-      log.info(`Found ${earlyBundlers.length} early transactions (including mint)`, {
-        bundlers: earlyBundlers.map(b => ({
-          wallet: b.walletAddress.slice(0, 8) + '...',
-          isMint: b.isMint,
-          tokenAmount: b.tokenAmount,
-        })),
-      });
-
-      // Step 2: Create database position (skip the first one as it's the mint)
-      const creatorVaultAddress = earlyBundlers.find(b => b.isMint)?.creatorVaultAddress;
-      const bundlerWallets = earlyBundlers.filter(b => !b.isMint);
-      
-      if (bundlerWallets.length === 0) {
-        log.warn('No bundler wallets found (only mint transaction)', { mint: event.mint });
-        return;
-      }
-
-      const positionId = this.db.insertEarlyBundlerPosition(
-        event.walletAddress,
-        event.mint,
-        0, // Token amount will be updated later
-        event.buySol
-      );
-
-      // Step 3: Store bundler wallets in database
-      const storedBundlerWallets: BundlerWallet[] = [];
-      
-      for (const bundler of bundlerWallets) {
-        const bundlerWalletId = this.db.insertEarlyBundlerWallet(
-          positionId,
-          bundler.walletAddress,
-          bundler.tokenAmount,
-          bundler.signature,
-          bundler.slot,
-          bundler.timestamp
-        );
-
-        storedBundlerWallets.push({
-          id: bundlerWalletId,
-          walletAddress: bundler.walletAddress,
-          initialTokenAmount: bundler.tokenAmount,
-          totalSoldAmount: 0,
-        });
-      }
-
-      // Step 4: Set up active position
-      this.activePosition = {
-        positionId,
-        tradingWallet: event.walletAddress,
-        mint: event.mint,
-        tokenAmount: 0,
-        buySol: event.buySol,
-        creatorVaultAddress,
-        bundlerWallets: storedBundlerWallets,
-      };
-
-      // Step 5: Start bundler monitor
-      this.bundlerMonitor = new BundlerMonitor(this.config, this.heliusClient);
-      this.setupBundlerMonitorListeners();
-      
-      await this.bundlerMonitor.startMonitoring(
-        positionId,
-        event.walletAddress,
-        event.mint,
-        storedBundlerWallets,
-        creatorVaultAddress
-      );
-
-      // Step 6: Emit event
-      this.emit('bundlerDetected', {
-        position: this.activePosition,
-        bundlers: earlyBundlers,
-      });
-
-      // Step 7: Send Telegram notification
-      await this.sendBundlerDetectedNotification(this.activePosition, earlyBundlers);
-
-      log.info(`[EARLY BUNDLER] Setup complete - monitoring ${storedBundlerWallets.length} bundler wallets`, {
-        positionId,
-        mint: event.mint,
-        creatorVaultAddress,
-      });
-
-    } catch (err) {
-      log.error('Failed to handle trading wallet buy for early bundler detection', err);
-      this.emit('error', err instanceof Error ? err : new Error(String(err)));
+    if (!config.heliusApiKey && !config.insiderHeliusApiKey) {
+      log.warn('No HELIUS_API_KEY configured; bundler transfer-pattern detection will not work.');
     }
   }
 
-  /**
-   * Handle trading wallet exit - cleanup and stop monitoring
-   */
-  async handleTradingWalletExit(event: TokenExitEvent): Promise<void> {
-    if (!this.activePosition || this.activePosition.mint !== event.mint) {
-      log.warn('Trading wallet exit for unknown position', {
-        mint: event.mint,
+  async followWallet(address: string): Promise<void> {
+    const normalized = new PublicKey(address).toBase58();
+    if (this.followedWallet !== normalized) {
+      this.boughtMints.clear();
+    }
+
+    await this.stopFollowMonitor();
+    this.followedWallet = normalized;
+    this.isEnabled = true;
+
+    if (this.activePosition || this.watchingMint) {
+      log.info('Bundler follow wallet set, but an existing token is still active', {
+        followedWallet: normalized,
         activeMint: this.activePosition?.mint,
+        watchingMint: this.watchingMint,
       });
       return;
     }
 
-    log.info(`[EARLY BUNDLER] Trading wallet exited position - cleaning up`, {
-      tradingWallet: event.walletAddress,
-      mint: event.mint,
-      positionId: this.activePosition.positionId,
-    });
-
-    // Stop bundler monitor
-    if (this.bundlerMonitor) {
-      await this.bundlerMonitor.stopMonitoring();
-      this.bundlerMonitor = null;
-    }
-
-    // Close position in database
-    this.db.closeEarlyBundlerPosition(
-      this.activePosition.positionId,
-      'Trading wallet exited position'
-    );
-
-    // Clear active position
-    const closedPosition = this.activePosition;
-    this.activePosition = null;
-
-    // Send Telegram notification
-    await this.sendPositionClosedNotification(closedPosition, 'Trading wallet exited position');
-
-    log.info(`[EARLY BUNDLER] Cleanup complete`, {
-      positionId: closedPosition.positionId,
-      mint: closedPosition.mint,
-    });
-  }
-
-  /**
-   * Set up listeners for bundler monitor events
-   */
-  private setupBundlerMonitorListeners(): void {
-    if (!this.bundlerMonitor) return;
-
-    // Handle bundler buy → immediate sell
-    this.bundlerMonitor.on('bundlerBuy', async (event) => {
-      const label = event.source === 'receiver' ? 'Receiver wallet' : 'Bundler';
-      log.info(`[EARLY BUNDLER] Bundler BUY detected - triggering immediate sell`, {
-        walletAddress: event.walletAddress,
-        source: event.source,
-        parentWalletAddress: event.parentWalletAddress,
-        mint: event.mint,
-        tokenAmount: event.tokenAmount,
-        signature: event.signature,
-      });
-
-      await this.triggerSell({
-        type: 'bundler_buy',
-        walletAddress: event.walletAddress,
-      }, `${label} ${event.walletAddress.slice(0, 8)}... bought the token - selling immediately`);
-    });
-
-    // Handle bundler sell → check 40% threshold
-    this.bundlerMonitor.on('bundlerSell', async (event) => {
-      log.info(`[EARLY BUNDLER] Bundler SELL detected`, {
-        walletAddress: event.walletAddress,
-        source: event.source,
-        parentWalletAddress: event.parentWalletAddress,
-        mint: event.mint,
-        tokenAmount: event.tokenAmount,
-        cumulativeSoldPercentage: event.cumulativeSoldPercentage,
-        signature: event.signature,
-      });
-
-      // Update database with sell
-      if (this.activePosition) {
-        const bundlerWallet = this.activePosition.bundlerWallets.find(
-          b => b.walletAddress === event.walletAddress
-        );
-        
-        if (bundlerWallet) {
-          this.db.recordBundlerWalletSell(
-            bundlerWallet.id,
-            event.signature,
-            event.tokenAmount,
-            event.slot,
-            event.timestamp
-          );
-        }
-      }
-
-      // Send notification about bundler sell
-      await this.sendBundlerSellNotification(event);
-    });
-
-    // Handle 40% threshold reached
-    this.bundlerMonitor.on('thresholdReached', async (event) => {
-      const label = event.source === 'receiver' ? 'Receiver wallet' : 'Bundler';
-      log.info(`[EARLY BUNDLER] 40% sell threshold reached - triggering sell`, {
-        walletAddress: event.walletAddress,
-        source: event.source,
-        parentWalletAddress: event.parentWalletAddress,
-        mint: event.mint,
-        soldPercentage: event.soldPercentage,
-      });
-
-      await this.triggerSell({
-        type: 'bundler_sell_40pct',
-        walletAddress: event.walletAddress,
-        soldPercentage: event.soldPercentage,
-      }, `${label} ${event.walletAddress.slice(0, 8)}... sold ${event.soldPercentage.toFixed(1)}% of holdings - selling immediately`);
-    });
-
-    this.bundlerMonitor.on('creatorVaultF1', async (event) => {
-      log.info('[EARLY BUNDLER] Creator vault F1 program detected - triggering sell', {
-        creatorVaultAddress: event.creatorVaultAddress,
-        mint: event.mint,
-        signature: event.signature,
-        programId: event.programId,
-      });
-
-      await this.triggerSell({
-        type: 'creator_vault_f1',
-        walletAddress: event.creatorVaultAddress,
-        reason: `Creator vault ${event.creatorVaultAddress.slice(0, 8)}... used F1 program ${event.programId}`,
-      }, `Creator vault ${event.creatorVaultAddress.slice(0, 8)}... used F1 program - selling immediately`);
-    });
-  }
-
-  /**
-   * Trigger a sell for the active position
-   */
-  private async triggerSell(
-    reason: BundlerSellReason,
-    message: string
-  ): Promise<void> {
-    if (!this.isEnabled) {
-      log.info('Ignoring early bundler sell trigger because orchestrator is inactive', { reason });
-      return;
-    }
-
-    if (!this.activePosition) {
-      log.warn('Cannot trigger sell - no active position');
-      return;
-    }
-
-    // Stop bundler monitor
-    if (this.bundlerMonitor) {
-      await this.bundlerMonitor.stopMonitoring();
-      this.bundlerMonitor = null;
-    }
-
-    // Close position in database
-    this.db.closeEarlyBundlerPosition(
-      this.activePosition.positionId,
-      message
-    );
-
-    // Get position and clear active
-    const position = this.activePosition;
-    this.activePosition = null;
-
-    // Emit sell trigger event
-    this.emit('sellTrigger', {
-      ...reason,
-      position,
-    });
-
-    // Send Telegram notification
-    await this.sendSellTriggerNotification(position, reason, message);
-
-    log.info(`[EARLY BUNDLER] Sell triggered and position closed`, {
-      positionId: position.positionId,
-      mint: position.mint,
-      reason,
-    });
-  }
-
-  /**
-   * Shutdown the orchestrator and stop any active monitoring
-   */
-  async shutdown(): Promise<void> {
-    this.isShuttingDown = true;
-    this.isEnabled = false;
-    
-    if (this.bundlerMonitor) {
-      await this.bundlerMonitor.stopMonitoring();
-      this.bundlerMonitor = null;
-    }
-    
-    this.activePosition = null;
-    log.info('Early Bundler Orchestrator shut down');
-  }
-
-  async stopActiveMonitoring(reason = 'Bundler mode stopped'): Promise<void> {
-    this.isEnabled = false;
-
-    if (this.bundlerMonitor) {
-      await this.bundlerMonitor.stopMonitoring();
-      this.bundlerMonitor = null;
-    }
-
-    if (this.activePosition) {
-      this.db.closeEarlyBundlerPosition(this.activePosition.positionId, reason);
-      log.info('[EARLY BUNDLER] Active position closed because bundler mode stopped', {
-        positionId: this.activePosition.positionId,
-        mint: this.activePosition.mint,
-        reason,
-      });
-    }
-
-    this.activePosition = null;
-  }
-
-  clearActivePosition(): void {
-    this.activePosition = null;
-    if (this.bundlerMonitor) {
-      this.bundlerMonitor.stopMonitoring().catch(() => undefined);
-      this.bundlerMonitor = null;
-    }
-    log.info('Early bundler active position cleared');
+    await this.startFollowMonitor();
   }
 
   setEnabled(enabled: boolean): void {
     this.isEnabled = enabled;
+    if (!enabled) {
+      void this.stopActiveMonitoring('Disabled');
+    } else if (this.followedWallet && !this.followMonitor && !this.activePosition && !this.watchingMint) {
+      void this.startFollowMonitor();
+    }
   }
 
-  // ── Telegram Notifications ────────────────────────────────────────────────
-
-  private async sendBundlerDetectedNotification(
-    position: EarlyBundlerPosition,
-    bundlers: EarlyBundlerInfo[]
-  ): Promise<void> {
-    if (!this.telegramBot) return;
-
-    const html = (value: string): string =>
-      value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-    const bundlerLines = bundlers
-      .filter(b => !b.isMint)
-      .map((b, i) => `${i + 1}. <code>${html(b.walletAddress)}</code> (${b.tokenAmount.toLocaleString()} tokens)`);
-
-    const marketCapUsd = this.gmgnClient ? await this.gmgnClient.fetchTokenMarketCapUsd(position.mint).catch(() => null) : null;
-
-    await this.telegramBot.sendDefault([
-      '<b>🚨 Early Bundler Detected</b>',
-      `Token: <code>${html(position.mint)}</code>`,
-      `Trading Wallet: <code>${html(position.tradingWallet)}</code>`,
-      `Market Cap: <b>$${marketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
-      position.creatorVaultAddress ? `Creator Vault: <code>${html(position.creatorVaultAddress)}</code>` : '',
-      '',
-      '<b>Detected Bundler Wallets:</b>',
-      ...bundlerLines,
-      '',
-      'I am now monitoring these wallets. If any of them buy more or sell 40% of their holdings, I will trigger an immediate sell.',
-    ].filter(Boolean).join('\n'), {
-      replyMarkup: {
-        inline_keyboard: [[{ text: '🔄 Refresh P/L & MC', callback_data: `r:m:${position.mint}:b` }]],
-      },
-    }).catch(err => log.warn('Failed to send bundler detected notification', err));
+  setBuySol(value: number): void {
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error('Bundler buy SOL must be greater than 0');
+    }
+    this.buySol = value;
   }
 
-  private async sendBundlerSellNotification(
-    event: BundlerTransaction & { cumulativeSoldPercentage: number }
-  ): Promise<void> {
-    if (!this.telegramBot) return;
-
-    const html = (value: string): string =>
-      value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-    await this.telegramBot.sendDefault([
-      '<b>⚠️ Bundler Sell Activity</b>',
-      `Token: <code>${html(event.mint)}</code>`,
-      `Bundler: <code>${html(event.walletAddress)}</code>`,
-      `Sold: <b>${event.tokenAmount.toLocaleString()}</b> tokens`,
-      `Cumulative Sold: <b>${event.cumulativeSoldPercentage.toFixed(2)}%</b>`,
-      '',
-      event.cumulativeSoldPercentage >= 40 
-        ? '<b>Threshold (40%) reached! Triggering sell...</b>'
-        : 'Monitoring continues until 40% threshold is reached.',
-    ].join('\n')).catch(err => log.warn('Failed to send bundler sell notification', err));
+  getBuySol(): number {
+    return this.buySol;
   }
 
-  private async sendSellTriggerNotification(
-    position: EarlyBundlerPosition,
-    reason: BundlerSellReason,
-    message: string
-  ): Promise<void> {
-    if (!this.telegramBot) return;
-
-    const html = (value: string): string =>
-      value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-    await this.telegramBot.sendDefault([
-      '<b>📉 Early Bundler Sell Triggered</b>',
-      `Token: <code>${html(position.mint)}</code>`,
-      `Reason: <b>${html(reason.type)}</b>`,
-      `Detail: ${html(message)}`,
-      '',
-      'Executing sell on GMGN...',
-    ].join('\n')).catch(err => log.warn('Failed to send sell trigger notification', err));
+  setExitPercent(value: number): void {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error('Bundler exit percent must be a non-negative number');
+    }
+    this.exitPercent = value;
   }
 
-  private async sendPositionClosedNotification(
-    position: EarlyBundlerPosition,
-    reason: string
-  ): Promise<void> {
-    if (!this.telegramBot) return;
-
-    const html = (value: string): string =>
-      value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-    await this.telegramBot.sendDefault([
-      '<b>ℹ️ Early Bundler Monitoring Stopped</b>',
-      `Token: <code>${html(position.mint)}</code>`,
-      `Reason: ${html(reason)}`,
-    ].join('\n')).catch(err => log.warn('Failed to send position closed notification', err));
+  getExitPercent(): number {
+    return this.exitPercent;
   }
 
-  // ── Getters ──────────────────────────────────────────────────────────────
+  getFollowedWallet(): string | null {
+    return this.followedWallet;
+  }
+
+  getWatchingMint(): string | null {
+    return this.watchingMint;
+  }
 
   getActivePosition(): EarlyBundlerPosition | null {
     return this.activePosition;
   }
 
-  isMonitoring(): boolean {
-    return !this.isShuttingDown && this.bundlerMonitor !== null;
+  isRunning(): boolean {
+    return this.followMonitor !== null;
+  }
+
+  markPositionBought(position: EarlyBundlerPosition, entryMc: number | null): void {
+    this.activePosition = { ...position, entryMc };
+    this.watchingMint = null;
+    this.boughtMints.add(position.mint);
+  }
+
+  async shutdown(): Promise<void> {
+    this.isShuttingDown = true;
+    this.isEnabled = false;
+    await this.stopFollowMonitor();
+    this.activePosition = null;
+    this.watchingMint = null;
+  }
+
+  async stopActiveMonitoring(reason = 'Bundler mode stopped'): Promise<void> {
+    this.isEnabled = false;
+    await this.stopFollowMonitor();
+    this.activePosition = null;
+    this.watchingMint = null;
+    log.info('Bundler monitoring stopped', { reason });
+  }
+
+  clearActivePosition(): void {
+    this.activePosition = null;
+    this.watchingMint = null;
+    log.info('Bundler active position cleared; resuming follow wallet if configured');
+    if (this.isEnabled && this.followedWallet && !this.followMonitor) {
+      void this.startFollowMonitor();
+    }
+  }
+
+  private async startFollowMonitor(): Promise<void> {
+    if (!this.isEnabled || this.isShuttingDown || !this.followedWallet || this.followMonitor) return;
+
+    this.followMonitor = new WalletMonitor(this.config, this.followedWallet, { enforceMinBuySol: false });
+    this.followMonitor.on('newToken', (event) => {
+      this.handleFollowWalletBuy(event).catch((err) => {
+        log.error('Failed to handle bundler follow-wallet buy', err);
+        this.emit('error', err instanceof Error ? err : new Error(String(err)));
+      });
+    });
+
+    await this.followMonitor.start();
+    log.info('Bundler follow-wallet monitoring started', {
+      followedWallet: this.followedWallet,
+      buySol: this.buySol,
+      exitPercent: this.exitPercent,
+    });
+  }
+
+  private async stopFollowMonitor(): Promise<void> {
+    if (!this.followMonitor) return;
+    this.followMonitor.stop();
+    this.followMonitor = null;
+  }
+
+  private async handleFollowWalletBuy(event: NewTokenEvent): Promise<void> {
+    if (!this.isEnabled || this.isShuttingDown) return;
+    if (this.activePosition || this.watchingMint) return;
+    if (this.boughtMints.has(event.mint)) return;
+
+    this.watchingMint = event.mint;
+    this.boughtMints.add(event.mint);
+    await this.stopFollowMonitor();
+
+    log.info('Bundler follow wallet bought new token; checking transfer pattern', {
+      followedWallet: event.walletAddress,
+      mint: event.mint,
+    });
+
+    await this.sendTokenDetectedNotification(event.mint, event.walletAddress);
+    await this.monitorTokenTransfers(event.mint, event.walletAddress);
+  }
+
+  private async monitorTokenTransfers(mint: string, followedWallet: string): Promise<void> {
+    while (this.isEnabled && !this.isShuttingDown && this.watchingMint === mint) {
+      const transactions = await this.heliusClient.getTokenSystemTransfers(mint, 10);
+      log.info('Bundler Helius transfer check complete', {
+        mint,
+        records: transactions.length,
+        action: 'evaluating immediately',
+      });
+
+      const match = this.findRepeatedBuyer(transactions, mint);
+      if (match) {
+        const position: EarlyBundlerPosition = {
+          positionId: this.nextPositionId++,
+          tradingWallet: this.config.tradingWalletAddress ?? this.config.walletAddress ?? followedWallet,
+          followedWallet,
+          mint,
+          buySol: this.buySol,
+          matchedWallet: match.wallet,
+        };
+
+        this.activePosition = position;
+        this.watchingMint = null;
+
+        await this.sendPatternMatchedNotification(position, match);
+        this.emit('buyTrigger', {
+          position,
+          signature: match.signature,
+          matchedWallet: match.wallet,
+        });
+        return;
+      }
+
+      if (transactions.length >= 10) {
+        log.info('Bundler pattern rejected after checking up to 10 transfer records', { mint });
+        await this.sendPatternRejectedNotification(mint);
+        this.watchingMint = null;
+        if (this.isEnabled && !this.activePosition) {
+          await this.startFollowMonitor();
+        }
+        return;
+      }
+
+      await sleep(2_000);
+    }
+  }
+
+  private findRepeatedBuyer(
+    transactions: HeliusTransaction[],
+    mint: string
+  ): { wallet: string; signature: string; firstTwo: TransferSide[] } | null {
+    const byFeePayer = new Map<string, Array<{ tx: HeliusTransaction; side: TransferSide }>>();
+
+    for (const tx of transactions) {
+      if (!tx.feePayer) continue;
+      const side = this.classifyTransferSide(tx, mint);
+      const entries = byFeePayer.get(tx.feePayer) ?? [];
+      entries.push({ tx, side });
+      byFeePayer.set(tx.feePayer, entries);
+    }
+
+    for (const [wallet, entries] of byFeePayer.entries()) {
+      if (entries.length < 2) continue;
+      const firstTwo = entries.slice(0, 2).map((entry) => entry.side);
+      if (firstTwo[0] === 'buy' && firstTwo[1] === 'buy') {
+        return {
+          wallet,
+          signature: entries[1].tx.signature,
+          firstTwo,
+        };
+      }
+
+      log.info('Repeated feePayer found, but first two actions were not both buys', {
+        mint,
+        wallet,
+        firstTwo,
+      });
+    }
+
+    return null;
+  }
+
+  private classifyTransferSide(tx: HeliusTransaction, mint: string): TransferSide {
+    const transfer = tx.tokenTransfers?.find((item) => item.mint === mint);
+    if (!transfer || !tx.feePayer) return 'unknown';
+    if (transfer.toUserAccount === tx.feePayer) return 'buy';
+    if (transfer.fromUserAccount === tx.feePayer) return 'sell';
+    return 'unknown';
+  }
+
+  private async sendTokenDetectedNotification(mint: string, followedWallet: string): Promise<void> {
+    if (!this.telegramBot) return;
+    await this.telegramBot.sendDefault([
+      '<b>Bundler Follow Buy Detected</b>',
+      `Follow wallet: <code>${this.html(followedWallet)}</code>`,
+      `Token: <code>${this.html(mint)}</code>`,
+      '',
+      'Checking the first 10 Helius system transfers for repeated buyer pattern.',
+    ].join('\n')).catch((err) => log.warn('Failed to send bundler detected notification', err));
+  }
+
+  private async sendPatternMatchedNotification(
+    position: EarlyBundlerPosition,
+    match: { wallet: string; firstTwo: TransferSide[] }
+  ): Promise<void> {
+    if (!this.telegramBot) return;
+    const marketCapUsd = this.gmgnClient ? await this.gmgnClient.fetchTokenMarketCapUsd(position.mint).catch(() => null) : null;
+    await this.telegramBot.sendDefault([
+      '<b>Bundler Buy Pattern Matched</b>',
+      `Token: <code>${this.html(position.mint)}</code>`,
+      `Repeated feePayer: <code>${this.html(match.wallet)}</code>`,
+      `First two actions: <b>${match.firstTwo.join(' + ')}</b>`,
+      `Market Cap: <b>$${marketCapUsd?.toLocaleString() ?? 'Unknown'}</b>`,
+      `Buying: <b>${position.buySol} SOL</b>`,
+      '',
+      'Submitting swap...',
+    ].join('\n')).catch((err) => log.warn('Failed to send bundler pattern notification', err));
+  }
+
+  private async sendPatternRejectedNotification(mint: string): Promise<void> {
+    if (!this.telegramBot) return;
+    await this.telegramBot.sendDefault([
+      '<b>Bundler Pattern Rejected</b>',
+      `Token: <code>${this.html(mint)}</code>`,
+      'No repeated feePayer with two buys found in the first 10 Helius system transfers.',
+    ].join('\n')).catch((err) => log.warn('Failed to send bundler reject notification', err));
+  }
+
+  private html(value: string): string {
+    return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 }

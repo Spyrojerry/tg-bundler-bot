@@ -164,6 +164,7 @@ export interface ServiceConfig {
   insiderMinTransferProfit: number;
   insiderFollowWallet: string | null;
   insiderFollowWallet2: string | null;
+  defaultBotMode: 'insider' | 'bundler';
   reverseCopySellTargetWallet: string | null;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;

@@ -85,6 +85,8 @@ export interface InsiderBot {
   setMinTransferProfit(value: number): void;
   getProfitType(): 'realized' | 'total' | 'both';
   setProfitType(value: 'realized' | 'total' | 'both'): void;
+  configureFollowWallet(address: string): void;
+  pause(): void;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -273,6 +275,17 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  configureFollowWallet(address: string): void {
+    const normalized = new PublicKey(address).toBase58();
+    if (this.followedWallet !== normalized) {
+      this.boughtMints.clear();
+    }
+    this.pause();
+    this.followedWallet = normalized;
+    this.activePosition = null;
+    this.watchingMint = null;
+  }
+
   async stop(): Promise<void> {
     if (this.followMonitor) {
       this.followMonitor.stop();
@@ -280,6 +293,13 @@ export class InsiderBot extends EventEmitter {
     }
     this.activePosition = null;
     this.watchingMint = null;
+  }
+
+  pause(): void {
+    if (this.followMonitor) {
+      this.followMonitor.stop();
+      this.followMonitor = null;
+    }
   }
 
   markPositionBought(trigger: InsiderBuyTrigger): void {

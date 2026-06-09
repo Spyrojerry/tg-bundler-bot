@@ -71,6 +71,10 @@ function isValidGmgnFetchMode(s: string): s is ServiceConfig['gmgnFetchMode'] {
   return ['auto', 'direct', 'cli'].includes(s);
 }
 
+function isValidDefaultBotMode(s: string): s is ServiceConfig['defaultBotMode'] {
+  return ['insider', 'bundler'].includes(s);
+}
+
 export function loadConfig(): ServiceConfig {
   const walletAddress    = optionalNullable('WALLET_ADDRESS');
   const tradingWalletAddress = optionalNullable('TRADING_WALLET_ADDRESS');
@@ -123,6 +127,7 @@ export function loadConfig(): ServiceConfig {
   const dbPath           = optional('DB_PATH', './data/monitor.db');
   const insiderFollowWallet = optionalNullable('INSIDER_FOLLOW_WALLET');
   const insiderFollowWallet2 = optionalNullable('INSIDER_FOLLOW_WALLET_2');
+  const defaultBotMode = optional('DEFAULT_BOT_MODE', 'insider').toLowerCase();
   const reverseCopySellTargetWallet = optionalNullable('REVERSE_COPYSELL_TARGET_WALLET');
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
@@ -151,6 +156,9 @@ export function loadConfig(): ServiceConfig {
   }
   if (!isValidGmgnFetchMode(gmgnFetchMode)) {
     throw new Error(`GMGN_FETCH_MODE must be one of auto|direct|cli, got: ${gmgnFetchMode}`);
+  }
+  if (!isValidDefaultBotMode(defaultBotMode)) {
+    throw new Error(`DEFAULT_BOT_MODE must be one of insider|bundler, got: ${defaultBotMode}`);
   }
 
   // Sanity checks
@@ -205,6 +213,7 @@ export function loadConfig(): ServiceConfig {
     insiderMinTransferProfit,
     insiderFollowWallet,
     insiderFollowWallet2,
+    defaultBotMode,
     reverseCopySellTargetWallet,
     logLevel: rawLogLevel,
     telegramBotToken,
