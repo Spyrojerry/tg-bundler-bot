@@ -35,7 +35,7 @@ import { randomBytes } from 'crypto';
 const log = createLogger('MAIN');
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
-const INSIDER_MIN_MARKET_CAP_USD = 1_000;
+const INSIDER_MIN_MARKET_CAP_USD = 2_000;
 const MCAP_CHECK_INTERVAL_MS = 1000; // Increased frequency from 1500ms to 1000ms
 
 async function main(): Promise<void> {
@@ -1277,8 +1277,8 @@ async function main(): Promise<void> {
       log.info(`[INSIDER ${index + 1} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${preFetchedMc !== undefined ? 'Prefetched' : 'Client'})`);
 
       // 2. IMMEDIATE GLOBAL CHECKS (Rug / Reset)
-      if (currentMc < 1000) {
-        const reason = `Market cap $${currentMc.toLocaleString()} below $1,000 (Rug)`;
+      if (currentMc < INSIDER_MIN_MARKET_CAP_USD) {
+        const reason = `Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} (Rug)`;
         log.warn(`[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Resetting state.`);
 
         // If we have an active position, trigger a sell just in case there's salvageable balance
@@ -1872,7 +1872,7 @@ async function main(): Promise<void> {
           '4. Bot buys when MC >= Entry MC.',
           '5. Bot sets Exit MC at your chosen % increase from entry MC.',
           '6. Bot sells when MC >= Exit MC.',
-          '• Rug Protection: Bot resets if MC is below $1,000.',
+          `• Rug Protection: Bot resets if MC is below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
         ].join('\n'),
         replyMarkup: {
           inline_keyboard: [
@@ -1967,10 +1967,10 @@ async function main(): Promise<void> {
         '',
         '<b>Flow</b>',
         '1. Set a follow wallet.',
-        '2. Bot waits for that wallet to buy a new token.',
-        '3. Bot checks Helius system transfers every 2s, up to the first 10 records.',
+        '2. Bot waits for that wallet to buy a new token within 10 minutes of creation.',
+        '3. Bot checks Helius system transfers every 2s for up to 5 minutes, or until the first 10 records arrive.',
         '4. As soon as a feePayer appears twice and its first two actions are buys, bot buys.',
-        '5. Bot exits at your % MC increase or sells on rug below $1,000.',
+        `5. Bot exits at your % MC increase or sells on rug below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
       ].filter(Boolean).join('\n'),
       replyMarkup: {
         inline_keyboard: [

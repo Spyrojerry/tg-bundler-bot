@@ -10,6 +10,8 @@ import { WalletMonitor } from './wallet-monitor';
 
 const log = createLogger('BUNDLER');
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const MAX_FOLLOW_BUY_AGE_MS = 10 * 60 * 1000;
+const MAX_PATTERN_MONITOR_MS = 5 * 60 * 1000;
 
 type TransferSide = 'buy' | 'sell' | 'unknown';
 
@@ -207,6 +209,15 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     this.boughtMints.add(event.mint);
     await this.stopFollowMonitor();
 
+    const ageOk = await this.isFollowBuyWithinCreationWindow(event);
+    if (!ageOk) {
+      this.watchingMint = null;
+      if (this.isEnabled && !this.activePosition) {
+        await this.startFollowMonitor();
+      }
+      return;
+    }
+
     log.info('Bundler follow wallet bought new token; checking transfer pattern', {
       followedWallet: event.walletAddress,
       mint: event.mint,
@@ -217,11 +228,15 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
   }
 
   private async monitorTokenTransfers(mint: string, followedWallet: string): Promise<void> {
+    const startedAt = Date.now();
+
     while (this.isEnabled && !this.isShuttingDown && this.watchingMint === mint) {
-      const transactions = await this.heliusClient.getTokenSystemTransfers(mint, 10);
+      const remainingMs = Math.max(1_000, MAX_PATTERN_MONITOR_MS - (Date.now() - startedAt));
+      const transactions = await this.heliusClient.getTokenSystemTransfers(mint, 10, remainingMs);
       log.info('Bundler Helius transfer check complete', {
         mint,
         records: transactions.length,
+        elapsedSec: Math.round((Date.now() - startedAt) / 1000),
         action: 'evaluating immediately',
       });
 
@@ -258,7 +273,63 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
         return;
       }
 
+      if (Date.now() - startedAt >= MAX_PATTERN_MONITOR_MS) {
+        log.info('Bundler pattern rejected after 5 minute Helius monitoring timeout', {
+          mint,
+          records: transactions.length,
+        });
+        await this.sendPatternRejectedNotification(mint, 'No matching pattern found within 5 minutes.');
+        this.watchingMint = null;
+        if (this.isEnabled && !this.activePosition) {
+          await this.startFollowMonitor();
+        }
+        return;
+      }
+
       await sleep(2_000);
+    }
+  }
+
+  private async isFollowBuyWithinCreationWindow(event: NewTokenEvent): Promise<boolean> {
+    try {
+      const creationTimestamp = await this.heliusClient.getTokenCreationTimestamp(event.mint);
+      const buyTimestamp = event.timestamp ?? Math.floor(event.detectedAt / 1000);
+
+      if (creationTimestamp === null) {
+        log.warn('Bundler token rejected because creation timestamp could not be found', {
+          mint: event.mint,
+          followedWallet: event.walletAddress,
+          signature: event.signature,
+        });
+        await this.sendPatternRejectedNotification(event.mint, 'Token creation timestamp could not be verified.');
+        return false;
+      }
+
+      const ageMs = (buyTimestamp - creationTimestamp) * 1000;
+      if (ageMs <= MAX_FOLLOW_BUY_AGE_MS) {
+        log.info('Bundler follow buy passed token age check', {
+          mint: event.mint,
+          followedWallet: event.walletAddress,
+          ageSec: Math.max(0, Math.round(ageMs / 1000)),
+        });
+        return true;
+      }
+
+      log.info('Bundler token rejected because follow buy was older than 10 minutes from creation', {
+        mint: event.mint,
+        followedWallet: event.walletAddress,
+        ageSec: Math.round(ageMs / 1000),
+      });
+      await this.sendPatternRejectedNotification(event.mint, 'Follow-wallet first buy was more than 10 minutes after token creation.');
+      return false;
+    } catch (err) {
+      log.warn('Bundler token rejected because token age check failed', {
+        mint: event.mint,
+        followedWallet: event.walletAddress,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await this.sendPatternRejectedNotification(event.mint, 'Token age check failed.');
+      return false;
     }
   }
 
@@ -334,12 +405,12 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     ].join('\n')).catch((err) => log.warn('Failed to send bundler pattern notification', err));
   }
 
-  private async sendPatternRejectedNotification(mint: string): Promise<void> {
+  private async sendPatternRejectedNotification(mint: string, reason?: string): Promise<void> {
     if (!this.telegramBot) return;
     await this.telegramBot.sendDefault([
       '<b>Bundler Pattern Rejected</b>',
       `Token: <code>${this.html(mint)}</code>`,
-      'No repeated feePayer with two buys found in the first 10 Helius system transfers.',
+      reason ?? 'No repeated feePayer with two buys found in the first 10 Helius system transfers.',
     ].join('\n')).catch((err) => log.warn('Failed to send bundler reject notification', err));
   }
 

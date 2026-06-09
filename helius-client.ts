@@ -88,7 +88,11 @@ export class HeliusClient {
     throw lastError;
   }
 
-  async getTokenSystemTransfers(mintAddress: string, limit: number = 10): Promise<HeliusTransaction[]> {
+  async getTokenSystemTransfers(
+    mintAddress: string,
+    limit: number = 10,
+    timeoutMs?: number
+  ): Promise<HeliusTransaction[]> {
     const params = new URLSearchParams({
       'token-accounts': 'none',
       'sort-order': 'asc',
@@ -99,8 +103,13 @@ export class HeliusClient {
     });
     const url = `${this.baseUrl}/v0/addresses/${mintAddress}/transactions?${params.toString()}`;
 
+    const controller = timeoutMs ? new AbortController() : null;
+    const timeout = controller
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, controller ? { signal: controller.signal } : undefined);
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -109,6 +118,32 @@ export class HeliusClient {
       return await response.json() as HeliusTransaction[];
     } catch (err) {
       log.error(`Failed to fetch token system transfers for ${mintAddress}`, err);
+      throw err;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  async getTokenCreationTimestamp(mintAddress: string): Promise<number | null> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'asc',
+      'api-key': this.apiKey,
+      limit: '1',
+    });
+    const url = `${this.baseUrl}/v0/addresses/${mintAddress}/transactions?${params.toString()}`;
+
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+      }
+
+      const [first] = await response.json() as HeliusTransaction[];
+      return first?.timestamp ?? null;
+    } catch (err) {
+      log.error(`Failed to fetch token creation timestamp for ${mintAddress}`, err);
       throw err;
     }
   }

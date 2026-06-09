@@ -281,9 +281,10 @@ export class WalletMonitor extends EventEmitter {
           detectedAt: Date.now(),
           buySol: buy.buySol,
           signature,
+          timestamp: buy.timestamp,
         });
 
-        this.emitNewToken(buy.mint, Date.now(), 'tx-detected', source, buy.buySol);
+        this.emitNewToken(buy.mint, Date.now(), 'tx-detected', source, buy.buySol, signature, buy.timestamp);
       }
     } finally {
       this.pendingSignatures.delete(signature);
@@ -293,7 +294,7 @@ export class WalletMonitor extends EventEmitter {
 
   private async fetchBoughtMintsFromSignature(
     signature: string
-  ): Promise<Array<{ mint: string; buySol: number | null }> | null> {
+  ): Promise<Array<{ mint: string; buySol: number | null; timestamp?: number }> | null> {
     let tx = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
       tx = await this.connection.getParsedTransaction(signature, {
@@ -332,7 +333,7 @@ export class WalletMonitor extends EventEmitter {
       }
     }
 
-    return [...boughtMints].map((mint) => ({ mint, buySol }));
+    return [...boughtMints].map((mint) => ({ mint, buySol, timestamp: tx.blockTime ?? undefined }));
   }
 
   private estimateSolSpent(
@@ -373,7 +374,9 @@ export class WalletMonitor extends EventEmitter {
     detectedAt: number,
     amount: string | number,
     source: string,
-    buySol: number | null
+    buySol: number | null,
+    signature?: string,
+    timestamp?: number
   ): void {
     if (this.knownMints.has(mint)) return;
 
@@ -406,6 +409,8 @@ export class WalletMonitor extends EventEmitter {
       mint,
       detectedAt,
       buySol,
+      signature,
+      timestamp,
     };
     this.emit('newToken', event);
   }

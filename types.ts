@@ -183,6 +183,8 @@ export interface NewTokenEvent {
   mint: string;
   detectedAt: number;
   buySol: number | null;
+  signature?: string;
+  timestamp?: number;
   matchingWallets?: string[];
 }
 
