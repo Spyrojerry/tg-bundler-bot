@@ -1968,8 +1968,8 @@ async function main(): Promise<void> {
         '<b>Flow</b>',
         '1. Set a follow wallet.',
         '2. Bot waits for that wallet to buy a new token within 10 minutes of creation.',
-        '3. Bot checks Helius system transfers every 2s for up to 5 minutes, or until the first 10 records arrive.',
-        '4. As soon as a feePayer appears twice and its first two actions are buys, bot buys.',
+        '3. Bot checks Helius system transfers every 2s for up to 2 minutes, waiting for 10 records.',
+        '4. Once 10 records are available, bot buys only if a repeated feePayer has buy + buy as its first two actions.',
         `5. Bot exits at your % MC increase or sells on rug below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
       ].filter(Boolean).join('\n'),
       replyMarkup: {

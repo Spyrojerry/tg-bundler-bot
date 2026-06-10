@@ -11,7 +11,7 @@ import { WalletMonitor } from './wallet-monitor';
 const log = createLogger('BUNDLER');
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 const MAX_FOLLOW_BUY_AGE_MS = 10 * 60 * 1000;
-const MAX_PATTERN_MONITOR_MS = 5 * 60 * 1000;
+const MAX_PATTERN_MONITOR_MS = 2 * 60 * 1000;
 
 type TransferSide = 'buy' | 'sell' | 'unknown';
 
@@ -237,33 +237,33 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
         mint,
         records: transactions.length,
         elapsedSec: Math.round((Date.now() - startedAt) / 1000),
-        action: 'evaluating immediately',
+        action: transactions.length >= 10 ? 'evaluating first 10 records' : 'waiting for 10 records',
       });
 
-      const match = this.findRepeatedBuyer(transactions, mint);
-      if (match) {
-        const position: EarlyBundlerPosition = {
-          positionId: this.nextPositionId++,
-          tradingWallet: this.config.tradingWalletAddress ?? this.config.walletAddress ?? followedWallet,
-          followedWallet,
-          mint,
-          buySol: this.buySol,
-          matchedWallet: match.wallet,
-        };
-
-        this.activePosition = position;
-        this.watchingMint = null;
-
-        await this.sendPatternMatchedNotification(position, match);
-        this.emit('buyTrigger', {
-          position,
-          signature: match.signature,
-          matchedWallet: match.wallet,
-        });
-        return;
-      }
-
       if (transactions.length >= 10) {
+        const match = this.findRepeatedBuyer(transactions, mint);
+        if (match) {
+          const position: EarlyBundlerPosition = {
+            positionId: this.nextPositionId++,
+            tradingWallet: this.config.tradingWalletAddress ?? this.config.walletAddress ?? followedWallet,
+            followedWallet,
+            mint,
+            buySol: this.buySol,
+            matchedWallet: match.wallet,
+          };
+
+          this.activePosition = position;
+          this.watchingMint = null;
+
+          await this.sendPatternMatchedNotification(position, match);
+          this.emit('buyTrigger', {
+            position,
+            signature: match.signature,
+            matchedWallet: match.wallet,
+          });
+          return;
+        }
+
         log.info('Bundler pattern rejected after checking up to 10 transfer records', { mint });
         await this.sendPatternRejectedNotification(mint);
         this.watchingMint = null;
@@ -274,11 +274,11 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       }
 
       if (Date.now() - startedAt >= MAX_PATTERN_MONITOR_MS) {
-        log.info('Bundler pattern rejected after 5 minute Helius monitoring timeout', {
+        log.info('Bundler pattern rejected after 2 minute Helius monitoring timeout', {
           mint,
           records: transactions.length,
         });
-        await this.sendPatternRejectedNotification(mint, 'No matching pattern found within 5 minutes.');
+        await this.sendPatternRejectedNotification(mint, 'No matching pattern found within 2 minutes.');
         this.watchingMint = null;
         if (this.isEnabled && !this.activePosition) {
           await this.startFollowMonitor();
