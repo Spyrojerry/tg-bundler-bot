@@ -403,22 +403,32 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
     }
 
     for (const [wallet, entries] of byFeePayer.entries()) {
-      if (entries.length < 2) continue;
-      const firstTwo = entries.slice(0, 2).map((entry) => entry.side);
-      if (firstTwo[0] === 'buy' && firstTwo[1] === 'buy') {
-        return {
-          wallet,
-          signature: entries[1].tx.signature,
-          firstTwo,
-        };
-      }
+  if (entries.length < 2) continue;
 
-      log.info('Repeated feePayer found, but first two actions were not both buys', {
-        mint,
-        wallet,
-        firstTwo,
-      });
-    }
+  // Skip the followed wallet — it is expected to buy repeatedly and is not a signal
+  if (wallet === this.followedWallet) {
+    log.info('Skipping repeated feePayer because it is the followed wallet', {
+      mint,
+      wallet,
+    });
+    continue;
+  }
+
+  const firstTwo = entries.slice(0, 2).map((entry) => entry.side);
+  if (firstTwo[0] === 'buy' && firstTwo[1] === 'buy') {
+    return {
+      wallet,
+      signature: entries[1].tx.signature,
+      firstTwo,
+    };
+  }
+
+  log.info('Repeated feePayer found, but first two actions were not both buys', {
+    mint,
+    wallet,
+    firstTwo,
+  });
+}
 
     return null;
   }

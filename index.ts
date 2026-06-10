@@ -668,10 +668,11 @@ async function main(): Promise<void> {
       const balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
 
       if (balance <= 0n) {
-        log.info('[BUNDLER SELL SKIP] creator_hold_rate failed, but trading wallet is not holding token', {
+        log.info('[BUNDLER SELL SKIP] No position held; resetting orchestrator', {
           mint: trigger.position.mint,
           reason: trigger.reason,
         });
+        earlyBundlerOrchestrator.clearActivePosition();
         return;
       }
 
@@ -1149,6 +1150,18 @@ async function main(): Promise<void> {
         buySol: earlyBundlerOrchestrator.getBuySol(),
         matchingWallets: position.matchedWallet ? [position.matchedWallet] : [],
       };
+
+            const owner = new PublicKey(config.tradingWalletAddress);
+      const mintPk = new PublicKey(position.mint);
+      const balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
+
+      if (balance <= 0n) {
+        log.info('[BUNDLER MCAP SELL SKIP] No position held; resetting orchestrator', {
+          mint: position.mint,
+        });
+        earlyBundlerOrchestrator.clearActivePosition();
+        return;
+      }
 
       const sellId = randomBytes(5).toString('hex');
       pendingSells.set(sellId, {
