@@ -10,7 +10,7 @@ import { WalletMonitor } from './wallet-monitor';
 
 const log = createLogger('BUNDLER');
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
-const MAX_FOLLOW_BUY_AGE_MS = 10 * 60 * 1000;
+const MAX_FOLLOW_BUY_AGE_MS = 60 * 60 * 1000;
 const MAX_PATTERN_MONITOR_MS = 2 * 60 * 1000;
 
 type TransferSide = 'buy' | 'sell' | 'unknown';
