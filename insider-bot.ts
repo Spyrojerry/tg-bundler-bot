@@ -74,9 +74,11 @@ export interface InsiderBot {
     event: "sellTrigger",
     listener: (trigger: InsiderSellTrigger) => void,
   ): this;
+   on(event: 'mintSeen', listener: (mint: string) => void): this; 
   on(event: "error", listener: (error: Error) => void): this;
   emit(event: "buyTrigger", trigger: InsiderBuyTrigger): boolean;
   emit(event: "sellTrigger", trigger: InsiderSellTrigger): boolean;
+  emit(event: 'mintSeen', mint: string): boolean;
   emit(event: "error", error: Error): boolean;
   getActivePosition(): { followedWallet: string; mint: string } | null;
   getPreBuyMint(): string | null;
@@ -141,9 +143,9 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
-  seedBoughtMints(mints: Set<string>): void {
-    for (const m of mints) this.boughtMints.add(m);
-  }
+  seedSeenMints(mints: Set<string>): void {
+  for (const m of mints) this.boughtMints.add(m);
+}
 
   getActivePosition(): { followedWallet: string; mint: string } | null {
     return this.activePosition;
@@ -285,6 +287,7 @@ export class InsiderBot extends EventEmitter {
       }
 
       this.boughtMints.add(event.mint);
+      this.emit('mintSeen', event.mint);
       this.watchingMint = event.mint;
     });
 

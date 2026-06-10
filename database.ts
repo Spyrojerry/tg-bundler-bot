@@ -134,6 +134,13 @@ CREATE TABLE IF NOT EXISTS bundler_wallet_sells (
   FOREIGN KEY (bundler_wallet_id) REFERENCES early_bundler_wallets(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS seen_mints (
+  trading_wallet  TEXT NOT NULL,
+  mint            TEXT NOT NULL,
+  seen_at         TEXT NOT NULL,
+  PRIMARY KEY (trading_wallet, mint)
+);
+
 CREATE INDEX IF NOT EXISTS idx_ebp_status ON early_bundler_positions(status);
 CREATE INDEX IF NOT EXISTS idx_ebw_position ON early_bundler_wallets(position_id);
 CREATE INDEX IF NOT EXISTS idx_bws_bundler ON bundler_wallet_sells(bundler_wallet_id);
@@ -378,21 +385,21 @@ export class MonitorDatabase {
     return rows.length > 0;
   }
 
-  addBoughtMint(tradingWallet: string, mint: string): void {
-    this.run(
-      `INSERT OR IGNORE INTO bought_mints (trading_wallet, mint, bought_at)
+  addSeenMint(tradingWallet: string, mint: string): void {
+  this.run(
+    `INSERT OR IGNORE INTO seen_mints (trading_wallet, mint, seen_at)
      VALUES (?, ?, ?)`,
-      [tradingWallet, mint, new Date().toISOString()],
-    );
-  }
+    [tradingWallet, mint, new Date().toISOString()]
+  );
+}
 
-  getBoughtMints(tradingWallet: string): Set<string> {
-    const rows = this.query<{ mint: string }>(
-      `SELECT mint FROM bought_mints WHERE trading_wallet = ?`,
-      [tradingWallet],
-    );
-    return new Set(rows.map((r) => r.mint));
-  }
+getSeenMints(tradingWallet: string): Set<string> {
+  const rows = this.query<{ mint: string }>(
+    `SELECT mint FROM seen_mints WHERE trading_wallet = ?`,
+    [tradingWallet]
+  );
+  return new Set(rows.map(r => r.mint));
+}
 
   addWallet(address: string): void {
     this.run(
