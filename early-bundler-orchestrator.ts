@@ -32,7 +32,7 @@ export interface BundlerBuyTrigger {
 }
 
 export interface BundlerSellReason {
-  type: 'mcap_exit' | 'rug' | 'manual';
+  type: 'mcap_exit' | 'rug' | 'manual' | 'creator_hold_zero';
   reason?: string;
 }
 
@@ -241,6 +241,9 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       });
 
       if (transactions.length >= 10) {
+        const creatorHoldOk = await this.checkCreatorHoldRate(mint, followedWallet);
+        if (!creatorHoldOk) return;
+
         const match = this.findRepeatedBuyer(transactions, mint);
         if (match) {
           const position: EarlyBundlerPosition = {
@@ -274,6 +277,9 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
       }
 
       if (Date.now() - startedAt >= MAX_PATTERN_MONITOR_MS) {
+        const creatorHoldOk = await this.checkCreatorHoldRate(mint, followedWallet);
+        if (!creatorHoldOk) return;
+
         log.info('Bundler pattern rejected after 2 minute Helius monitoring timeout', {
           mint,
           records: transactions.length,
@@ -288,6 +294,55 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
 
       await sleep(2_000);
     }
+  }
+
+  private async checkCreatorHoldRate(mint: string, followedWallet: string): Promise<boolean> {
+    const creatorHoldRate = this.gmgnClient
+      ? await this.gmgnClient.fetchCreatorHoldRate(mint).catch(() => null)
+      : null;
+
+    if (creatorHoldRate !== null && creatorHoldRate > 0) {
+      log.info('Bundler creator_hold_rate check passed', {
+        mint,
+        creatorHoldRate,
+      });
+      return true;
+    }
+
+    const reason = creatorHoldRate === null
+      ? 'creator_hold_rate could not be verified; must be greater than 0.'
+      : `creator_hold_rate is ${creatorHoldRate}; must be greater than 0.`;
+
+    log.warn('Bundler creator_hold_rate check failed', {
+      mint,
+      creatorHoldRate,
+      reason,
+    });
+
+    const position: EarlyBundlerPosition = {
+      positionId: this.nextPositionId++,
+      tradingWallet: this.config.tradingWalletAddress ?? this.config.walletAddress ?? followedWallet,
+      followedWallet,
+      mint,
+      buySol: this.buySol,
+    };
+
+    this.watchingMint = null;
+    this.activePosition = null;
+
+    if (creatorHoldRate !== null && creatorHoldRate <= 0) {
+      this.emit('sellTrigger', {
+        type: 'creator_hold_zero',
+        reason,
+        position,
+      });
+    }
+
+    await this.sendPatternRejectedNotification(mint, reason);
+    if (this.isEnabled && !this.activePosition) {
+      await this.startFollowMonitor();
+    }
+    return false;
   }
 
   private async isFollowBuyWithinCreationWindow(event: NewTokenEvent): Promise<boolean> {

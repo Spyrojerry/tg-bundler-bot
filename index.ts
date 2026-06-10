@@ -642,6 +642,79 @@ async function main(): Promise<void> {
       })();
   });
 
+  earlyBundlerOrchestrator.on('sellTrigger', (trigger) => {
+    if (botMode !== 'bundler') {
+      log.info('[BUNDLER SELL SKIP] Ignoring sell trigger because Bundler mode is inactive', {
+        mint: trigger.position.mint,
+        mode: botMode,
+        reason: trigger.reason,
+      });
+      return;
+    }
+
+    if (!config.tradingWalletAddress) {
+      log.warn('[BUNDLER SELL SKIP] No trading wallet configured', trigger);
+      return;
+    }
+
+    if (hasPendingSellForMint(config.tradingWalletAddress, trigger.position.mint)) {
+      log.info(`[BUNDLER SELL SKIP] Sell already pending for ${trigger.position.mint}`);
+      return;
+    }
+
+    void (async () => {
+      const owner = new PublicKey(config.tradingWalletAddress!);
+      const mintPk = new PublicKey(trigger.position.mint);
+      const balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
+
+      if (balance <= 0n) {
+        log.info('[BUNDLER SELL SKIP] creator_hold_rate failed, but trading wallet is not holding token', {
+          mint: trigger.position.mint,
+          reason: trigger.reason,
+        });
+        return;
+      }
+
+      const event: FilterFailEvent = {
+        walletAddress: config.tradingWalletAddress!,
+        mint: trigger.position.mint,
+        sampleNumber: 0,
+        elapsedSec: 0,
+        reasons: [trigger.reason ?? 'Bundler creator_hold_rate is 0; selling existing position.'],
+        settings: db.getWalletSettings(config.tradingWalletAddress!),
+        metrics: {
+          mint: trigger.position.mint,
+          timestamp: new Date().toISOString(),
+          bundlersPercent: null,
+          bundlersCount: null,
+          initialBaseReserve: null,
+          topWallets: null,
+          top10HolderRate: null,
+          bundledAmountRate: null,
+        },
+        buySol: trigger.position.buySol,
+        matchingWallets: trigger.position.matchedWallet ? [trigger.position.matchedWallet] : [],
+      };
+
+      const sellId = randomBytes(5).toString('hex');
+      activePositionCache.set(trigger.position.mint, { balance, quote: null, timestamp: Date.now() });
+      pendingSells.set(sellId, {
+        event,
+        createdAt: Date.now(),
+        executing: true,
+      });
+
+      telegramBot?.sendDefault([
+        '<b>🚨 Bundler Creator Hold Sell Triggered</b>',
+        `Token: <code>${html(trigger.position.mint)}</code>`,
+        `Reason: <b>${html(trigger.reason ?? 'creator_hold_rate is 0')}</b>`,
+        `Action: submit sell for <b>${config.sellPercent}%</b>.`,
+      ].join('\n')).catch((err) => log.warn('Telegram bundler creator-hold sell alert failed', err));
+
+      void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
+    })();
+  });
+
   reverseCopySellOrchestrator.on('sellTrigger', (data) => {
     if (botMode !== 'reverse_copysell') return;
     
@@ -1969,8 +2042,9 @@ async function main(): Promise<void> {
         '1. Set a follow wallet.',
         '2. Bot waits for that wallet to buy a new token within 10 minutes of creation.',
         '3. Bot checks Helius system transfers every 2s for up to 2 minutes, waiting for 10 records.',
-        '4. Once 10 records are available, bot buys only if a repeated feePayer has buy + buy as its first two actions.',
-        `5. Bot exits at your % MC increase or sells on rug below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
+        '4. creator_hold_rate must be greater than 0; if it is 0 and you already hold, bot sells.',
+        '5. Once 10 records are available, bot buys only if a repeated feePayer has buy + buy as its first two actions.',
+        `6. Bot exits at your % MC increase or sells on rug below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
       ].filter(Boolean).join('\n'),
       replyMarkup: {
         inline_keyboard: [

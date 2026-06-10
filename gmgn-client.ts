@@ -172,6 +172,40 @@ export class GmgnClient {
     return null;
   }
 
+  async fetchCreatorHoldRate(mint: string): Promise<number | null> {
+    this.validateSolAddress(mint, 'mint');
+
+    try {
+      let data: Record<string, unknown> | null = null;
+      if (this.fetchMode !== 'direct') {
+        data = await this.fetchCliData('token', mint);
+      }
+
+      if (!data) {
+        data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/info', mint));
+      }
+
+      if (!data) return null;
+
+      const candidates = [
+        data.creator_hold_rate,
+        this.asRecord(data.stat).creator_hold_rate,
+        this.asRecord(data.dev).creator_hold_rate,
+        this.asRecord(data.token).creator_hold_rate,
+      ];
+
+      for (const candidate of candidates) {
+        const parsed = this.parseNullableNumber(candidate);
+        if (parsed !== null) return parsed;
+      }
+
+      return null;
+    } catch (err) {
+      log.warn(`Failed to fetch creator_hold_rate for ${mint}`, err);
+      return null;
+    }
+  }
+
   // ── Public: fetch top profitable traders for a token ──────────────────────
 
   async fetchTokenTraders(
