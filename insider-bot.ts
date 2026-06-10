@@ -1,12 +1,12 @@
-import { Connection, PublicKey } from '@solana/web3.js';
-import { EventEmitter } from 'events';
-import { createLogger } from './logger';
-import type { ServiceConfig } from './types';
-import { TelegramBot } from './telegram-bot';
-import { WalletMonitor } from './wallet-monitor';
+import { Connection, PublicKey } from "@solana/web3.js";
+import { EventEmitter } from "events";
+import { createLogger } from "./logger";
+import type { ServiceConfig } from "./types";
+import { TelegramBot } from "./telegram-bot";
+import { WalletMonitor } from "./wallet-monitor";
 
-const log = createLogger('INSIDER');
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const log = createLogger("INSIDER");
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 interface HeliusEnhancedTransaction {
   signature?: string;
@@ -29,13 +29,21 @@ interface HeliusEnhancedTransaction {
     swap?: {
       nativeInput?: { account: string; amount: string };
       nativeOutput?: { account: string; amount: string };
-      tokenInputs?: Array<{ userCashFlowAccount: string; amount: string; mint: string }>;
-      tokenOutputs?: Array<{ userCashFlowAccount: string; amount: string; mint: string }>;
+      tokenInputs?: Array<{
+        userCashFlowAccount: string;
+        amount: string;
+        mint: string;
+      }>;
+      tokenOutputs?: Array<{
+        userCashFlowAccount: string;
+        amount: string;
+        mint: string;
+      }>;
     };
   };
 }
 
-type HeliusPoolSwapDirection = 'buy' | 'sell';
+type HeliusPoolSwapDirection = "buy" | "sell";
 
 interface HeliusPoolSwap {
   wallet: string;
@@ -61,12 +69,15 @@ export interface InsiderSellTrigger {
 }
 
 export interface InsiderBot {
-  on(event: 'buyTrigger', listener: (trigger: InsiderBuyTrigger) => void): this;
-  on(event: 'sellTrigger', listener: (trigger: InsiderSellTrigger) => void): this;
-  on(event: 'error', listener: (error: Error) => void): this;
-  emit(event: 'buyTrigger', trigger: InsiderBuyTrigger): boolean;
-  emit(event: 'sellTrigger', trigger: InsiderSellTrigger): boolean;
-  emit(event: 'error', error: Error): boolean;
+  on(event: "buyTrigger", listener: (trigger: InsiderBuyTrigger) => void): this;
+  on(
+    event: "sellTrigger",
+    listener: (trigger: InsiderSellTrigger) => void,
+  ): this;
+  on(event: "error", listener: (error: Error) => void): this;
+  emit(event: "buyTrigger", trigger: InsiderBuyTrigger): boolean;
+  emit(event: "sellTrigger", trigger: InsiderSellTrigger): boolean;
+  emit(event: "error", error: Error): boolean;
   getActivePosition(): { followedWallet: string; mint: string } | null;
   getPreBuyMint(): string | null;
   markPositionBought(trigger: InsiderBuyTrigger): void;
@@ -83,8 +94,8 @@ export interface InsiderBot {
   setBuyDisabled(value: boolean): void;
   getMinTransferProfit(): number;
   setMinTransferProfit(value: number): void;
-  getProfitType(): 'realized' | 'total' | 'both';
-  setProfitType(value: 'realized' | 'total' | 'both'): void;
+  getProfitType(): "realized" | "total" | "both";
+  setProfitType(value: "realized" | "total" | "both"): void;
   configureFollowWallet(address: string): void;
   pause(): void;
 }
@@ -100,7 +111,7 @@ export class InsiderBot extends EventEmitter {
   private exitPercent: number;
   private buyDisabled: boolean = false;
   private minTransferProfit: number;
-  private profitType: 'realized' | 'total' | 'both' = 'both';
+  private profitType: "realized" | "total" | "both" = "both";
   private followMonitor: WalletMonitor | null = null;
   private watchingMint: string | null = null;
   private activePosition: {
@@ -114,7 +125,7 @@ export class InsiderBot extends EventEmitter {
     config: ServiceConfig,
     rpcUrl: string,
     wsUrl: string,
-    telegramBot: TelegramBot | null = null
+    telegramBot: TelegramBot | null = null,
   ) {
     super();
     this.config = config;
@@ -125,9 +136,13 @@ export class InsiderBot extends EventEmitter {
     this.exitPercent = config.insiderExitPercent;
     this.minTransferProfit = config.insiderMinTransferProfit;
     this.connection = new Connection(rpcUrl, {
-      commitment: 'processed',
+      commitment: "processed",
       wsEndpoint: wsUrl,
     });
+  }
+
+  seedBoughtMints(mints: Set<string>): void {
+    for (const m of mints) this.boughtMints.add(m);
   }
 
   getActivePosition(): { followedWallet: string; mint: string } | null {
@@ -148,7 +163,7 @@ export class InsiderBot extends EventEmitter {
 
   setBuySol(value: number): void {
     if (!Number.isFinite(value) || value <= 0) {
-      throw new Error('Insider buy SOL must be greater than 0');
+      throw new Error("Insider buy SOL must be greater than 0");
     }
     this.buySol = value;
   }
@@ -159,7 +174,7 @@ export class InsiderBot extends EventEmitter {
 
   setEntryMc(value: number): void {
     if (!Number.isFinite(value) || value < 0) {
-      throw new Error('Entry MC must be a non-negative number');
+      throw new Error("Entry MC must be a non-negative number");
     }
     this.entryMc = value;
   }
@@ -170,7 +185,7 @@ export class InsiderBot extends EventEmitter {
 
   setExitMc(value: number): void {
     if (!Number.isFinite(value) || value < 0) {
-      throw new Error('Exit MC must be a non-negative number');
+      throw new Error("Exit MC must be a non-negative number");
     }
     this.exitMc = value;
   }
@@ -181,7 +196,7 @@ export class InsiderBot extends EventEmitter {
 
   setExitPercent(value: number): void {
     if (!Number.isFinite(value) || value < 0) {
-      throw new Error('Exit percent must be a non-negative number');
+      throw new Error("Exit percent must be a non-negative number");
     }
     this.exitPercent = value;
   }
@@ -204,16 +219,16 @@ export class InsiderBot extends EventEmitter {
 
   setMinTransferProfit(value: number): void {
     if (!Number.isFinite(value) || value < 0) {
-      throw new Error('Min transfer profit must be a non-negative number');
+      throw new Error("Min transfer profit must be a non-negative number");
     }
     this.minTransferProfit = value;
   }
 
-  getProfitType(): 'realized' | 'total' | 'both' {
+  getProfitType(): "realized" | "total" | "both" {
     return this.profitType;
   }
 
-  setProfitType(value: 'realized' | 'total' | 'both'): void {
+  setProfitType(value: "realized" | "total" | "both"): void {
     this.profitType = value;
   }
 
@@ -241,19 +256,27 @@ export class InsiderBot extends EventEmitter {
     await this.stop();
     this.followedWallet = normalized;
 
-    this.followMonitor = new WalletMonitor(this.config, normalized, { enforceMinBuySol: false });
-    this.followMonitor.on('newToken', (event) => {
+    this.followMonitor = new WalletMonitor(this.config, normalized, {
+      enforceMinBuySol: false,
+    });
+    this.followMonitor.on("newToken", (event) => {
       if (this.boughtMints.has(event.mint)) return;
       if (this.activePosition || this.watchingMint) {
-        log.info('Already watching or holding a token; ignoring new buy from followed wallet', {
-          newMint: event.mint,
-        });
+        log.info(
+          "Already watching or holding a token; ignoring new buy from followed wallet",
+          {
+            newMint: event.mint,
+          },
+        );
         return;
       }
-      log.info('Followed wallet buy detected - pausing monitor and starting MC monitoring for entry', {
-        followedWallet: this.followedWallet,
-        mint: event.mint,
-      });
+      log.info(
+        "Followed wallet buy detected - pausing monitor and starting MC monitoring for entry",
+        {
+          followedWallet: this.followedWallet,
+          mint: event.mint,
+        },
+      );
 
       // Pause the monitor to focus entirely on the current token and avoid RPC overhead
       if (this.followMonitor) {
@@ -267,7 +290,15 @@ export class InsiderBot extends EventEmitter {
 
     await this.followMonitor.start();
 
-    log.info('Insider follow wallet monitoring started', {
+    // Seed boughtMints with tokens the followed wallet already holds at startup
+    for (const mint of this.followMonitor.existingMints) {
+      this.boughtMints.add(mint);
+    }
+    log.info("Seeded boughtMints from follow-wallet snapshot", {
+      count: this.followMonitor.existingMints.size,
+    });
+
+    log.info("Insider follow wallet monitoring started", {
       followedWallet: normalized,
       buySol: this.buySol,
       entryMc: this.entryMc,
@@ -314,8 +345,8 @@ export class InsiderBot extends EventEmitter {
   private async resetForNewToken(): Promise<void> {
     this.activePosition = null;
     this.watchingMint = null;
-    log.info('InsiderBot reset; resuming followed wallet monitoring');
-    
+    log.info("InsiderBot reset; resuming followed wallet monitoring");
+
     // Resume monitoring the followed wallet if one was set
     if (this.followedWallet && !this.followMonitor) {
       await this.followWallet(this.followedWallet);
@@ -324,11 +355,11 @@ export class InsiderBot extends EventEmitter {
 }
 
 const KNOWN_POOL_AUTHORITIES = new Set([
-  'FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM',
-  '5Q544fKrZM6W6y77W4A2B4L2S97E6q5nN5T6v8D5H5',
-  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
-  '9W959DqmcGTu2YHcR6Yn3S3XN6XN6S6S6S6S6S6S',
-  'Eo7WjKq67rjJQSvbdBk6RToZp4EAtX4F2Xv7V95v2',
-  '6EF8rrecthR5DkjtvAXth2Jy1Gq3BvF4YQDQe4N362K',
-  'TSLpA7P3qPqbeXh3WfJLue2osyZH1G1A2A2A2A2A2A2',
+  "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM",
+  "5Q544fKrZM6W6y77W4A2B4L2S97E6q5nN5T6v8D5H5",
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+  "9W959DqmcGTu2YHcR6Yn3S3XN6XN6S6S6S6S6S6S",
+  "Eo7WjKq67rjJQSvbdBk6RToZp4EAtX4F2Xv7V95v2",
+  "6EF8rrecthR5DkjtvAXth2Jy1Gq3BvF4YQDQe4N362K",
+  "TSLpA7P3qPqbeXh3WfJLue2osyZH1G1A2A2A2A2A2A2",
 ]);

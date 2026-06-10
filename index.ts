@@ -545,6 +545,18 @@ async function main(): Promise<void> {
   insiderBots.push(new InsiderBot(config, config.insiderSolanaRpcUrl, config.insiderSolanaWsUrl, telegramBot));
   insiderBots.push(new InsiderBot(config, config.insiderSolanaRpcUrl2, config.insiderSolanaWsUrl2, telegramBot));
 
+    insiderBots.push(new InsiderBot(config, config.insiderSolanaRpcUrl, config.insiderSolanaWsUrl, telegramBot));
+  insiderBots.push(new InsiderBot(config, config.insiderSolanaRpcUrl2, config.insiderSolanaWsUrl2, telegramBot));
+
+  // ── Seed boughtMints from DB so restarts don't re-buy previous tokens ──────
+  if (config.tradingWalletAddress) {
+    const persistedBoughts = db.getBoughtMints(config.tradingWalletAddress);
+    for (const bot of insiderBots) {
+      bot.seedBoughtMints(persistedBoughts);
+    }
+    log.info(`Seeded ${persistedBoughts.size} previously-bought mint(s) from DB`);
+  }
+
   // Load default wallets from config as paused saved wallets. They do not start
   // monitoring until the user resumes or switches into the active mode.
   if (config.insiderFollowWallet) {
@@ -835,6 +847,10 @@ async function main(): Promise<void> {
             }
 
             bot.markPositionBought(trigger);
+             // ── Persist to DB so this mint is skipped on restart ─────────────
+            if (config.tradingWalletAddress) {
+              db.addBoughtMint(config.tradingWalletAddress, trigger.mint);
+            }
             bot.setBuyExecuting(false); // Clear execution flag after state is saved
 
             await telegramBot?.sendDefault([

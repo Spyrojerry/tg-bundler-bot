@@ -7,34 +7,35 @@
 //  writes ~30 rows per token this is perfectly fast.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
-import * as fs from 'fs';
-import * as path from 'path';
+import initSqlJs, { Database as SqlJsDatabase } from "sql.js";
+import * as fs from "fs";
+import * as path from "path";
 import {
   BundlerMetrics,
   MonitoringStatus,
   TrackedToken,
   WalletFilterProfileSettings,
   WalletFilterSettings,
-} from './types';
-import { createLogger } from './logger';
+} from "./types";
+import { createLogger } from "./logger";
 
-const log = createLogger('DB');
+const log = createLogger("DB");
 
-export const DEFAULT_WALLET_FILTER_PROFILE_SETTINGS: WalletFilterProfileSettings = {
-  applyAtSample: 20,
-  minBundlersPercent: null,
-  maxBundlersPercent: null,
-  minBundlersCount: null,
-  maxBundlersCount: null,
-  maxPctAboveValue: null,
-  maxPctAboveOccurrences: null,
-  maxPctBelowValue: null,
-  maxPctBelowOccurrences: null,
-  sellIfFirstThreePctZero: false,
-  sellIfNoTeenOrTwentyPct: false,
-  sellIfNoPctAbove50: false,
-};
+export const DEFAULT_WALLET_FILTER_PROFILE_SETTINGS: WalletFilterProfileSettings =
+  {
+    applyAtSample: 20,
+    minBundlersPercent: null,
+    maxBundlersPercent: null,
+    minBundlersCount: null,
+    maxBundlersCount: null,
+    maxPctAboveValue: null,
+    maxPctAboveOccurrences: null,
+    maxPctBelowValue: null,
+    maxPctBelowOccurrences: null,
+    sellIfFirstThreePctZero: false,
+    sellIfNoTeenOrTwentyPct: false,
+    sellIfNoPctAbove50: false,
+  };
 
 export const DEFAULT_WALLET_FILTER_SETTINGS: WalletFilterSettings = {
   ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS,
@@ -54,6 +55,13 @@ CREATE TABLE IF NOT EXISTS tokens (
   detected_at_ms     INTEGER NOT NULL,
   buy_sol            REAL,
   PRIMARY KEY (wallet_address, mint)
+);
+
+CREATE TABLE IF NOT EXISTS bought_mints (
+  trading_wallet  TEXT NOT NULL,
+  mint            TEXT NOT NULL,
+  bought_at       TEXT NOT NULL,
+  PRIMARY KEY (trading_wallet, mint)
 );
 
 CREATE TABLE IF NOT EXISTS monitored_wallets (
@@ -197,36 +205,50 @@ export class MonitorDatabase {
   private migrate(): void {
     this.migrateTokensTable();
 
-    const tokenColumns = this.query<{ name: string }>(`PRAGMA table_info(tokens)`);
-    if (!tokenColumns.some((c) => c.name === 'wallet_address')) {
-      this.db.run(`ALTER TABLE tokens ADD COLUMN wallet_address TEXT NOT NULL DEFAULT ''`);
+    const tokenColumns = this.query<{ name: string }>(
+      `PRAGMA table_info(tokens)`,
+    );
+    if (!tokenColumns.some((c) => c.name === "wallet_address")) {
+      this.db.run(
+        `ALTER TABLE tokens ADD COLUMN wallet_address TEXT NOT NULL DEFAULT ''`,
+      );
     }
-    if (!tokenColumns.some((c) => c.name === 'buy_sol')) {
+    if (!tokenColumns.some((c) => c.name === "buy_sol")) {
       this.db.run(`ALTER TABLE tokens ADD COLUMN buy_sol REAL`);
     }
-    const metricColumns = this.query<{ name: string }>(`PRAGMA table_info(bundler_metrics)`);
-    if (!metricColumns.some((c) => c.name === 'wallet_address')) {
-      this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN wallet_address TEXT NOT NULL DEFAULT ''`);
+    const metricColumns = this.query<{ name: string }>(
+      `PRAGMA table_info(bundler_metrics)`,
+    );
+    if (!metricColumns.some((c) => c.name === "wallet_address")) {
+      this.db.run(
+        `ALTER TABLE bundler_metrics ADD COLUMN wallet_address TEXT NOT NULL DEFAULT ''`,
+      );
     }
-    if (!metricColumns.some((c) => c.name === 'initial_base_reserve')) {
-      this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN initial_base_reserve REAL`);
+    if (!metricColumns.some((c) => c.name === "initial_base_reserve")) {
+      this.db.run(
+        `ALTER TABLE bundler_metrics ADD COLUMN initial_base_reserve REAL`,
+      );
     }
-    if (!metricColumns.some((c) => c.name === 'top_wallets')) {
+    if (!metricColumns.some((c) => c.name === "top_wallets")) {
       this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN top_wallets INTEGER`);
     }
-    if (!metricColumns.some((c) => c.name === 'top_10_holder_rate')) {
-      this.db.run(`ALTER TABLE bundler_metrics ADD COLUMN top_10_holder_rate REAL`);
+    if (!metricColumns.some((c) => c.name === "top_10_holder_rate")) {
+      this.db.run(
+        `ALTER TABLE bundler_metrics ADD COLUMN top_10_holder_rate REAL`,
+      );
     }
   }
 
   private migrateTokensTable(): void {
-    const columns = this.query<{ name: string; pk: number }>(`PRAGMA table_info(tokens)`);
-    const walletPk = columns.find((c) => c.name === 'wallet_address')?.pk ?? 0;
-    const mintPk = columns.find((c) => c.name === 'mint')?.pk ?? 0;
+    const columns = this.query<{ name: string; pk: number }>(
+      `PRAGMA table_info(tokens)`,
+    );
+    const walletPk = columns.find((c) => c.name === "wallet_address")?.pk ?? 0;
+    const mintPk = columns.find((c) => c.name === "mint")?.pk ?? 0;
 
     if (walletPk === 1 && mintPk === 2) return;
 
-    this.db.run('BEGIN TRANSACTION');
+    this.db.run("BEGIN TRANSACTION");
     try {
       this.db.run(`
         CREATE TABLE IF NOT EXISTS tokens_new (
@@ -240,10 +262,10 @@ export class MonitorDatabase {
         )
       `);
 
-      const hasWalletAddress = columns.some((c) => c.name === 'wallet_address');
-      const selectWalletAddress = hasWalletAddress ? 'wallet_address' : "''";
-      const hasBuySol = columns.some((c) => c.name === 'buy_sol');
-      const selectBuySol = hasBuySol ? 'buy_sol' : 'NULL';
+      const hasWalletAddress = columns.some((c) => c.name === "wallet_address");
+      const selectWalletAddress = hasWalletAddress ? "wallet_address" : "''";
+      const hasBuySol = columns.some((c) => c.name === "buy_sol");
+      const selectBuySol = hasBuySol ? "buy_sol" : "NULL";
 
       this.db.run(`
         INSERT OR IGNORE INTO tokens_new
@@ -252,12 +274,12 @@ export class MonitorDatabase {
         FROM tokens
       `);
 
-      this.db.run('DROP TABLE tokens');
-      this.db.run('ALTER TABLE tokens_new RENAME TO tokens');
-      this.db.run('COMMIT');
-      log.info('Migrated tokens table to wallet+mint primary key');
+      this.db.run("DROP TABLE tokens");
+      this.db.run("ALTER TABLE tokens_new RENAME TO tokens");
+      this.db.run("COMMIT");
+      log.info("Migrated tokens table to wallet+mint primary key");
     } catch (err) {
-      this.db.run('ROLLBACK');
+      this.db.run("ROLLBACK");
       throw err;
     }
   }
@@ -302,20 +324,24 @@ export class MonitorDatabase {
         token.monitoringStatus,
         token.detectedAt,
         token.buySol,
-      ]
+      ],
     );
   }
 
-  updateTokenStatus(walletAddress: string, mint: string, status: MonitoringStatus): void {
+  updateTokenStatus(
+    walletAddress: string,
+    mint: string,
+    status: MonitoringStatus,
+  ): void {
     this.run(
       `UPDATE tokens SET monitoring_status = ? WHERE wallet_address = ? AND mint = ?`,
-      [status, walletAddress, mint]
+      [status, walletAddress, mint],
     );
   }
 
   getAllActiveTokens(): TrackedToken[] {
     const rows = this.query<TokenRow>(
-      `SELECT * FROM tokens WHERE monitoring_status = 'active'`
+      `SELECT * FROM tokens WHERE monitoring_status = 'active'`,
     );
     return rows.map((r) => ({
       mint: r.mint,
@@ -330,7 +356,7 @@ export class MonitorDatabase {
   getToken(walletAddress: string, mint: string): TrackedToken | null {
     const rows = this.query<TokenRow>(
       `SELECT * FROM tokens WHERE wallet_address = ? AND mint = ?`,
-      [walletAddress, mint]
+      [walletAddress, mint],
     );
     const row = rows[0];
     if (!row) return null;
@@ -347,9 +373,25 @@ export class MonitorDatabase {
   tokenExists(walletAddress: string, mint: string): boolean {
     const rows = this.query<{ found: number }>(
       `SELECT 1 AS found FROM tokens WHERE wallet_address = ? AND mint = ?`,
-      [walletAddress, mint]
+      [walletAddress, mint],
     );
     return rows.length > 0;
+  }
+
+  addBoughtMint(tradingWallet: string, mint: string): void {
+    this.run(
+      `INSERT OR IGNORE INTO bought_mints (trading_wallet, mint, bought_at)
+     VALUES (?, ?, ?)`,
+      [tradingWallet, mint, new Date().toISOString()],
+    );
+  }
+
+  getBoughtMints(tradingWallet: string): Set<string> {
+    const rows = this.query<{ mint: string }>(
+      `SELECT mint FROM bought_mints WHERE trading_wallet = ?`,
+      [tradingWallet],
+    );
+    return new Set(rows.map((r) => r.mint));
   }
 
   addWallet(address: string): void {
@@ -357,20 +399,20 @@ export class MonitorDatabase {
       `INSERT INTO monitored_wallets (address, added_at, status)
        VALUES (?, ?, 'active')
        ON CONFLICT(address) DO UPDATE SET status = 'active'`,
-      [address, new Date().toISOString()]
+      [address, new Date().toISOString()],
     );
   }
 
   removeWallet(address: string): void {
     this.run(
       `UPDATE monitored_wallets SET status = 'stopped' WHERE address = ?`,
-      [address]
+      [address],
     );
   }
 
   getActiveWallets(): string[] {
     const rows = this.query<{ address: string }>(
-      `SELECT address FROM monitored_wallets WHERE status = 'active' ORDER BY added_at ASC`
+      `SELECT address FROM monitored_wallets WHERE status = 'active' ORDER BY added_at ASC`,
     );
     return rows.map((r) => r.address);
   }
@@ -380,20 +422,20 @@ export class MonitorDatabase {
       `INSERT INTO reverse_buy_wallets (address, added_at, status)
        VALUES (?, ?, 'active')
        ON CONFLICT(address) DO UPDATE SET status = 'active'`,
-      [address, new Date().toISOString()]
+      [address, new Date().toISOString()],
     );
   }
 
   removeReverseBuyWallet(address: string): void {
     this.run(
       `UPDATE reverse_buy_wallets SET status = 'stopped' WHERE address = ?`,
-      [address]
+      [address],
     );
   }
 
   getActiveReverseBuyWallets(): string[] {
     const rows = this.query<{ address: string }>(
-      `SELECT address FROM reverse_buy_wallets WHERE status = 'active' ORDER BY added_at ASC`
+      `SELECT address FROM reverse_buy_wallets WHERE status = 'active' ORDER BY added_at ASC`,
     );
     return rows.map((r) => r.address);
   }
@@ -401,7 +443,7 @@ export class MonitorDatabase {
   isReverseBuyWallet(address: string): boolean {
     const rows = this.query<{ found: number }>(
       `SELECT 1 AS found FROM reverse_buy_wallets WHERE address = ? AND status = 'active'`,
-      [address]
+      [address],
     );
     return rows.length > 0;
   }
@@ -414,17 +456,17 @@ export class MonitorDatabase {
          (wallet_address, mint, timestamp, bundlers_percent, bundlers_count, initial_base_reserve, top_wallets, top_10_holder_rate, bundled_amount_rate, raw_data)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        m.walletAddress ?? '',
+        m.walletAddress ?? "",
         m.mint,
         m.timestamp,
-        m.bundlersPercent  ?? null,
-        m.bundlersCount    ?? null,
+        m.bundlersPercent ?? null,
+        m.bundlersCount ?? null,
         m.initialBaseReserve ?? null,
         m.topWallets ?? null,
         m.top10HolderRate ?? null,
         m.bundledAmountRate ?? null,
-        m.rawData          ?? null,
-      ]
+        m.rawData ?? null,
+      ],
     );
   }
 
@@ -436,47 +478,51 @@ export class MonitorDatabase {
     const rows = this.query<MetricRow>(
       `SELECT * FROM bundler_metrics WHERE mint = ?
        ORDER BY timestamp DESC LIMIT ?`,
-      [mint, limit]
+      [mint, limit],
     );
     return rows.map((r) => ({
-      id:               r.id,
-      mint:             r.mint,
-      timestamp:        r.timestamp,
-      bundlersPercent:  r.bundlers_percent,
-      bundlersCount:    r.bundlers_count,
+      id: r.id,
+      mint: r.mint,
+      timestamp: r.timestamp,
+      bundlersPercent: r.bundlers_percent,
+      bundlersCount: r.bundlers_count,
       initialBaseReserve: r.initial_base_reserve,
       topWallets: r.top_wallets,
       top10HolderRate: r.top_10_holder_rate,
       bundledAmountRate: r.bundled_amount_rate,
-      rawData:          r.raw_data ?? undefined,
+      rawData: r.raw_data ?? undefined,
     }));
   }
 
-  getLatestMetricsForWallet(walletAddress: string, mint: string, limit = 10): BundlerMetrics[] {
+  getLatestMetricsForWallet(
+    walletAddress: string,
+    mint: string,
+    limit = 10,
+  ): BundlerMetrics[] {
     const rows = this.query<MetricRow>(
       `SELECT * FROM bundler_metrics WHERE wallet_address = ? AND mint = ?
        ORDER BY timestamp DESC LIMIT ?`,
-      [walletAddress, mint, limit]
+      [walletAddress, mint, limit],
     );
     return rows.map((r) => ({
-      id:               r.id,
-      walletAddress:    r.wallet_address,
-      mint:             r.mint,
-      timestamp:        r.timestamp,
-      bundlersPercent:  r.bundlers_percent,
-      bundlersCount:    r.bundlers_count,
+      id: r.id,
+      walletAddress: r.wallet_address,
+      mint: r.mint,
+      timestamp: r.timestamp,
+      bundlersPercent: r.bundlers_percent,
+      bundlersCount: r.bundlers_count,
       initialBaseReserve: r.initial_base_reserve,
       topWallets: r.top_wallets,
       top10HolderRate: r.top_10_holder_rate,
       bundledAmountRate: r.bundled_amount_rate,
-      rawData:          r.raw_data ?? undefined,
+      rawData: r.raw_data ?? undefined,
     }));
   }
 
   metricsCount(mint: string): number {
     const rows = this.query<{ cnt: number }>(
       `SELECT COUNT(*) AS cnt FROM bundler_metrics WHERE mint = ?`,
-      [mint]
+      [mint],
     );
     return rows[0]?.cnt ?? 0;
   }
@@ -484,7 +530,7 @@ export class MonitorDatabase {
   metricsCountForWallet(walletAddress: string, mint: string): number {
     const rows = this.query<{ cnt: number }>(
       `SELECT COUNT(*) AS cnt FROM bundler_metrics WHERE wallet_address = ? AND mint = ?`,
-      [walletAddress, mint]
+      [walletAddress, mint],
     );
     return rows[0]?.cnt ?? 0;
   }
@@ -492,7 +538,7 @@ export class MonitorDatabase {
   tokenCountForWallet(walletAddress: string): number {
     const rows = this.query<{ cnt: number }>(
       `SELECT COUNT(*) AS cnt FROM tokens WHERE wallet_address = ?`,
-      [walletAddress]
+      [walletAddress],
     );
     return rows[0]?.cnt ?? 0;
   }
@@ -500,7 +546,7 @@ export class MonitorDatabase {
   sampleCountForWallet(walletAddress: string): number {
     const rows = this.query<{ cnt: number }>(
       `SELECT COUNT(*) AS cnt FROM bundler_metrics WHERE wallet_address = ?`,
-      [walletAddress]
+      [walletAddress],
     );
     return rows[0]?.cnt ?? 0;
   }
@@ -508,52 +554,91 @@ export class MonitorDatabase {
   getWalletSettings(walletAddress: string): WalletFilterSettings {
     const rows = this.query<{ filter_settings: string }>(
       `SELECT filter_settings FROM wallet_settings WHERE wallet_address = ?`,
-      [walletAddress]
+      [walletAddress],
     );
     if (rows.length === 0) return this.normalizeWalletSettings({});
 
     try {
-      const parsed = JSON.parse(rows[0].filter_settings) as Partial<WalletFilterSettings>;
+      const parsed = JSON.parse(
+        rows[0].filter_settings,
+      ) as Partial<WalletFilterSettings>;
       return this.normalizeWalletSettings(parsed);
     } catch {
       return this.normalizeWalletSettings({});
     }
   }
 
-  private normalizeWalletSettings(parsed: Partial<WalletFilterSettings>): WalletFilterSettings {
+  private normalizeWalletSettings(
+    parsed: Partial<WalletFilterSettings>,
+  ): WalletFilterSettings {
     const legacyProfile: WalletFilterProfileSettings = {
       ...DEFAULT_WALLET_FILTER_PROFILE_SETTINGS,
-      applyAtSample: parsed.applyAtSample ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.applyAtSample,
-      minBundlersPercent: parsed.minBundlersPercent ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.minBundlersPercent,
-      maxBundlersPercent: parsed.maxBundlersPercent ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxBundlersPercent,
-      minBundlersCount: parsed.minBundlersCount ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.minBundlersCount,
-      maxBundlersCount: parsed.maxBundlersCount ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxBundlersCount,
-      maxPctAboveValue: parsed.maxPctAboveValue ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctAboveValue,
-      maxPctAboveOccurrences: parsed.maxPctAboveOccurrences ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctAboveOccurrences,
-      maxPctBelowValue: parsed.maxPctBelowValue ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctBelowValue,
-      maxPctBelowOccurrences: parsed.maxPctBelowOccurrences ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctBelowOccurrences,
-      sellIfFirstThreePctZero: parsed.sellIfFirstThreePctZero ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfFirstThreePctZero,
-      sellIfNoTeenOrTwentyPct: parsed.sellIfNoTeenOrTwentyPct ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoTeenOrTwentyPct,
-      sellIfNoPctAbove50: parsed.sellIfNoPctAbove50 ?? DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoPctAbove50,
+      applyAtSample:
+        parsed.applyAtSample ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.applyAtSample,
+      minBundlersPercent:
+        parsed.minBundlersPercent ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.minBundlersPercent,
+      maxBundlersPercent:
+        parsed.maxBundlersPercent ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxBundlersPercent,
+      minBundlersCount:
+        parsed.minBundlersCount ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.minBundlersCount,
+      maxBundlersCount:
+        parsed.maxBundlersCount ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxBundlersCount,
+      maxPctAboveValue:
+        parsed.maxPctAboveValue ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctAboveValue,
+      maxPctAboveOccurrences:
+        parsed.maxPctAboveOccurrences ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctAboveOccurrences,
+      maxPctBelowValue:
+        parsed.maxPctBelowValue ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctBelowValue,
+      maxPctBelowOccurrences:
+        parsed.maxPctBelowOccurrences ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.maxPctBelowOccurrences,
+      sellIfFirstThreePctZero:
+        parsed.sellIfFirstThreePctZero ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfFirstThreePctZero,
+      sellIfNoTeenOrTwentyPct:
+        parsed.sellIfNoTeenOrTwentyPct ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoTeenOrTwentyPct,
+      sellIfNoPctAbove50:
+        parsed.sellIfNoPctAbove50 ??
+        DEFAULT_WALLET_FILTER_PROFILE_SETTINGS.sellIfNoPctAbove50,
     };
-    const normalizeProfile = (profile?: Partial<WalletFilterProfileSettings>): WalletFilterProfileSettings => ({
+    const normalizeProfile = (
+      profile?: Partial<WalletFilterProfileSettings>,
+    ): WalletFilterProfileSettings => ({
       ...legacyProfile,
       ...(profile ?? {}),
     });
     return {
       ...legacyProfile,
-      minBundlersCountChange: parsed.minBundlersCountChange ?? (parsed as { minBundlersPercentIncrease?: number | null }).minBundlersPercentIncrease ?? DEFAULT_WALLET_FILTER_SETTINGS.minBundlersCountChange,
-      reverseBuySellTriggerEnabled: parsed.reverseBuySellTriggerEnabled ?? DEFAULT_WALLET_FILTER_SETTINGS.reverseBuySellTriggerEnabled,
+      minBundlersCountChange:
+        parsed.minBundlersCountChange ??
+        (parsed as { minBundlersPercentIncrease?: number | null })
+          .minBundlersPercentIncrease ??
+        DEFAULT_WALLET_FILTER_SETTINGS.minBundlersCountChange,
+      reverseBuySellTriggerEnabled:
+        parsed.reverseBuySellTriggerEnabled ??
+        DEFAULT_WALLET_FILTER_SETTINGS.reverseBuySellTriggerEnabled,
       minSolBuy: parsed.minSolBuy ?? DEFAULT_WALLET_FILTER_SETTINGS.minSolBuy,
     };
   }
 
-  updateWalletSettings(walletAddress: string, settings: WalletFilterSettings): void {
+  updateWalletSettings(
+    walletAddress: string,
+    settings: WalletFilterSettings,
+  ): void {
     this.run(
       `INSERT INTO wallet_settings (wallet_address, filter_settings)
        VALUES (?, ?)
        ON CONFLICT(wallet_address) DO UPDATE SET filter_settings = excluded.filter_settings`,
-      [walletAddress, JSON.stringify(settings)]
+      [walletAddress, JSON.stringify(settings)],
     );
   }
 
@@ -563,7 +648,7 @@ export class MonitorDatabase {
     tradingWallet: string,
     mint: string,
     tokenAmount: number,
-    buySol: number | null
+    buySol: number | null,
   ): number {
     const existing = this.getActiveEarlyBundlerPosition(tradingWallet, mint);
     if (existing) {
@@ -573,31 +658,39 @@ export class MonitorDatabase {
     this.run(
       `INSERT INTO early_bundler_positions (trading_wallet, mint, token_amount, buy_sol, status, created_at)
        VALUES (?, ?, ?, ?, 'active', ?)`,
-      [tradingWallet, mint, tokenAmount, buySol, new Date().toISOString()]
+      [tradingWallet, mint, tokenAmount, buySol, new Date().toISOString()],
     );
     const rows = this.query<{ id: number }>(`SELECT last_insert_rowid() as id`);
     return rows[0].id;
   }
 
-  getActiveEarlyBundlerPosition(tradingWallet: string, mint: string): { id: number; tokenAmount: number; buySol: number | null } | null {
-    const rows = this.query<{ id: number; token_amount: number; buy_sol: number | null }>(
+  getActiveEarlyBundlerPosition(
+    tradingWallet: string,
+    mint: string,
+  ): { id: number; tokenAmount: number; buySol: number | null } | null {
+    const rows = this.query<{
+      id: number;
+      token_amount: number;
+      buy_sol: number | null;
+    }>(
       `SELECT id, token_amount, buy_sol FROM early_bundler_positions 
        WHERE trading_wallet = ? AND mint = ? AND status = 'active'`,
-      [tradingWallet, mint]
+      [tradingWallet, mint],
     );
     if (rows.length === 0) return null;
-    return { id: rows[0].id, tokenAmount: rows[0].token_amount, buySol: rows[0].buy_sol };
+    return {
+      id: rows[0].id,
+      tokenAmount: rows[0].token_amount,
+      buySol: rows[0].buy_sol,
+    };
   }
 
-  closeEarlyBundlerPosition(
-    positionId: number,
-    exitReason: string
-  ): void {
+  closeEarlyBundlerPosition(positionId: number, exitReason: string): void {
     this.run(
       `UPDATE early_bundler_positions 
        SET status = 'exited', exited_at = ?, exit_reason = ?
        WHERE id = ?`,
-      [new Date().toISOString(), exitReason, positionId]
+      [new Date().toISOString(), exitReason, positionId],
     );
   }
 
@@ -609,11 +702,11 @@ export class MonitorDatabase {
     initialTokenAmount: number,
     signature: string,
     slot: number,
-    timestamp: number
+    timestamp: number,
   ): number {
     const rows_existing = this.query<{ id: number }>(
       `SELECT id FROM early_bundler_wallets WHERE position_id = ? AND wallet_address = ?`,
-      [positionId, walletAddress]
+      [positionId, walletAddress],
     );
     if (rows_existing.length > 0) {
       return rows_existing[0].id;
@@ -623,7 +716,14 @@ export class MonitorDatabase {
       `INSERT INTO early_bundler_wallets 
        (position_id, wallet_address, initial_token_amount, signature, slot, timestamp, status, total_sold_amount)
        VALUES (?, ?, ?, ?, ?, ?, 'monitoring', 0)`,
-      [positionId, walletAddress, initialTokenAmount, signature, slot, timestamp]
+      [
+        positionId,
+        walletAddress,
+        initialTokenAmount,
+        signature,
+        slot,
+        timestamp,
+      ],
     );
     const rows = this.query<{ id: number }>(`SELECT last_insert_rowid() as id`);
     return rows[0].id;
@@ -644,7 +744,7 @@ export class MonitorDatabase {
       `SELECT id, wallet_address, initial_token_amount, total_sold_amount 
        FROM early_bundler_wallets 
        WHERE position_id = ? AND status = 'monitoring'`,
-      [positionId]
+      [positionId],
     );
     return rows.map((r) => ({
       id: r.id,
@@ -654,19 +754,22 @@ export class MonitorDatabase {
     }));
   }
 
-  updateBundlerWalletSoldAmount(bundlerWalletId: number, soldAmount: number): void {
+  updateBundlerWalletSoldAmount(
+    bundlerWalletId: number,
+    soldAmount: number,
+  ): void {
     this.run(
       `UPDATE early_bundler_wallets 
        SET total_sold_amount = total_sold_amount + ? 
        WHERE id = ?`,
-      [soldAmount, bundlerWalletId]
+      [soldAmount, bundlerWalletId],
     );
   }
 
   stopMonitoringBundlerWallet(bundlerWalletId: number): void {
     this.run(
       `UPDATE early_bundler_wallets SET status = 'stopped' WHERE id = ?`,
-      [bundlerWalletId]
+      [bundlerWalletId],
     );
   }
 
@@ -677,18 +780,18 @@ export class MonitorDatabase {
     signature: string,
     tokenAmountSold: number,
     slot: number,
-    timestamp: number
+    timestamp: number,
   ): void {
     this.run(
       `INSERT INTO bundler_wallet_sells (bundler_wallet_id, signature, token_amount_sold, slot, timestamp)
        VALUES (?, ?, ?, ?, ?)`,
-      [bundlerWalletId, signature, tokenAmountSold, slot, timestamp]
+      [bundlerWalletId, signature, tokenAmountSold, slot, timestamp],
     );
   }
 
   close(): void {
     this.persist();
     this.db.close();
-    log.info('Database connection closed');
+    log.info("Database connection closed");
   }
 }
