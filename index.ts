@@ -1554,6 +1554,11 @@ async function main(): Promise<void> {
     const mint = preBuyMint || activePos!.mint;
 
     try {
+      // If we have an active position, sync dev wallet's last 20 txs (once)
+      if (activePos) {
+        await bot.syncAfterBuy();
+      }
+
       const currentMc =
         preFetchedMc !== undefined
           ? preFetchedMc

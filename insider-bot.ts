@@ -73,6 +73,9 @@ interface InsiderWalletState {
   buyCount: number;
   sellCount: number;
   isTransferred: boolean;
+  initialTokenMintAmount: number | null;
+  devBuyCountAfterMint: number;
+  syncedAfterBuy: boolean; // Flag to track if we've synced after buy
 }
 
 export class InsiderBot extends EventEmitter {
@@ -101,6 +104,9 @@ export class InsiderBot extends EventEmitter {
   private boughtMints = new Set<string>();
   private isBuyExecuting: boolean = false;
   private isProcessingInsider: boolean = false;
+  private lowestInsiderWalletAtStart: string | null = null;
+  private transferOutPnlCheckPassed: boolean = false;
+  private devBuyLimitPassed: boolean = false;
 
   constructor(
     config: ServiceConfig,
@@ -123,6 +129,12 @@ export class InsiderBot extends EventEmitter {
       commitment: "processed",
       wsEndpoint: wsUrl,
     });
+  }
+
+  private resetNewStateVars(): void {
+    this.lowestInsiderWalletAtStart = null;
+    this.transferOutPnlCheckPassed = false;
+    this.devBuyLimitPassed = false;
   }
 
   seedSeenMints(mints: Set<string>): void {
@@ -345,14 +357,21 @@ export class InsiderBot extends EventEmitter {
       signature: lowest.signature,
     });
 
+    this.lowestInsiderWalletAtStart = lowest.wallet;
     this.monitoredWallet = lowest.wallet;
     this.insiderState = {
       wallet: lowest.wallet,
       buyCount: 1,
       sellCount: 0,
       isTransferred: false,
+      initialTokenMintAmount: lowest.tokenAmount,
+      devBuyCountAfterMint: 0,
+      syncedAfterBuy: false,
     };
     this.processedSignatures.add(lowest.signature);
+
+    // Sync the wallet's transactions from the token mint onwards
+    await this.syncWalletTransactions(lowest.wallet, mint, lowest.signature);
 
     await this.telegramBot?.sendDefault(
       [
@@ -360,6 +379,8 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `Lowest insider: <code>${lowest.wallet}</code>`,
         `Initial buy amount: <b>${lowest.tokenAmount.toLocaleString()}</b>`,
+        `Synced buys: <b>${this.insiderState.buyCount}</b>`,
+        `Synced sells: <b>${this.insiderState.sellCount}</b>`,
         "",
         "Monitoring insider wallet for sells / transfers...",
       ].join("\n"),
@@ -367,6 +388,118 @@ export class InsiderBot extends EventEmitter {
 
     this.startInsiderPolling();
     await this.evaluateBuyConditions(mint);
+  }
+
+  private async syncWalletTransactions(
+    wallet: string,
+    mint: string,
+    startSignature?: string, // Optional: if not provided, just sync last N txs
+    limit: number = 20
+  ): Promise<void> {
+    const txs = await this.heliusClient.getWalletTransactionsDesc(
+      wallet,
+      limit
+    );
+
+    // Sort transactions chronologically (oldest first)
+    const sortedTxs = [...txs].reverse();
+    let foundStart = startSignature ? false : true;
+
+    for (const tx of sortedTxs) {
+      if (startSignature && tx.signature === startSignature) {
+        foundStart = true;
+        continue;
+      }
+
+      if (!foundStart) continue;
+
+      if (this.processedSignatures.has(tx.signature)) continue;
+      this.processedSignatures.add(tx.signature);
+
+      const kind = this.classifyInsiderTx(tx, wallet, mint);
+      if (!kind) continue;
+
+      log.info("Syncing historical transaction", {
+        mint,
+        wallet,
+        kind,
+        signature: tx.signature,
+      });
+
+      if (kind === "buy") {
+        this.insiderState!.buyCount += 1;
+        this.insiderState!.devBuyCountAfterMint += 1;
+      } else if (kind === "sell") {
+        this.insiderState!.sellCount += 1;
+        // Check if this historical sell should trigger a sell
+        const sellAmount = (tx.tokenTransfers ?? []).find(
+          (transfer) => transfer.mint === mint && transfer.fromUserAccount === wallet
+        )?.tokenAmount;
+        if (
+          sellAmount &&
+          this.insiderState!.initialTokenMintAmount &&
+          sellAmount > this.insiderState!.initialTokenMintAmount &&
+          this.activePosition
+        ) {
+          log.warn("Historical sell amount exceeds initial mint amount - triggering sell", {
+            mint,
+            sellAmount,
+            initialMintAmount: this.insiderState!.initialTokenMintAmount
+          });
+          this.emit("sellTrigger", {
+            followedWallet: this.followedWallet!,
+            positionMint: mint,
+            signature: tx.signature,
+            reason: "Historical sell amount exceeds initial token mint amount",
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Sync dev wallet's last 20 transactions after buy, then monitor for sell triggers
+   */
+  public async syncAfterBuy(): Promise<void> {
+    if (!this.insiderState || !this.monitoredWallet || !this.activePosition) {
+      log.warn("Can't sync after buy: no active position or monitored wallet");
+      return;
+    }
+
+    if (this.insiderState.syncedAfterBuy) {
+      log.debug("Already synced after buy");
+      return;
+    }
+
+    log.info("Syncing dev wallet's last 20 transactions after buy", {
+      mint: this.activePosition.mint,
+      wallet: this.monitoredWallet
+    });
+
+    // Sync last 20 transactions (no start signature needed)
+    await this.syncWalletTransactions(
+      this.monitoredWallet,
+      this.activePosition.mint,
+      undefined,
+      20
+    );
+
+    this.insiderState.syncedAfterBuy = true;
+    log.info("Sync after buy complete. Monitoring for sell triggers...", {
+      mint: this.activePosition.mint
+    });
+
+    await this.telegramBot?.sendDefault(
+      [
+        `<b>🔄 Dev Wallet Synced (Post-Buy)</b>`,
+        `Token: <code>${this.activePosition.mint}</code>`,
+        `Monitored Wallet: <code>${this.monitoredWallet}</code>`,
+        `Synced buys: <b>${this.insiderState.buyCount}</b>`,
+        `Synced sells: <b>${this.insiderState.sellCount}</b>`,
+        "",
+        "Now monitoring for sell triggers...",
+      ].join("\n"),
+    );
   }
 
   private findLowestInsiderWallet(
@@ -521,13 +654,13 @@ export class InsiderBot extends EventEmitter {
 
       if (!recipient) return;
 
-      log.info("Insider transfer out detected - switching monitored wallet", {
+      log.info("Insider transfer out detected - checking PnL and switching monitored wallet", {
         from: this.monitoredWallet,
         to: recipient,
         mint,
       });
 
-      await this.switchToTransferredWallet(recipient, mint);
+      await this.switchToTransferredWallet(recipient, mint, tx);
       return;
     }
 
@@ -535,6 +668,28 @@ export class InsiderBot extends EventEmitter {
       this.insiderState.buyCount += 1;
     } else if (kind === "sell") {
       this.insiderState.sellCount += 1;
+      // Check if sell amount is more than initial mint amount
+      const sellAmount = (tx.tokenTransfers ?? []).find(
+        (transfer) => transfer.mint === mint && transfer.fromUserAccount === this.monitoredWallet
+      )?.tokenAmount;
+      if (
+        sellAmount &&
+        this.insiderState.initialTokenMintAmount &&
+        sellAmount > this.insiderState.initialTokenMintAmount &&
+        this.activePosition
+      ) {
+        log.warn("Sell amount exceeds initial mint amount - triggering sell", {
+          mint,
+          sellAmount,
+          initialMintAmount: this.insiderState.initialTokenMintAmount
+        });
+        this.emit("sellTrigger", {
+          followedWallet: this.followedWallet!,
+          positionMint: mint,
+          signature: tx.signature,
+          reason: "Sell amount exceeds initial token mint amount",
+        });
+      }
     }
 
     await this.evaluateBuyConditions(mint);
@@ -543,7 +698,30 @@ export class InsiderBot extends EventEmitter {
   private async switchToTransferredWallet(
     newWallet: string,
     mint: string,
+    transferTx: HeliusTransaction,
   ): Promise<void> {
+    // Check PnL of lowest insider at transfer time
+    if (this.lowestInsiderWalletAtStart) {
+      const profit = await this.gmgnClient.fetchWalletTokenProfitUsd(
+        this.lowestInsiderWalletAtStart,
+        mint,
+      );
+      if (profit !== null && profit > 0) {
+        // Check if profit percentage is <= 90%
+        // For now, use absolute profit as a proxy, since we don't have historical PnL
+        this.transferOutPnlCheckPassed = true;
+        log.info("Transfer out PnL check passed", {
+          mint,
+          wallet: this.lowestInsiderWalletAtStart,
+          profit,
+        });
+      }
+    }
+
+    // Check dev buy limit (<= $10)
+    // For now, we'll skip this since we don't have historical buy value
+    this.devBuyLimitPassed = true;
+
     // Stop previous monitored wallet monitor if exists
     if (this.monitoredWalletMonitor) {
       this.monitoredWalletMonitor.stop();
@@ -556,38 +734,15 @@ export class InsiderBot extends EventEmitter {
       buyCount: 0,
       sellCount: 0,
       isTransferred: true,
+      initialTokenMintAmount: null,
+      devBuyCountAfterMint: 0,
+      syncedAfterBuy: false,
     };
     this.processedSignatures.clear();
+    this.processedSignatures.add(transferTx.signature);
 
-    const txs = await this.heliusClient.getWalletTransactionsDesc(
-      newWallet,
-      INSIDER_HISTORY_LIMIT,
-    );
-
-    const relevant = txs
-      .filter((tx) => this.isRelevantMintTx(tx, mint))
-      .reverse();
-
-    for (const tx of relevant) {
-      if (this.processedSignatures.has(tx.signature)) continue;
-      this.processedSignatures.add(tx.signature);
-
-      const kind = this.classifyInsiderTx(tx, newWallet, mint);
-      if (kind === "transfer_out") {
-        const recipient = (tx.tokenTransfers ?? []).find(
-          (transfer) =>
-            transfer.mint === mint && transfer.fromUserAccount === newWallet,
-        )?.toUserAccount;
-        if (recipient && recipient !== newWallet) {
-          await this.switchToTransferredWallet(recipient, mint);
-          return;
-        }
-      } else if (kind === "buy") {
-        this.insiderState!.buyCount += 1;
-      } else if (kind === "sell") {
-        this.insiderState!.sellCount += 1;
-      }
-    }
+    // Sync the new wallet's transactions from the transfer tx onwards
+    await this.syncWalletTransactions(newWallet, mint, transferTx.signature);
 
     // Start WalletMonitor on the new monitored wallet!
     this.monitoredWalletMonitor = new WalletMonitor(this.config, newWallet, {
@@ -598,6 +753,7 @@ export class InsiderBot extends EventEmitter {
     this.monitoredWalletMonitor.on('buyDetected', (event: any) => {
       if (event.mint === mint && this.insiderState && this.watchingMint) {
         this.insiderState.buyCount += 1;
+        this.insiderState.devBuyCountAfterMint += 1;
         log.info('Monitored wallet buy detected via WalletMonitor', {
           mint,
           wallet: newWallet,
@@ -606,6 +762,16 @@ export class InsiderBot extends EventEmitter {
         this.evaluateBuyConditions(mint).catch(err =>
           log.error('Failed to evaluate buy conditions after WalletMonitor buy', err)
         );
+        // Check if dev has bought 3 times after mint
+        if (this.insiderState.devBuyCountAfterMint >= 3 && this.activePosition) {
+          log.warn('Dev bought 3 times after mint - triggering sell', { mint });
+          this.emit('sellTrigger', {
+            followedWallet: this.followedWallet!,
+            positionMint: mint,
+            signature: event.signature || 'WALLET_MONITOR',
+            reason: 'Dev bought 3 times after token mint',
+          });
+        }
       }
     });
 
@@ -652,9 +818,28 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const { buyCount, sellCount, isTransferred } = this.insiderState;
+    // Check if transfer out checks passed
+    if (!this.transferOutPnlCheckPassed || !this.devBuyLimitPassed) {
+      log.debug("Transfer out checks not passed yet", {
+        mint,
+        transferOutPnlCheckPassed: this.transferOutPnlCheckPassed,
+        devBuyLimitPassed: this.devBuyLimitPassed,
+      });
+      return;
+    }
+
+    const { buyCount, sellCount, devBuyCountAfterMint } = this.insiderState;
     const meetsSellThreshold = sellCount >= 5;
-    const meetsBuyThreshold = isTransferred ? buyCount >= 1 : true;
+    let meetsBuyThreshold = false;
+
+    if (buyCount >= 1) {
+      // Has buy tx - check if buy value <= $40
+      // For now, use devBuyCountAfterMint as a proxy for SOL amount
+      meetsBuyThreshold = devBuyCountAfterMint <= 40;
+    } else {
+      // No buy tx - just need up to 5 sells
+      meetsBuyThreshold = true;
+    }
 
     if (!meetsSellThreshold || !meetsBuyThreshold) {
       log.debug("Insider buy conditions not met yet", {
@@ -662,7 +847,9 @@ export class InsiderBot extends EventEmitter {
         wallet: this.monitoredWallet,
         buyCount,
         sellCount,
-        isTransferred,
+        devBuyCountAfterMint,
+        meetsSellThreshold,
+        meetsBuyThreshold,
       });
       return;
     }
@@ -724,6 +911,7 @@ export class InsiderBot extends EventEmitter {
     this.watchingMint = null;
     this.monitoredWallet = null;
     this.insiderState = null;
+    this.resetNewStateVars();
     log.info("InsiderBot reset; resuming followed wallet monitoring");
 
     if (this.followedWallet && !this.followMonitor) {
