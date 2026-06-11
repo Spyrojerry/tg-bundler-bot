@@ -75,6 +75,7 @@ interface InsiderWalletState {
   isTransferred: boolean;
   initialTokenMintAmount: number | null;
   devBuyCountAfterMint: number;
+  devBuyUsd: number; // USD value of dev's buy(s)
   syncedAfterBuy: boolean; // Flag to track if we've synced after buy
 }
 
@@ -107,6 +108,8 @@ export class InsiderBot extends EventEmitter {
   private lowestInsiderWalletAtStart: string | null = null;
   private transferOutPnlCheckPassed: boolean = false;
   private devBuyLimitPassed: boolean = false;
+  private earlyInsiderTotalSol: number = 0; // Total SOL for 4 early insiders
+  private lowestInsiderBuySol: number = 0; // SOL amount of lowest insider's buy
 
   constructor(
     config: ServiceConfig,
@@ -135,6 +138,8 @@ export class InsiderBot extends EventEmitter {
     this.lowestInsiderWalletAtStart = null;
     this.transferOutPnlCheckPassed = false;
     this.devBuyLimitPassed = false;
+    this.earlyInsiderTotalSol = 0;
+    this.lowestInsiderBuySol = 0;
   }
 
   seedSeenMints(mints: Set<string>): void {
@@ -350,14 +355,55 @@ export class InsiderBot extends EventEmitter {
       throw new Error(`Could not identify lowest insider wallet for ${mint}`);
     }
 
+    // Fetch SOL price first
+    const solPriceUsd = await this.gmgnClient.fetchSolPriceUsd();
+    if (!solPriceUsd) {
+      log.warn("Could not fetch SOL price, can't proceed with insider flow", { mint });
+      await this.resetForNewToken();
+      return;
+    }
+
+    // Calculate total SOL for 4 early insiders and lowest insider's buy SOL
+    let totalEarlyInsiderSol = 0;
+    let lowestInsiderBuySol = 0;
+
+    for (const tx of swaps) {
+      if (tx.type !== 'SWAP') continue;
+      
+      // Get SOL amount spent in this swap (native transfer from wallet)
+      let solSpent = 0;
+      for (const transfer of tx.nativeTransfers || []) {
+        if (transfer.fromUserAccount) { // If it's a native SOL transfer from someone
+          solSpent += transfer.amount / 1e9; // Convert lamports to SOL
+        }
+      }
+      
+      totalEarlyInsiderSol += solSpent;
+      
+      if (tx.signature === lowest.signature) {
+        lowestInsiderBuySol = solSpent;
+      }
+    }
+
     log.info("Lowest insider wallet identified", {
       mint,
       wallet: lowest.wallet,
       tokenAmount: lowest.tokenAmount,
       signature: lowest.signature,
+      totalEarlyInsiderSol,
+      lowestInsiderBuySol,
     });
 
+    // Check that total early insider SOL > 6
+    if (totalEarlyInsiderSol <= 6) {
+      log.warn(`Total early insider SOL (${totalEarlyInsiderSol.toFixed(2)}) <= 6, skipping buy`, { mint });
+      await this.resetForNewToken();
+      return;
+    }
+
     this.lowestInsiderWalletAtStart = lowest.wallet;
+    this.earlyInsiderTotalSol = totalEarlyInsiderSol;
+    this.lowestInsiderBuySol = lowestInsiderBuySol;
     this.monitoredWallet = lowest.wallet;
     this.insiderState = {
       wallet: lowest.wallet,
@@ -366,9 +412,19 @@ export class InsiderBot extends EventEmitter {
       isTransferred: false,
       initialTokenMintAmount: lowest.tokenAmount,
       devBuyCountAfterMint: 0,
+      devBuyUsd: lowestInsiderBuySol * solPriceUsd,
       syncedAfterBuy: false,
     };
     this.processedSignatures.add(lowest.signature);
+
+    // Check dev buy limit (<= $10) using current SOL price
+    const devBuyUsd = lowestInsiderBuySol * solPriceUsd;
+    this.devBuyLimitPassed = devBuyUsd <= 10;
+    log.info(`Dev buy check: ${devBuyUsd.toFixed(2)} USD (${lowestInsiderBuySol.toFixed(2)} SOL @ $${solPriceUsd.toFixed(2)})`, {
+      mint,
+      devBuyUsd,
+      passed: this.devBuyLimitPassed,
+    });
 
     // Sync the wallet's transactions from the token mint onwards
     await this.syncWalletTransactions(lowest.wallet, mint, lowest.signature);
@@ -401,6 +457,9 @@ export class InsiderBot extends EventEmitter {
       limit
     );
 
+    // Fetch SOL price to convert buy amounts to USD
+    const solPriceUsd = await this.gmgnClient.fetchSolPriceUsd();
+
     // Sort transactions chronologically (oldest first)
     const sortedTxs = [...txs].reverse();
     let foundStart = startSignature ? false : true;
@@ -429,6 +488,19 @@ export class InsiderBot extends EventEmitter {
       if (kind === "buy") {
         this.insiderState!.buyCount += 1;
         this.insiderState!.devBuyCountAfterMint += 1;
+        
+        // Calculate buy amount in USD
+        let solSpent = 0;
+        for (const transfer of tx.nativeTransfers || []) {
+          if (transfer.fromUserAccount === wallet) {
+            solSpent += transfer.amount / 1e9;
+          }
+        }
+        if (solPriceUsd) {
+          const buyUsd = solSpent * solPriceUsd;
+          this.insiderState!.devBuyUsd += buyUsd;
+          log.info(`Buy tx synced: ${buyUsd.toFixed(2)} USD (${solSpent.toFixed(2)} SOL)`, { mint });
+        }
       } else if (kind === "sell") {
         this.insiderState!.sellCount += 1;
         // Check if this historical sell should trigger a sell
@@ -718,10 +790,6 @@ export class InsiderBot extends EventEmitter {
       }
     }
 
-    // Check dev buy limit (<= $10)
-    // For now, we'll skip this since we don't have historical buy value
-    this.devBuyLimitPassed = true;
-
     // Stop previous monitored wallet monitor if exists
     if (this.monitoredWalletMonitor) {
       this.monitoredWalletMonitor.stop();
@@ -736,6 +804,7 @@ export class InsiderBot extends EventEmitter {
       isTransferred: true,
       initialTokenMintAmount: null,
       devBuyCountAfterMint: 0,
+      devBuyUsd: 0,
       syncedAfterBuy: false,
     };
     this.processedSignatures.clear();
@@ -828,14 +897,13 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const { buyCount, sellCount, devBuyCountAfterMint } = this.insiderState;
+    const { buyCount, sellCount, devBuyUsd } = this.insiderState;
     const meetsSellThreshold = sellCount >= 5;
     let meetsBuyThreshold = false;
 
     if (buyCount >= 1) {
       // Has buy tx - check if buy value <= $40
-      // For now, use devBuyCountAfterMint as a proxy for SOL amount
-      meetsBuyThreshold = devBuyCountAfterMint <= 40;
+      meetsBuyThreshold = devBuyUsd <= 40;
     } else {
       // No buy tx - just need up to 5 sells
       meetsBuyThreshold = true;
@@ -847,7 +915,7 @@ export class InsiderBot extends EventEmitter {
         wallet: this.monitoredWallet,
         buyCount,
         sellCount,
-        devBuyCountAfterMint,
+        devBuyUsd,
         meetsSellThreshold,
         meetsBuyThreshold,
       });
@@ -883,6 +951,7 @@ export class InsiderBot extends EventEmitter {
       monitoredWallet: this.monitoredWallet,
       buyCount,
       sellCount,
+      devBuyUsd,
       profit,
       currentMc,
       exitMc: newExitMc,
@@ -900,6 +969,7 @@ export class InsiderBot extends EventEmitter {
         "<b>Insider Signal</b>",
         `Wallet: <code>${this.monitoredWallet}</code>`,
         `Buys: <b>${buyCount}</b> | Sells: <b>${sellCount}</b>`,
+        `Dev Buy: <b>$${devBuyUsd.toFixed(2)}</b>`,
         `Wallet PnL: <b>$${profit.toLocaleString()}</b>`,
       ].join("\n"),
     });

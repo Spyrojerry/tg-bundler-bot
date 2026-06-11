@@ -245,6 +245,45 @@ export class GmgnClient {
     return profit;
   }
 
+  /**
+   * Fetches current SOL price in USD using Jupiter Price API
+   */
+  async fetchSolPriceUsd(): Promise<number | null> {
+    try {
+      const solMint = 'So11111111111111111111111111111111111111112';
+      const url = `https://api.jup.ag/price/v3?ids=${solMint}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'x-api-key': this.jupiterPriceApiKey
+        },
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+
+      if (resp.ok) {
+        const json = await resp.json() as Record<string, any>;
+        const priceData = json[solMint];
+        if (priceData && priceData.usdPrice) {
+          const priceUsd = parseFloat(priceData.usdPrice);
+          if (!isNaN(priceUsd)) {
+            log.debug(`Fetched SOL price: $${priceUsd.toFixed(2)}`);
+            return priceUsd;
+          }
+        }
+      }
+      log.warn('Could not fetch SOL price from Jupiter');
+      return null;
+    } catch (err) {
+      log.error('Failed to fetch SOL price', err);
+      return null;
+    }
+  }
+
   async fetchCreatorHoldRate(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, 'mint');
 
