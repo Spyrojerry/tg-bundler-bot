@@ -172,6 +172,79 @@ export class GmgnClient {
     return null;
   }
 
+  async fetchTokenAthMarketCapUsd(mint: string): Promise<number | null> {
+    this.validateSolAddress(mint, 'mint');
+
+    try {
+      let data: Record<string, unknown> | null = null;
+      if (this.fetchMode !== 'direct') {
+        data = await this.fetchCliData('token', mint);
+      }
+
+      if (!data) {
+        data = await this.limiter.schedule(() => this.fetchRawTokenData('v1/token/info', mint));
+      }
+
+      if (!data) return null;
+
+      const athPrice =
+        this.parseNullableNumber(data.ath_price) ??
+        this.parseNullableNumber(this.asRecord(data.stat).ath_price) ??
+        this.parseNullableNumber(this.asRecord(data.token).ath_price) ??
+        this.parseNullableNumber(this.asRecord(data.price).ath_price);
+
+      if (athPrice === null || athPrice <= 0) return null;
+
+      const supply =
+        this.parseNullableNumber(data.circulating_supply ?? data.total_supply) ??
+        this.parseNullableNumber(
+          this.asRecord(data.token).circulating_supply ??
+            this.asRecord(data.token).total_supply,
+        );
+
+      if (supply === null) return null;
+
+      const athMc = athPrice * supply;
+      if (athMc > 0) {
+        log.debug(`Calculated ATH MC: $${athMc.toLocaleString()}`, { mint, athPrice, supply });
+        return athMc;
+      }
+    } catch (err) {
+      log.debug(`ATH MC fetch failed for ${mint}`, { error: String(err) });
+    }
+
+    return null;
+  }
+
+  async fetchWalletTokenProfitUsd(
+    walletAddress: string,
+    mint: string,
+  ): Promise<number | null> {
+    const traders = await this.fetchTokenTraders(mint, 100, 'profit');
+    if (!traders) return null;
+
+    let list = traders.list;
+    if (!Array.isArray(list)) {
+      list =
+        traders.traders ||
+        traders.data?.list ||
+        traders.data?.traders ||
+        traders.items;
+    }
+
+    if (!Array.isArray(list)) return null;
+
+    const trader = list.find((entry: { address?: string }) => entry.address === walletAddress);
+    if (!trader) return null;
+
+    const profit =
+      this.parseNullableNumber(trader.profit) ??
+      this.parseNullableNumber(trader.realized_profit) ??
+      this.parseNullableNumber(trader.total_profit);
+
+    return profit;
+  }
+
   async fetchCreatorHoldRate(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, 'mint');
 

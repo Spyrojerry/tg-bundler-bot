@@ -147,7 +147,7 @@ export function loadConfig(): ServiceConfig {
   const insiderBuySol          = optionalNumber('INSIDER_BUY_SOL', 0.01);
   const insiderEntryMc         = optionalNumber('INSIDER_ENTRY_MC', 15_000);
   const insiderExitMc          = optionalNumber('INSIDER_EXIT_MC', 30_000);
-  const insiderExitPercent     = optionalNumber('INSIDER_EXIT_PERCENT', 50);
+  const insiderExitPercent     = optionalNumber('INSIDER_EXIT_PERCENT', 40);
   const insiderMinTransferProfit = optionalNumber('INSIDER_MIN_TRANSFER_PROFIT', 70);
   const port                   = optionalInt('PORT', 8080);
 

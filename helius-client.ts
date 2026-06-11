@@ -149,6 +149,82 @@ export class HeliusClient {
   }
 
   /**
+   * Fetches early SWAP transactions for a token mint (skips CREATE).
+   * Returns the first `swapLimit` SWAP txs after the mint CREATE tx.
+   */
+  async getEarlyInsiderSwaps(
+    mintAddress: string,
+    swapLimit: number = 4,
+  ): Promise<HeliusTransaction[]> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'asc',
+      'api-key': this.apiKey,
+      limit: String(swapLimit + 1),
+    });
+    const url = `${this.baseUrl}/v0/addresses/${mintAddress}/transactions?${params.toString()}`;
+
+    log.info(`Fetching early insider swaps for mint ${mintAddress}`);
+
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+        }
+
+        const data = await response.json() as HeliusTransaction[];
+        const swaps = data.filter((tx) => tx.type === 'SWAP').slice(0, swapLimit);
+        if (swaps.length === 0) {
+          throw new Error('No SWAP transactions found for mint yet');
+        }
+
+        log.info(`Found ${swaps.length} early insider SWAP txs for ${mintAddress}`);
+        return swaps;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        log.warn(`Attempt ${attempt} failed to fetch early insider swaps`, { error: lastError.message });
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+        }
+      }
+    }
+
+    throw lastError ?? new Error('Failed to fetch early insider swaps');
+  }
+
+  /**
+   * Fetches recent transactions for a wallet address (newest first).
+   */
+  async getWalletTransactionsDesc(
+    address: string,
+    limit: number = 21,
+  ): Promise<HeliusTransaction[]> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'desc',
+      'api-key': this.apiKey,
+      limit: String(limit),
+    });
+    const url = `${this.baseUrl}/v0/addresses/${address}/transactions?${params.toString()}`;
+
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+      }
+
+      return await response.json() as HeliusTransaction[];
+    } catch (err) {
+      log.error(`Failed to fetch desc transactions for ${address} from Helius`, err);
+      throw err;
+    }
+  }
+
+  /**
    * Fetches recent transactions for a wallet address.
    */
   async getTransactionsForAddress(address: string, limit: number = 10): Promise<HeliusTransaction[]> {

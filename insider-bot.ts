@@ -1,56 +1,18 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { EventEmitter } from "events";
 import { createLogger } from "./logger";
+import { HeliusClient, HeliusTransaction } from "./helius-client";
+import { GmgnClient } from "./gmgn-client";
 import type { ServiceConfig } from "./types";
 import { TelegramBot } from "./telegram-bot";
 import { WalletMonitor } from "./wallet-monitor";
 
 const log = createLogger("INSIDER");
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const INSIDER_WALLET_POLL_MS = 2_000;
+const INSIDER_HISTORY_LIMIT = 21;
 
-interface HeliusEnhancedTransaction {
-  signature?: string;
-  timestamp?: number;
-  type?: string;
-  description?: string;
-  feePayer?: string;
-  tokenTransfers?: Array<{
-    fromUserAccount?: string;
-    toUserAccount?: string;
-    tokenAmount?: number;
-    mint?: string;
-  }>;
-  nativeTransfers?: Array<{
-    fromUserAccount?: string;
-    toUserAccount?: string;
-    amount?: number;
-  }>;
-  events?: {
-    swap?: {
-      nativeInput?: { account: string; amount: string };
-      nativeOutput?: { account: string; amount: string };
-      tokenInputs?: Array<{
-        userCashFlowAccount: string;
-        amount: string;
-        mint: string;
-      }>;
-      tokenOutputs?: Array<{
-        userCashFlowAccount: string;
-        amount: string;
-        mint: string;
-      }>;
-    };
-  };
-}
-
-type HeliusPoolSwapDirection = "buy" | "sell";
-
-interface HeliusPoolSwap {
-  wallet: string;
-  direction: HeliusPoolSwapDirection;
-  mint: string;
-  amount: number;
-}
+type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 
 export interface InsiderBuyTrigger {
   followedWallet: string;
@@ -59,6 +21,7 @@ export interface InsiderBuyTrigger {
   buySol: number;
   entryMc?: number;
   tradersListStr?: string;
+  monitoredWallet?: string;
 }
 
 export interface InsiderSellTrigger {
@@ -74,11 +37,11 @@ export interface InsiderBot {
     event: "sellTrigger",
     listener: (trigger: InsiderSellTrigger) => void,
   ): this;
-   on(event: 'mintSeen', listener: (mint: string) => void): this; 
+  on(event: "mintSeen", listener: (mint: string) => void): this;
   on(event: "error", listener: (error: Error) => void): this;
   emit(event: "buyTrigger", trigger: InsiderBuyTrigger): boolean;
   emit(event: "sellTrigger", trigger: InsiderSellTrigger): boolean;
-  emit(event: 'mintSeen', mint: string): boolean;
+  emit(event: "mintSeen", mint: string): boolean;
   emit(event: "error", error: Error): boolean;
   getActivePosition(): { followedWallet: string; mint: string } | null;
   getPreBuyMint(): string | null;
@@ -91,52 +54,71 @@ export interface InsiderBot {
   getExitPercent(): number;
   setExitPercent(value: number): void;
   getFollowedWallet(): string | null;
+  getMonitoredWallet(): string | null;
   getBuySol(): number;
   isBuyDisabled(): boolean;
   setBuyDisabled(value: boolean): void;
-  getMinTransferProfit(): number;
-  setMinTransferProfit(value: number): void;
-  getProfitType(): "realized" | "total" | "both";
-  setProfitType(value: "realized" | "total" | "both"): void;
   configureFollowWallet(address: string): void;
   pause(): void;
+  isRunning(): boolean;
+  isBuyInProgress(): boolean;
+  setBuyExecuting(executing: boolean): void;
+  seedSeenMints(mints: Set<string>): void;
+  followWallet(address: string): Promise<void>;
+  stop(): Promise<void>;
+}
+
+interface InsiderWalletState {
+  wallet: string;
+  buyCount: number;
+  sellCount: number;
+  isTransferred: boolean;
 }
 
 export class InsiderBot extends EventEmitter {
   private readonly config: ServiceConfig;
   private readonly connection: Connection;
   private readonly telegramBot: TelegramBot | null;
+  private readonly heliusClient: HeliusClient;
+  private readonly gmgnClient: GmgnClient;
   private followedWallet: string | null = null;
   private buySol: number;
   private entryMc: number;
   private exitMc: number;
   private exitPercent: number;
   private buyDisabled: boolean = false;
-  private minTransferProfit: number;
-  private profitType: "realized" | "total" | "both" = "both";
   private followMonitor: WalletMonitor | null = null;
   private watchingMint: string | null = null;
+  private monitoredWallet: string | null = null;
+  private monitoredWalletMonitor: WalletMonitor | null = null;
+  private insiderState: InsiderWalletState | null = null;
+  private insiderPollTimer: ReturnType<typeof setInterval> | null = null;
+  private processedSignatures = new Set<string>();
   private activePosition: {
     followedWallet: string;
     mint: string;
   } | null = null;
   private boughtMints = new Set<string>();
   private isBuyExecuting: boolean = false;
+  private isProcessingInsider: boolean = false;
 
   constructor(
     config: ServiceConfig,
     rpcUrl: string,
     wsUrl: string,
+    gmgnClient: GmgnClient,
+    heliusApiKey: string,
     telegramBot: TelegramBot | null = null,
   ) {
     super();
     this.config = config;
     this.telegramBot = telegramBot;
+    this.gmgnClient = gmgnClient;
+    this.heliusClient = new HeliusClient(heliusApiKey);
     this.buySol = config.insiderBuySol;
     this.entryMc = config.insiderEntryMc;
     this.exitMc = config.insiderExitMc;
     this.exitPercent = config.insiderExitPercent;
-    this.minTransferProfit = config.insiderMinTransferProfit;
     this.connection = new Connection(rpcUrl, {
       commitment: "processed",
       wsEndpoint: wsUrl,
@@ -144,8 +126,8 @@ export class InsiderBot extends EventEmitter {
   }
 
   seedSeenMints(mints: Set<string>): void {
-  for (const m of mints) this.boughtMints.add(m);
-}
+    for (const m of mints) this.boughtMints.add(m);
+  }
 
   getActivePosition(): { followedWallet: string; mint: string } | null {
     return this.activePosition;
@@ -153,6 +135,10 @@ export class InsiderBot extends EventEmitter {
 
   getPreBuyMint(): string | null {
     return this.watchingMint;
+  }
+
+  getMonitoredWallet(): string | null {
+    return this.monitoredWallet;
   }
 
   clearActivePosition(): void {
@@ -215,25 +201,6 @@ export class InsiderBot extends EventEmitter {
     this.buyDisabled = value;
   }
 
-  getMinTransferProfit(): number {
-    return this.minTransferProfit;
-  }
-
-  setMinTransferProfit(value: number): void {
-    if (!Number.isFinite(value) || value < 0) {
-      throw new Error("Min transfer profit must be a non-negative number");
-    }
-    this.minTransferProfit = value;
-  }
-
-  getProfitType(): "realized" | "total" | "both" {
-    return this.profitType;
-  }
-
-  setProfitType(value: "realized" | "total" | "both"): void {
-    this.profitType = value;
-  }
-
   getFollowedWallet(): string | null {
     return this.followedWallet;
   }
@@ -247,7 +214,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   isRunning(): boolean {
-    return this.followMonitor !== null;
+    return this.followMonitor !== null || this.insiderPollTimer !== null;
   }
 
   async followWallet(address: string): Promise<void> {
@@ -255,6 +222,7 @@ export class InsiderBot extends EventEmitter {
     if (this.followedWallet !== normalized) {
       this.boughtMints.clear();
     }
+    await this.stopInsiderMonitoring();
     await this.stop();
     this.followedWallet = normalized;
 
@@ -262,38 +230,11 @@ export class InsiderBot extends EventEmitter {
       enforceMinBuySol: false,
     });
     this.followMonitor.on("newToken", (event) => {
-      if (this.boughtMints.has(event.mint)) return;
-      if (this.activePosition || this.watchingMint) {
-        log.info(
-          "Already watching or holding a token; ignoring new buy from followed wallet",
-          {
-            newMint: event.mint,
-          },
-        );
-        return;
-      }
-      log.info(
-        "Followed wallet buy detected - pausing monitor and starting MC monitoring for entry",
-        {
-          followedWallet: this.followedWallet,
-          mint: event.mint,
-        },
-      );
-
-      // Pause the monitor to focus entirely on the current token and avoid RPC overhead
-      if (this.followMonitor) {
-        this.followMonitor.stop();
-        this.followMonitor = null;
-      }
-
-      this.boughtMints.add(event.mint);
-      this.emit('mintSeen', event.mint);
-      this.watchingMint = event.mint;
+      void this.handleFollowWalletBuy(event.mint, event.signature);
     });
 
     await this.followMonitor.start();
 
-    // Seed boughtMints with tokens the followed wallet already holds at startup
     for (const mint of this.followMonitor.existingMints) {
       this.boughtMints.add(mint);
     }
@@ -304,8 +245,7 @@ export class InsiderBot extends EventEmitter {
     log.info("Insider follow wallet monitoring started", {
       followedWallet: normalized,
       buySol: this.buySol,
-      entryMc: this.entryMc,
-      exitMc: this.exitMc,
+      exitPercent: this.exitPercent,
     });
   }
 
@@ -318,18 +258,24 @@ export class InsiderBot extends EventEmitter {
     this.followedWallet = normalized;
     this.activePosition = null;
     this.watchingMint = null;
+    this.monitoredWallet = null;
+    this.insiderState = null;
   }
 
   async stop(): Promise<void> {
+    await this.stopInsiderMonitoring();
     if (this.followMonitor) {
       this.followMonitor.stop();
       this.followMonitor = null;
     }
     this.activePosition = null;
     this.watchingMint = null;
+    this.monitoredWallet = null;
+    this.insiderState = null;
   }
 
   pause(): void {
+    void this.stopInsiderMonitoring();
     if (this.followMonitor) {
       this.followMonitor.stop();
       this.followMonitor = null;
@@ -343,26 +289,440 @@ export class InsiderBot extends EventEmitter {
     };
     this.watchingMint = null;
     this.boughtMints.add(trigger.mint);
+    void this.stopInsiderMonitoring();
+  }
+
+  private async handleFollowWalletBuy(
+    mint: string,
+    signature: string,
+  ): Promise<void> {
+    if (this.boughtMints.has(mint)) return;
+    if (this.activePosition || this.watchingMint) {
+      log.info("Already watching or holding a token; ignoring new buy", {
+        newMint: mint,
+      });
+      return;
+    }
+
+    log.info("Followed wallet buy detected - pausing follow monitor", {
+      followedWallet: this.followedWallet,
+      mint,
+      signature,
+    });
+
+    if (this.followMonitor) {
+      this.followMonitor.stop();
+      this.followMonitor = null;
+    }
+
+    this.boughtMints.add(mint);
+    this.watchingMint = mint;
+    this.emit("mintSeen", mint);
+
+    try {
+      await this.startInsiderFlow(mint);
+    } catch (err) {
+      log.error("Failed to start insider flow; resetting", err);
+      this.emit(
+        "error",
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      await this.resetForNewToken();
+    }
+  }
+
+  private async startInsiderFlow(mint: string): Promise<void> {
+    const swaps = await this.heliusClient.getEarlyInsiderSwaps(mint, 4);
+    const lowest = this.findLowestInsiderWallet(swaps, mint);
+    if (!lowest) {
+      throw new Error(`Could not identify lowest insider wallet for ${mint}`);
+    }
+
+    log.info("Lowest insider wallet identified", {
+      mint,
+      wallet: lowest.wallet,
+      tokenAmount: lowest.tokenAmount,
+      signature: lowest.signature,
+    });
+
+    this.monitoredWallet = lowest.wallet;
+    this.insiderState = {
+      wallet: lowest.wallet,
+      buyCount: 1,
+      sellCount: 0,
+      isTransferred: false,
+    };
+    this.processedSignatures.add(lowest.signature);
+
+    await this.telegramBot?.sendDefault(
+      [
+        "<b>🔍 Insider Flow Started</b>",
+        `Token: <code>${mint}</code>`,
+        `Lowest insider: <code>${lowest.wallet}</code>`,
+        `Initial buy amount: <b>${lowest.tokenAmount.toLocaleString()}</b>`,
+        "",
+        "Monitoring insider wallet for sells / transfers...",
+      ].join("\n"),
+    );
+
+    this.startInsiderPolling();
+    await this.evaluateBuyConditions(mint);
+  }
+
+  private findLowestInsiderWallet(
+    swaps: HeliusTransaction[],
+    mint: string,
+  ): { wallet: string; tokenAmount: number; signature: string } | null {
+    let lowest: { wallet: string; tokenAmount: number; signature: string } | null =
+      null;
+
+    for (const tx of swaps) {
+      if (tx.type !== "SWAP") continue;
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint !== mint) continue;
+        const amount = transfer.tokenAmount ?? 0;
+        const wallet = transfer.toUserAccount;
+        if (!wallet) continue;
+        if (!lowest || amount < lowest.tokenAmount) {
+          lowest = {
+            wallet,
+            tokenAmount: amount,
+            signature: tx.signature,
+          };
+        }
+      }
+    }
+
+    return lowest;
+  }
+
+  private startInsiderPolling(): void {
+    this.stopInsiderPolling();
+    this.insiderPollTimer = setInterval(() => {
+      void this.pollInsiderWallet();
+    }, INSIDER_WALLET_POLL_MS);
+  }
+
+  private stopInsiderPolling(): void {
+    if (this.insiderPollTimer) {
+      clearInterval(this.insiderPollTimer);
+      this.insiderPollTimer = null;
+    }
+  }
+
+  private async stopInsiderMonitoring(): Promise<void> {
+    this.stopInsiderPolling();
+    this.processedSignatures.clear();
+    if (this.monitoredWalletMonitor) {
+      this.monitoredWalletMonitor.stop();
+      this.monitoredWalletMonitor = null;
+    }
+  }
+
+  private async pollInsiderWallet(): Promise<void> {
+    if (
+      this.isProcessingInsider ||
+      !this.watchingMint ||
+      !this.monitoredWallet ||
+      !this.insiderState ||
+      this.activePosition
+    ) {
+      return;
+    }
+
+    this.isProcessingInsider = true;
+    try {
+      const txs = await this.heliusClient.getWalletTransactionsDesc(
+        this.monitoredWallet,
+        INSIDER_HISTORY_LIMIT,
+      );
+
+      const relevant = txs
+        .filter((tx) => this.isRelevantMintTx(tx, this.watchingMint!))
+        .reverse();
+
+      for (const tx of relevant) {
+        if (this.processedSignatures.has(tx.signature)) continue;
+        this.processedSignatures.add(tx.signature);
+        await this.handleInsiderTransaction(tx, this.watchingMint);
+      }
+    } catch (err) {
+      log.error("Insider wallet poll failed", err);
+    } finally {
+      this.isProcessingInsider = false;
+    }
+  }
+
+  private isRelevantMintTx(tx: HeliusTransaction, mint: string): boolean {
+    return (tx.tokenTransfers ?? []).some((transfer) => transfer.mint === mint);
+  }
+
+  private classifyInsiderTx(
+    tx: HeliusTransaction,
+    wallet: string,
+    mint: string,
+  ): InsiderTxKind | null {
+    if (tx.type === "TRANSFER") {
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint !== mint) continue;
+        if (transfer.fromUserAccount === wallet) return "transfer_out";
+        if (transfer.toUserAccount === wallet) return "transfer_in";
+      }
+      return null;
+    }
+
+    if (tx.type === "SWAP") {
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint === mint && transfer.toUserAccount === wallet) {
+          return "buy";
+        }
+      }
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint === SOL_MINT && transfer.toUserAccount === wallet) {
+          return "sell";
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private async handleInsiderTransaction(
+    tx: HeliusTransaction,
+    mint: string,
+  ): Promise<void> {
+    if (!this.insiderState || !this.monitoredWallet) return;
+
+    const kind = this.classifyInsiderTx(
+      tx,
+      this.monitoredWallet,
+      mint,
+    );
+    if (!kind) return;
+
+    log.info("Insider wallet activity detected", {
+      mint,
+      wallet: this.monitoredWallet,
+      kind,
+      signature: tx.signature,
+    });
+
+    if (kind === "transfer_out") {
+      const recipient = (tx.tokenTransfers ?? []).find(
+        (transfer) =>
+          transfer.mint === mint &&
+          transfer.fromUserAccount === this.monitoredWallet,
+      )?.toUserAccount;
+
+      if (!recipient) return;
+
+      log.info("Insider transfer out detected - switching monitored wallet", {
+        from: this.monitoredWallet,
+        to: recipient,
+        mint,
+      });
+
+      await this.switchToTransferredWallet(recipient, mint);
+      return;
+    }
+
+    if (kind === "buy") {
+      this.insiderState.buyCount += 1;
+    } else if (kind === "sell") {
+      this.insiderState.sellCount += 1;
+    }
+
+    await this.evaluateBuyConditions(mint);
+  }
+
+  private async switchToTransferredWallet(
+    newWallet: string,
+    mint: string,
+  ): Promise<void> {
+    // Stop previous monitored wallet monitor if exists
+    if (this.monitoredWalletMonitor) {
+      this.monitoredWalletMonitor.stop();
+      this.monitoredWalletMonitor = null;
+    }
+
+    this.monitoredWallet = newWallet;
+    this.insiderState = {
+      wallet: newWallet,
+      buyCount: 0,
+      sellCount: 0,
+      isTransferred: true,
+    };
+    this.processedSignatures.clear();
+
+    const txs = await this.heliusClient.getWalletTransactionsDesc(
+      newWallet,
+      INSIDER_HISTORY_LIMIT,
+    );
+
+    const relevant = txs
+      .filter((tx) => this.isRelevantMintTx(tx, mint))
+      .reverse();
+
+    for (const tx of relevant) {
+      if (this.processedSignatures.has(tx.signature)) continue;
+      this.processedSignatures.add(tx.signature);
+
+      const kind = this.classifyInsiderTx(tx, newWallet, mint);
+      if (kind === "transfer_out") {
+        const recipient = (tx.tokenTransfers ?? []).find(
+          (transfer) =>
+            transfer.mint === mint && transfer.fromUserAccount === newWallet,
+        )?.toUserAccount;
+        if (recipient && recipient !== newWallet) {
+          await this.switchToTransferredWallet(recipient, mint);
+          return;
+        }
+      } else if (kind === "buy") {
+        this.insiderState!.buyCount += 1;
+      } else if (kind === "sell") {
+        this.insiderState!.sellCount += 1;
+      }
+    }
+
+    // Start WalletMonitor on the new monitored wallet!
+    this.monitoredWalletMonitor = new WalletMonitor(this.config, newWallet, {
+      enforceMinBuySol: false,
+    });
+
+    // Listen for new buys/sells on this monitored wallet to update insiderState
+    this.monitoredWalletMonitor.on('buyDetected', (event: any) => {
+      if (event.mint === mint && this.insiderState && this.watchingMint) {
+        this.insiderState.buyCount += 1;
+        log.info('Monitored wallet buy detected via WalletMonitor', {
+          mint,
+          wallet: newWallet,
+          buyCount: this.insiderState.buyCount,
+        });
+        this.evaluateBuyConditions(mint).catch(err =>
+          log.error('Failed to evaluate buy conditions after WalletMonitor buy', err)
+        );
+      }
+    });
+
+    // Also, let's make sure we process transactions from WalletMonitor for sells too
+    // Wait, WalletMonitor emits 'tokenExited' when a token is sold!
+    this.monitoredWalletMonitor.on('tokenExited', (event: any) => {
+      if (event.mint === mint && this.insiderState && this.watchingMint) {
+        this.insiderState.sellCount += 1;
+        log.info('Monitored wallet sell detected via WalletMonitor', {
+          mint,
+          wallet: newWallet,
+          sellCount: this.insiderState.sellCount,
+        });
+        this.evaluateBuyConditions(mint).catch(err =>
+          log.error('Failed to evaluate buy conditions after WalletMonitor sell', err)
+        );
+      }
+    });
+
+    await this.monitoredWalletMonitor.start();
+
+    await this.telegramBot?.sendDefault(
+      [
+        "<b>🔀 Insider Transfer Detected</b>",
+        `Token: <code>${mint}</code>`,
+        `Now monitoring: <code>${newWallet}</code>`,
+        `Synced buys: <b>${this.insiderState?.buyCount ?? 0}</b>`,
+        `Synced sells: <b>${this.insiderState?.sellCount ?? 0}</b>`,
+      ].join("\n"),
+    );
+
+    await this.evaluateBuyConditions(mint);
+  }
+
+  private async evaluateBuyConditions(mint: string): Promise<void> {
+    if (
+      !this.insiderState ||
+      !this.monitoredWallet ||
+      !this.watchingMint ||
+      this.activePosition ||
+      this.isBuyExecuting ||
+      this.buyDisabled
+    ) {
+      return;
+    }
+
+    const { buyCount, sellCount, isTransferred } = this.insiderState;
+    const meetsSellThreshold = sellCount >= 5;
+    const meetsBuyThreshold = isTransferred ? buyCount >= 1 : true;
+
+    if (!meetsSellThreshold || !meetsBuyThreshold) {
+      log.debug("Insider buy conditions not met yet", {
+        mint,
+        wallet: this.monitoredWallet,
+        buyCount,
+        sellCount,
+        isTransferred,
+      });
+      return;
+    }
+
+    const profit = await this.gmgnClient.fetchWalletTokenProfitUsd(
+      this.monitoredWallet,
+      mint,
+    );
+    if (profit === null || profit <= 0) {
+      log.info("Insider wallet PnL not positive; skipping buy", {
+        mint,
+        wallet: this.monitoredWallet,
+        profit,
+      });
+      return;
+    }
+
+    const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
+    if (currentMc === null) {
+      log.warn("Could not fetch MC for insider buy trigger", { mint });
+      return;
+    }
+
+    const exitPercent = this.exitPercent;
+    const newExitMc = currentMc * (1 + exitPercent / 100);
+    this.setExitMc(newExitMc);
+    this.setEntryMc(currentMc);
+
+    log.warn("Insider buy conditions met - triggering buy", {
+      mint,
+      monitoredWallet: this.monitoredWallet,
+      buyCount,
+      sellCount,
+      profit,
+      currentMc,
+      exitMc: newExitMc,
+    });
+
+    this.setBuyExecuting(true);
+    this.emit("buyTrigger", {
+      followedWallet: this.followedWallet!,
+      mint,
+      signature: "INSIDER_TRIGGER",
+      buySol: this.buySol,
+      entryMc: currentMc,
+      monitoredWallet: this.monitoredWallet,
+      tradersListStr: [
+        "<b>Insider Signal</b>",
+        `Wallet: <code>${this.monitoredWallet}</code>`,
+        `Buys: <b>${buyCount}</b> | Sells: <b>${sellCount}</b>`,
+        `Wallet PnL: <b>$${profit.toLocaleString()}</b>`,
+      ].join("\n"),
+    });
   }
 
   private async resetForNewToken(): Promise<void> {
+    await this.stopInsiderMonitoring();
     this.activePosition = null;
     this.watchingMint = null;
+    this.monitoredWallet = null;
+    this.insiderState = null;
     log.info("InsiderBot reset; resuming followed wallet monitoring");
 
-    // Resume monitoring the followed wallet if one was set
     if (this.followedWallet && !this.followMonitor) {
       await this.followWallet(this.followedWallet);
     }
   }
 }
-
-const KNOWN_POOL_AUTHORITIES = new Set([
-  "FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM",
-  "5Q544fKrZM6W6y77W4A2B4L2S97E6q5nN5T6v8D5H5",
-  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-  "9W959DqmcGTu2YHcR6Yn3S3XN6XN6S6S6S6S6S6S",
-  "Eo7WjKq67rjJQSvbdBk6RToZp4EAtX4F2Xv7V95v2",
-  "6EF8rrecthR5DkjtvAXth2Jy1Gq3BvF4YQDQe4N362K",
-  "TSLpA7P3qPqbeXh3WfJLue2osyZH1G1A2A2A2A2A2A2",
-]);
