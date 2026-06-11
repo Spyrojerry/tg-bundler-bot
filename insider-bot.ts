@@ -472,13 +472,18 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (tx.type === "SWAP") {
+      // First check if it's a buy: wallet receives the token mint
       for (const transfer of tx.tokenTransfers ?? []) {
         if (transfer.mint === mint && transfer.toUserAccount === wallet) {
           return "buy";
         }
       }
+      // Now check if it's a sell: either wallet receives SOL/WSOL, OR wallet sends out the token mint!
       for (const transfer of tx.tokenTransfers ?? []) {
         if (transfer.mint === SOL_MINT && transfer.toUserAccount === wallet) {
+          return "sell";
+        }
+        if (transfer.mint === mint && transfer.fromUserAccount === wallet) {
           return "sell";
         }
       }
