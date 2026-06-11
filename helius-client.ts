@@ -210,18 +210,28 @@ export class HeliusClient {
     });
     const url = `${this.baseUrl}/v0/addresses/${address}/transactions?${params.toString()}`;
 
-    try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
-      }
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+        }
 
-      return await response.json() as HeliusTransaction[];
-    } catch (err) {
-      log.error(`Failed to fetch desc transactions for ${address} from Helius`, err);
-      throw err;
+        const data = await response.json() as HeliusTransaction[];
+        log.info(`Fetched ${data.length} transactions for ${address} (attempt ${attempt})`);
+        return data;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        log.warn(`Attempt ${attempt} failed to fetch desc transactions for ${address}`, { error: lastError.message });
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+        }
+      }
     }
+
+    throw lastError ?? new Error('Failed to fetch wallet transactions');
   }
 
   /**

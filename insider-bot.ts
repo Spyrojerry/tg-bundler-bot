@@ -96,7 +96,9 @@ export class InsiderBot extends EventEmitter {
   private monitoredWallet: string | null = null;
   private monitoredWalletMonitor: WalletMonitor | null = null;
   private insiderState: InsiderWalletState | null = null;
-  private insiderPollTimer: ReturnType<typeof setInterval> | null = null;
+  
+  // Logs subscription
+  private logsSubscriptionId: number | null = null;
   private processedSignatures = new Set<string>();
   private activePosition: {
     followedWallet: string;
@@ -104,12 +106,17 @@ export class InsiderBot extends EventEmitter {
   } | null = null;
   private boughtMints = new Set<string>();
   private isBuyExecuting: boolean = false;
-  private isProcessingInsider: boolean = false;
   private lowestInsiderWalletAtStart: string | null = null;
   private transferOutPnlCheckPassed: boolean = false;
   private devBuyLimitPassed: boolean = false;
   private earlyInsiderTotalSol: number = 0; // Total SOL for 4 early insiders
   private lowestInsiderBuySol: number = 0; // SOL amount of lowest insider's buy
+  
+  // Signature batching
+  private pendingSignaturesBatch: string[] = [];
+  private batchTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly BATCH_WINDOW_MS = 1000; // 1 second batch window
+  private readonly MAX_BATCH_SIZE = 100; // Max 100 signatures per batch
 
   constructor(
     config: ServiceConfig,
@@ -231,7 +238,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   isRunning(): boolean {
-    return this.followMonitor !== null || this.insiderPollTimer !== null;
+    return this.followMonitor !== null || this.logsSubscriptionId !== null;
   }
 
   async followWallet(address: string): Promise<void> {
@@ -442,7 +449,7 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
     );
 
-    this.startInsiderPolling();
+    this.startLogsSubscription();
     await this.evaluateBuyConditions(mint);
   }
 
@@ -601,60 +608,100 @@ export class InsiderBot extends EventEmitter {
     return lowest;
   }
 
-  private startInsiderPolling(): void {
-    this.stopInsiderPolling();
-    this.insiderPollTimer = setInterval(() => {
-      void this.pollInsiderWallet();
-    }, INSIDER_WALLET_POLL_MS);
-  }
-
-  private stopInsiderPolling(): void {
-    if (this.insiderPollTimer) {
-      clearInterval(this.insiderPollTimer);
-      this.insiderPollTimer = null;
+  private addSignatureToBatch(signature: string): void {
+    if (this.processedSignatures.has(signature)) return;
+    this.pendingSignaturesBatch.push(signature);
+    
+    // If we've hit max batch size, process immediately
+    if (this.pendingSignaturesBatch.length >= this.MAX_BATCH_SIZE) {
+      this.processBatch().catch(err => log.error("Failed to process signature batch", err));
+    } else if (!this.batchTimer) {
+      // Otherwise start a timer to process after batch window
+      this.batchTimer = setTimeout(() => {
+        this.processBatch().catch(err => log.error("Failed to process signature batch", err));
+      }, this.BATCH_WINDOW_MS);
     }
   }
-
-  private async stopInsiderMonitoring(): Promise<void> {
-    this.stopInsiderPolling();
-    this.processedSignatures.clear();
-    if (this.monitoredWalletMonitor) {
-      this.monitoredWalletMonitor.stop();
-      this.monitoredWalletMonitor = null;
+  
+  private async processBatch(): Promise<void> {
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = null;
     }
-  }
-
-  private async pollInsiderWallet(): Promise<void> {
-    if (
-      this.isProcessingInsider ||
-      !this.watchingMint ||
-      !this.monitoredWallet ||
-      !this.insiderState ||
-      this.activePosition
-    ) {
-      return;
-    }
-
-    this.isProcessingInsider = true;
+    
+    if (this.pendingSignaturesBatch.length === 0) return;
+    
+    const signatures = [...this.pendingSignaturesBatch];
+    this.pendingSignaturesBatch = [];
+    
+    // Filter out already processed signatures
+    const newSignatures = signatures.filter(sig => !this.processedSignatures.has(sig));
+    if (newSignatures.length === 0) return;
+    
+    log.info(`Processing batch of ${newSignatures.length} signatures`, { signatures: newSignatures });
+    
     try {
-      const txs = await this.heliusClient.getWalletTransactionsDesc(
-        this.monitoredWallet,
-        INSIDER_HISTORY_LIMIT,
-      );
-
-      const relevant = txs
-        .filter((tx) => this.isRelevantMintTx(tx, this.watchingMint!))
-        .reverse();
-
-      for (const tx of relevant) {
+      // Fetch all transactions in batch using Helius POST endpoint
+      const txs = await this.heliusClient.getTransactionsBySignatures(newSignatures);
+      
+      for (const tx of txs) {
         if (this.processedSignatures.has(tx.signature)) continue;
+        if (!this.watchingMint) continue;
+        if (!this.isRelevantMintTx(tx, this.watchingMint)) continue;
+        
         this.processedSignatures.add(tx.signature);
         await this.handleInsiderTransaction(tx, this.watchingMint);
       }
     } catch (err) {
-      log.error("Insider wallet poll failed", err);
-    } finally {
-      this.isProcessingInsider = false;
+      log.error("Failed to process transaction batch", err);
+      // Put signatures back in the batch to retry later
+      this.pendingSignaturesBatch.push(...newSignatures.filter(sig => !this.processedSignatures.has(sig)));
+    }
+  }
+
+  private startLogsSubscription(): void {
+    if (!this.monitoredWallet || !this.watchingMint) return;
+    
+    try {
+      const walletPubkey = new PublicKey(this.monitoredWallet);
+      this.logsSubscriptionId = this.connection.onLogs(
+        walletPubkey,
+        (logInfo) => {
+          if (logInfo.err) return;
+          
+          // Add signature to batch
+          this.addSignatureToBatch(logInfo.signature);
+        },
+        "processed"
+      );
+      log.info(`Started logs subscription for monitored wallet ${this.monitoredWallet}`, { subscriptionId: this.logsSubscriptionId });
+    } catch (err) {
+      log.error("Failed to start logs subscription", err);
+    }
+  }
+  
+  private stopLogsSubscription(): void {
+    if (this.logsSubscriptionId !== null) {
+      const subId = this.logsSubscriptionId;
+      this.logsSubscriptionId = null;
+      this.connection.removeOnLogsListener(subId).catch(err => {
+        log.warn("Failed to remove logs subscription", err);
+      });
+      log.info("Stopped logs subscription for monitored wallet");
+    }
+  }
+  
+  private async stopInsiderMonitoring(): Promise<void> {
+    this.stopLogsSubscription();
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = null;
+    }
+    this.processedSignatures.clear();
+    this.pendingSignaturesBatch = [];
+    if (this.monitoredWalletMonitor) {
+      this.monitoredWalletMonitor.stop();
+      this.monitoredWalletMonitor = null;
     }
   }
 
@@ -790,7 +837,8 @@ export class InsiderBot extends EventEmitter {
       }
     }
 
-    // Stop previous monitored wallet monitor if exists
+    // Stop previous monitoring
+    this.stopLogsSubscription();
     if (this.monitoredWalletMonitor) {
       this.monitoredWalletMonitor.stop();
       this.monitoredWalletMonitor = null;
@@ -813,54 +861,8 @@ export class InsiderBot extends EventEmitter {
     // Sync the new wallet's transactions from the transfer tx onwards
     await this.syncWalletTransactions(newWallet, mint, transferTx.signature);
 
-    // Start WalletMonitor on the new monitored wallet!
-    this.monitoredWalletMonitor = new WalletMonitor(this.config, newWallet, {
-      enforceMinBuySol: false,
-    });
-
-    // Listen for new buys/sells on this monitored wallet to update insiderState
-    this.monitoredWalletMonitor.on('buyDetected', (event: any) => {
-      if (event.mint === mint && this.insiderState && this.watchingMint) {
-        this.insiderState.buyCount += 1;
-        this.insiderState.devBuyCountAfterMint += 1;
-        log.info('Monitored wallet buy detected via WalletMonitor', {
-          mint,
-          wallet: newWallet,
-          buyCount: this.insiderState.buyCount,
-        });
-        this.evaluateBuyConditions(mint).catch(err =>
-          log.error('Failed to evaluate buy conditions after WalletMonitor buy', err)
-        );
-        // Check if dev has bought 3 times after mint
-        if (this.insiderState.devBuyCountAfterMint >= 3 && this.activePosition) {
-          log.warn('Dev bought 3 times after mint - triggering sell', { mint });
-          this.emit('sellTrigger', {
-            followedWallet: this.followedWallet!,
-            positionMint: mint,
-            signature: event.signature || 'WALLET_MONITOR',
-            reason: 'Dev bought 3 times after token mint',
-          });
-        }
-      }
-    });
-
-    // Also, let's make sure we process transactions from WalletMonitor for sells too
-    // Wait, WalletMonitor emits 'tokenExited' when a token is sold!
-    this.monitoredWalletMonitor.on('tokenExited', (event: any) => {
-      if (event.mint === mint && this.insiderState && this.watchingMint) {
-        this.insiderState.sellCount += 1;
-        log.info('Monitored wallet sell detected via WalletMonitor', {
-          mint,
-          wallet: newWallet,
-          sellCount: this.insiderState.sellCount,
-        });
-        this.evaluateBuyConditions(mint).catch(err =>
-          log.error('Failed to evaluate buy conditions after WalletMonitor sell', err)
-        );
-      }
-    });
-
-    await this.monitoredWalletMonitor.start();
+    // Start logs subscription for new wallet
+    this.startLogsSubscription();
 
     await this.telegramBot?.sendDefault(
       [
