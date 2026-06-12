@@ -84,12 +84,15 @@ interface InsiderWalletState {
 interface BundlerMatch {
   address: string;
   buyUsd: number;
+  buyTxCount: number;
 }
 
 interface BundlerWatchState {
   wallets: string[];
   sellCounts: Map<string, number>;
 }
+
+type BundlerMatchType = "single_buy" | "multi_buy";
 
 export class InsiderBot extends EventEmitter {
   private readonly config: ServiceConfig;
@@ -119,6 +122,11 @@ export class InsiderBot extends EventEmitter {
   private insiderState: InsiderWalletState | null = null;
   private bundlerWatch: BundlerWatchState | null = null;
   private matchedBundlers: BundlerMatch[] = [];
+  /** First-seen single-buy bundlers locked at discovery (snapshot frozen). */
+  private accumulatedSingleBuyBundlers: BundlerMatch[] = [];
+  /** First-seen multi-buy bundlers locked at discovery (snapshot frozen). */
+  private accumulatedMultiBuyBundlers: BundlerMatch[] = [];
+  private bundlerMatchType: BundlerMatchType | null = null;
   private insiderSellsReady = false;
   private bundlerMatchesReady = false;
 
@@ -370,7 +378,7 @@ export class InsiderBot extends EventEmitter {
     this.monitoredWallet = null;
     this.insiderState = null;
     this.bundlerWatch = null;
-    this.matchedBundlers = [];
+    this.clearBundlerAccumulation();
   }
 
   pause(): void {
@@ -459,7 +467,7 @@ export class InsiderBot extends EventEmitter {
     this.resetTokenTxCounts();
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
-    this.matchedBundlers = [];
+    this.clearBundlerAccumulation();
 
     const swaps = await this.heliusClient.getEarlyInsiderSwaps(mint, 4);
     const lowest = this.findLowestInsiderWallet(swaps, mint);
@@ -846,6 +854,74 @@ export class InsiderBot extends EventEmitter {
     await this.evaluateBuyGate(mint);
   }
 
+  private clearBundlerAccumulation(): void {
+    this.accumulatedSingleBuyBundlers = [];
+    this.accumulatedMultiBuyBundlers = [];
+    this.matchedBundlers = [];
+    this.bundlerMatchType = null;
+  }
+
+  private bundlerMatchTypeLabel(type: BundlerMatchType): string {
+    return type === "single_buy" ? "Single-buy pair" : "Multi-buy pair";
+  }
+
+  private async tryCompleteBundlerGate(mint: string): Promise<boolean> {
+    if (this.accumulatedSingleBuyBundlers.length >= REQUIRED_BUNDLER_MATCHES) {
+      return this.completeBundlerGate(
+        mint,
+        "single_buy",
+        this.accumulatedSingleBuyBundlers,
+      );
+    }
+    if (this.accumulatedMultiBuyBundlers.length >= REQUIRED_BUNDLER_MATCHES) {
+      return this.completeBundlerGate(
+        mint,
+        "multi_buy",
+        this.accumulatedMultiBuyBundlers,
+      );
+    }
+    return false;
+  }
+
+  private async completeBundlerGate(
+    mint: string,
+    matchType: BundlerMatchType,
+    source: BundlerMatch[],
+  ): Promise<boolean> {
+    this.matchedBundlers = source.slice(0, REQUIRED_BUNDLER_MATCHES);
+    this.bundlerMatchType = matchType;
+    this.bundlerMatchesReady = true;
+    log.info(
+      `Bundler match threshold reached (${this.bundlerMatchTypeLabel(matchType)}) — stopped GMGN bundler scan`,
+      {
+        mint,
+        matchType,
+        wallets: this.matchedBundlers.map((m) => m.address),
+        insiderSellsReady: this.insiderSellsReady,
+        insiderSellCount: this.insiderState?.sellCount ?? 0,
+        requiredInsiderSells: this.requiredInsiderSells,
+      },
+    );
+    await this.evaluateBuyGate(mint);
+    return true;
+  }
+
+  private knownBundlerAddresses(): Set<string> {
+    return new Set([
+      ...this.accumulatedSingleBuyBundlers.map((b) => b.address),
+      ...this.accumulatedMultiBuyBundlers.map((b) => b.address),
+    ]);
+  }
+
+  private parseBundlerCandidate(entry: Record<string, unknown>): BundlerMatch | null {
+    const buyUsd = this.parseBuyVolumeUsd(entry);
+    const buyTxCount = this.parseBuyTxCount(entry);
+    const address = entry.address as string | undefined;
+    if (!address || buyUsd === null || buyTxCount === null) return null;
+    if (buyUsd < this.bundlerBuyMinUsd || buyUsd > this.bundlerBuyMaxUsd) return null;
+    return { address, buyUsd, buyTxCount };
+  }
+
   private async scanBundlerTraders(mint: string): Promise<void> {
     if (
       this.phase !== "pre_buy" ||
@@ -863,42 +939,61 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const matches = list
-      .map((entry) => {
-        const buyUsd = this.parseBuyVolumeUsd(entry);
-        const address = entry.address as string | undefined;
-        if (!address || buyUsd === null) return null;
-        if (buyUsd < this.bundlerBuyMinUsd || buyUsd > this.bundlerBuyMaxUsd) return null;
-        return { address, buyUsd };
-      })
-      .filter((m): m is BundlerMatch => m !== null)
-      .slice(0, REQUIRED_BUNDLER_MATCHES);
+    const known = this.knownBundlerAddresses();
 
     log.info("Bundler GMGN scan", {
       mint,
       totalTraders: list.length,
-      matchesInRange: matches.length,
+      lockedSingleBuy: this.accumulatedSingleBuyBundlers.length,
+      lockedMultiBuy: this.accumulatedMultiBuyBundlers.length,
       range: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
       insiderSellsReady: this.insiderSellsReady,
       insiderSellCount: this.insiderState?.sellCount ?? 0,
     });
 
-    if (matches.length < REQUIRED_BUNDLER_MATCHES) return;
+    for (const entry of list) {
+      const candidate = this.parseBundlerCandidate(entry);
+      if (!candidate || known.has(candidate.address)) continue;
 
-    this.matchedBundlers = matches;
-    this.bundlerMatchesReady = true;
-    log.info(
-      "Bundler match threshold reached — stopped GMGN bundler scan, waiting for insider sells",
-      {
-        mint,
-        wallets: matches.map((m) => m.address),
-        insiderSellsReady: this.insiderSellsReady,
-        insiderSellCount: this.insiderState?.sellCount ?? 0,
-        requiredInsiderSells: this.requiredInsiderSells,
-      },
-    );
+      if (candidate.buyTxCount <= 1) {
+        if (this.accumulatedSingleBuyBundlers.length < REQUIRED_BUNDLER_MATCHES) {
+          this.accumulatedSingleBuyBundlers.push(candidate);
+          known.add(candidate.address);
+          if (
+            this.accumulatedSingleBuyBundlers.length >=
+            this.accumulatedMultiBuyBundlers.length
+          ) {
+            this.matchedBundlers = [...this.accumulatedSingleBuyBundlers];
+          }
+          log.info("Locked single-buy bundler (first-seen snapshot)", {
+            mint,
+            wallet: candidate.address,
+            buyUsd: candidate.buyUsd,
+            buyTxCount: candidate.buyTxCount,
+            locked: this.accumulatedSingleBuyBundlers.length,
+            required: REQUIRED_BUNDLER_MATCHES,
+          });
+        }
+      } else if (this.accumulatedMultiBuyBundlers.length < REQUIRED_BUNDLER_MATCHES) {
+        this.accumulatedMultiBuyBundlers.push(candidate);
+        known.add(candidate.address);
+        if (
+          this.accumulatedMultiBuyBundlers.length >
+          this.accumulatedSingleBuyBundlers.length
+        ) {
+          this.matchedBundlers = [...this.accumulatedMultiBuyBundlers];
+        }
+        log.info("Locked multi-buy bundler in range (first-seen snapshot)", {
+          mint,
+          wallet: candidate.address,
+          buyUsd: candidate.buyUsd,
+          buyTxCount: candidate.buyTxCount,
+          locked: this.accumulatedMultiBuyBundlers.length,
+        });
+      }
 
-    await this.evaluateBuyGate(mint);
+      if (await this.tryCompleteBundlerGate(mint)) return;
+    }
   }
 
   private async evaluateBuyGate(mint: string): Promise<void> {
@@ -914,6 +1009,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (this.matchedBundlers.length < REQUIRED_BUNDLER_MATCHES) return;
+    if (!this.bundlerMatchType) return;
 
     const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
     if (currentMc === null) {
@@ -928,12 +1024,13 @@ export class InsiderBot extends EventEmitter {
     const tradersListStr = this.matchedBundlers
       .map(
         (b, i) =>
-          `${i + 1}. <code>${b.address}</code> buy: <b>$${b.buyUsd.toFixed(2)}</b>`,
+          `${i + 1}. <code>${b.address}</code> buy: <b>$${b.buyUsd.toFixed(2)}</b> (${b.buyTxCount} buy tx)`,
       )
       .join("\n");
 
     log.warn("Buy gate passed — both insider sells and bundler matches ready", {
       mint,
+      bundlerMatchType: this.bundlerMatchType,
       insiderSells: this.insiderState?.sellCount,
       bundlers: this.matchedBundlers.map((b) => b.address),
       totalBuyTxs: this.tokenBuyCount,
@@ -961,6 +1058,7 @@ export class InsiderBot extends EventEmitter {
       monitoredWallet: this.monitoredWallet ?? undefined,
       tradersListStr: [
         "<b>Buy Gate Passed</b>",
+        `Bundler trigger: <b>${this.bundlerMatchTypeLabel(this.bundlerMatchType)}</b>`,
         `Insider sells: <b>${this.insiderState?.sellCount ?? 0}</b>`,
         tradersListStr,
       ].join("\n"),
@@ -986,6 +1084,12 @@ export class InsiderBot extends EventEmitter {
     return Number.isFinite(n) ? n : null;
   }
 
+  private parseBuyTxCount(entry: Record<string, unknown>): number | null {
+    const raw = entry.buy_tx_count_cur;
+    const n = typeof raw === "number" ? raw : Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
   private async handleBundlerTransaction(
     tx: HeliusTransaction,
     mint: string,
@@ -1006,6 +1110,36 @@ export class InsiderBot extends EventEmitter {
     if (kind === "buy" || kind === "sell") {
       this.logTokenTx(mint, kind, "bundler", tx.signature, wallet);
     }
+
+    if (kind === "transfer_out") {
+      const recipient = (tx.tokenTransfers ?? []).find(
+        (t) => t.mint === mint && t.fromUserAccount === wallet,
+      )?.toUserAccount;
+      log.warn("Bundler wallet transfer-out detected (post-buy) — selling ASAP", {
+        mint,
+        wallet,
+        recipient,
+        signature: tx.signature,
+        totalBuyTxs: this.tokenBuyCount,
+        totalSellTxs: this.tokenSellCount,
+      });
+      await this.triggerBundlerPositionSell(
+        mint,
+        recipient
+          ? `Bundler wallet ${wallet} transferred token out to ${recipient}`
+          : `Bundler wallet ${wallet} transferred token out`,
+        [
+          "<b>🚨 Bundler Transfer-Out — Selling ASAP</b>",
+          `Token: <code>${mint}</code>`,
+          `Bundler: <code>${wallet}</code>`,
+          recipient ? `Recipient: <code>${recipient}</code>` : "",
+          "Tracked bundler moved tokens out — immediate sell triggered.",
+        ].filter(Boolean),
+        "BUNDLER_TRANSFER_OUT_TRIGGER",
+      );
+      return;
+    }
+
     if (kind !== "sell") return;
 
     const current = this.bundlerWatch.sellCounts.get(wallet) ?? 0;
@@ -1039,20 +1173,34 @@ export class InsiderBot extends EventEmitter {
       totalSellTxs: this.tokenSellCount,
     });
 
-    await this.telegramBot?.sendDefault(
+    await this.triggerBundlerPositionSell(
+      mint,
+      "Both tracked bundler wallets have sold at least once",
       [
         "<b>🚨 Bundler Sell Signal</b>",
         `Token: <code>${mint}</code>`,
         "Both tracked bundler wallets have sold at least once.",
         `Total sell txs seen: <b>${this.tokenSellCount}</b>`,
-      ].join("\n"),
+      ],
+      "BUNDLER_SELL_TRIGGER",
     );
+  }
+
+  private async triggerBundlerPositionSell(
+    mint: string,
+    reason: string,
+    telegramLines: string[],
+    signature: string,
+  ): Promise<void> {
+    if (!this.bundlerWatch || !this.activePosition) return;
+
+    await this.telegramBot?.sendDefault(telegramLines.join("\n"));
 
     this.emit("sellTrigger", {
       followedWallet: this.followedWallet!,
       positionMint: mint,
-      signature: "BUNDLER_SELL_TRIGGER",
-      reason: "Both tracked bundler wallets have sold at least once",
+      signature,
+      reason,
     });
 
     await this.completeFlowCycle();
@@ -1068,7 +1216,7 @@ export class InsiderBot extends EventEmitter {
     this.watchingMint = null;
     this.monitoredWallet = null;
     this.insiderState = null;
-    this.matchedBundlers = [];
+    this.clearBundlerAccumulation();
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
     this.phase = this.activePosition ? "holding" : null;
@@ -1098,7 +1246,7 @@ export class InsiderBot extends EventEmitter {
     this.monitoredWallet = null;
     this.insiderState = null;
     this.bundlerWatch = null;
-    this.matchedBundlers = [];
+    this.clearBundlerAccumulation();
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
     this.buySubmitted = false;

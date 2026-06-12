@@ -2,6 +2,19 @@
 
 ## 2026-06-11
 
+### Bundler transfer-out sell
+
+- Post-buy bundler monitoring now triggers an immediate sell when either tracked wallet transfers the token out (Helius `TRANSFER` + `fromUserAccount`).
+- Existing rule remains: sell when both bundlers have sold at least once.
+
+### Bundler match race (single vs multi)
+
+- Two parallel bundler tracks: **single-buy** (`buy_tx_count_cur ≤ 1`) and **multi-buy** (`> 1`), both in USD range.
+- First-seen wallets are locked at discovery; snapshots frozen so later buys can't change locked matches.
+- Whichever track locks **2 wallets first** triggers the bundler gate; buy proceeds after insider sells are ready.
+- Buy notification classifies trigger as "Single-buy pair" or "Multi-buy pair".
+- Rug-reset Telegram card when MC falls below $5k during pre-buy monitoring.
+
 ### Insider parallel buy gate (stop-and-wait)
 
 - `INSIDER_REQUIRED_SELLS` env var (default 5) configures how many insider sells are needed before buy.

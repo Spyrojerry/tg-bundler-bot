@@ -1663,6 +1663,8 @@ async function main(): Promise<void> {
           `[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Resetting state.`,
         );
 
+        const preBuyOnly = !!preBuyMint && !activePos;
+
         if (activePos) {
           bot.emit("sellTrigger", {
             followedWallet: bot.getFollowedWallet()!,
@@ -1670,6 +1672,24 @@ async function main(): Promise<void> {
             signature: "MC_TRIGGER",
             reason: `Rug protection: ${reason}`,
           });
+        }
+
+        if (preBuyOnly) {
+          telegramBot
+            ?.sendDefault(
+              [
+                "<b>🧹 Rug Reset — Token Skipped</b>",
+                `Bot: <b>${index + 1}</b>`,
+                `Token: <code>${html(mint)}</code>`,
+                `Market cap: <b>$${currentMc.toLocaleString()}</b>`,
+                `Rug threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
+                "Token rugged during insider/bundler monitoring before buy.",
+                "Flow reset — waiting for next follow-wallet buy.",
+              ].join("\n"),
+            )
+            .catch((err) =>
+              log.warn("Telegram insider rug reset alert failed", err),
+            );
         }
 
         bot.clearActivePosition();
@@ -2218,8 +2238,10 @@ async function main(): Promise<void> {
           "<b>Flow</b>",
           "1. Bot 1 & 2 run in parallel on their own follow wallets (same mint blocked).",
           "2. After lowest insider found: monitor insider + GMGN bundler scan in parallel.",
-          `3. Buy when BOTH ${html(String(bot.getRequiredInsiderSells()))} insider sells AND 2 bundlers in USD range are found (each monitor stops when its target is met).`,
-          "4. After buy: watch both bundlers; sell when each has sold once.",
+          `3. Buy when BOTH ${html(String(bot.getRequiredInsiderSells()))} insider sells AND 2 locked bundlers in USD range are ready.`,
+          "   Race: 2 single-buy wallets (buy_tx_count_cur ≤ 1) OR 2 multi-buy wallets (> 1) — whichever pair completes first.",
+          "   First-seen wallets are snapshotted; later buys won't change locked matches.",
+          "4. After buy: watch both bundlers; sell when each has sold once, or ASAP on token transfer-out.",
           "5. ATH MC % exit and rug protection remain active.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
         ].join("\n"),
