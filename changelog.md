@@ -2,6 +2,24 @@
 
 ## 2026-06-11
 
+### Insider parallel buy gate
+
+- GMGN bundler scan starts immediately when lowest insider is found (parallel with insider monitoring).
+- Buy only triggers when both 5 insider sells and 2 bundler matches ($110–$120 default) are ready.
+- Post-buy: sell when both tracked bundlers have sold at least once.
+- Buy/sell tx logs include running totals per token.
+- Bot 1 and Bot 2 auto-resume in parallel on insider mode start.
+- Removed dev wallet sell triggers.
+
+### Insider bundler buy flow
+
+- After 5 insider sells, scan GMGN bundler traders (limit 20, API key 2) for buy_volume_cur in configurable USD range.
+- Buy when 2 bundler wallets match; then monitor both via WSS + Helius until each sells once before resuming follow wallet.
+- Cross-bot mint lock prevents Bot 1 and Bot 2 from working the same token simultaneously.
+- Dev wallet sell triggers: 3rd buy after mint, or sell amount exceeding initial mint amount; full dev exit uses ATH % MC.
+- Removed legacy PnL-at-transfer, dev $10 cap, and $40 buy threshold logic.
+- Telegram: bundler min/max USD settings added.
+
 ### Insider mode rewrite
 
 - Follow-wallet monitoring now pauses on new token buy and switches to lowest early insider wallet detection via Helius.

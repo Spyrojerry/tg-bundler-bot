@@ -152,6 +152,25 @@ export class HeliusClient {
    * Fetches early SWAP transactions for a token mint (skips CREATE).
    * Returns the first `swapLimit` SWAP txs after the mint CREATE tx.
    */
+  async getMintCreateTransaction(mintAddress: string): Promise<HeliusTransaction | null> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'asc',
+      'api-key': this.apiKey,
+      limit: '5',
+    });
+    const url = `${this.baseUrl}/v0/addresses/${mintAddress}/transactions?${params.toString()}`;
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+
+    const data = await response.json() as HeliusTransaction[];
+    return data.find((tx) => tx.type === 'CREATE') ?? data[0] ?? null;
+  }
+
   async getEarlyInsiderSwaps(
     mintAddress: string,
     swapLimit: number = 4,

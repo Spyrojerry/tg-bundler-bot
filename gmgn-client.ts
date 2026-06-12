@@ -320,6 +320,33 @@ export class GmgnClient {
 
   // ── Public: fetch top profitable traders for a token ──────────────────────
 
+  async fetchBundlerTraders(
+    mint: string,
+    limit: number = 20,
+  ): Promise<any> {
+    this.validateSolAddress(mint, 'mint');
+
+    try {
+      if (this.fetchMode !== 'direct') {
+        const data = await this.fetchCliData('traders', mint, {
+          limit,
+          orderBy: 'buy_volume_cur',
+          tag: 'bundler',
+        });
+        if (data) return data;
+        log.debug(`GMGN CLI bundler traders returned no data for ${mint}, falling back to API`);
+      }
+
+      const endpoint =
+        `v1/token/traders/sol/${mint}?limit=${limit}&tag=bundler&orderby=buy_volume_cur&direction=desc`;
+      const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
+      return data;
+    } catch (err) {
+      log.error(`Failed to fetch bundler traders for ${mint}`, err);
+      return null;
+    }
+  }
+
   async fetchTokenTraders(
     mint: string,
     limit: number = 50,
@@ -390,7 +417,7 @@ export class GmgnClient {
   private async fetchCliData(
     type: 'token' | 'traders' | 'security',
     mint: string,
-    options: { limit?: number; orderBy?: string } = {}
+    options: { limit?: number; orderBy?: string; tag?: string } = {}
   ): Promise<Record<string, unknown> | null> {
     // Map internal types to CLI subcommands
     let subcommand = '';
@@ -407,9 +434,10 @@ export class GmgnClient {
       cmd += ` --limit ${options.limit}`;
     }
     if (options.orderBy) {
-      // Map 'profit_change' or others to CLI supported 'profit' if needed, 
-      // but 'profit' is requested and supported.
       cmd += ` --order-by ${options.orderBy}`;
+    }
+    if (options.tag) {
+      cmd += ` --tag ${options.tag}`;
     }
 
     try {

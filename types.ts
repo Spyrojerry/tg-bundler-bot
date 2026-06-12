@@ -162,6 +162,8 @@ export interface ServiceConfig {
   insiderExitMc: number;
   insiderExitPercent: number;
   insiderMinTransferProfit: number;
+  insiderBundlerBuyMinUsd: number;
+  insiderBundlerBuyMaxUsd: number;
   insiderFollowWallet: string | null;
   insiderFollowWallet2: string | null;
   defaultBotMode: 'insider' | 'bundler';

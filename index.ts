@@ -33,6 +33,7 @@ import {
 import { EarlyBundlerOrchestrator } from "./early-bundler-orchestrator";
 import { ReverseCopySellOrchestrator } from "./reverse-copysell-orchestrator";
 import { InsiderBot } from "./insider-bot";
+import type { InsiderMintClaimFn } from "./insider-bot";
 import { PublicKey } from "@solana/web3.js";
 import { randomBytes } from "crypto";
 
@@ -107,7 +108,9 @@ async function main(): Promise<void> {
         type:
           | "insiderFollowWallet"
           | "insiderBuySol"
-          | "insiderExitPercent";
+          | "insiderExitPercent"
+          | "insiderBundlerMinUsd"
+          | "insiderBundlerMaxUsd";
         index: number;
       }
     | { type: "bundlerFollowWallet" | "bundlerBuySol" | "bundlerExitPercent" }
@@ -313,6 +316,7 @@ async function main(): Promise<void> {
           await stopBundlerModeServices("Switched to Insider mode");
           await stopReverseCopySellModeServices("Switched to Insider mode");
           botMode = "insider";
+          await resumeAllInsiderBots();
           return homeReply(true);
         }
         if (data === "mode:bundler") {
@@ -399,6 +403,28 @@ async function main(): Promise<void> {
           });
           return {
             text: `[Bot ${activeInsiderIndex + 1}] Send the Exit profit percentage increase.\nExample: <code>40</code> for a 40% ATH MC increase from your entry point.`,
+            trackPrompt: true,
+            editCurrent: true,
+          };
+        }
+        if (data === "insider:bundlermin") {
+          pendingTelegramActions.set(chatId, {
+            type: "insiderBundlerMinUsd",
+            index: activeInsiderIndex,
+          });
+          return {
+            text: `[Bot ${activeInsiderIndex + 1}] Send the minimum bundler buy USD.\nExample: <code>110</code>`,
+            trackPrompt: true,
+            editCurrent: true,
+          };
+        }
+        if (data === "insider:bundlermax") {
+          pendingTelegramActions.set(chatId, {
+            type: "insiderBundlerMaxUsd",
+            index: activeInsiderIndex,
+          });
+          return {
+            text: `[Bot ${activeInsiderIndex + 1}] Send the maximum bundler buy USD.\nExample: <code>120</code>`,
             trackPrompt: true,
             editCurrent: true,
           };
@@ -597,6 +623,22 @@ async function main(): Promise<void> {
             bot.setExitPercent(value);
             return homeReply();
           }
+          if (pendingAction.type === "insiderBundlerMinUsd") {
+            const bot = insiderBots[pendingAction.index];
+            const value = Number(text.trim());
+            if (!Number.isFinite(value) || value < 0)
+              return "Send a valid USD amount.";
+            bot.setBundlerBuyMinUsd(value);
+            return homeReply();
+          }
+          if (pendingAction.type === "insiderBundlerMaxUsd") {
+            const bot = insiderBots[pendingAction.index];
+            const value = Number(text.trim());
+            if (!Number.isFinite(value) || value < 0)
+              return "Send a valid USD amount.";
+            bot.setBundlerBuyMaxUsd(value);
+            return homeReply();
+          }
           if (pendingAction.type === "bundlerFollowWallet") {
             await earlyBundlerOrchestrator.followWallet(text);
             return homeReply();
@@ -656,14 +698,34 @@ async function main(): Promise<void> {
     config.insiderHeliusApiKey2 || config.insiderHeliusApiKey || config.heliusApiKey,
   ];
 
+  const bundlerGmgnClient = gmgnClients[1];
+
+  function claimInsiderMint(botIndex: number, mint: string): boolean {
+    if (botIndex > 1) return true;
+    const otherIndex = botIndex === 0 ? 1 : 0;
+    const otherBot = insiderBots[otherIndex];
+    if (!otherBot) return true;
+    if (otherBot.getPreBuyMint() === mint) return false;
+    if (otherBot.getActivePosition()?.mint === mint) return false;
+    return true;
+  }
+
+  const makeClaimFn =
+    (botIndex: number): InsiderMintClaimFn =>
+    (mint: string) =>
+      claimInsiderMint(botIndex, mint);
+
   insiderBots.push(
     new InsiderBot(
       config,
       config.insiderSolanaRpcUrl,
       config.insiderSolanaWsUrl,
       gmgnClients[0],
+      bundlerGmgnClient,
       insiderHeliusKeys[0],
       telegramBot,
+      makeClaimFn(0),
+      () => undefined,
     ),
   );
   insiderBots.push(
@@ -672,8 +734,11 @@ async function main(): Promise<void> {
       config.insiderSolanaRpcUrl2,
       config.insiderSolanaWsUrl2,
       gmgnClients[1],
+      bundlerGmgnClient,
       insiderHeliusKeys[1],
       telegramBot,
+      makeClaimFn(1),
+      () => undefined,
     ),
   );
 
@@ -683,6 +748,7 @@ async function main(): Promise<void> {
       config.insiderSolanaRpcUrl,
       config.insiderSolanaWsUrl,
       gmgnClients[0],
+      bundlerGmgnClient,
       insiderHeliusKeys[0],
       telegramBot,
     ),
@@ -693,10 +759,31 @@ async function main(): Promise<void> {
       config.insiderSolanaRpcUrl2,
       config.insiderSolanaWsUrl2,
       gmgnClients[1],
+      bundlerGmgnClient,
       insiderHeliusKeys[1],
       telegramBot,
+      makeClaimFn(1),
+      () => undefined,
     ),
   );
+
+  async function resumeAllInsiderBots(): Promise<void> {
+    for (let i = 0; i < 2; i++) {
+      const bot = insiderBots[i];
+      const wallet = bot.getFollowedWallet();
+      if (
+        wallet &&
+        !bot.isRunning() &&
+        !bot.getActivePosition() &&
+        !bot.getPreBuyMint()
+      ) {
+        await bot.followWallet(wallet);
+        log.info(`[INSIDER ${i + 1}] Resumed follow-wallet monitoring`, {
+          wallet,
+        });
+      }
+    }
+  }
 
   // ── Seed boughtMints from DB so restarts don't re-buy previous tokens ──────
   if (config.tradingWalletAddress) {
@@ -1111,7 +1198,7 @@ async function main(): Promise<void> {
             },
           );
         } catch (err) {
-          bot.setBuyExecuting(false); // Ensure flag is cleared on failure
+          bot.resetBuyAttempt();
           log.error(`Insider ${index + 1} buy failed`, err);
           await telegramBot?.sendDefault(
             [
@@ -1554,11 +1641,6 @@ async function main(): Promise<void> {
     const mint = preBuyMint || activePos!.mint;
 
     try {
-      // If we have an active position, sync dev wallet's last 20 txs (once)
-      if (activePos) {
-        await bot.syncAfterBuy();
-      }
-
       const currentMc =
         preFetchedMc !== undefined
           ? preFetchedMc
@@ -2129,16 +2211,17 @@ async function main(): Promise<void> {
             ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
             : "",
           `Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
+          `Bundler buy USD: <b>$${html(String(bot.getBundlerBuyMinUsd()))} – $${html(String(bot.getBundlerBuyMaxUsd()))}</b>`,
           `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% ATH MC from Entry</b>`,
           `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
           "",
           "<b>Flow</b>",
-          "1. Set follow wallet, buy SOL, and exit % increase.",
-          "2. Bot waits for the followed wallet to buy a new token.",
-          "3. Bot finds the lowest early insider via Helius and monitors that wallet.",
-          "4. Bot buys after insider sell signals + positive wallet PnL.",
-          "5. Bot sells when ATH MC reaches your % increase from entry.",
-          `• Rug Protection: Bot resets if MC is below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
+          "1. Bot 1 & 2 run in parallel on their own follow wallets (same mint blocked).",
+          "2. After lowest insider found: monitor insider + GMGN bundler scan in parallel.",
+          "3. Buy when BOTH 5 insider sells AND 2 bundlers in USD range are found.",
+          "4. After buy: watch both bundlers; sell when each has sold once.",
+          "5. ATH MC % exit and rug protection remain active.",
+          `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
         ].join("\n"),
         replyMarkup: {
           inline_keyboard: [
@@ -2151,7 +2234,11 @@ async function main(): Promise<void> {
               { text: "Follow wallet", callback_data: "insider:follow" },
               { text: "Buy SOL", callback_data: "insider:buysol" },
             ],
-            [{ text: "Set Exit %", callback_data: "insider:exitpercent" }],
+            [
+              { text: "Set Exit %", callback_data: "insider:exitpercent" },
+              { text: "Bundler Min $", callback_data: "insider:bundlermin" },
+            ],
+            [{ text: "Bundler Max $", callback_data: "insider:bundlermax" }],
             [
               disableBuyButton,
               { text: "Refresh", callback_data: "menu:refresh" },
@@ -2569,6 +2656,7 @@ async function main(): Promise<void> {
     await startBundlerModeServices();
   } else {
     await stopBundlerModeServices("Service started in Insider mode");
+    await resumeAllInsiderBots();
   }
   startMarketCapChecker();
 
