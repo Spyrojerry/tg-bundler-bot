@@ -2,6 +2,12 @@
 
 ## 2026-06-11
 
+### Pre-buy stop + profitable trader exit trigger
+
+- GMGN bundler scan and insider/transfer monitoring stop as soon as the buy gate passes (before MC fetch / buy execution).
+- Post-buy: poll GMGN token traders by profit (limit 20, API key 2); lock first 5 valid wallets excluding the 4 initial insider wallets and any wallet whose GMGN `token_transfer_in` / `token_transfer` is from one of those insiders.
+- Sell when all 5 locked profitable wallets have fully exited; logs and Telegram include tracked wallets and reason.
+
 ### Bundler transfer-out sell
 
 - Post-buy bundler monitoring now triggers an immediate sell when either tracked wallet transfers the token out (Helius `TRANSFER` + `fromUserAccount`).

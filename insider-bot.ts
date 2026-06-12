@@ -12,6 +12,8 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const POLL_MS = 2_000;
 const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
+const REQUIRED_PROFITABLE_EXIT_WALLETS = 5;
+const PROFIT_TRADER_SCAN_LIMIT = 20;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 type FlowPhase = "pre_buy" | "holding";
@@ -92,6 +94,12 @@ interface BundlerWatchState {
   sellCounts: Map<string, number>;
 }
 
+interface ProfitableTraderLock {
+  address: string;
+  profit: number;
+  exited: boolean;
+}
+
 type BundlerMatchType = "single_buy" | "multi_buy";
 
 export class InsiderBot extends EventEmitter {
@@ -127,6 +135,12 @@ export class InsiderBot extends EventEmitter {
   /** First-seen multi-buy bundlers locked at discovery (snapshot frozen). */
   private accumulatedMultiBuyBundlers: BundlerMatch[] = [];
   private bundlerMatchType: BundlerMatchType | null = null;
+  /** Wallets from the first 4 early SWAP buys — fixed at flow start for profitable-trader exclusions. */
+  private initialInsiderWallets = new Set<string>();
+  private lockedProfitableTraders: ProfitableTraderLock[] = [];
+  private profitableTraderWatchActive = false;
+  private preBuyStopped = false;
+  private positionSellTriggered = false;
   private insiderSellsReady = false;
   private bundlerMatchesReady = false;
 
@@ -390,19 +404,24 @@ export class InsiderBot extends EventEmitter {
   }
 
   markPositionBought(trigger: InsiderBuyTrigger): void {
+    void this.stopPreBuyMonitoring();
     this.activePosition = {
       followedWallet: trigger.followedWallet,
       mint: trigger.mint,
     };
     this.watchingMint = null;
+    this.monitoredWallet = null;
+    this.insiderState = null;
     this.boughtMints.add(trigger.mint);
     this.phase = "holding";
-    void this.stopInsiderMonitoring();
+    this.profitableTraderWatchActive = true;
+    this.lockedProfitableTraders = [];
 
     const wallets = this.matchedBundlers.map((b) => b.address);
     if (wallets.length >= REQUIRED_BUNDLER_MATCHES) {
       void this.startBundlerMonitoring(wallets, trigger.mint);
     }
+    void this.scanProfitableTraders(trigger.mint);
   }
 
   private resetTokenTxCounts(): void {
@@ -476,6 +495,14 @@ export class InsiderBot extends EventEmitter {
     }
 
     this.monitoredWallet = lowest.wallet;
+    this.initialInsiderWallets.clear();
+    for (const wallet of this.extractEarlyInsiderWallets(swaps, mint)) {
+      this.initialInsiderWallets.add(wallet);
+    }
+    this.preBuyStopped = false;
+    this.positionSellTriggered = false;
+    this.profitableTraderWatchActive = false;
+    this.lockedProfitableTraders = [];
     this.insiderState = {
       wallet: lowest.wallet,
       sellCount: 0,
@@ -508,6 +535,19 @@ export class InsiderBot extends EventEmitter {
     this.startPollLoop();
     await this.scanBundlerTraders(mint);
     await this.evaluateBuyGate(mint);
+  }
+
+  private extractEarlyInsiderWallets(swaps: HeliusTransaction[], mint: string): string[] {
+    const wallets = new Set<string>();
+    for (const tx of swaps) {
+      if (tx.type !== "SWAP") continue;
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint !== mint) continue;
+        const wallet = transfer.toUserAccount;
+        if (wallet) wallets.add(wallet);
+      }
+    }
+    return [...wallets];
   }
 
   private findLowestInsiderWallet(swaps: HeliusTransaction[], mint: string) {
@@ -548,18 +588,23 @@ export class InsiderBot extends EventEmitter {
       const mint = this.watchingMint ?? this.activePosition?.mint;
       if (!mint) return;
 
-      if (this.phase === "pre_buy") {
+      if (this.phase === "pre_buy" && !this.preBuyStopped) {
         if (this.monitoredWallet && !this.insiderSellsReady) {
           await this.pollWallet(this.monitoredWallet, mint, "insider");
         }
-        if (!this.bundlerMatchesReady) {
+        if (!this.bundlerMatchesReady && !this.buySubmitted) {
           await this.scanBundlerTraders(mint);
         }
       }
 
-      if (this.phase === "holding" && this.bundlerWatch) {
-        for (const wallet of this.bundlerWatch.wallets) {
-          await this.pollWallet(wallet, mint, "bundler");
+      if (this.phase === "holding") {
+        if (this.bundlerWatch) {
+          for (const wallet of this.bundlerWatch.wallets) {
+            await this.pollWallet(wallet, mint, "bundler");
+          }
+        }
+        if (this.profitableTraderWatchActive) {
+          await this.scanProfitableTraders(mint);
         }
       }
     } finally {
@@ -694,10 +739,22 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  private async stopPreBuyMonitoring(): Promise<void> {
+    if (this.preBuyStopped) return;
+    this.preBuyStopped = true;
+    await this.stopInsiderMonitoring();
+    log.info("Pre-buy monitoring stopped (insider + GMGN bundler scan)", {
+      mint: this.watchingMint ?? this.activePosition?.mint,
+      initialInsiderWallets: [...this.initialInsiderWallets],
+    });
+  }
+
   private async stopFlowMonitoring(): Promise<void> {
     this.stopPollLoop();
+    await this.stopPreBuyMonitoring();
     await this.stopInsiderMonitoring();
     await this.stopBundlerMonitoring();
+    this.profitableTraderWatchActive = false;
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
@@ -922,9 +979,145 @@ export class InsiderBot extends EventEmitter {
     return { address, buyUsd, buyTxCount };
   }
 
+  private isExcludedInsiderTrader(entry: Record<string, unknown>): boolean {
+    const address = entry.address as string | undefined;
+    if (!address) return true;
+    if (this.initialInsiderWallets.has(address)) return true;
+
+    for (const field of ["token_transfer_in", "token_transfer"] as const) {
+      const transfer = entry[field] as { address?: string } | undefined;
+      const source = transfer?.address?.trim();
+      if (source && this.initialInsiderWallets.has(source)) return true;
+    }
+    return false;
+  }
+
+  private hasSoldAllPosition(entry: Record<string, unknown>): boolean {
+    const balance = Number(entry.balance ?? entry.amount_cur ?? NaN);
+    const amountPct = Number(entry.amount_percentage ?? NaN);
+    const sellPct = Number(entry.sell_amount_percentage ?? 0);
+
+    if (Number.isFinite(balance) && balance <= 0) {
+      if (!Number.isFinite(amountPct) || amountPct <= 0) return true;
+    }
+    if (sellPct >= 1 && Number.isFinite(balance) && balance <= 0) return true;
+    return false;
+  }
+
+  private lockProfitableTraders(list: Array<Record<string, unknown>>): void {
+    const known = new Set(this.lockedProfitableTraders.map((t) => t.address));
+    for (const entry of list) {
+      if (this.lockedProfitableTraders.length >= REQUIRED_PROFITABLE_EXIT_WALLETS) break;
+      if (this.isExcludedInsiderTrader(entry)) continue;
+
+      const address = entry.address as string | undefined;
+      const profit = Number(entry.profit ?? 0);
+      if (!address || known.has(address) || !Number.isFinite(profit) || profit <= 0) continue;
+
+      this.lockedProfitableTraders.push({ address, profit, exited: false });
+      known.add(address);
+      log.info("Locked profitable trader (first-seen)", {
+        mint: this.activePosition?.mint,
+        wallet: address,
+        profit,
+        locked: this.lockedProfitableTraders.length,
+        required: REQUIRED_PROFITABLE_EXIT_WALLETS,
+      });
+    }
+  }
+
+  private updateProfitableTraderExitStatus(list: Array<Record<string, unknown>>): void {
+    const byAddress = new Map(
+      list
+        .map((entry) => [entry.address as string, entry] as const)
+        .filter(([address]) => !!address),
+    );
+
+    for (const trader of this.lockedProfitableTraders) {
+      if (trader.exited) continue;
+      const entry = byAddress.get(trader.address);
+      if (entry && this.hasSoldAllPosition(entry)) {
+        trader.exited = true;
+        log.info("Profitable trader fully exited position", {
+          mint: this.activePosition?.mint,
+          wallet: trader.address,
+          profit: trader.profit,
+        });
+      }
+    }
+  }
+
+  private async scanProfitableTraders(mint: string): Promise<void> {
+    if (
+      !this.profitableTraderWatchActive ||
+      this.phase !== "holding" ||
+      !this.activePosition ||
+      this.positionSellTriggered
+    ) {
+      return;
+    }
+
+    const traders = await this.bundlerGmgnClient.fetchTokenTraders(
+      mint,
+      PROFIT_TRADER_SCAN_LIMIT,
+      "profit",
+    );
+    const list = this.extractTraderList(traders);
+    if (!list.length) {
+      log.debug("No profitable traders returned from GMGN", { mint });
+      return;
+    }
+
+    this.lockProfitableTraders(list);
+    this.updateProfitableTraderExitStatus(list);
+
+    const locked = this.lockedProfitableTraders.length;
+    const exited = this.lockedProfitableTraders.filter((t) => t.exited).length;
+
+    log.info("Profitable trader GMGN scan", {
+      mint,
+      locked,
+      exited,
+      required: REQUIRED_PROFITABLE_EXIT_WALLETS,
+      initialInsiderWallets: [...this.initialInsiderWallets],
+    });
+
+    if (locked < REQUIRED_PROFITABLE_EXIT_WALLETS || exited < REQUIRED_PROFITABLE_EXIT_WALLETS) {
+      return;
+    }
+
+    const walletLines = this.lockedProfitableTraders
+      .map(
+        (t, i) =>
+          `${i + 1}. <code>${t.address}</code> profit: <b>$${t.profit.toFixed(2)}</b>`,
+      )
+      .join("\n");
+
+    log.warn("Top profitable wallets fully exited — triggering position sell", {
+      mint,
+      wallets: this.lockedProfitableTraders.map((t) => t.address),
+    });
+
+    await this.triggerPositionSell(
+      mint,
+      `Top ${REQUIRED_PROFITABLE_EXIT_WALLETS} profitable wallets (excl. insider) have sold all positions`,
+      [
+        "<b>🚨 Profitable Trader Exit Signal</b>",
+        `Token: <code>${mint}</code>`,
+        `All <b>${REQUIRED_PROFITABLE_EXIT_WALLETS}</b> tracked profitable wallets have fully exited.`,
+        "Initial 4 insider wallets and insider transfer-in recipients were excluded.",
+        "",
+        "<b>Tracked wallets:</b>",
+        walletLines,
+      ],
+      "PROFITABLE_TRADER_EXIT_TRIGGER",
+    );
+  }
+
   private async scanBundlerTraders(mint: string): Promise<void> {
     if (
       this.phase !== "pre_buy" ||
+      this.preBuyStopped ||
       this.bundlerMatchesReady ||
       this.buySubmitted ||
       this.buyDisabled
@@ -1011,9 +1204,13 @@ export class InsiderBot extends EventEmitter {
     if (this.matchedBundlers.length < REQUIRED_BUNDLER_MATCHES) return;
     if (!this.bundlerMatchType) return;
 
+    await this.stopPreBuyMonitoring();
+
     const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
     if (currentMc === null) {
       log.warn("Could not fetch MC for buy gate", { mint });
+      this.preBuyStopped = false;
+      if (this.monitoredWallet) this.startInsiderMonitoring();
       return;
     }
 
@@ -1041,7 +1238,6 @@ export class InsiderBot extends EventEmitter {
 
     this.setBuyExecuting(true);
     this.buySubmitted = true;
-    await this.stopInsiderMonitoring();
 
     log.info("Buy gate complete — both pre-buy monitors stopped, triggering buy", {
       mint,
@@ -1123,20 +1319,20 @@ export class InsiderBot extends EventEmitter {
         totalBuyTxs: this.tokenBuyCount,
         totalSellTxs: this.tokenSellCount,
       });
-      await this.triggerBundlerPositionSell(
-        mint,
-        recipient
+    await this.triggerPositionSell(
+      mint,
+      recipient
           ? `Bundler wallet ${wallet} transferred token out to ${recipient}`
           : `Bundler wallet ${wallet} transferred token out`,
-        [
-          "<b>🚨 Bundler Transfer-Out — Selling ASAP</b>",
-          `Token: <code>${mint}</code>`,
-          `Bundler: <code>${wallet}</code>`,
-          recipient ? `Recipient: <code>${recipient}</code>` : "",
-          "Tracked bundler moved tokens out — immediate sell triggered.",
-        ].filter(Boolean),
-        "BUNDLER_TRANSFER_OUT_TRIGGER",
-      );
+      [
+        "<b>🚨 Bundler Transfer-Out — Selling ASAP</b>",
+        `Token: <code>${mint}</code>`,
+        `Bundler: <code>${wallet}</code>`,
+        recipient ? `Recipient: <code>${recipient}</code>` : "",
+        "Tracked bundler moved tokens out — immediate sell triggered.",
+      ].filter(Boolean),
+      "BUNDLER_TRANSFER_OUT_TRIGGER",
+    );
       return;
     }
 
@@ -1173,7 +1369,7 @@ export class InsiderBot extends EventEmitter {
       totalSellTxs: this.tokenSellCount,
     });
 
-    await this.triggerBundlerPositionSell(
+    await this.triggerPositionSell(
       mint,
       "Both tracked bundler wallets have sold at least once",
       [
@@ -1186,13 +1382,15 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private async triggerBundlerPositionSell(
+  private async triggerPositionSell(
     mint: string,
     reason: string,
     telegramLines: string[],
     signature: string,
   ): Promise<void> {
-    if (!this.bundlerWatch || !this.activePosition) return;
+    if (!this.activePosition || this.positionSellTriggered) return;
+    this.positionSellTriggered = true;
+    this.profitableTraderWatchActive = false;
 
     await this.telegramBot?.sendDefault(telegramLines.join("\n"));
 
@@ -1217,6 +1415,10 @@ export class InsiderBot extends EventEmitter {
     this.monitoredWallet = null;
     this.insiderState = null;
     this.clearBundlerAccumulation();
+    this.initialInsiderWallets.clear();
+    this.lockedProfitableTraders = [];
+    this.profitableTraderWatchActive = false;
+    this.preBuyStopped = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
     this.phase = this.activePosition ? "holding" : null;
@@ -1247,6 +1449,11 @@ export class InsiderBot extends EventEmitter {
     this.insiderState = null;
     this.bundlerWatch = null;
     this.clearBundlerAccumulation();
+    this.initialInsiderWallets.clear();
+    this.lockedProfitableTraders = [];
+    this.profitableTraderWatchActive = false;
+    this.preBuyStopped = false;
+    this.positionSellTriggered = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
     this.buySubmitted = false;
