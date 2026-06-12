@@ -2,10 +2,17 @@
 
 ## 2026-06-11
 
+### Insider parallel buy gate (stop-and-wait)
+
+- `INSIDER_REQUIRED_SELLS` env var (default 5) configures how many insider sells are needed before buy.
+- After lowest insider is found, insider monitoring and GMGN bundler scan run in parallel every 2s.
+- Whichever finishes first stops its own monitor and waits; buy fires only when both insider sells and 2 bundler matches are ready.
+- Post-buy bundler sell trigger unchanged: sell when each matched bundler has sold once.
+
 ### Insider parallel buy gate
 
 - GMGN bundler scan starts immediately when lowest insider is found (parallel with insider monitoring).
-- Buy only triggers when both 5 insider sells and 2 bundler matches ($110–$120 default) are ready.
+- Buy only triggers when both insider sell threshold and 2 bundler matches ($110–$120 default) are ready.
 - Post-buy: sell when both tracked bundlers have sold at least once.
 - Buy/sell tx logs include running totals per token.
 - Bot 1 and Bot 2 auto-resume in parallel on insider mode start.

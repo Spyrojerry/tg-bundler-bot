@@ -2218,7 +2218,7 @@ async function main(): Promise<void> {
           "<b>Flow</b>",
           "1. Bot 1 & 2 run in parallel on their own follow wallets (same mint blocked).",
           "2. After lowest insider found: monitor insider + GMGN bundler scan in parallel.",
-          "3. Buy when BOTH 5 insider sells AND 2 bundlers in USD range are found.",
+          `3. Buy when BOTH ${html(String(bot.getRequiredInsiderSells()))} insider sells AND 2 bundlers in USD range are found (each monitor stops when its target is met).`,
           "4. After buy: watch both bundlers; sell when each has sold once.",
           "5. ATH MC % exit and rug protection remain active.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,

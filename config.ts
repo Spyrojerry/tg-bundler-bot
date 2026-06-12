@@ -151,6 +151,7 @@ export function loadConfig(): ServiceConfig {
   const insiderMinTransferProfit = optionalNumber('INSIDER_MIN_TRANSFER_PROFIT', 70);
   const insiderBundlerBuyMinUsd = optionalNumber('INSIDER_BUNDLER_BUY_MIN_USD', 110);
   const insiderBundlerBuyMaxUsd = optionalNumber('INSIDER_BUNDLER_BUY_MAX_USD', 120);
+  const insiderRequiredSells = optionalInt('INSIDER_REQUIRED_SELLS', 5);
   const port                   = optionalInt('PORT', 8080);
 
   if (!isValidLogLevel(rawLogLevel)) {
@@ -215,6 +216,7 @@ export function loadConfig(): ServiceConfig {
     insiderMinTransferProfit,
     insiderBundlerBuyMinUsd,
     insiderBundlerBuyMaxUsd,
+    insiderRequiredSells,
     insiderFollowWallet,
     insiderFollowWallet2,
     defaultBotMode,

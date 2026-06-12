@@ -11,7 +11,6 @@ const log = createLogger("INSIDER");
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const POLL_MS = 2_000;
 const INSIDER_HISTORY_LIMIT = 21;
-const REQUIRED_INSIDER_SELLS = 5;
 const REQUIRED_BUNDLER_MATCHES = 2;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
@@ -59,6 +58,7 @@ export interface InsiderBot {
   setBundlerBuyMinUsd(value: number): void;
   getBundlerBuyMaxUsd(): number;
   setBundlerBuyMaxUsd(value: number): void;
+  getRequiredInsiderSells(): number;
   getFollowedWallet(): string | null;
   getMonitoredWallet(): string | null;
   getBuySol(): number;
@@ -108,6 +108,7 @@ export class InsiderBot extends EventEmitter {
   private exitPercent: number;
   private bundlerBuyMinUsd: number;
   private bundlerBuyMaxUsd: number;
+  private requiredInsiderSells: number;
   private buyDisabled = false;
 
   private followMonitor: WalletMonitor | null = null;
@@ -167,6 +168,7 @@ export class InsiderBot extends EventEmitter {
     this.exitPercent = config.insiderExitPercent;
     this.bundlerBuyMinUsd = config.insiderBundlerBuyMinUsd;
     this.bundlerBuyMaxUsd = config.insiderBundlerBuyMaxUsd;
+    this.requiredInsiderSells = config.insiderRequiredSells;
     this.connection = new Connection(rpcUrl, {
       commitment: "processed",
       wsEndpoint: wsUrl,
@@ -174,8 +176,8 @@ export class InsiderBot extends EventEmitter {
   }
 
   seedSeenMints(mints: Set<string>): void {
-    for (const m of mints) this.boughtMints.add(m);
-  }
+  for (const m of mints) this.boughtMints.add(m);
+}
 
   getActivePosition() {
     return this.activePosition;
@@ -263,6 +265,10 @@ export class InsiderBot extends EventEmitter {
     return this.bundlerBuyMaxUsd;
   }
 
+  getRequiredInsiderSells() {
+    return this.requiredInsiderSells;
+  }
+
   isBuyDisabled() {
     return this.buyDisabled;
   }
@@ -284,7 +290,7 @@ export class InsiderBot extends EventEmitter {
     this.buySubmitted = false;
     if (!this.activePosition && this.watchingMint) {
       this.phase = "pre_buy";
-      if (this.monitoredWallet) {
+      if (this.monitoredWallet && !this.insiderSellsReady) {
         this.startInsiderMonitoring();
       }
       void this.evaluateBuyGate(this.watchingMint);
@@ -483,10 +489,10 @@ export class InsiderBot extends EventEmitter {
         "<b>🔍 Insider Flow Started</b>",
         `Token: <code>${mint}</code>`,
         `Lowest insider: <code>${lowest.wallet}</code>`,
-        `Insider sells: <b>${this.insiderState.sellCount}</b> / ${REQUIRED_INSIDER_SELLS}`,
+        `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
         `Bundler matches: <b>${this.matchedBundlers.length}</b> / ${REQUIRED_BUNDLER_MATCHES}`,
         "",
-        "Monitoring insider + scanning GMGN bundlers in parallel...",
+        "Monitoring insider + scanning GMGN bundlers in parallel (each stops when its target is met)...",
       ].join("\n"),
     );
 
@@ -535,7 +541,7 @@ export class InsiderBot extends EventEmitter {
       if (!mint) return;
 
       if (this.phase === "pre_buy") {
-        if (this.monitoredWallet) {
+        if (this.monitoredWallet && !this.insiderSellsReady) {
           await this.pollWallet(this.monitoredWallet, mint, "insider");
         }
         if (!this.bundlerMatchesReady) {
@@ -779,17 +785,28 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (kind === "sell") {
+      if (this.insiderSellsReady) return;
       this.insiderState.sellCount += 1;
-      if (this.insiderState.sellCount >= REQUIRED_INSIDER_SELLS) {
-        this.insiderSellsReady = true;
-        log.info("Insider sell threshold reached", {
-          mint,
-          sellCount: this.insiderState.sellCount,
-          bundlerMatchesReady: this.bundlerMatchesReady,
-        });
+      if (this.insiderState.sellCount >= this.requiredInsiderSells) {
+        await this.markInsiderSellsReady(mint);
       }
-      await this.evaluateBuyGate(mint);
     }
+  }
+
+  private async markInsiderSellsReady(mint: string): Promise<void> {
+    if (this.insiderSellsReady) return;
+    this.insiderSellsReady = true;
+    await this.stopInsiderMonitoring();
+    log.info(
+      "Insider sell threshold reached — stopped insider monitoring, waiting for bundler matches",
+      {
+        mint,
+        sellCount: this.insiderState?.sellCount,
+        required: this.requiredInsiderSells,
+        bundlerMatchesReady: this.bundlerMatchesReady,
+      },
+    );
+    await this.evaluateBuyGate(mint);
   }
 
   private async switchToTransferredWallet(
@@ -816,9 +833,14 @@ export class InsiderBot extends EventEmitter {
         "<b>🔀 Insider Transfer Detected</b>",
         `Token: <code>${mint}</code>`,
         `Now monitoring: <code>${newWallet}</code>`,
-        `Insider sells: <b>${this.insiderState.sellCount}</b> / ${REQUIRED_INSIDER_SELLS}`,
+        `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
         `Bundler matches: <b>${this.matchedBundlers.length}</b> / ${REQUIRED_BUNDLER_MATCHES}`,
-      ].join("\n"),
+        this.bundlerMatchesReady
+          ? "Bundler scan already met — waiting for insider sells on new wallet."
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
     );
 
     await this.evaluateBuyGate(mint);
@@ -865,11 +887,16 @@ export class InsiderBot extends EventEmitter {
 
     this.matchedBundlers = matches;
     this.bundlerMatchesReady = true;
-    log.info("Bundler match threshold reached", {
-      mint,
-      wallets: matches.map((m) => m.address),
-      insiderSellsReady: this.insiderSellsReady,
-    });
+    log.info(
+      "Bundler match threshold reached — stopped GMGN bundler scan, waiting for insider sells",
+      {
+        mint,
+        wallets: matches.map((m) => m.address),
+        insiderSellsReady: this.insiderSellsReady,
+        insiderSellCount: this.insiderState?.sellCount ?? 0,
+        requiredInsiderSells: this.requiredInsiderSells,
+      },
+    );
 
     await this.evaluateBuyGate(mint);
   }
@@ -918,6 +945,12 @@ export class InsiderBot extends EventEmitter {
     this.setBuyExecuting(true);
     this.buySubmitted = true;
     await this.stopInsiderMonitoring();
+
+    log.info("Buy gate complete — both pre-buy monitors stopped, triggering buy", {
+      mint,
+      insiderSells: this.insiderState?.sellCount,
+      bundlers: this.matchedBundlers.map((b) => b.address),
+    });
 
     this.emit("buyTrigger", {
       followedWallet: this.followedWallet!,
@@ -1058,7 +1091,7 @@ export class InsiderBot extends EventEmitter {
 
     await this.stopFlowMonitoring();
     if (clearPosition) {
-      this.activePosition = null;
+    this.activePosition = null;
     }
     this.watchingMint = null;
     this.phase = null;
