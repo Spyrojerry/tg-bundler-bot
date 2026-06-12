@@ -2241,7 +2241,7 @@ async function main(): Promise<void> {
           `3. Buy when BOTH ${html(String(bot.getRequiredInsiderSells()))} insider sells AND 2 locked bundlers in USD range are ready.`,
           "   Race: 2 single-buy wallets (buy_tx_count_cur ≤ 1) OR 2 multi-buy wallets (> 1) — whichever pair completes first.",
           "   First-seen wallets are snapshotted; later buys won't change locked matches.",
-          "4. After buy: watch matched bundlers (sell/transfer-out), plus top 5 profitable GMGN traders (excl. initial 4 insiders + transfer-in from them).",
+          "4. After buy: watch matched bundlers (sell/transfer-out), plus top 5 profitable GMGN traders (excl. dev, initial 4 insiders + transfer-in from them).",
           "5. Sell on bundler signals, top 5 profitable exits, ATH MC % target, or rug below threshold.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
         ].join("\n"),

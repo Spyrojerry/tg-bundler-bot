@@ -94,12 +94,6 @@ interface BundlerWatchState {
   sellCounts: Map<string, number>;
 }
 
-interface ProfitableTraderLock {
-  address: string;
-  profit: number;
-  exited: boolean;
-}
-
 type BundlerMatchType = "single_buy" | "multi_buy";
 
 export class InsiderBot extends EventEmitter {
@@ -137,7 +131,8 @@ export class InsiderBot extends EventEmitter {
   private bundlerMatchType: BundlerMatchType | null = null;
   /** Wallets from the first 4 early SWAP buys — fixed at flow start for profitable-trader exclusions. */
   private initialInsiderWallets = new Set<string>();
-  private lockedProfitableTraders: ProfitableTraderLock[] = [];
+  /** Token dev wallet (CREATE tx fee payer) — fixed at flow start for profitable-trader exclusions. */
+  private devWallet: string | null = null;
   private profitableTraderWatchActive = false;
   private preBuyStopped = false;
   private positionSellTriggered = false;
@@ -415,7 +410,6 @@ export class InsiderBot extends EventEmitter {
     this.boughtMints.add(trigger.mint);
     this.phase = "holding";
     this.profitableTraderWatchActive = true;
-    this.lockedProfitableTraders = [];
 
     const wallets = this.matchedBundlers.map((b) => b.address);
     if (wallets.length >= REQUIRED_BUNDLER_MATCHES) {
@@ -499,10 +493,17 @@ export class InsiderBot extends EventEmitter {
     for (const wallet of this.extractEarlyInsiderWallets(swaps, mint)) {
       this.initialInsiderWallets.add(wallet);
     }
+    const createTx = await this.heliusClient.getMintCreateTransaction(mint);
+    this.devWallet = createTx?.feePayer ?? null;
+    if (this.devWallet) {
+      log.info("Dev wallet identified for profitable-trader exclusions", {
+        mint,
+        devWallet: this.devWallet,
+      });
+    }
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.profitableTraderWatchActive = false;
-    this.lockedProfitableTraders = [];
     this.insiderState = {
       wallet: lowest.wallet,
       sellCount: 0,
@@ -746,6 +747,7 @@ export class InsiderBot extends EventEmitter {
     log.info("Pre-buy monitoring stopped (insider + GMGN bundler scan)", {
       mint: this.watchingMint ?? this.activePosition?.mint,
       initialInsiderWallets: [...this.initialInsiderWallets],
+      devWallet: this.devWallet,
     });
   }
 
@@ -979,15 +981,22 @@ export class InsiderBot extends EventEmitter {
     return { address, buyUsd, buyTxCount };
   }
 
-  private isExcludedInsiderTrader(entry: Record<string, unknown>): boolean {
+  private profitableTraderSkipAddresses(): Set<string> {
+    const skip = new Set(this.initialInsiderWallets);
+    if (this.devWallet) skip.add(this.devWallet);
+    return skip;
+  }
+
+  private isExcludedProfitableTrader(entry: Record<string, unknown>): boolean {
+    const skip = this.profitableTraderSkipAddresses();
     const address = entry.address as string | undefined;
     if (!address) return true;
-    if (this.initialInsiderWallets.has(address)) return true;
+    if (skip.has(address)) return true;
 
     for (const field of ["token_transfer_in", "token_transfer"] as const) {
       const transfer = entry[field] as { address?: string } | undefined;
       const source = transfer?.address?.trim();
-      if (source && this.initialInsiderWallets.has(source)) return true;
+      if (source && skip.has(source)) return true;
     }
     return false;
   }
@@ -1004,47 +1013,21 @@ export class InsiderBot extends EventEmitter {
     return false;
   }
 
-  private lockProfitableTraders(list: Array<Record<string, unknown>>): void {
-    const known = new Set(this.lockedProfitableTraders.map((t) => t.address));
+  private getCurrentTopProfitableTraders(
+    list: Array<Record<string, unknown>>,
+  ): Array<{ address: string; profit: number }> {
+    const top: Array<{ address: string; profit: number }> = [];
     for (const entry of list) {
-      if (this.lockedProfitableTraders.length >= REQUIRED_PROFITABLE_EXIT_WALLETS) break;
-      if (this.isExcludedInsiderTrader(entry)) continue;
+      if (top.length >= REQUIRED_PROFITABLE_EXIT_WALLETS) break;
+      if (this.isExcludedProfitableTrader(entry)) continue;
 
       const address = entry.address as string | undefined;
       const profit = Number(entry.profit ?? 0);
-      if (!address || known.has(address) || !Number.isFinite(profit) || profit <= 0) continue;
+      if (!address || !Number.isFinite(profit) || profit <= 0) continue;
 
-      this.lockedProfitableTraders.push({ address, profit, exited: false });
-      known.add(address);
-      log.info("Locked profitable trader (first-seen)", {
-        mint: this.activePosition?.mint,
-        wallet: address,
-        profit,
-        locked: this.lockedProfitableTraders.length,
-        required: REQUIRED_PROFITABLE_EXIT_WALLETS,
-      });
+      top.push({ address, profit });
     }
-  }
-
-  private updateProfitableTraderExitStatus(list: Array<Record<string, unknown>>): void {
-    const byAddress = new Map(
-      list
-        .map((entry) => [entry.address as string, entry] as const)
-        .filter(([address]) => !!address),
-    );
-
-    for (const trader of this.lockedProfitableTraders) {
-      if (trader.exited) continue;
-      const entry = byAddress.get(trader.address);
-      if (entry && this.hasSoldAllPosition(entry)) {
-        trader.exited = true;
-        log.info("Profitable trader fully exited position", {
-          mint: this.activePosition?.mint,
-          wallet: trader.address,
-          profit: trader.profit,
-        });
-      }
-    }
+    return top;
   }
 
   private async scanProfitableTraders(mint: string): Promise<void> {
@@ -1068,44 +1051,55 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    this.lockProfitableTraders(list);
-    this.updateProfitableTraderExitStatus(list);
-
-    const locked = this.lockedProfitableTraders.length;
-    const exited = this.lockedProfitableTraders.filter((t) => t.exited).length;
+    const top = this.getCurrentTopProfitableTraders(list);
+    const byAddress = new Map(
+      list
+        .map((entry) => [entry.address as string, entry] as const)
+        .filter(([address]) => !!address),
+    );
+    const exitedCount = top.filter((t) => {
+      const entry = byAddress.get(t.address);
+      return entry && this.hasSoldAllPosition(entry);
+    }).length;
 
     log.info("Profitable trader GMGN scan", {
       mint,
-      locked,
-      exited,
+      topCount: top.length,
+      exitedCount,
       required: REQUIRED_PROFITABLE_EXIT_WALLETS,
+      topWallets: top.map((t) => t.address),
       initialInsiderWallets: [...this.initialInsiderWallets],
+      devWallet: this.devWallet,
     });
 
-    if (locked < REQUIRED_PROFITABLE_EXIT_WALLETS || exited < REQUIRED_PROFITABLE_EXIT_WALLETS) {
-      return;
-    }
+    if (top.length < REQUIRED_PROFITABLE_EXIT_WALLETS) return;
 
-    const walletLines = this.lockedProfitableTraders
+    const allExited = top.every((t) => {
+      const entry = byAddress.get(t.address);
+      return entry && this.hasSoldAllPosition(entry);
+    });
+    if (!allExited) return;
+
+    const walletLines = top
       .map(
         (t, i) =>
           `${i + 1}. <code>${t.address}</code> profit: <b>$${t.profit.toFixed(2)}</b>`,
       )
       .join("\n");
 
-    log.warn("Top profitable wallets fully exited — triggering position sell", {
+    log.warn("Current top profitable wallets fully exited — triggering position sell", {
       mint,
-      wallets: this.lockedProfitableTraders.map((t) => t.address),
+      wallets: top.map((t) => t.address),
     });
 
     await this.triggerPositionSell(
       mint,
-      `Top ${REQUIRED_PROFITABLE_EXIT_WALLETS} profitable wallets (excl. insider) have sold all positions`,
+      `Current top ${REQUIRED_PROFITABLE_EXIT_WALLETS} profitable wallets (excl. insider) have sold all positions`,
       [
         "<b>🚨 Profitable Trader Exit Signal</b>",
         `Token: <code>${mint}</code>`,
-        `All <b>${REQUIRED_PROFITABLE_EXIT_WALLETS}</b> tracked profitable wallets have fully exited.`,
-        "Initial 4 insider wallets and insider transfer-in recipients were excluded.",
+        `Current top <b>${REQUIRED_PROFITABLE_EXIT_WALLETS}</b> profitable wallets have fully exited.`,
+        "Dev wallet, initial 4 insiders, and insider/dev transfer-in recipients were excluded.",
         "",
         "<b>Tracked wallets:</b>",
         walletLines,
@@ -1416,7 +1410,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderState = null;
     this.clearBundlerAccumulation();
     this.initialInsiderWallets.clear();
-    this.lockedProfitableTraders = [];
+    this.devWallet = null;
     this.profitableTraderWatchActive = false;
     this.preBuyStopped = false;
     this.insiderSellsReady = false;
@@ -1450,7 +1444,7 @@ export class InsiderBot extends EventEmitter {
     this.bundlerWatch = null;
     this.clearBundlerAccumulation();
     this.initialInsiderWallets.clear();
-    this.lockedProfitableTraders = [];
+    this.devWallet = null;
     this.profitableTraderWatchActive = false;
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
