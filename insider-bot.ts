@@ -103,6 +103,8 @@ export class InsiderBot extends EventEmitter {
   private readonly heliusClient: HeliusClient;
   private readonly gmgnClient: GmgnClient;
   private readonly bundlerGmgnClient: GmgnClient;
+  /** GMGN_API_KEY_3 — pre-buy profitable-trader scan only. */
+  private readonly preBuyProfitGmgnClient: GmgnClient;
   private readonly claimMint: InsiderMintClaimFn | null;
   private readonly releaseMint: InsiderMintReleaseFn | null;
 
@@ -166,6 +168,7 @@ export class InsiderBot extends EventEmitter {
     wsUrl: string,
     gmgnClient: GmgnClient,
     bundlerGmgnClient: GmgnClient,
+    preBuyProfitGmgnClient: GmgnClient,
     heliusApiKey: string,
     telegramBot: TelegramBot | null = null,
     claimMint: InsiderMintClaimFn | null = null,
@@ -176,6 +179,7 @@ export class InsiderBot extends EventEmitter {
     this.telegramBot = telegramBot;
     this.gmgnClient = gmgnClient;
     this.bundlerGmgnClient = bundlerGmgnClient;
+    this.preBuyProfitGmgnClient = preBuyProfitGmgnClient;
     this.heliusClient = new HeliusClient(heliusApiKey);
     this.claimMint = claimMint;
     this.releaseMint = releaseMint;
@@ -415,7 +419,7 @@ export class InsiderBot extends EventEmitter {
     if (wallets.length >= REQUIRED_BUNDLER_MATCHES) {
       void this.startBundlerMonitoring(wallets, trigger.mint);
     }
-    void this.scanProfitableTraders(trigger.mint);
+    void this.scanProfitableTradersPostBuy(trigger.mint);
   }
 
   private resetTokenTxCounts(): void {
@@ -535,6 +539,7 @@ export class InsiderBot extends EventEmitter {
     this.startInsiderMonitoring();
     this.startPollLoop();
     await this.scanBundlerTraders(mint);
+    await this.scanProfitableTradersPreBuy(mint);
     await this.evaluateBuyGate(mint);
   }
 
@@ -596,6 +601,7 @@ export class InsiderBot extends EventEmitter {
         if (!this.bundlerMatchesReady && !this.buySubmitted) {
           await this.scanBundlerTraders(mint);
         }
+        await this.scanProfitableTradersPreBuy(mint);
       }
 
       if (this.phase === "holding") {
@@ -605,7 +611,7 @@ export class InsiderBot extends EventEmitter {
           }
         }
         if (this.profitableTraderWatchActive) {
-          await this.scanProfitableTraders(mint);
+          await this.scanProfitableTradersPostBuy(mint);
         }
       }
     } finally {
@@ -1030,26 +1036,22 @@ export class InsiderBot extends EventEmitter {
     return top;
   }
 
-  private async scanProfitableTraders(mint: string): Promise<void> {
-    if (
-      !this.profitableTraderWatchActive ||
-      this.phase !== "holding" ||
-      !this.activePosition ||
-      this.positionSellTriggered
-    ) {
-      return;
-    }
-
-    const traders = await this.bundlerGmgnClient.fetchTokenTraders(
-      mint,
-      PROFIT_TRADER_SCAN_LIMIT,
-      "profit",
-    );
-    const list = this.extractTraderList(traders);
-    if (!list.length) {
-      log.debug("No profitable traders returned from GMGN", { mint });
-      return;
-    }
+  private logProfitableTraderScan(
+    mint: string,
+    phase: "pre_buy" | "post_buy",
+    list: Array<Record<string, unknown>>,
+  ): {
+    top: Array<{ address: string; profit: number }>;
+    byAddress: Map<string, Record<string, unknown>>;
+    soldPositionRatio: string;
+    topExitedRatio: string;
+    topExitedCount: number;
+    apiTotal: number;
+    excludedCount: number;
+    validCount: number;
+    soldAmongValid: number;
+  } | null {
+    if (!list.length) return null;
 
     const apiTotal = list.length;
     let excludedCount = 0;
@@ -1081,10 +1083,12 @@ export class InsiderBot extends EventEmitter {
     const topExitedRatio =
       top.length > 0 ? `${topExitedCount}/${top.length}` : "0/0";
 
+    const phaseLabel = phase === "pre_buy" ? "pre-buy" : "post-buy";
     log.info(
-      `Profitable trader GMGN scan — ${soldPositionRatio} sold all position after exclusions (no wallets locked; limit ${PROFIT_TRADER_SCAN_LIMIT})`,
+      `Profitable trader GMGN scan [${phaseLabel}] — ${soldPositionRatio} sold all position after exclusions (no wallets locked; limit ${PROFIT_TRADER_SCAN_LIMIT})`,
       {
         mint,
+        phase,
         apiTotal,
         excludedCount,
         validCount,
@@ -1100,6 +1104,68 @@ export class InsiderBot extends EventEmitter {
       },
     );
 
+    return {
+      top,
+      byAddress,
+      soldPositionRatio,
+      topExitedRatio,
+      topExitedCount,
+      apiTotal,
+      excludedCount,
+      validCount,
+      soldAmongValid,
+    };
+  }
+
+  private async scanProfitableTradersPreBuy(mint: string): Promise<void> {
+    if (
+      this.phase !== "pre_buy" ||
+      this.preBuyStopped ||
+      this.buySubmitted ||
+      !this.watchingMint
+    ) {
+      return;
+    }
+
+    const traders = await this.preBuyProfitGmgnClient.fetchTokenTraders(
+      mint,
+      PROFIT_TRADER_SCAN_LIMIT,
+      "profit",
+    );
+    const list = this.extractTraderList(traders);
+    if (!list.length) {
+      log.debug("No profitable traders returned from GMGN [pre-buy]", { mint });
+      return;
+    }
+
+    this.logProfitableTraderScan(mint, "pre_buy", list);
+  }
+
+  private async scanProfitableTradersPostBuy(mint: string): Promise<void> {
+    if (
+      !this.profitableTraderWatchActive ||
+      this.phase !== "holding" ||
+      !this.activePosition ||
+      this.positionSellTriggered
+    ) {
+      return;
+    }
+
+    const traders = await this.bundlerGmgnClient.fetchTokenTraders(
+      mint,
+      PROFIT_TRADER_SCAN_LIMIT,
+      "profit",
+    );
+    const list = this.extractTraderList(traders);
+    if (!list.length) {
+      log.debug("No profitable traders returned from GMGN [post-buy]", { mint });
+      return;
+    }
+
+    const stats = this.logProfitableTraderScan(mint, "post_buy", list);
+    if (!stats) return;
+
+    const { top, byAddress } = stats;
     if (top.length < REQUIRED_PROFITABLE_EXIT_WALLETS) return;
 
     const allExited = top.every((t) => {

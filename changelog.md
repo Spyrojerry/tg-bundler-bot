@@ -2,6 +2,12 @@
 
 ## 2026-06-11
 
+### GMGN_API_KEY_3 — pre-buy profitable trader scan
+
+- `GMGN_API_KEY_3` (falls back to key 2) runs profitable-trader GMGN scan during pre-buy (order-by profit, limit 20).
+- Pre-buy logs match post-buy format (`soldPositionRatio`, `topExitedRatio`, exclusions) with `[pre-buy]` label; no sell trigger.
+- Post-buy profitable scan continues on `GMGN_API_KEY_2` with sell trigger when top 5 eligible wallets fully exit.
+
 ### Pre-buy stop + profitable trader exit trigger
 
 - GMGN bundler scan and insider/transfer monitoring stop as soon as the buy gate passes (before MC fetch / buy execution).

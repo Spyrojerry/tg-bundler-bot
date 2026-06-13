@@ -134,6 +134,7 @@ export interface ServiceConfig {
   minBuySol: number;
   gmgnApiKey: string;
   gmgnApiKey2: string;
+  gmgnApiKey3: string;
   gmgnApiBaseUrl: string;
   gmgnFetchMode: 'auto' | 'direct' | 'cli';
   jupiterSwapBaseUrl: string;

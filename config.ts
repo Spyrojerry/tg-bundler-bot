@@ -80,6 +80,7 @@ export function loadConfig(): ServiceConfig {
   const tradingWalletAddress = optionalNullable('TRADING_WALLET_ADDRESS');
   const gmgnApiKey       = required('GMGN_API_KEY');
   const gmgnApiKey2      = optional('GMGN_API_KEY_2', gmgnApiKey);
+  const gmgnApiKey3      = optional('GMGN_API_KEY_3', gmgnApiKey2);
   const solanaRpcUrl     = optional('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com');
   const solanaWsUrl      = optional('SOLANA_WS_URL', deriveWsUrl(solanaRpcUrl));
   const gmgnApiBaseUrl   = optional('GMGN_API_BASE_URL', 'https://gmgn.ai');
@@ -186,6 +187,7 @@ export function loadConfig(): ServiceConfig {
     minBuySol,
     gmgnApiKey,
     gmgnApiKey2,
+    gmgnApiKey3,
     gmgnApiBaseUrl,
     gmgnFetchMode,
     jupiterSwapBaseUrl,

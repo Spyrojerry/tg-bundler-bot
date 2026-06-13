@@ -85,6 +85,11 @@ async function main(): Promise<void> {
       config.insiderSolanaRpcUrl2,
     ),
   ];
+  const preBuyProfitGmgnClient = new GmgnClient(
+    { ...config, gmgnApiKey: config.gmgnApiKey3 },
+    limiter,
+    config.insiderSolanaRpcUrl,
+  );
 
   let telegramBot: TelegramBot | null = null;
   const insiderBots: InsiderBot[] = [];
@@ -722,6 +727,7 @@ async function main(): Promise<void> {
       config.insiderSolanaWsUrl,
       gmgnClients[0],
       bundlerGmgnClient,
+      preBuyProfitGmgnClient,
       insiderHeliusKeys[0],
       telegramBot,
       makeClaimFn(0),
@@ -735,6 +741,7 @@ async function main(): Promise<void> {
       config.insiderSolanaWsUrl2,
       gmgnClients[1],
       bundlerGmgnClient,
+      preBuyProfitGmgnClient,
       insiderHeliusKeys[1],
       telegramBot,
       makeClaimFn(1),
@@ -749,6 +756,7 @@ async function main(): Promise<void> {
       config.insiderSolanaWsUrl,
       gmgnClients[0],
       bundlerGmgnClient,
+      preBuyProfitGmgnClient,
       insiderHeliusKeys[0],
       telegramBot,
     ),
@@ -760,6 +768,7 @@ async function main(): Promise<void> {
       config.insiderSolanaWsUrl2,
       gmgnClients[1],
       bundlerGmgnClient,
+      preBuyProfitGmgnClient,
       insiderHeliusKeys[1],
       telegramBot,
       makeClaimFn(1),
@@ -2237,11 +2246,11 @@ async function main(): Promise<void> {
           "",
           "<b>Flow</b>",
           "1. Bot 1 & 2 run in parallel on their own follow wallets (same mint blocked).",
-          "2. After lowest insider found: monitor insider + GMGN bundler scan in parallel.",
+          "2. After lowest insider found: monitor insider + GMGN bundler scan + pre-buy profitable-trader scan in parallel.",
           `3. Buy when BOTH ${html(String(bot.getRequiredInsiderSells()))} insider sells AND 2 locked bundlers in USD range are ready.`,
           "   Race: 2 single-buy wallets (buy_tx_count_cur ≤ 1) OR 2 multi-buy wallets (> 1) — whichever pair completes first.",
           "   First-seen wallets are snapshotted; later buys won't change locked matches.",
-          "4. After buy: watch matched bundlers (sell/transfer-out), plus top 5 profitable GMGN traders (excl. dev, initial 4 insiders + transfer-in from them).",
+          "4. After buy: watch matched bundlers (sell/transfer-out), plus post-buy profitable GMGN scan (key 2) for top-5 exit.",
           "5. Sell on bundler signals, top 5 profitable exits, ATH MC % target, or rug below threshold.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
         ].join("\n"),
