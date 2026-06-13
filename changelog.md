@@ -5,7 +5,7 @@
 ### Pre-buy stop + profitable trader exit trigger
 
 - GMGN bundler scan and insider/transfer monitoring stop as soon as the buy gate passes (before MC fetch / buy execution).
-- Post-buy: poll GMGN token traders by profit (limit 20, API key 2); on each scan take the current top 5 valid wallets (excl. dev wallet, initial 4 insiders + insider/dev transfer-in recipients).
+- Post-buy profitable-trader scan: exclusions applied first; `soldPositionRatio` is sold/valid (e.g. `6/16`). `topExitedRatio` tracks current top 5 eligible wallets for sell trigger.
 - Sell when all 5 of the current top profitable wallets have fully exited on that scan; logs and Telegram include those wallets and reason.
 
 ### Bundler transfer-out sell

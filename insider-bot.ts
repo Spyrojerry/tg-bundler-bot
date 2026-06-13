@@ -1051,26 +1051,54 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
+    const apiTotal = list.length;
+    let excludedCount = 0;
+    let validCount = 0;
+    let soldAmongValid = 0;
+
+    for (const entry of list) {
+      if (this.isExcludedProfitableTrader(entry)) {
+        excludedCount += 1;
+        continue;
+      }
+      validCount += 1;
+      if (this.hasSoldAllPosition(entry)) soldAmongValid += 1;
+    }
+
+    const soldPositionRatio =
+      validCount > 0 ? `${soldAmongValid}/${validCount}` : "0/0";
+
     const top = this.getCurrentTopProfitableTraders(list);
     const byAddress = new Map(
       list
         .map((entry) => [entry.address as string, entry] as const)
         .filter(([address]) => !!address),
     );
-    const exitedCount = top.filter((t) => {
+    const topExitedCount = top.filter((t) => {
       const entry = byAddress.get(t.address);
       return entry && this.hasSoldAllPosition(entry);
     }).length;
+    const topExitedRatio =
+      top.length > 0 ? `${topExitedCount}/${top.length}` : "0/0";
 
-    log.info("Profitable trader GMGN scan", {
-      mint,
-      topCount: top.length,
-      exitedCount,
-      required: REQUIRED_PROFITABLE_EXIT_WALLETS,
-      topWallets: top.map((t) => t.address),
-      initialInsiderWallets: [...this.initialInsiderWallets],
-      devWallet: this.devWallet,
-    });
+    log.info(
+      `Profitable trader GMGN scan — ${soldPositionRatio} sold all position after exclusions (no wallets locked; limit ${PROFIT_TRADER_SCAN_LIMIT})`,
+      {
+        mint,
+        apiTotal,
+        excludedCount,
+        validCount,
+        soldAmongValid,
+        soldPositionRatio,
+        topEligibleCount: top.length,
+        topExitedCount,
+        topExitedRatio,
+        requiredTopForSell: REQUIRED_PROFITABLE_EXIT_WALLETS,
+        topWallets: top.map((t) => t.address),
+        initialInsiderWallets: [...this.initialInsiderWallets],
+        devWallet: this.devWallet,
+      },
+    );
 
     if (top.length < REQUIRED_PROFITABLE_EXIT_WALLETS) return;
 
