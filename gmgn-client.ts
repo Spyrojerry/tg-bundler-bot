@@ -350,19 +350,20 @@ export class GmgnClient {
   async fetchTokenTraders(
     mint: string,
     limit: number = 50,
-    orderBy: 'profit' | 'profit_change' | 'last_active' = 'profit'
+    orderBy: 'profit' | 'profit_change' | 'last_active' | 'buy_volume_cur' = 'profit',
+    tag: 'all' | 'bundler' = 'all',
   ): Promise<any> {
     this.validateSolAddress(mint, 'mint');
     
     try {
       if (this.fetchMode !== 'direct') {
         // CLI calls are local and shouldn't be bottlenecked by API rate limits
-        const data = await this.fetchCliData('traders', mint, { limit, orderBy });
+        const data = await this.fetchCliData('traders', mint, { limit, orderBy, tag });
         if (data) return data;
         log.debug(`GMGN CLI traders returned no data for ${mint}, falling back to API`);
       }
       
-      const endpoint = `v1/token/traders/sol/${mint}?limit=${limit}&tag=all&orderby=${orderBy}&direction=desc`;
+      const endpoint = `v1/token/traders/sol/${mint}?limit=${limit}&tag=${tag}&orderby=${orderBy}&direction=desc`;
       const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
       return data;
     } catch (err) {

@@ -14,6 +14,7 @@ const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const REQUIRED_PROFITABLE_EXIT_WALLETS = 5;
 const PROFIT_TRADER_SCAN_LIMIT = 20;
+const MIN_PROFITABLE_TRADER_BUY_USD = 100;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 type FlowPhase = "pre_buy" | "holding";
@@ -1019,6 +1020,13 @@ export class InsiderBot extends EventEmitter {
     return false;
   }
 
+  private meetsPreBuyProfitableTraderBuyThreshold(
+    entry: Record<string, unknown>,
+  ): boolean {
+    const buyUsd = this.parseBuyVolumeUsd(entry);
+    return buyUsd !== null && buyUsd > MIN_PROFITABLE_TRADER_BUY_USD;
+  }
+
   private getCurrentTopProfitableTraders(
     list: Array<Record<string, unknown>>,
   ): Array<{ address: string; profit: number }> {
@@ -1054,6 +1062,71 @@ export class InsiderBot extends EventEmitter {
     if (!list.length) return null;
 
     const apiTotal = list.length;
+    const byAddress = new Map(
+      list
+        .map((entry) => [entry.address as string, entry] as const)
+        .filter(([address]) => !!address),
+    );
+
+    if (phase === "pre_buy") {
+      let excludedCount = 0;
+      let validCount = 0;
+      let soldAmongValid = 0;
+      const matchingWallets: Array<{ address: string; buyUsd: number }> = [];
+
+      for (const entry of list) {
+        if (this.isExcludedProfitableTrader(entry)) {
+          excludedCount += 1;
+          continue;
+        }
+        if (!this.meetsPreBuyProfitableTraderBuyThreshold(entry)) continue;
+
+        validCount += 1;
+        if (!this.hasSoldAllPosition(entry)) continue;
+
+        soldAmongValid += 1;
+        const address = entry.address as string | undefined;
+        const buyUsd = this.parseBuyVolumeUsd(entry);
+        if (address && buyUsd !== null) {
+          matchingWallets.push({ address, buyUsd });
+        }
+      }
+
+      const soldPositionRatio =
+        validCount > 0 ? `${soldAmongValid}/${validCount}` : "0/0";
+
+      log.info(
+        `Profitable trader GMGN scan [pre-buy] — ${soldPositionRatio} sold all position (skip-list excl., buy > $${MIN_PROFITABLE_TRADER_BUY_USD}; tag bundler, order buy_volume_cur; limit ${PROFIT_TRADER_SCAN_LIMIT})`,
+        {
+          mint,
+          phase,
+          tag: "bundler",
+          orderBy: "buy_volume_cur",
+          minBuyUsd: MIN_PROFITABLE_TRADER_BUY_USD,
+          apiTotal,
+          excludedCount,
+          validCount,
+          soldAmongValid,
+          soldPositionRatio,
+          matchingWallets,
+          initialInsiderWallets: [...this.initialInsiderWallets],
+          devWallet: this.devWallet,
+        },
+      );
+
+      return {
+        top: [],
+        byAddress,
+        soldPositionRatio,
+        topExitedRatio: "0/0",
+        topExitedCount: 0,
+        apiTotal,
+        excludedCount,
+        validCount,
+        soldAmongValid,
+      };
+    }
+
     let excludedCount = 0;
     let validCount = 0;
     let soldAmongValid = 0;
@@ -1071,11 +1144,6 @@ export class InsiderBot extends EventEmitter {
       validCount > 0 ? `${soldAmongValid}/${validCount}` : "0/0";
 
     const top = this.getCurrentTopProfitableTraders(list);
-    const byAddress = new Map(
-      list
-        .map((entry) => [entry.address as string, entry] as const)
-        .filter(([address]) => !!address),
-    );
     const topExitedCount = top.filter((t) => {
       const entry = byAddress.get(t.address);
       return entry && this.hasSoldAllPosition(entry);
@@ -1083,12 +1151,13 @@ export class InsiderBot extends EventEmitter {
     const topExitedRatio =
       top.length > 0 ? `${topExitedCount}/${top.length}` : "0/0";
 
-    const phaseLabel = phase === "pre_buy" ? "pre-buy" : "post-buy";
     log.info(
-      `Profitable trader GMGN scan [${phaseLabel}] — ${soldPositionRatio} sold all position after exclusions (no wallets locked; limit ${PROFIT_TRADER_SCAN_LIMIT})`,
+      `Profitable trader GMGN scan [post-buy] — ${soldPositionRatio} sold all position after exclusions (tag bundler, order profit; limit ${PROFIT_TRADER_SCAN_LIMIT})`,
       {
         mint,
         phase,
+        tag: "bundler",
+        orderBy: "profit",
         apiTotal,
         excludedCount,
         validCount,
@@ -1127,10 +1196,9 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const traders = await this.preBuyProfitGmgnClient.fetchTokenTraders(
+    const traders = await this.preBuyProfitGmgnClient.fetchBundlerTraders(
       mint,
       PROFIT_TRADER_SCAN_LIMIT,
-      "profit",
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
@@ -1155,6 +1223,7 @@ export class InsiderBot extends EventEmitter {
       mint,
       PROFIT_TRADER_SCAN_LIMIT,
       "profit",
+      "bundler",
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {

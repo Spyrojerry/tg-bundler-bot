@@ -1,11 +1,19 @@
 # Changelog
 
+## 2026-06-14
+
+### Pre-buy profitable trader scan — buy_volume_cur + $100 exit filter
+
+- Pre-buy GMGN scan (key 3) uses `tag=bundler`, orders by `buy_volume_cur` with limit 20.
+- Pre-buy logs count wallets that pass skip-list exclusions, bought above $100, and sold all positions (`matchingWallets`, `soldPositionRatio`).
+- Post-buy profitable scan uses `tag=bundler`, order-by `profit`, top-5 exit trigger.
+
 ## 2026-06-11
 
 ### GMGN_API_KEY_3 — pre-buy profitable trader scan
 
-- `GMGN_API_KEY_3` (falls back to key 2) runs profitable-trader GMGN scan during pre-buy (order-by profit, limit 20).
-- Pre-buy logs match post-buy format (`soldPositionRatio`, `topExitedRatio`, exclusions) with `[pre-buy]` label; no sell trigger.
+- `GMGN_API_KEY_3` (falls back to key 2) runs profitable-trader GMGN scan during pre-buy.
+- Pre-buy logs use `[pre-buy]` label; no sell trigger.
 - Post-buy profitable scan continues on `GMGN_API_KEY_2` with sell trigger when top 5 eligible wallets fully exit.
 
 ### Pre-buy stop + profitable trader exit trigger
