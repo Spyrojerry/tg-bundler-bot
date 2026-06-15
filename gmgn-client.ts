@@ -9,7 +9,7 @@
 
 import { createLogger } from './logger';
 import { RateLimiter } from './rate-limiter';
-import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, VersionedTransaction, ParsedAccountData } from '@solana/web3.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import {
@@ -39,6 +39,10 @@ const JUPITER_SELL_RETRIES = 5;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
+const TOKEN_PROGRAM_IDS = [
+  new PublicKey(TOKEN_PROGRAM_ID),
+  new PublicKey(TOKEN_2022_PROGRAM_ID),
+];
 
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 
@@ -771,16 +775,37 @@ export class GmgnClient {
   // ── Utils ─────────────────────────────────────────────────────────────────
 
   async getParsedTokenAccountsForMint(owner: PublicKey, mint: PublicKey) {
-    const { value } = await this.connection.getParsedTokenAccountsByOwner(owner, { mint });
-    return value;
+    const accounts = [];
+    for (const programId of TOKEN_PROGRAM_IDS) {
+      const { value } = await this.connection.getParsedTokenAccountsByOwner(
+        owner,
+        { programId, mint },
+      );
+      accounts.push(...value);
+    }
+    return accounts;
   }
 
   private async getTokenBalance(wallet: string, mint: string): Promise<bigint> {
     const pubkey = new PublicKey(wallet);
     const mintPubkey = new PublicKey(mint);
-    const accounts = await this.connection.getParsedTokenAccountsByOwner(pubkey, { mint: mintPubkey });
-    if (accounts.value.length === 0) return 0n;
-    return BigInt(accounts.value[0].account.data.parsed.info.tokenAmount.amount);
+    let total = 0n;
+
+    for (const programId of TOKEN_PROGRAM_IDS) {
+      const accounts = await this.connection.getParsedTokenAccountsByOwner(
+        pubkey,
+        { programId, mint: mintPubkey },
+      );
+      for (const { account } of accounts.value) {
+        const parsed = account.data as ParsedAccountData;
+        const amount = parsed?.parsed?.info?.tokenAmount?.amount;
+        if (typeof amount === 'string' && /^\d+$/.test(amount)) {
+          total += BigInt(amount);
+        }
+      }
+    }
+
+    return total;
   }
 
   private validateSolAddress(value: string, label: string): void {

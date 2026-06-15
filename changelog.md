@@ -2,6 +2,16 @@
 
 ## 2026-06-15
 
+### Telegram refresh P/L & MC fixes
+
+- Refresh handler resolves insider bot index from callback (`i0`, `i1`), shows entry/current/ATH/exit MC, cost basis, and quote errors.
+- Token balance for P/L quotes now sums Token + Token-2022 accounts (fixes missing balance / stuck "Calculating...").
+- Refresh timestamp uses ISO format so Telegram edits always apply; toast shown when already up to date.
+
+### Axiom scan excludes multi-buy wallets
+
+- Axiom/empty trader filter now requires exactly `buy_tx_count_cur === 1`; multi-buy entries are counted in `skippedMultiBuy` logs.
+
 ### Axiom single-buy scan limit increased to 50
 
 - Pre-buy and post-buy `fetchBuyVolumeTraders` scans now request limit 50 (was 20) for a wider view.

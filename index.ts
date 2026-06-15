@@ -176,20 +176,30 @@ async function main(): Promise<void> {
         if (data === "menu:refresh") return homeReply(true);
         if (data.startsWith("r:m:")) {
           const [, , mint, contextCode] = parts;
-          const context =
-            contextCode === "i"
-              ? "insider"
-              : contextCode === "r"
-                ? "reverse_copysell"
-                : "bundler";
+          let context: "insider" | "bundler" | "reverse_copysell" = "bundler";
+          let resolvedBotIndex: number | null = null;
+
+          if (contextCode === "b") {
+            context = "bundler";
+          } else if (contextCode === "r") {
+            context = "reverse_copysell";
+          } else if (contextCode === "i" || contextCode?.startsWith("i")) {
+            context = "insider";
+            if (contextCode && contextCode.length > 1) {
+              const parsed = parseInt(contextCode.slice(1), 10);
+              if (Number.isFinite(parsed)) resolvedBotIndex = parsed;
+            }
+          }
 
           let currentMarketCapUsd: number | null = null;
+          let athMarketCapUsd: number | null = null;
           let currentPrice: SellQuote | null = null;
           let balanceIsZero = false;
+          let quoteError: string | null = null;
 
-          const botIndex = insiderBots.findIndex(
-            (b) => b.getActivePosition()?.mint === mint,
-          );
+          const botIndex =
+            resolvedBotIndex ??
+            insiderBots.findIndex((b) => b.getActivePosition()?.mint === mint);
           const effectiveBotIndex = botIndex !== -1 ? botIndex : 0;
           const client =
             context === "insider"
@@ -201,38 +211,62 @@ async function main(): Promise<void> {
               ? client
                   .quoteTokenSellForSol(config.tradingWalletAddress, mint, 100)
                   .catch(async (err) => {
-                    if (err.message.includes("No token balance found")) {
+                    const message =
+                      err instanceof Error ? err.message : String(err);
+                    if (message.includes("No token balance found")) {
                       balanceIsZero = true;
+                    } else {
+                      quoteError = message;
                     }
                     return null;
                   })
               : Promise.resolve(null);
 
-            [currentMarketCapUsd, currentPrice] = await Promise.all([
-              client.fetchTokenMarketCapUsd(mint),
-              quotePromise,
-            ]);
+            [currentMarketCapUsd, athMarketCapUsd, currentPrice] =
+              await Promise.all([
+                client.fetchTokenMarketCapUsd(mint),
+                context === "insider"
+                  ? client.fetchTokenAthMarketCapUsd(mint)
+                  : Promise.resolve(null),
+                quotePromise,
+              ]);
           } catch (err) {
             log.error(`Failed to refresh position data for ${mint}`, err);
+            quoteError =
+              err instanceof Error ? err.message : String(err);
           }
 
           let buySol = 0;
+          let entryMc: number | null = null;
+          let exitMc: number | null = null;
+
           if (context === "insider") {
             const bot =
               botIndex !== -1 ? insiderBots[botIndex] : insiderBots[0];
             buySol = bot.getBuySol();
+            entryMc = bot.getEntryMc();
+            exitMc = bot.getExitMc();
           } else if (context === "bundler") {
-            buySol = earlyBundlerOrchestrator.getActivePosition()?.buySol ?? 0;
+            const position = earlyBundlerOrchestrator.getActivePosition();
+            buySol = position?.buySol ?? earlyBundlerOrchestrator.getBuySol();
+            entryMc = position?.entryMc ?? null;
+            exitMc =
+              entryMc !== null
+                ? entryMc *
+                  (1 + earlyBundlerOrchestrator.getExitPercent() / 100)
+                : null;
           } else if (context === "reverse_copysell") {
             buySol =
               reverseCopySellOrchestrator.getActivePosition()?.buySol ?? 0;
           }
 
-          // Fallback to DB if buySol is 0
           if (buySol === 0 && config.tradingWalletAddress) {
-            const dbToken = db.getToken(config.tradingWalletAddress, mint);
-            if (dbToken && dbToken.buySol) {
-              buySol = dbToken.buySol;
+            const dbPosition = db.getActiveEarlyBundlerPosition(
+              config.tradingWalletAddress,
+              mint,
+            );
+            if (dbPosition?.buySol) {
+              buySol = dbPosition.buySol;
             }
           }
 
@@ -251,20 +285,41 @@ async function main(): Promise<void> {
             profitDisplay = "Profit/Loss: <b>Position Closed (0 balance)</b>";
           } else if (!config.tradingWalletAddress) {
             profitDisplay = "Profit/Loss: <b>N/A (No trading wallet)</b>";
+          } else if (quoteError) {
+            profitDisplay = `Profit/Loss: <b>Quote failed</b> (${html(quoteError)})`;
           }
+
+          const refreshContextCode =
+            context === "insider"
+              ? `i${effectiveBotIndex}`
+              : context === "reverse_copysell"
+                ? "r"
+                : "b";
 
           const lines = [
             context === "insider"
-              ? "<b>Insider Position Update</b>"
+              ? `<b>Insider ${effectiveBotIndex + 1} Position Update</b>`
               : context === "reverse_copysell"
                 ? "<b>Reverse CopySell Update</b>"
                 : "<b>Bundler Position Update</b>",
             `Token: <code>${html(mint)}</code>`,
+            entryMc !== null
+              ? `Entry MC: <b>$${entryMc.toLocaleString()}</b>`
+              : null,
             `Market Cap: <b>$${currentMarketCapUsd?.toLocaleString() ?? "Unknown"}</b>`,
+            context === "insider" && athMarketCapUsd !== null
+              ? `ATH MC: <b>$${athMarketCapUsd.toLocaleString()}</b>`
+              : null,
+            context === "insider" && exitMc !== null
+              ? `Exit MC: <b>$${exitMc.toLocaleString()}</b>`
+              : context === "bundler" && exitMc !== null
+                ? `Exit MC: <b>$${exitMc.toLocaleString()}</b>`
+                : null,
             profitDisplay,
+            buySol > 0 ? `Cost Basis: <b>${buySol.toFixed(4)} SOL</b>` : null,
             "",
-            `Last Updated: ${new Date().toLocaleTimeString()}`,
-          ];
+            `Last Updated: ${new Date().toISOString()}`,
+          ].filter(Boolean) as string[];
 
           const buttons = [];
 
@@ -275,13 +330,12 @@ async function main(): Promise<void> {
             });
             buttons.push({
               text: "🔄 Refresh",
-              callback_data: `r:m:${mint}:${contextCode}`,
+              callback_data: `r:m:${mint}:${refreshContextCode}`,
             });
           } else {
-            // If it's not insider context, or position is closed, just show refresh
             buttons.push({
               text: "🔄 Refresh",
-              callback_data: `r:m:${mint}:${contextCode}`,
+              callback_data: `r:m:${mint}:${refreshContextCode}`,
             });
           }
 
@@ -1199,7 +1253,7 @@ async function main(): Promise<void> {
                     },
                     {
                       text: "🔄 Refresh P/L & MC",
-                      callback_data: `r:m:${trigger.mint}:i`,
+                      callback_data: `r:m:${trigger.mint}:i${index}`,
                     },
                   ],
                 ],
@@ -1282,7 +1336,7 @@ async function main(): Promise<void> {
                 [
                   {
                     text: "🔄 Refresh P/L & MC",
-                    callback_data: `r:m:${trigger.positionMint}:i`,
+                    callback_data: `r:m:${trigger.positionMint}:i${index}`,
                   },
                 ],
               ],

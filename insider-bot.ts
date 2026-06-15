@@ -1017,7 +1017,7 @@ export class InsiderBot extends EventEmitter {
     if (!this.hasAxiomOrEmptyTag(entry)) return false;
 
     const buyTxCount = this.parseBuyTxCount(entry);
-    if (buyTxCount === null || buyTxCount > 1) return false;
+    if (buyTxCount !== 1) return false;
 
     const buyUsd = this.parseBuyVolumeUsd(entry);
     if (buyUsd === null) return false;
@@ -1047,11 +1047,13 @@ export class InsiderBot extends EventEmitter {
     }>;
     apiTotal: number;
     excludedCount: number;
+    skippedMultiBuy: number;
     validCount: number;
     soldAmongValid: number;
     soldPositionRatio: string;
   } {
     let excludedCount = 0;
+    let skippedMultiBuy = 0;
     let validCount = 0;
     let soldAmongValid = 0;
     const matchingWallets: Array<{
@@ -1066,6 +1068,13 @@ export class InsiderBot extends EventEmitter {
         excludedCount += 1;
         continue;
       }
+
+      const buyTxCount = this.parseBuyTxCount(entry);
+      if (buyTxCount !== 1) {
+        if (buyTxCount !== null && buyTxCount > 1) skippedMultiBuy += 1;
+        continue;
+      }
+
       if (!this.isAxiomSingleBuyCandidate(entry)) continue;
 
       validCount += 1;
@@ -1087,6 +1096,7 @@ export class InsiderBot extends EventEmitter {
       matchingWallets,
       apiTotal: list.length,
       excludedCount,
+      skippedMultiBuy,
       validCount,
       soldAmongValid,
       soldPositionRatio,
@@ -1118,6 +1128,7 @@ export class InsiderBot extends EventEmitter {
         buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
         apiTotal: stats.apiTotal,
         excludedCount: stats.excludedCount,
+        skippedMultiBuy: stats.skippedMultiBuy,
         validCount: stats.validCount,
         soldAmongValid: stats.soldAmongValid,
         soldPositionRatio: stats.soldPositionRatio,

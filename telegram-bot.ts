@@ -152,8 +152,12 @@ export class TelegramBot {
             }
 
             const reply = await this.commandHandler(chatIdString, `/callback ${data}`);
-            await this.answerCallbackQuery(callbackQuery.id);
-            await this.sendReply(chatIdString, reply, callbackQuery.message?.message_id);
+            const feedback = await this.sendReply(
+              chatIdString,
+              reply,
+              callbackQuery.message?.message_id,
+            );
+            await this.answerCallbackQuery(callbackQuery.id, feedback);
             continue;
           }
 
@@ -195,23 +199,24 @@ export class TelegramBot {
     chatId: string,
     reply: string | TelegramReply,
     messageId?: number
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     if (typeof reply === 'string') {
       await this.sendMessage(chatId, reply);
-      return;
+      return undefined;
     }
     if (reply.editCurrent && messageId !== undefined) {
       const edited = await this.editMessage(chatId, messageId, reply.text, reply.replyMarkup);
       if (reply.trackPrompt) {
         this.promptMessagesByChat.set(chatId, messageId);
       }
-      if (!edited) return;
-      return;
+      if (edited) return undefined;
+      return 'Already up to date';
     }
     const sent = await this.sendMessage(chatId, reply.text, reply.replyMarkup);
     if (reply.trackPrompt) {
       this.promptMessagesByChat.set(chatId, sent.message_id);
     }
+    return undefined;
   }
 
   private async sendMessage(
