@@ -12,9 +12,7 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const POLL_MS = 2_000;
 const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
-const REQUIRED_PROFITABLE_EXIT_WALLETS = 5;
-const PROFIT_TRADER_SCAN_LIMIT = 20;
-const MIN_PROFITABLE_TRADER_BUY_USD = 100;
+const AXIOM_TRADER_SCAN_LIMIT = 50;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 type FlowPhase = "pre_buy" | "holding";
@@ -104,8 +102,8 @@ export class InsiderBot extends EventEmitter {
   private readonly heliusClient: HeliusClient;
   private readonly gmgnClient: GmgnClient;
   private readonly bundlerGmgnClient: GmgnClient;
-  /** GMGN_API_KEY_3 — pre-buy profitable-trader scan only. */
-  private readonly preBuyProfitGmgnClient: GmgnClient;
+  /** GMGN_API_KEY_3 — pre-buy axiom/empty single-buy scan only. */
+  private readonly preBuyAxiomGmgnClient: GmgnClient;
   private readonly claimMint: InsiderMintClaimFn | null;
   private readonly releaseMint: InsiderMintReleaseFn | null;
 
@@ -132,11 +130,11 @@ export class InsiderBot extends EventEmitter {
   /** First-seen multi-buy bundlers locked at discovery (snapshot frozen). */
   private accumulatedMultiBuyBundlers: BundlerMatch[] = [];
   private bundlerMatchType: BundlerMatchType | null = null;
-  /** Wallets from the first 4 early SWAP buys — fixed at flow start for profitable-trader exclusions. */
+  /** Wallets from the first 4 early SWAP buys — fixed at flow start for trader-scan exclusions. */
   private initialInsiderWallets = new Set<string>();
-  /** Token dev wallet (CREATE tx fee payer) — fixed at flow start for profitable-trader exclusions. */
+  /** Token dev wallet (CREATE tx fee payer) — fixed at flow start for trader-scan exclusions. */
   private devWallet: string | null = null;
-  private profitableTraderWatchActive = false;
+  private axiomTraderWatchActive = false;
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private insiderSellsReady = false;
@@ -169,7 +167,7 @@ export class InsiderBot extends EventEmitter {
     wsUrl: string,
     gmgnClient: GmgnClient,
     bundlerGmgnClient: GmgnClient,
-    preBuyProfitGmgnClient: GmgnClient,
+    preBuyAxiomGmgnClient: GmgnClient,
     heliusApiKey: string,
     telegramBot: TelegramBot | null = null,
     claimMint: InsiderMintClaimFn | null = null,
@@ -180,7 +178,7 @@ export class InsiderBot extends EventEmitter {
     this.telegramBot = telegramBot;
     this.gmgnClient = gmgnClient;
     this.bundlerGmgnClient = bundlerGmgnClient;
-    this.preBuyProfitGmgnClient = preBuyProfitGmgnClient;
+    this.preBuyAxiomGmgnClient = preBuyAxiomGmgnClient;
     this.heliusClient = new HeliusClient(heliusApiKey);
     this.claimMint = claimMint;
     this.releaseMint = releaseMint;
@@ -414,13 +412,13 @@ export class InsiderBot extends EventEmitter {
     this.insiderState = null;
     this.boughtMints.add(trigger.mint);
     this.phase = "holding";
-    this.profitableTraderWatchActive = true;
+    this.axiomTraderWatchActive = true;
 
     const wallets = this.matchedBundlers.map((b) => b.address);
     if (wallets.length >= REQUIRED_BUNDLER_MATCHES) {
       void this.startBundlerMonitoring(wallets, trigger.mint);
     }
-    void this.scanProfitableTradersPostBuy(trigger.mint);
+    void this.scanAxiomSingleBuyTradersPostBuy(trigger.mint);
   }
 
   private resetTokenTxCounts(): void {
@@ -501,14 +499,14 @@ export class InsiderBot extends EventEmitter {
     const createTx = await this.heliusClient.getMintCreateTransaction(mint);
     this.devWallet = createTx?.feePayer ?? null;
     if (this.devWallet) {
-      log.info("Dev wallet identified for profitable-trader exclusions", {
+      log.info("Dev wallet identified for trader-scan exclusions", {
         mint,
         devWallet: this.devWallet,
       });
     }
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
-    this.profitableTraderWatchActive = false;
+    this.axiomTraderWatchActive = false;
     this.insiderState = {
       wallet: lowest.wallet,
       sellCount: 0,
@@ -540,7 +538,7 @@ export class InsiderBot extends EventEmitter {
     this.startInsiderMonitoring();
     this.startPollLoop();
     await this.scanBundlerTraders(mint);
-    await this.scanProfitableTradersPreBuy(mint);
+    await this.scanAxiomSingleBuyTradersPreBuy(mint);
     await this.evaluateBuyGate(mint);
   }
 
@@ -602,7 +600,7 @@ export class InsiderBot extends EventEmitter {
         if (!this.bundlerMatchesReady && !this.buySubmitted) {
           await this.scanBundlerTraders(mint);
         }
-        await this.scanProfitableTradersPreBuy(mint);
+        await this.scanAxiomSingleBuyTradersPreBuy(mint);
       }
 
       if (this.phase === "holding") {
@@ -611,8 +609,8 @@ export class InsiderBot extends EventEmitter {
             await this.pollWallet(wallet, mint, "bundler");
           }
         }
-        if (this.profitableTraderWatchActive) {
-          await this.scanProfitableTradersPostBuy(mint);
+        if (this.axiomTraderWatchActive) {
+          await this.scanAxiomSingleBuyTradersPostBuy(mint);
         }
       }
     } finally {
@@ -763,7 +761,7 @@ export class InsiderBot extends EventEmitter {
     await this.stopPreBuyMonitoring();
     await this.stopInsiderMonitoring();
     await this.stopBundlerMonitoring();
-    this.profitableTraderWatchActive = false;
+    this.axiomTraderWatchActive = false;
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
@@ -988,14 +986,14 @@ export class InsiderBot extends EventEmitter {
     return { address, buyUsd, buyTxCount };
   }
 
-  private profitableTraderSkipAddresses(): Set<string> {
+  private traderScanSkipAddresses(): Set<string> {
     const skip = new Set(this.initialInsiderWallets);
     if (this.devWallet) skip.add(this.devWallet);
     return skip;
   }
 
-  private isExcludedProfitableTrader(entry: Record<string, unknown>): boolean {
-    const skip = this.profitableTraderSkipAddresses();
+  private isExcludedTraderScan(entry: Record<string, unknown>): boolean {
+    const skip = this.traderScanSkipAddresses();
     const address = entry.address as string | undefined;
     if (!address) return true;
     if (skip.has(address)) return true;
@@ -1006,6 +1004,24 @@ export class InsiderBot extends EventEmitter {
       if (source && skip.has(source)) return true;
     }
     return false;
+  }
+
+  private hasAxiomOrEmptyTag(entry: Record<string, unknown>): boolean {
+    const tags = entry.tags;
+    if (!Array.isArray(tags)) return false;
+    if (tags.length === 0) return true;
+    return tags.length === 1 && tags[0] === "axiom";
+  }
+
+  private isAxiomSingleBuyCandidate(entry: Record<string, unknown>): boolean {
+    if (!this.hasAxiomOrEmptyTag(entry)) return false;
+
+    const buyTxCount = this.parseBuyTxCount(entry);
+    if (buyTxCount === null || buyTxCount > 1) return false;
+
+    const buyUsd = this.parseBuyVolumeUsd(entry);
+    if (buyUsd === null) return false;
+    return buyUsd >= this.bundlerBuyMinUsd && buyUsd <= this.bundlerBuyMaxUsd;
   }
 
   private hasSoldAllPosition(entry: Record<string, unknown>): boolean {
@@ -1020,173 +1036,103 @@ export class InsiderBot extends EventEmitter {
     return false;
   }
 
-  private meetsPreBuyProfitableTraderBuyThreshold(
-    entry: Record<string, unknown>,
-  ): boolean {
-    const buyUsd = this.parseBuyVolumeUsd(entry);
-    return buyUsd !== null && buyUsd > MIN_PROFITABLE_TRADER_BUY_USD;
-  }
-
-  private getCurrentTopProfitableTraders(
-    list: Array<Record<string, unknown>>,
-  ): Array<{ address: string; profit: number }> {
-    const top: Array<{ address: string; profit: number }> = [];
-    for (const entry of list) {
-      if (top.length >= REQUIRED_PROFITABLE_EXIT_WALLETS) break;
-      if (this.isExcludedProfitableTrader(entry)) continue;
-
-      const address = entry.address as string | undefined;
-      const profit = Number(entry.profit ?? 0);
-      if (!address || !Number.isFinite(profit) || profit <= 0) continue;
-
-      top.push({ address, profit });
-    }
-    return top;
-  }
-
-  private logProfitableTraderScan(
-    mint: string,
-    phase: "pre_buy" | "post_buy",
+  private collectAxiomSingleBuyMatches(
     list: Array<Record<string, unknown>>,
   ): {
-    top: Array<{ address: string; profit: number }>;
-    byAddress: Map<string, Record<string, unknown>>;
-    soldPositionRatio: string;
-    topExitedRatio: string;
-    topExitedCount: number;
+    matchingWallets: Array<{
+      address: string;
+      buyUsd: number;
+      sold: boolean;
+      tags: string[];
+    }>;
     apiTotal: number;
     excludedCount: number;
     validCount: number;
     soldAmongValid: number;
-  } | null {
-    if (!list.length) return null;
-
-    const apiTotal = list.length;
-    const byAddress = new Map(
-      list
-        .map((entry) => [entry.address as string, entry] as const)
-        .filter(([address]) => !!address),
-    );
-
-    if (phase === "pre_buy") {
-      let excludedCount = 0;
-      let validCount = 0;
-      let soldAmongValid = 0;
-      const matchingWallets: Array<{ address: string; buyUsd: number }> = [];
-
-      for (const entry of list) {
-        if (this.isExcludedProfitableTrader(entry)) {
-          excludedCount += 1;
-          continue;
-        }
-        if (!this.meetsPreBuyProfitableTraderBuyThreshold(entry)) continue;
-
-        validCount += 1;
-        if (!this.hasSoldAllPosition(entry)) continue;
-
-        soldAmongValid += 1;
-        const address = entry.address as string | undefined;
-        const buyUsd = this.parseBuyVolumeUsd(entry);
-        if (address && buyUsd !== null) {
-          matchingWallets.push({ address, buyUsd });
-        }
-      }
-
-      const soldPositionRatio =
-        validCount > 0 ? `${soldAmongValid}/${validCount}` : "0/0";
-
-      log.info(
-        `Profitable trader GMGN scan [pre-buy] — ${soldPositionRatio} sold all position (skip-list excl., buy > $${MIN_PROFITABLE_TRADER_BUY_USD}; tag bundler, order buy_volume_cur; limit ${PROFIT_TRADER_SCAN_LIMIT})`,
-        {
-          mint,
-          phase,
-          tag: "bundler",
-          orderBy: "buy_volume_cur",
-          minBuyUsd: MIN_PROFITABLE_TRADER_BUY_USD,
-          apiTotal,
-          excludedCount,
-          validCount,
-          soldAmongValid,
-          soldPositionRatio,
-          matchingWallets,
-          initialInsiderWallets: [...this.initialInsiderWallets],
-          devWallet: this.devWallet,
-        },
-      );
-
-      return {
-        top: [],
-        byAddress,
-        soldPositionRatio,
-        topExitedRatio: "0/0",
-        topExitedCount: 0,
-        apiTotal,
-        excludedCount,
-        validCount,
-        soldAmongValid,
-      };
-    }
-
+    soldPositionRatio: string;
+  } {
     let excludedCount = 0;
     let validCount = 0;
     let soldAmongValid = 0;
+    const matchingWallets: Array<{
+      address: string;
+      buyUsd: number;
+      sold: boolean;
+      tags: string[];
+    }> = [];
 
     for (const entry of list) {
-      if (this.isExcludedProfitableTrader(entry)) {
+      if (this.isExcludedTraderScan(entry)) {
         excludedCount += 1;
         continue;
       }
+      if (!this.isAxiomSingleBuyCandidate(entry)) continue;
+
       validCount += 1;
-      if (this.hasSoldAllPosition(entry)) soldAmongValid += 1;
+      const address = entry.address as string;
+      const buyUsd = this.parseBuyVolumeUsd(entry)!;
+      const sold = this.hasSoldAllPosition(entry);
+      const tags = Array.isArray(entry.tags)
+        ? (entry.tags as string[])
+        : [];
+
+      if (sold) soldAmongValid += 1;
+      matchingWallets.push({ address, buyUsd, sold, tags });
     }
 
     const soldPositionRatio =
       validCount > 0 ? `${soldAmongValid}/${validCount}` : "0/0";
 
-    const top = this.getCurrentTopProfitableTraders(list);
-    const topExitedCount = top.filter((t) => {
-      const entry = byAddress.get(t.address);
-      return entry && this.hasSoldAllPosition(entry);
-    }).length;
-    const topExitedRatio =
-      top.length > 0 ? `${topExitedCount}/${top.length}` : "0/0";
+    return {
+      matchingWallets,
+      apiTotal: list.length,
+      excludedCount,
+      validCount,
+      soldAmongValid,
+      soldPositionRatio,
+    };
+  }
+
+  private logAxiomSingleBuyTraderScan(
+    mint: string,
+    phase: "pre_buy" | "post_buy",
+    list: Array<Record<string, unknown>>,
+  ): ReturnType<InsiderBot["collectAxiomSingleBuyMatches"]> | null {
+    if (!list.length) return null;
+
+    const stats = this.collectAxiomSingleBuyMatches(list);
+    const soldWallets = stats.matchingWallets
+      .filter((w) => w.sold)
+      .map((w) => w.address);
+    const holdingWallets = stats.matchingWallets
+      .filter((w) => !w.sold)
+      .map((w) => w.address);
 
     log.info(
-      `Profitable trader GMGN scan [post-buy] — ${soldPositionRatio} sold all position after exclusions (tag bundler, order profit; limit ${PROFIT_TRADER_SCAN_LIMIT})`,
+      `Axiom/empty single-buy GMGN scan [${phase}] — ${stats.soldPositionRatio} sold all position (skip-list excl., buy $${this.bundlerBuyMinUsd}-$${this.bundlerBuyMaxUsd}, tag axiom or []; order buy_volume_cur; limit ${AXIOM_TRADER_SCAN_LIMIT})`,
       {
         mint,
         phase,
-        tag: "bundler",
-        orderBy: "profit",
-        apiTotal,
-        excludedCount,
-        validCount,
-        soldAmongValid,
-        soldPositionRatio,
-        topEligibleCount: top.length,
-        topExitedCount,
-        topExitedRatio,
-        requiredTopForSell: REQUIRED_PROFITABLE_EXIT_WALLETS,
-        topWallets: top.map((t) => t.address),
+        orderBy: "buy_volume_cur",
+        tag: null,
+        buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
+        apiTotal: stats.apiTotal,
+        excludedCount: stats.excludedCount,
+        validCount: stats.validCount,
+        soldAmongValid: stats.soldAmongValid,
+        soldPositionRatio: stats.soldPositionRatio,
+        matchingWallets: stats.matchingWallets,
+        soldWallets,
+        holdingWallets,
         initialInsiderWallets: [...this.initialInsiderWallets],
         devWallet: this.devWallet,
       },
     );
 
-    return {
-      top,
-      byAddress,
-      soldPositionRatio,
-      topExitedRatio,
-      topExitedCount,
-      apiTotal,
-      excludedCount,
-      validCount,
-      soldAmongValid,
-    };
+    return stats;
   }
 
-  private async scanProfitableTradersPreBuy(mint: string): Promise<void> {
+  private async scanAxiomSingleBuyTradersPreBuy(mint: string): Promise<void> {
     if (
       this.phase !== "pre_buy" ||
       this.preBuyStopped ||
@@ -1196,22 +1142,22 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const traders = await this.preBuyProfitGmgnClient.fetchBundlerTraders(
+    const traders = await this.preBuyAxiomGmgnClient.fetchBuyVolumeTraders(
       mint,
-      PROFIT_TRADER_SCAN_LIMIT,
+      AXIOM_TRADER_SCAN_LIMIT,
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
-      log.debug("No profitable traders returned from GMGN [pre-buy]", { mint });
+      log.debug("No traders returned from GMGN [pre-buy axiom scan]", { mint });
       return;
     }
 
-    this.logProfitableTraderScan(mint, "pre_buy", list);
+    this.logAxiomSingleBuyTraderScan(mint, "pre_buy", list);
   }
 
-  private async scanProfitableTradersPostBuy(mint: string): Promise<void> {
+  private async scanAxiomSingleBuyTradersPostBuy(mint: string): Promise<void> {
     if (
-      !this.profitableTraderWatchActive ||
+      !this.axiomTraderWatchActive ||
       this.phase !== "holding" ||
       !this.activePosition ||
       this.positionSellTriggered
@@ -1219,55 +1165,52 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const traders = await this.bundlerGmgnClient.fetchTokenTraders(
+    const traders = await this.bundlerGmgnClient.fetchBuyVolumeTraders(
       mint,
-      PROFIT_TRADER_SCAN_LIMIT,
-      "profit",
-      "bundler",
+      AXIOM_TRADER_SCAN_LIMIT,
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
-      log.debug("No profitable traders returned from GMGN [post-buy]", { mint });
+      log.debug("No traders returned from GMGN [post-buy axiom scan]", { mint });
       return;
     }
 
-    const stats = this.logProfitableTraderScan(mint, "post_buy", list);
-    if (!stats) return;
+    const stats = this.logAxiomSingleBuyTraderScan(mint, "post_buy", list);
+    if (!stats || stats.validCount === 0) return;
 
-    const { top, byAddress } = stats;
-    if (top.length < REQUIRED_PROFITABLE_EXIT_WALLETS) return;
+    const allSold =
+      stats.soldAmongValid === stats.validCount && stats.validCount > 0;
+    if (!allSold) return;
 
-    const allExited = top.every((t) => {
-      const entry = byAddress.get(t.address);
-      return entry && this.hasSoldAllPosition(entry);
-    });
-    if (!allExited) return;
-
-    const walletLines = top
+    const walletLines = stats.matchingWallets
       .map(
-        (t, i) =>
-          `${i + 1}. <code>${t.address}</code> profit: <b>$${t.profit.toFixed(2)}</b>`,
+        (w, i) =>
+          `${i + 1}. <code>${w.address}</code> buy: <b>$${w.buyUsd.toFixed(2)}</b> tags: <b>${w.tags.length ? w.tags.join(", ") : "[]"}</b>`,
       )
       .join("\n");
 
-    log.warn("Current top profitable wallets fully exited — triggering position sell", {
-      mint,
-      wallets: top.map((t) => t.address),
-    });
+    log.warn(
+      "All axiom/empty single-buy wallets in range fully exited — triggering position sell",
+      {
+        mint,
+        validCount: stats.validCount,
+        wallets: stats.matchingWallets.map((w) => w.address),
+      },
+    );
 
     await this.triggerPositionSell(
       mint,
-      `Current top ${REQUIRED_PROFITABLE_EXIT_WALLETS} profitable wallets (excl. insider) have sold all positions`,
+      `All ${stats.validCount} axiom/empty single-buy wallets ($${this.bundlerBuyMinUsd}-$${this.bundlerBuyMaxUsd}) have sold all positions`,
       [
-        "<b>🚨 Profitable Trader Exit Signal</b>",
+        "<b>🚨 Axiom Single-Buy Exit Signal</b>",
         `Token: <code>${mint}</code>`,
-        `Current top <b>${REQUIRED_PROFITABLE_EXIT_WALLETS}</b> profitable wallets have fully exited.`,
+        `All <b>${stats.validCount}</b> axiom/empty single-buy wallets in buy range have fully exited.`,
         "Dev wallet, initial 4 insiders, and insider/dev transfer-in recipients were excluded.",
         "",
         "<b>Tracked wallets:</b>",
         walletLines,
       ],
-      "PROFITABLE_TRADER_EXIT_TRIGGER",
+      "AXIOM_SINGLE_BUY_EXIT_TRIGGER",
     );
   }
 
@@ -1547,7 +1490,7 @@ export class InsiderBot extends EventEmitter {
   ): Promise<void> {
     if (!this.activePosition || this.positionSellTriggered) return;
     this.positionSellTriggered = true;
-    this.profitableTraderWatchActive = false;
+    this.axiomTraderWatchActive = false;
 
     await this.telegramBot?.sendDefault(telegramLines.join("\n"));
 
@@ -1574,7 +1517,7 @@ export class InsiderBot extends EventEmitter {
     this.clearBundlerAccumulation();
     this.initialInsiderWallets.clear();
     this.devWallet = null;
-    this.profitableTraderWatchActive = false;
+    this.axiomTraderWatchActive = false;
     this.preBuyStopped = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
@@ -1608,7 +1551,7 @@ export class InsiderBot extends EventEmitter {
     this.clearBundlerAccumulation();
     this.initialInsiderWallets.clear();
     this.devWallet = null;
-    this.profitableTraderWatchActive = false;
+    this.axiomTraderWatchActive = false;
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.insiderSellsReady = false;

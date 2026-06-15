@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-06-15
+
+### Axiom single-buy scan limit increased to 50
+
+- Pre-buy and post-buy `fetchBuyVolumeTraders` scans now request limit 50 (was 20) for a wider view.
+
+### Axiom/empty single-buy trader scan replaces profitable-trader GMGN scans
+
+- Pre-buy and post-buy GMGN scans now use `fetchBuyVolumeTraders` (no `tag`, order-by `buy_volume_cur`, limit 50).
+- Filters: single-buy (`buy_tx_count_cur ≤ 1`), buy USD in `INSIDER_BUNDLER_BUY_MIN_USD`–`INSIDER_BUNDLER_BUY_MAX_USD`, `tags` is `["axiom"]` or `[]`.
+- Skip-list exclusions unchanged (initial 4 insiders, dev wallet, transfer-in sources).
+- Logs include `validCount`, `soldAmongValid`, `soldPositionRatio`, `soldWallets`, and `holdingWallets`.
+- Post-buy sell triggers when all eligible axiom/empty single-buy wallets in range have fully exited.
+
 ## 2026-06-14
 
 ### Pre-buy profitable trader scan — buy_volume_cur + $100 exit filter

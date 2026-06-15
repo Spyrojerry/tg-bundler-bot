@@ -318,7 +318,33 @@ export class GmgnClient {
     }
   }
 
-  // ── Public: fetch top profitable traders for a token ──────────────────────
+  // ── Public: fetch top traders by buy volume (no tag filter) ───────────────
+
+  async fetchBuyVolumeTraders(
+    mint: string,
+    limit: number = 50,
+  ): Promise<any> {
+    this.validateSolAddress(mint, 'mint');
+
+    try {
+      if (this.fetchMode !== 'direct') {
+        const data = await this.fetchCliData('traders', mint, {
+          limit,
+          orderBy: 'buy_volume_cur',
+        });
+        if (data) return data;
+        log.debug(`GMGN CLI buy-volume traders returned no data for ${mint}, falling back to API`);
+      }
+
+      const endpoint =
+        `v1/token/traders/sol/${mint}?limit=${limit}&orderby=buy_volume_cur&direction=desc`;
+      const data = await this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
+      return data;
+    } catch (err) {
+      log.error(`Failed to fetch buy-volume traders for ${mint}`, err);
+      return null;
+    }
+  }
 
   async fetchBundlerTraders(
     mint: string,
