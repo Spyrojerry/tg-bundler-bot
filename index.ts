@@ -815,33 +815,7 @@ async function main(): Promise<void> {
     ),
   );
 
-  insiderBots.push(
-    new InsiderBot(
-      config,
-      config.insiderSolanaRpcUrl,
-      config.insiderSolanaWsUrl,
-      gmgnClients[0],
-      bundlerGmgnClient,
-      preBuyAxiomGmgnClient,
-      insiderHeliusKeys[0],
-      telegramBot,
-    ),
-  );
-  insiderBots.push(
-    new InsiderBot(
-      config,
-      config.insiderSolanaRpcUrl2,
-      config.insiderSolanaWsUrl2,
-      gmgnClients[1],
-      bundlerGmgnClient,
-      preBuyAxiomGmgnClient,
-      insiderHeliusKeys[1],
-      telegramBot,
-      makeClaimFn(1),
-      () => undefined,
-    ),
-  );
-
+ 
   async function resumeAllInsiderBots(): Promise<void> {
     for (let i = 0; i < 2; i++) {
       const bot = insiderBots[i];
