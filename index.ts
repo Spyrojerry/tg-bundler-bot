@@ -54,19 +54,31 @@ async function main(): Promise<void> {
   log.info("Config", {
     wallet: config.walletAddress,
     tradingWallet: config.tradingWalletAddress,
+
+    // Global solana endpoints (used by wallet monitors / default gmgn client)
     rpc: config.solanaRpcUrl,
     ws: config.solanaWsUrl,
+
     receiverRpc: config.receiverSolanaRpcUrl,
     receiverWs: config.receiverSolanaWsUrl,
+
     f1Rpc: config.f1SolanaRpcUrl,
     f1Ws: config.f1SolanaWsUrl,
+
+    // Insider endpoints (used by Insider Bot 1 & 2)
+    insider1Rpc: config.insiderSolanaRpcUrl,
+    insider1Ws: config.insiderSolanaWsUrl,
+    insider2Rpc: config.insiderSolanaRpcUrl2,
+    insider2Ws: config.insiderSolanaWsUrl2,
+
+    insiderEntryMc: config.insiderEntryMc,
+    insiderExitMc: config.insiderExitMc,
+
     minBuySol: config.minBuySol,
     gmgnFetchMode: config.gmgnFetchMode,
     monitorInterval: config.monitorInterval,
     rateLimitMinTime: config.rateLimitMinTime,
     dbPath: config.dbPath,
-    insiderEntryMc: config.insiderEntryMc,
-    insiderExitMc: config.insiderExitMc,
   });
 
   // ── 2. Database ────────────────────────────────────────────────────────────
@@ -754,7 +766,7 @@ async function main(): Promise<void> {
 
   const insiderHeliusKeys = [
     config.insiderHeliusApiKey || config.heliusApiKey,
-    config.insiderHeliusApiKey2 || config.insiderHeliusApiKey || config.heliusApiKey,
+    config.insiderHeliusApiKey2 || config.heliusApiKey,
   ];
 
   const bundlerGmgnClient = gmgnClients[1];
