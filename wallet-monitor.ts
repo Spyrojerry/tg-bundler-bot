@@ -59,7 +59,12 @@ export class WalletMonitor extends EventEmitter {
   constructor(
     config: ServiceConfig,
     walletAddress?: string,
-    options: { enforceMinBuySol?: boolean; minBuySol?: number } = {}
+    options: {
+      enforceMinBuySol?: boolean;
+      minBuySol?: number;
+      rpcUrl?: string;
+      wsUrl?: string;
+    } = {}
   ) {
     super();
 
@@ -67,9 +72,12 @@ export class WalletMonitor extends EventEmitter {
       throw new Error('WalletMonitor requires a wallet address');
     }
 
-    this.connection = new Connection(config.solanaRpcUrl, {
+    const rpcUrl = options.rpcUrl ?? config.solanaRpcUrl;
+    const wsUrl = options.wsUrl ?? config.solanaWsUrl;
+
+    this.connection = new Connection(rpcUrl, {
       commitment: WALLET_COMMITMENT,
-      wsEndpoint: config.solanaWsUrl,
+      wsEndpoint: wsUrl,
     });
 
     try {

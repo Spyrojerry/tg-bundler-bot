@@ -96,7 +96,7 @@ interface BundlerWatchState {
 type BundlerMatchType = "single_buy" | "multi_buy";
 
 export class InsiderBot extends EventEmitter {
-  private readonly config: ServiceConfig;
+   private readonly config: ServiceConfig;
   private readonly connection: Connection;
   private readonly telegramBot: TelegramBot | null;
   private readonly heliusClient: HeliusClient;
@@ -106,6 +106,9 @@ export class InsiderBot extends EventEmitter {
   private readonly preBuyAxiomGmgnClient: GmgnClient;
   private readonly claimMint: InsiderMintClaimFn | null;
   private readonly releaseMint: InsiderMintReleaseFn | null;
+  private readonly rpcUrl: string;
+  private readonly wsUrl: string;
+  
 
   private followedWallet: string | null = null;
   private buySol: number;
@@ -175,6 +178,8 @@ export class InsiderBot extends EventEmitter {
   ) {
     super();
     this.config = config;
+    this.rpcUrl = rpcUrl;
+    this.wsUrl = wsUrl;
     this.telegramBot = telegramBot;
     this.gmgnClient = gmgnClient;
     this.bundlerGmgnClient = bundlerGmgnClient;
@@ -342,8 +347,10 @@ export class InsiderBot extends EventEmitter {
     }
     this.followedWallet = normalized;
 
-    this.followMonitor = new WalletMonitor(this.config, normalized, {
+   this.followMonitor = new WalletMonitor(this.config, normalized, {
       enforceMinBuySol: false,
+      rpcUrl: this.rpcUrl,
+      wsUrl: this.wsUrl,
     });
     this.followMonitor.on("newToken", (event) => {
       void this.handleFollowWalletBuy(event.mint, event.signature);
