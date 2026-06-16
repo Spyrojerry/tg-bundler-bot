@@ -655,50 +655,79 @@ export class GmgnClient {
     };
   }
 
-  async sellTokenForSol(
-    walletAddress: string,
-    mint: string,
-    options: SellOptions & { preFetchedBalance?: bigint }
-  ): Promise<SellResult> {
-    if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
+ // REPLACE lines 658-701 with:
+async sellTokenForSol(
+  walletAddress: string,
+  mint: string,
+  options: SellOptions & { preFetchedBalance?: bigint }
+): Promise<SellResult> {
+  if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
 
-    const balance = options.preFetchedBalance !== undefined 
-      ? options.preFetchedBalance 
-      : await this.getTokenBalance(walletAddress, mint);
+  const balance = options.preFetchedBalance !== undefined
+    ? options.preFetchedBalance
+    : await this.getTokenBalance(walletAddress, mint);
 
-    if (balance === 0n) throw new Error(`No token balance found for ${mint}`);
+  if (balance === 0n) throw new Error(`No token balance found for ${mint}`);
 
-    const amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
+  const amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
 
-    // 1. GET ORDER (V2 Meta-Aggregator)
-    const orderUrl = `${this.jupiterSwapBaseUrl}/order?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amountRaw.toString()}&taker=${walletAddress}`;
-    const order = await this.fetchJupiterJson(orderUrl, 'GET');
+  // 1. QUOTE (v1 standard aggregator)
+  const slippageBps = this.toJupiterSlippageBps(options);
+  const slippageParam = slippageBps !== null
+    ? `slippageBps=${slippageBps}`
+    : `autoSlippage=true&maxAutoSlippageBps=3000`;
 
-    if (!order.transaction || !order.requestId) {
-      throw new Error(`Invalid Jupiter order response: ${JSON.stringify(order)}`);
-    }
+  const JUPITER_V1_BASE = 'https://api.jup.ag/swap/v1';
+  const quoteUrl = `${JUPITER_V1_BASE}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amountRaw.toString()}&${slippageParam}`;
+  const quote = await this.fetchJupiterJson(quoteUrl, 'GET');
 
-    // 2. SIGN TRANSACTION
-    const signedTx = this.signVersionedTransaction(order.transaction as string);
-
-    // 3. EXECUTE
-    const execute = await this.fetchJupiterJson(`${this.jupiterSwapBaseUrl}/execute`, 'POST', {
-      signedTransaction: signedTx,
-      requestId: order.requestId,
-    });
-
-    return {
-      orderId: String(order.requestId),
-      hash: String(execute.signature),
-      status: 'confirmed',
-      inputToken: mint,
-      outputToken: SOL_MINT,
-      soldPercent: options.percent,
-      filledInputAmount: String(order.inAmount || 0),
-      filledOutputAmount: String(order.outAmount || 0),
-      raw: { order, execute }
-    };
+  if (!quote.outAmount) {
+    throw new Error(`Jupiter quote failed: ${JSON.stringify(quote)}`);
   }
+
+  // 2. GET SWAP TRANSACTION (v1 standard)
+  const swapBody: Record<string, unknown> = {
+    quoteResponse: quote,
+    userPublicKey: walletAddress,
+    wrapAndUnwrapSol: true,
+    prioritizationFeeLamports: options.priorityFeeSol > 0
+      ? Math.floor(options.priorityFeeSol * 1e9)
+      : 'auto',
+  };
+
+  const swapResp = await this.fetchJupiterJson(`${JUPITER_V1_BASE}/swap`, 'POST', swapBody);
+
+  if (!swapResp.swapTransaction) {
+    throw new Error(`Jupiter swap response missing transaction: ${JSON.stringify(swapResp)}`);
+  }
+
+  // 3. SIGN
+  const tx = VersionedTransaction.deserialize(
+    Buffer.from(swapResp.swapTransaction as string, 'base64')
+  );
+  tx.sign([this.tradingKeypair]);
+  const rawTx = Buffer.from(tx.serialize());
+
+  // 4. SEND via RPC directly (no Ultra /execute needed)
+  const signature = await this.connection.sendRawTransaction(rawTx, {
+    skipPreflight: true,
+    maxRetries: 3,
+  });
+
+  log.info(`Sell transaction sent: ${signature}`, { mint, amount: amountRaw.toString() });
+
+  return {
+    orderId: null,
+    hash: signature,
+    status: 'confirmed',
+    inputToken: mint,
+    outputToken: SOL_MINT,
+    soldPercent: options.percent,
+    filledInputAmount: String(amountRaw),
+    filledOutputAmount: String(quote.outAmount),
+    raw: { quote, swapResp },
+  };
+}
 
   // ── Jupiter Helpers ───────────────────────────────────────────────────────
 
@@ -722,27 +751,32 @@ export class GmgnClient {
     });
   }
 
-  private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-    const headers: Record<string, string> = { 
-      'Accept': 'application/json',
-      'x-api-key': this.jupiterApiKey 
-    };
-    if (method === 'POST') headers['Content-Type'] = 'application/json';
+  // REPLACE lines 725-745 with:
+private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+  const headers: Record<string, string> = {
+    'Accept': 'application/json',
+    'x-api-key': this.jupiterApiKey
+  };
+  if (method === 'POST') headers['Content-Type'] = 'application/json';
 
-    try {
-      const resp = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal });
-      const json = await resp.json() as Record<string, unknown>;
-      if (!resp.ok) {
-        log.error(`Jupiter API Error [${resp.status}]: ${JSON.stringify(json)}`, { url, method });
-        throw new Error(`Jupiter API failed: ${resp.status}${json.error ? ` - ${json.error}` : ''}${json.message ? ` - ${json.message}` : ''}`);
-      }
-      return json;
-    } finally {
-      clearTimeout(timer);
+  try {
+    const resp = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal });
+    const json = await resp.json() as Record<string, unknown>;
+    if (!resp.ok) {
+      log.error(`Jupiter API Error [${resp.status}]: ${JSON.stringify(json)}`, { url, method });
+      throw new Error(`Jupiter API failed: ${resp.status}${json.error ? ` - ${json.error}` : ''}${json.message ? ` - ${json.message}` : ''}`);
     }
+    // Jupiter Ultra returns HTTP 200 with errorCode in body on routing failure — catch it here
+    if (json.errorCode !== undefined) {
+      throw new Error(`Jupiter routing error (${json.errorCode}): ${json.errorMessage ?? json.error ?? JSON.stringify(json)}`);
+    }
+    return json;
+  } finally {
+    clearTimeout(timer);
   }
+}
 
   private parseJupiterSellResult(order: Record<string, unknown>, execute: Record<string, unknown>, mint: string, soldPercent: number): SellResult {
     const orderAny = order as any;
