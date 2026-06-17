@@ -1332,24 +1332,23 @@ export class InsiderBot extends EventEmitter {
     for (const wallet of watched) {
       if (hasPositiveBalance.has(wallet.address)) {
         holdingWallets.push(wallet);
-      } else {
+      } else if (hasAnyAta.has(wallet.address)) {
         soldWallets.push(wallet);
-        if (!hasAnyAta.has(wallet.address)) {
-          missingAtaWallets.push(wallet);
-        }
+      } else {
+        missingAtaWallets.push(wallet);
       }
     }
 
-    if (
-      soldWallets.length === watched.length &&
-      missingAtaWallets.length === watched.length
-    ) {
+    const existingAtaWalletCount = soldWallets.length + holdingWallets.length;
+
+    if (existingAtaWalletCount === 0) {
       log.warn(
         `Axiom watched-wallet ATA poll [${options.phase}] found no SPL or Token-2022 ATAs for any watched wallet; skipping sell trigger`,
         {
           mint,
           phase: options.phase,
           watchedCount: watched.length,
+          existingAtaWalletCount,
           existingAtaCount,
           positiveAtaCount,
           note: "Skipping to avoid a false positive from token-program mismatch or stale GMGN discovery.",
@@ -1358,17 +1357,18 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${soldWallets.length}/${watched.length} sold/no ATA`, {
+    log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${soldWallets.length}/${existingAtaWalletCount} sold existing ATA wallets`, {
       mint,
       phase: options.phase,
-      soldPositionRatio: `${soldWallets.length}/${watched.length}`,
+      soldPositionRatio: `${soldWallets.length}/${existingAtaWalletCount}`,
       watchedCount: watched.length,
+      existingAtaWalletCount,
       soldAllCount: soldWallets.length,
       holdingCount: holdingWallets.length,
       existingAtaCount,
       positiveAtaCount,
       missingAtaWalletCount: missingAtaWallets.length,
-      rule: `watched >= ${AXIOM_EXIT_VALID_WALLET_THRESHOLD}, sold >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
+      rule: `existing ATA wallets >= ${AXIOM_EXIT_VALID_WALLET_THRESHOLD}, sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
       soldWallets: soldWallets.map((wallet) => wallet.address),
       holdingWallets: holdingWallets.map((wallet) => wallet.address),
       missingAtaWallets: missingAtaWallets.map((wallet) => wallet.address),
@@ -1379,7 +1379,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (
-      watched.length < AXIOM_EXIT_VALID_WALLET_THRESHOLD ||
+      existingAtaWalletCount < AXIOM_EXIT_VALID_WALLET_THRESHOLD ||
       soldWallets.length < AXIOM_EXIT_SOLD_WALLET_THRESHOLD
     ) {
       return false;
@@ -1398,6 +1398,7 @@ export class InsiderBot extends EventEmitter {
       {
         mint,
         watchedCount: watched.length,
+        existingAtaWalletCount,
         soldAllCount: soldWallets.length,
         soldWallets: soldWallets.map((wallet) => wallet.address),
       },
@@ -1405,12 +1406,14 @@ export class InsiderBot extends EventEmitter {
 
     await this.triggerPositionSell(
       mint,
-      `${soldWallets.length}/${watched.length} cumulative axiom/empty single-buy wallets have zero ATA balance`,
+      `${soldWallets.length}/${existingAtaWalletCount} cumulative axiom/empty single-buy wallets with existing ATAs have zero balance`,
       [
         "<b>🚨 Axiom ATA Exit Threshold</b>",
         `Token: <code>${mint}</code>`,
-        `Sold all / no ATA: <b>${soldWallets.length}</b> / <b>${watched.length}</b>`,
-        `Rule: watched wallets >= <b>${AXIOM_EXIT_VALID_WALLET_THRESHOLD}</b> and sold/no-ATA wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b>.`,
+        `Sold all / existing ATA wallets: <b>${soldWallets.length}</b> / <b>${existingAtaWalletCount}</b>`,
+        `Cumulative valid wallets watched: <b>${watched.length}</b>`,
+        `Missing ATA wallets ignored: <b>${missingAtaWallets.length}</b>`,
+        `Rule: existing ATA wallets >= <b>${AXIOM_EXIT_VALID_WALLET_THRESHOLD}</b> and sold existing ATA wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b>.`,
         "",
         "<b>First sold wallets:</b>",
         walletLines,
