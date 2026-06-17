@@ -1,6 +1,10 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { EventEmitter } from "events";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import {
+  getAssociatedTokenAddressSync,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
 import { createLogger } from "./logger";
 import { HeliusClient, HeliusTransaction } from "./helius-client";
 import { GmgnClient } from "./gmgn-client";
@@ -116,7 +120,7 @@ interface AxiomWatchedWallet {
   address: string;
   buyUsd: number;
   tags: string[];
-  ata: PublicKey;
+  atas: PublicKey[];
 }
 
 export class InsiderBot extends EventEmitter {
@@ -1263,10 +1267,13 @@ export class InsiderBot extends EventEmitter {
       if (this.axiomWatchedWallets.has(wallet.address)) continue;
       this.axiomWatchedWallets.set(wallet.address, {
         ...wallet,
-        ata: getAssociatedTokenAddressSync(
-          new PublicKey(mint),
-          new PublicKey(wallet.address),
-          true,
+        atas: [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].map((tokenProgram) =>
+          getAssociatedTokenAddressSync(
+            new PublicKey(mint),
+            new PublicKey(wallet.address),
+            true,
+            tokenProgram,
+          ),
         ),
       });
       added += 1;
@@ -1282,33 +1289,69 @@ export class InsiderBot extends EventEmitter {
     if (this.axiomWatchedWallets.size === 0) return false;
 
     const watched = [...this.axiomWatchedWallets.values()];
-    const soldWallets: AxiomWatchedWallet[] = [];
-    const holdingWallets: AxiomWatchedWallet[] = [];
+    const ataLookups = watched.flatMap((wallet) =>
+      wallet.atas.map((ata) => ({ wallet, ata })),
+    );
+    const hasAnyAta = new Set<string>();
+    const hasPositiveBalance = new Set<string>();
+    let existingAtaCount = 0;
+    let positiveAtaCount = 0;
     const chunkSize = 100;
 
-    for (let start = 0; start < watched.length; start += chunkSize) {
-      const chunk = watched.slice(start, start + chunkSize);
+    for (let start = 0; start < ataLookups.length; start += chunkSize) {
+      const chunk = ataLookups.slice(start, start + chunkSize);
       const infos = await this.connection.getMultipleAccountsInfo(
-        chunk.map((wallet) => wallet.ata),
+        chunk.map((lookup) => lookup.ata),
         "processed",
       );
 
       for (let i = 0; i < chunk.length; i++) {
-        const wallet = chunk[i];
+        const lookup = chunk[i];
         const info = infos[i];
-        if (!info) {
-          soldWallets.push(wallet);
-          continue;
-        }
+        if (!info) continue;
+
+        existingAtaCount += 1;
+        hasAnyAta.add(lookup.wallet.address);
 
         const amount =
-          info.data.length >= 72 ? info.data.readBigUInt64LE(64) : 1n;
-        if (amount === 0n) {
-          soldWallets.push(wallet);
-        } else {
-          holdingWallets.push(wallet);
+          info.data.length >= 72 ? info.data.readBigUInt64LE(64) : 0n;
+        if (amount > 0n) {
+          positiveAtaCount += 1;
+          hasPositiveBalance.add(lookup.wallet.address);
         }
       }
+    }
+
+    const soldWallets: AxiomWatchedWallet[] = [];
+    const holdingWallets: AxiomWatchedWallet[] = [];
+    const missingAtaWallets: AxiomWatchedWallet[] = [];
+
+    for (const wallet of watched) {
+      if (hasPositiveBalance.has(wallet.address)) {
+        holdingWallets.push(wallet);
+      } else {
+        soldWallets.push(wallet);
+        if (!hasAnyAta.has(wallet.address)) {
+          missingAtaWallets.push(wallet);
+        }
+      }
+    }
+
+    if (
+      soldWallets.length === watched.length &&
+      missingAtaWallets.length === watched.length
+    ) {
+      log.warn(
+        "Axiom ATA poll found no SPL or Token-2022 ATAs for any watched wallet; skipping sell trigger",
+        {
+          mint,
+          watchedCount: watched.length,
+          existingAtaCount,
+          positiveAtaCount,
+          note: "Skipping to avoid a false positive from token-program mismatch or stale GMGN discovery.",
+        },
+      );
+      return false;
     }
 
     log.info(`Axiom watched-wallet ATA poll — ${soldWallets.length}/${watched.length} sold/no ATA`, {
@@ -1317,9 +1360,13 @@ export class InsiderBot extends EventEmitter {
       watchedCount: watched.length,
       soldAllCount: soldWallets.length,
       holdingCount: holdingWallets.length,
+      existingAtaCount,
+      positiveAtaCount,
+      missingAtaWalletCount: missingAtaWallets.length,
       rule: `watched >= ${AXIOM_EXIT_VALID_WALLET_THRESHOLD}, sold >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
       soldWallets: soldWallets.map((wallet) => wallet.address),
       holdingWallets: holdingWallets.map((wallet) => wallet.address),
+      missingAtaWallets: missingAtaWallets.map((wallet) => wallet.address),
     });
 
     if (

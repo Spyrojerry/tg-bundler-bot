@@ -2696,8 +2696,7 @@ async function main(): Promise<void> {
         }
 
         if (attempt < 5) {
-          // Faster retry delay for sells (500ms instead of 1500ms)
-          await sleep(500);
+          await sleep(250);
           const remainingBalance = await getTokenRawBalance(
             owner,
             mintPk,

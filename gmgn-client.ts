@@ -711,8 +711,15 @@ async sellTokenForSol(
   try {
     return await this.sellTokenForSolViaPump(walletAddress, mint, amountRaw, options);
   } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    if (this.isPumpOnlySellFailure(errorMessage)) {
+      log.warn(`Pump.fun sell path failed for ${mint}; skipping Jupiter fallback`, {
+        error: errorMessage,
+      });
+      throw err;
+    }
     log.warn(`Pump.fun sell path failed for ${mint}; falling back to Jupiter`, {
-      error: err instanceof Error ? err.message : String(err),
+      error: errorMessage,
     });
   }
 
@@ -781,10 +788,11 @@ private async sellTokenForSolViaPump(
 
   const user = new PublicKey(walletAddress);
   const mintPk = new PublicKey(mint);
-  const tokenAccounts = await this.getTokenAccountsWithBalance(user, mintPk);
-  const tokenPrograms = tokenAccounts.length > 0
-    ? [...new Map(tokenAccounts.map((account) => [account.tokenProgram.toBase58(), account.tokenProgram])).values()]
-    : TOKEN_PROGRAM_IDS;
+  const tokenAccounts = (await this.getTokenAccountsWithBalance(user, mintPk))
+    .sort((a, b) => (a.balance === b.balance ? 0 : a.balance > b.balance ? -1 : 1));
+  if (tokenAccounts.length === 0) {
+    throw new Error(`No token accounts with balance found for ${mint}`);
+  }
 
   const [global, feeConfig, supplyResp] = await Promise.all([
     this.pumpSdk.fetchGlobal(),
@@ -795,16 +803,13 @@ private async sellTokenForSolViaPump(
   const mintSupply = new BN(supplyResp.value.amount);
   let lastError: unknown = null;
 
-  for (const tokenProgram of tokenPrograms) {
+  for (const sourceTokenAccount of tokenAccounts) {
+    const tokenProgram = sourceTokenAccount.tokenProgram;
     try {
-      const programBalance = tokenAccounts
-        .filter((account) => account.tokenProgram.equals(tokenProgram))
-        .reduce((sum, account) => sum + account.balance, 0n);
-      const amountRawForProgram = programBalance > 0n
-        ? (programBalance * BigInt(Math.round(options.percent))) / 100n
-        : amountRaw;
+      const amountRawForProgram =
+        (sourceTokenAccount.balance * BigInt(Math.round(options.percent))) / 100n;
       if (amountRawForProgram <= 0n) {
-        throw new Error(`No token balance found for token program ${tokenProgram.toBase58()}`);
+        throw new Error(`No token balance found in ${sourceTokenAccount.account.toBase58()}`);
       }
       const amount = new BN(amountRawForProgram.toString());
 
@@ -842,9 +847,6 @@ private async sellTokenForSolViaPump(
         bondingCurveAddress,
         true,
         tokenProgram,
-      );
-      const sourceTokenAccount = tokenAccounts.find(
-        (account) => account.tokenProgram.equals(tokenProgram) && account.balance >= amountRawForProgram,
       );
       const setupInstructions: TransactionInstruction[] = [
         createAssociatedTokenAccountIdempotentInstruction(
@@ -927,6 +929,7 @@ private async sellTokenForSolViaPump(
         slippage,
         tokenProgram: tokenProgram.toBase58(),
         sourceTokenAccount: sourceTokenAccount?.account.toBase58() ?? associatedUser.toBase58(),
+        sourceTokenBalance: sourceTokenAccount.balance.toString(),
         associatedUser: associatedUser.toBase58(),
         associatedBondingCurve: associatedBondingCurve.toBase58(),
         setupInstructionCount: setupInstructions.length,
@@ -948,6 +951,7 @@ private async sellTokenForSolViaPump(
           slippage,
           tokenProgram: tokenProgram.toBase58(),
           sourceTokenAccount: sourceTokenAccount?.account.toBase58() ?? associatedUser.toBase58(),
+          sourceTokenBalance: sourceTokenAccount.balance.toString(),
           associatedUser: associatedUser.toBase58(),
           associatedBondingCurve: associatedBondingCurve.toBase58(),
           setupInstructionCount: setupInstructions.length,
@@ -962,6 +966,16 @@ private async sellTokenForSolViaPump(
   }
 
   throw lastError ?? new Error(`Pump.fun sell failed for ${mint}`);
+}
+
+private isPumpOnlySellFailure(message: string): boolean {
+  return (
+    message.includes('NotEnoughTokensToSell') ||
+    message.includes('IncorrectProgramId') ||
+    message.includes('Transaction ') ||
+    message.includes('token balance remains') ||
+    message.includes('was not confirmed')
+  );
 }
 
   // ── Jupiter Helpers ───────────────────────────────────────────────────────
@@ -992,7 +1006,7 @@ private async sellTokenForSolViaPump(
       maxRetries: 3,
     });
 
-    const deadline = Date.now() + 45_000;
+    const deadline = Date.now() + 12_000;
     while (Date.now() < deadline) {
       const status = await this.connection.getSignatureStatuses([signature], {
         searchTransactionHistory: true,
@@ -1004,14 +1018,11 @@ private async sellTokenForSolViaPump(
             `Transaction ${signature} failed on-chain for ${mint}: ${JSON.stringify(value.err)}`,
           );
         }
-        if (
-          value.confirmationStatus === 'confirmed' ||
-          value.confirmationStatus === 'finalized'
-        ) {
+        if (value.confirmationStatus) {
           return signature;
         }
       }
-      await sleep(500);
+      await sleep(250);
     }
 
     throw new Error(`Transaction ${signature} was not confirmed for ${mint} before timeout`);
