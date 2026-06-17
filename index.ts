@@ -1231,28 +1231,6 @@ async function main(): Promise<void> {
             },
           );
 
-          // Fetch actual MC after purchase for accurate tracking
-          let actualEntryMc = trigger.entryMc;
-          try {
-            const freshMc = await client.fetchTokenMarketCapUsd(trigger.mint);
-            if (freshMc !== null) {
-              actualEntryMc = freshMc;
-              bot.setEntryMc(freshMc);
-              // Recalculate Exit MC based on actual entry point
-              const exitPercent = bot.getExitPercent();
-              const newExitMc = freshMc * (1 + exitPercent / 100);
-              bot.setExitMc(newExitMc);
-              log.warn(
-                `[INSIDER ${index + 1} ACTUAL MC] Buy completed. Actual Entry MC: $${freshMc.toLocaleString()}. New Exit MC: $${newExitMc.toLocaleString()}`,
-              );
-            }
-          } catch (mcErr) {
-            log.error(
-              `Failed to fetch actual entry MC for ${trigger.mint}`,
-              mcErr,
-            );
-          }
-
           bot.markPositionBought(trigger);
           // ── Persist to DB so this mint is skipped on restart ─────────────
           if (config.tradingWalletAddress) {
@@ -1264,7 +1242,7 @@ async function main(): Promise<void> {
             [
               `<b>✅ Insider ${index + 1} Buy Completed</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
-              `Actual Entry MC: <b>$${html(actualEntryMc?.toLocaleString() ?? "Unknown")}</b>`,
+              `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
               `Status: <b>${html(result.status)}</b>`,
               result.hash
                 ? `Tx: https://solscan.io/tx/${html(result.hash)}`
