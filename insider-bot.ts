@@ -1285,7 +1285,10 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
-  private async checkAxiomWatchedWalletAtaExits(mint: string): Promise<boolean> {
+  private async checkAxiomWatchedWalletAtaExits(
+    mint: string,
+    options: { phase: "pre_buy" | "post_buy"; triggerSell: boolean },
+  ): Promise<boolean> {
     if (this.axiomWatchedWallets.size === 0) return false;
 
     const watched = [...this.axiomWatchedWallets.values()];
@@ -1342,9 +1345,10 @@ export class InsiderBot extends EventEmitter {
       missingAtaWallets.length === watched.length
     ) {
       log.warn(
-        "Axiom ATA poll found no SPL or Token-2022 ATAs for any watched wallet; skipping sell trigger",
+        `Axiom watched-wallet ATA poll [${options.phase}] found no SPL or Token-2022 ATAs for any watched wallet; skipping sell trigger`,
         {
           mint,
+          phase: options.phase,
           watchedCount: watched.length,
           existingAtaCount,
           positiveAtaCount,
@@ -1354,8 +1358,9 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    log.info(`Axiom watched-wallet ATA poll — ${soldWallets.length}/${watched.length} sold/no ATA`, {
+    log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${soldWallets.length}/${watched.length} sold/no ATA`, {
       mint,
+      phase: options.phase,
       soldPositionRatio: `${soldWallets.length}/${watched.length}`,
       watchedCount: watched.length,
       soldAllCount: soldWallets.length,
@@ -1368,6 +1373,10 @@ export class InsiderBot extends EventEmitter {
       holdingWallets: holdingWallets.map((wallet) => wallet.address),
       missingAtaWallets: missingAtaWallets.map((wallet) => wallet.address),
     });
+
+    if (!options.triggerSell) {
+      return false;
+    }
 
     if (
       watched.length < AXIOM_EXIT_VALID_WALLET_THRESHOLD ||
@@ -1442,6 +1451,10 @@ export class InsiderBot extends EventEmitter {
     const stats = this.logAxiomSingleBuyTraderScan(mint, "pre_buy", list);
     if (stats && stats.validCount > 0) {
       this.rememberAxiomWatchedWallets(mint, stats.matchingWallets);
+      await this.checkAxiomWatchedWalletAtaExits(mint, {
+        phase: "pre_buy",
+        triggerSell: false,
+      });
     }
   }
 
@@ -1470,18 +1483,27 @@ export class InsiderBot extends EventEmitter {
         limit: AXIOM_TRADER_SCAN_LIMIT,
         responseShape: this.describeTraderResponseShape(traders),
       });
-      await this.checkAxiomWatchedWalletAtaExits(mint);
+      await this.checkAxiomWatchedWalletAtaExits(mint, {
+        phase: "post_buy",
+        triggerSell: true,
+      });
       return;
     }
 
     const stats = this.logAxiomSingleBuyTraderScan(mint, "post_buy", list);
     if (!stats || stats.validCount === 0) {
-      await this.checkAxiomWatchedWalletAtaExits(mint);
+      await this.checkAxiomWatchedWalletAtaExits(mint, {
+        phase: "post_buy",
+        triggerSell: true,
+      });
       return;
     }
 
     this.rememberAxiomWatchedWallets(mint, stats.matchingWallets);
-    await this.checkAxiomWatchedWalletAtaExits(mint);
+    await this.checkAxiomWatchedWalletAtaExits(mint, {
+      phase: "post_buy",
+      triggerSell: true,
+    });
   }
 
   private async scanBundlerTraders(mint: string): Promise<void> {
