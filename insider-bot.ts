@@ -20,6 +20,13 @@ const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 type FlowPhase = "pre_buy" | "holding";
 
+class InsiderMinBuySolFilterError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InsiderMinBuySolFilterError";
+  }
+}
+
 export type InsiderMintClaimFn = (mint: string) => boolean;
 export type InsiderMintReleaseFn = (mint: string) => void;
 
@@ -502,9 +509,16 @@ export class InsiderBot extends EventEmitter {
     try {
       await this.startInsiderFlow(mint);
     } catch (err) {
-      log.error("Failed to start insider flow; resetting", err);
       this.releaseMint?.(mint);
-      this.emit("error", err instanceof Error ? err : new Error(String(err)));
+      if (err instanceof InsiderMinBuySolFilterError) {
+        log.info("Insider flow skipped by min-buy SOL filter; resetting", {
+          mint,
+          reason: err.message,
+        });
+      } else {
+        log.error("Failed to start insider flow; resetting", err);
+        this.emit("error", err instanceof Error ? err : new Error(String(err)));
+      }
       await this.resetForNewToken(true);
     }
   }
@@ -635,7 +649,7 @@ export class InsiderBot extends EventEmitter {
       })),
     });
 
-    throw new Error(
+    throw new InsiderMinBuySolFilterError(
       `Early insider buy SOL below MIN_BUY_SOL ${minBuySol} for ${mint}`,
     );
   }
