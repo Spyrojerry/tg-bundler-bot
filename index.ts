@@ -206,21 +206,50 @@ async function main(): Promise<void> {
           let currentMarketCapUsd: number | null = null;
           let athMarketCapUsd: number | null = null;
           let currentPrice: SellQuote | null = null;
+          let tokenBalance: bigint | null = null;
           let balanceIsZero = false;
           let quoteError: string | null = null;
 
           const botIndex =
             resolvedBotIndex ??
             insiderBots.findIndex((b) => b.getActivePosition()?.mint === mint);
-          const effectiveBotIndex = botIndex !== -1 ? botIndex : 0;
+          const effectiveBotIndex =
+            context === "insider" && botIndex !== -1 ? botIndex : 0;
           const client =
             context === "insider"
               ? gmgnClients[effectiveBotIndex]
               : gmgnClients[0];
 
           try {
+            const cached = activePositionCache.get(mint);
+            if (cached) {
+              tokenBalance = cached.balance;
+              currentPrice = cached.quote;
+              balanceIsZero = cached.balance <= 0n;
+            }
+
+            const balancePromise =
+              config.tradingWalletAddress && tokenBalance === null
+                ? getTokenRawBalance(
+                    new PublicKey(config.tradingWalletAddress),
+                    new PublicKey(mint),
+                  )
+                    .then((balance) => {
+                      tokenBalance = balance;
+                      balanceIsZero = balance <= 0n;
+                      return balance;
+                    })
+                    .catch((err) => {
+                      quoteError =
+                        err instanceof Error ? err.message : String(err);
+                      return null;
+                    })
+                : Promise.resolve(tokenBalance);
+
             const quotePromise = config.tradingWalletAddress
-              ? client
+              ? (currentPrice
+                  ? Promise.resolve(currentPrice)
+                  : client
                   .quoteTokenSellForSol(config.tradingWalletAddress, mint, 100)
                   .catch(async (err) => {
                     const message =
@@ -231,7 +260,7 @@ async function main(): Promise<void> {
                       quoteError = message;
                     }
                     return null;
-                  })
+                  }))
               : Promise.resolve(null);
 
             [currentMarketCapUsd, athMarketCapUsd, currentPrice] =
@@ -242,6 +271,15 @@ async function main(): Promise<void> {
                   : Promise.resolve(null),
                 quotePromise,
               ]);
+            await balancePromise;
+
+            if (config.tradingWalletAddress && tokenBalance !== null) {
+              activePositionCache.set(mint, {
+                balance: tokenBalance,
+                quote: currentPrice,
+                timestamp: Date.now(),
+              });
+            }
           } catch (err) {
             log.error(`Failed to refresh position data for ${mint}`, err);
             quoteError =
@@ -298,8 +336,13 @@ async function main(): Promise<void> {
           } else if (!config.tradingWalletAddress) {
             profitDisplay = "Profit/Loss: <b>N/A (No trading wallet)</b>";
           } else if (quoteError) {
-            profitDisplay = `Profit/Loss: <b>Quote failed</b> (${html(quoteError)})`;
+            profitDisplay = `Profit/Loss: <b>Quote unavailable</b> (${html(quoteError)})`;
           }
+
+          const tokenBalanceLine =
+            tokenBalance !== null
+              ? `Token Balance: <code>${html(tokenBalance.toString())}</code>`
+              : null;
 
           const refreshContextCode =
             context === "insider"
@@ -328,6 +371,7 @@ async function main(): Promise<void> {
                 ? `Exit MC: <b>$${exitMc.toLocaleString()}</b>`
                 : null,
             profitDisplay,
+            tokenBalanceLine,
             buySol > 0 ? `Cost Basis: <b>${buySol.toFixed(4)} SOL</b>` : null,
             "",
             `Last Updated: ${new Date().toISOString()}`,
@@ -798,6 +842,7 @@ async function main(): Promise<void> {
       telegramBot,
       makeClaimFn(0),
       () => undefined,
+      "Insider 1",
     ),
   );
   insiderBots.push(
@@ -812,6 +857,7 @@ async function main(): Promise<void> {
       telegramBot,
       makeClaimFn(1),
       () => undefined,
+      "Insider 2",
     ),
   );
 

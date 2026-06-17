@@ -117,6 +117,7 @@ export class InsiderBot extends EventEmitter {
   private readonly releaseMint: InsiderMintReleaseFn | null;
   private readonly rpcUrl: string;
   private readonly wsUrl: string;
+  private readonly label: string;
   
 
   private followedWallet: string | null = null;
@@ -184,6 +185,7 @@ export class InsiderBot extends EventEmitter {
     telegramBot: TelegramBot | null = null,
     claimMint: InsiderMintClaimFn | null = null,
     releaseMint: InsiderMintReleaseFn | null = null,
+    label: string = "Insider",
   ) {
     super();
     this.config = config;
@@ -196,6 +198,7 @@ export class InsiderBot extends EventEmitter {
     this.heliusClient = new HeliusClient(heliusApiKey);
     this.claimMint = claimMint;
     this.releaseMint = releaseMint;
+    this.label = label;
     this.buySol = config.insiderBuySol;
     this.entryMc = config.insiderEntryMc;
     this.exitMc = config.insiderExitMc;
@@ -544,7 +547,7 @@ export class InsiderBot extends EventEmitter {
 
     await this.telegramBot?.sendDefault(
       [
-        "<b>🔍 Insider Flow Started</b>",
+        `<b>🔍 ${this.label} Flow Started</b>`,
         `Token: <code>${mint}</code>`,
         `Lowest insider: <code>${lowest.wallet}</code>`,
         `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
@@ -980,7 +983,7 @@ export class InsiderBot extends EventEmitter {
 
     await this.telegramBot?.sendDefault(
       [
-        "<b>🔀 Insider Transfer Detected</b>",
+        `<b>🔀 ${this.label} Transfer Detected</b>`,
         `Token: <code>${mint}</code>`,
         `Now monitoring: <code>${newWallet}</code>`,
         `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
