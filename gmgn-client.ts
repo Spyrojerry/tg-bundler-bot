@@ -9,9 +9,18 @@
 
 import { createLogger } from './logger';
 import { RateLimiter } from './rate-limiter';
-import { Connection, Keypair, PublicKey, VersionedTransaction, ParsedAccountData } from '@solana/web3.js';
+import {
+  ComputeBudgetProgram,
+  Connection,
+  Keypair,
+  PublicKey,
+  TransactionMessage,
+  VersionedTransaction,
+  ParsedAccountData,
+} from '@solana/web3.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { PUMP_SDK, OnlinePumpSdk, getSellSolAmountFromTokenAmount } from '@pump-fun/pump-sdk';
 import {
   BundlerMetrics,
   FetchResult,
@@ -25,6 +34,7 @@ import {
 
 const execAsync = promisify(exec);
 const bs58 = require('bs58') as { decode(value: string): Buffer };
+const BN = require('bn.js');
 
 const log = createLogger('GMGN');
 
@@ -62,6 +72,7 @@ export class GmgnClient {
   private readonly limiter: RateLimiter;
   private readonly baselineMinTime: number;
   private readonly fetchMode: 'auto' | 'direct' | 'cli';
+  private readonly pumpSdk: OnlinePumpSdk;
   private readonly tradingKeypair: Keypair | null = null;
 
   constructor(config: ServiceConfig, limiter: RateLimiter, rpcUrlOverride?: string) {
@@ -71,6 +82,7 @@ export class GmgnClient {
     this.jupiterApiKey    = config.jupiterApiKey;
     this.jupiterPriceApiKey = config.jupiterPriceApiKey;
     this.connection       = new Connection(rpcUrlOverride || config.solanaRpcUrl, 'confirmed');
+    this.pumpSdk          = new OnlinePumpSdk(this.connection);
     this.limiter          = limiter;
     this.baselineMinTime  = config.rateLimitMinTime;
     this.fetchMode        = config.gmgnFetchMode;
@@ -670,6 +682,15 @@ async sellTokenForSol(
   if (balance === 0n) throw new Error(`No token balance found for ${mint}`);
 
   const amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
+  if (amountRaw <= 0n) throw new Error(`Sell amount is zero for ${mint}`);
+
+  try {
+    return await this.sellTokenForSolViaPump(walletAddress, mint, amountRaw, options);
+  } catch (err) {
+    log.warn(`Pump.fun sell path failed for ${mint}; falling back to Jupiter`, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   // 1. QUOTE (v1 standard aggregator)
   const slippageBps = this.toJupiterSlippageBps(options);
@@ -726,6 +747,103 @@ async sellTokenForSol(
     filledInputAmount: String(amountRaw),
     filledOutputAmount: String(quote.outAmount),
     raw: { quote, swapResp },
+  };
+}
+
+private async sellTokenForSolViaPump(
+  walletAddress: string,
+  mint: string,
+  amountRaw: bigint,
+  options: SellOptions
+): Promise<SellResult> {
+  if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
+
+  const user = new PublicKey(walletAddress);
+  const mintPk = new PublicKey(mint);
+  const amount = new BN(amountRaw.toString());
+
+  const [global, feeConfig, sellState, supplyResp] = await Promise.all([
+    this.pumpSdk.fetchGlobal(),
+    this.pumpSdk.fetchFeeConfig().catch(() => null),
+    this.pumpSdk.fetchSellState(mintPk, user),
+    this.connection.getTokenSupply(mintPk, 'confirmed'),
+  ]);
+
+  const mintSupply = new BN(supplyResp.value.amount);
+  const quotedSolAmount = getSellSolAmountFromTokenAmount({
+    global,
+    feeConfig,
+    mintSupply,
+    bondingCurve: sellState.bondingCurve,
+    amount,
+  });
+
+  if (quotedSolAmount.lte(new BN(0))) {
+    throw new Error('Pump.fun quote returned 0 SOL; token may be migrated or curve has no liquidity');
+  }
+
+  const slippage = this.toPumpSlippagePercent(options);
+  const instructions = await PUMP_SDK.sellInstructions({
+    global,
+    bondingCurveAccountInfo: sellState.bondingCurveAccountInfo,
+    bondingCurve: sellState.bondingCurve,
+    mint: mintPk,
+    user,
+    amount,
+    solAmount: quotedSolAmount,
+    slippage,
+    tokenProgram: new PublicKey(TOKEN_PROGRAM_ID),
+    mayhemMode: Boolean(sellState.bondingCurve.isMayhemMode),
+    cashback: Boolean(sellState.bondingCurve.isCashbackCoin),
+  });
+
+  const computeUnitLimit = 300_000;
+  const priorityFeeLamports = Math.floor(options.priorityFeeSol * 1e9);
+  if (priorityFeeLamports > 0) {
+    instructions.unshift(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
+      ComputeBudgetProgram.setComputeUnitPrice({
+        microLamports: Math.max(1, Math.floor((priorityFeeLamports * 1_000_000) / computeUnitLimit)),
+      }),
+    );
+  }
+
+  const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+  const tx = new VersionedTransaction(
+    new TransactionMessage({
+      payerKey: user,
+      recentBlockhash: latestBlockhash.blockhash,
+      instructions,
+    }).compileToV0Message(),
+  );
+  tx.sign([this.tradingKeypair]);
+
+  const signature = await this.connection.sendRawTransaction(Buffer.from(tx.serialize()), {
+    skipPreflight: true,
+    maxRetries: 3,
+  });
+
+  log.info(`Pump.fun sell transaction sent: ${signature}`, {
+    mint,
+    amount: amountRaw.toString(),
+    quotedSolLamports: quotedSolAmount.toString(),
+    slippage,
+  });
+
+  return {
+    orderId: null,
+    hash: signature,
+    status: 'confirmed',
+    inputToken: mint,
+    outputToken: SOL_MINT,
+    soldPercent: options.percent,
+    filledInputAmount: amountRaw.toString(),
+    filledOutputAmount: quotedSolAmount.toString(),
+    raw: {
+      route: 'pump.fun',
+      quotedSolLamports: quotedSolAmount.toString(),
+      slippage,
+    },
   };
 }
 
@@ -804,6 +922,12 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
     const bps = Math.round(options.slippage * 100);
     // Cap at 50% (5000 bps) for safety
     return Math.min(Math.max(bps, 0), 5000);
+  }
+
+  private toPumpSlippagePercent(options: SellOptions): number {
+    if (options.autoSlippage) return 30;
+    // Pump SDK expects percent-style slippage, same as SELL_SLIPPAGE.
+    return Math.min(Math.max(options.slippage, 0), 50);
   }
 
   // ── Utils ─────────────────────────────────────────────────────────────────

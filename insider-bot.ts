@@ -13,6 +13,8 @@ const POLL_MS = 2_000;
 const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const AXIOM_TRADER_SCAN_LIMIT = 50;
+const AXIOM_EXIT_VALID_WALLET_THRESHOLD = 10;
+const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 type FlowPhase = "pre_buy" | "holding";
@@ -94,6 +96,13 @@ interface BundlerWatchState {
 }
 
 type BundlerMatchType = "single_buy" | "multi_buy";
+
+interface EarlyInsiderBuy {
+  wallet: string;
+  tokenAmount: number;
+  signature: string;
+  buySol: number | null;
+}
 
 export class InsiderBot extends EventEmitter {
    private readonly config: ServiceConfig;
@@ -493,14 +502,17 @@ export class InsiderBot extends EventEmitter {
     this.clearBundlerAccumulation();
 
     const swaps = await this.heliusClient.getEarlyInsiderSwaps(mint, 4);
-    const lowest = this.findLowestInsiderWallet(swaps, mint);
+    const earlyInsiderBuys = this.extractEarlyInsiderBuys(swaps, mint);
+    this.assertEarlyInsidersMeetMinBuySol(mint, earlyInsiderBuys);
+
+    const lowest = this.findLowestInsiderWallet(earlyInsiderBuys);
     if (!lowest) {
       throw new Error(`Could not identify lowest insider wallet for ${mint}`);
     }
 
     this.monitoredWallet = lowest.wallet;
     this.initialInsiderWallets.clear();
-    for (const wallet of this.extractEarlyInsiderWallets(swaps, mint)) {
+    for (const wallet of this.extractEarlyInsiderWallets(earlyInsiderBuys)) {
       this.initialInsiderWallets.add(wallet);
     }
     const createTx = await this.heliusClient.getMintCreateTransaction(mint);
@@ -549,31 +561,90 @@ export class InsiderBot extends EventEmitter {
     await this.evaluateBuyGate(mint);
   }
 
-  private extractEarlyInsiderWallets(swaps: HeliusTransaction[], mint: string): string[] {
-    const wallets = new Set<string>();
+  private extractEarlyInsiderBuys(swaps: HeliusTransaction[], mint: string): EarlyInsiderBuy[] {
+    const buys: EarlyInsiderBuy[] = [];
     for (const tx of swaps) {
       if (tx.type !== "SWAP") continue;
       for (const transfer of tx.tokenTransfers ?? []) {
         if (transfer.mint !== mint) continue;
-        const wallet = transfer.toUserAccount;
-        if (wallet) wallets.add(wallet);
-      }
-    }
-    return [...wallets];
-  }
-
-  private findLowestInsiderWallet(swaps: HeliusTransaction[], mint: string) {
-    let lowest: { wallet: string; tokenAmount: number; signature: string } | null = null;
-    for (const tx of swaps) {
-      if (tx.type !== "SWAP") continue;
-      for (const transfer of tx.tokenTransfers ?? []) {
-        if (transfer.mint !== mint) continue;
-        const amount = transfer.tokenAmount ?? 0;
         const wallet = transfer.toUserAccount;
         if (!wallet) continue;
-        if (!lowest || amount < lowest.tokenAmount) {
-          lowest = { wallet, tokenAmount: amount, signature: tx.signature };
-        }
+        buys.push({
+          wallet,
+          tokenAmount: transfer.tokenAmount ?? 0,
+          signature: tx.signature,
+          buySol: this.estimateWalletSolSpent(tx, wallet),
+        });
+      }
+    }
+    return buys;
+  }
+
+  private extractEarlyInsiderWallets(buys: EarlyInsiderBuy[]): string[] {
+    return [...new Set(buys.map((buy) => buy.wallet))];
+  }
+
+  private assertEarlyInsidersMeetMinBuySol(mint: string, buys: EarlyInsiderBuy[]): void {
+    const minBuySol = this.config.minBuySol;
+    if (minBuySol <= 0) return;
+
+    const failing = buys.filter((buy) => buy.buySol === null || buy.buySol < minBuySol);
+    if (!failing.length) {
+      log.info("Early insider min-buy SOL check passed", {
+        mint,
+        minBuySol,
+        insiderBuys: buys.map((buy) => ({
+          wallet: buy.wallet,
+          buySol: buy.buySol,
+          tokenAmount: buy.tokenAmount,
+          signature: buy.signature,
+        })),
+      });
+      return;
+    }
+
+    log.warn("Early insider min-buy SOL check failed; resetting token flow", {
+      mint,
+      minBuySol,
+      failingInsiders: failing.map((buy) => ({
+        wallet: buy.wallet,
+        buySol: buy.buySol,
+        tokenAmount: buy.tokenAmount,
+        signature: buy.signature,
+      })),
+      insiderBuys: buys.map((buy) => ({
+        wallet: buy.wallet,
+        buySol: buy.buySol,
+        tokenAmount: buy.tokenAmount,
+        signature: buy.signature,
+      })),
+    });
+
+    throw new Error(
+      `Early insider buy SOL below MIN_BUY_SOL ${minBuySol} for ${mint}`,
+    );
+  }
+
+  private estimateWalletSolSpent(tx: HeliusTransaction, wallet: string): number | null {
+    let spentLamports = 0;
+    for (const transfer of tx.nativeTransfers ?? []) {
+      if (transfer.fromUserAccount === wallet) spentLamports += transfer.amount ?? 0;
+      if (transfer.toUserAccount === wallet) spentLamports -= transfer.amount ?? 0;
+    }
+
+    if (spentLamports <= 0) return null;
+    return parseFloat((spentLamports / 1_000_000_000).toFixed(6));
+  }
+
+  private findLowestInsiderWallet(buys: EarlyInsiderBuy[]) {
+    let lowest: { wallet: string; tokenAmount: number; signature: string } | null = null;
+    for (const buy of buys) {
+      if (!lowest || buy.tokenAmount < lowest.tokenAmount) {
+        lowest = {
+          wallet: buy.wallet,
+          tokenAmount: buy.tokenAmount,
+          signature: buy.signature,
+        };
       }
     }
     return lowest;
@@ -1166,7 +1237,14 @@ export class InsiderBot extends EventEmitter {
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
-      log.debug("No traders returned from GMGN [pre-buy axiom scan]", { mint });
+      log.info("Axiom/empty single-buy GMGN scan [pre_buy] — no traders returned", {
+        mint,
+        phase: "pre_buy",
+        orderBy: "buy_volume_cur",
+        tag: null,
+        buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
+        limit: AXIOM_TRADER_SCAN_LIMIT,
+      });
       return;
     }
 
@@ -1189,12 +1267,63 @@ export class InsiderBot extends EventEmitter {
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
-      log.debug("No traders returned from GMGN [post-buy axiom scan]", { mint });
+      log.info("Axiom/empty single-buy GMGN scan [post_buy] — no traders returned", {
+        mint,
+        phase: "post_buy",
+        orderBy: "buy_volume_cur",
+        tag: null,
+        buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
+        limit: AXIOM_TRADER_SCAN_LIMIT,
+      });
       return;
     }
 
     const stats = this.logAxiomSingleBuyTraderScan(mint, "post_buy", list);
     if (!stats || stats.validCount === 0) return;
+
+    const reachedSoldWalletThreshold =
+      stats.validCount > AXIOM_EXIT_VALID_WALLET_THRESHOLD &&
+      stats.soldAmongValid >= AXIOM_EXIT_SOLD_WALLET_THRESHOLD;
+    if (reachedSoldWalletThreshold) {
+      const walletLines = stats.matchingWallets
+        .filter((w) => w.sold)
+        .map(
+          (w, i) =>
+            `${i + 1}. <code>${w.address}</code> buy: <b>$${w.buyUsd.toFixed(2)}</b> tags: <b>${w.tags.length ? w.tags.join(", ") : "[]"}</b>`,
+        )
+        .join("\n");
+
+      log.warn(
+        "Axiom/empty single-buy sold-wallet threshold reached — triggering position sell",
+        {
+          mint,
+          validCount: stats.validCount,
+          soldAmongValid: stats.soldAmongValid,
+          soldPositionRatio: stats.soldPositionRatio,
+          validWalletThreshold: AXIOM_EXIT_VALID_WALLET_THRESHOLD,
+          soldWalletThreshold: AXIOM_EXIT_SOLD_WALLET_THRESHOLD,
+          soldWallets: stats.matchingWallets
+            .filter((w) => w.sold)
+            .map((w) => w.address),
+        },
+      );
+
+      await this.triggerPositionSell(
+        mint,
+        `${stats.soldAmongValid}/${stats.validCount} axiom/empty single-buy wallets sold all positions`,
+        [
+          "<b>🚨 Axiom Sold-Wallet Threshold</b>",
+          `Token: <code>${mint}</code>`,
+          `Sold all position: <b>${stats.soldAmongValid}</b> / <b>${stats.validCount}</b>`,
+          `Rule: valid wallets > <b>${AXIOM_EXIT_VALID_WALLET_THRESHOLD}</b> and sold wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b>.`,
+          "",
+          "<b>Sold wallets:</b>",
+          walletLines,
+        ],
+        "AXIOM_SINGLE_BUY_SOLD_THRESHOLD_TRIGGER",
+      );
+      return;
+    }
 
     const allSold =
       stats.soldAmongValid === stats.validCount && stats.validCount > 0;
