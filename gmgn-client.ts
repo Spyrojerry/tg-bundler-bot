@@ -754,10 +754,7 @@ async sellTokenForSol(
   const rawTx = Buffer.from(tx.serialize());
 
   // 4. SEND via RPC directly (no Ultra /execute needed)
-  const signature = await this.connection.sendRawTransaction(rawTx, {
-    skipPreflight: true,
-    maxRetries: 3,
-  });
+  const signature = await this.sendRawTransactionAndAssertSuccess(rawTx, mint);
 
   log.info(`Sell transaction sent: ${signature}`, { mint, amount: amountRaw.toString() });
 
@@ -829,10 +826,25 @@ private async sellTokenForSolViaPump(
         true,
         tokenProgram,
       );
+      const bondingCurveAddress = bondingCurvePda(mintPk);
+      const associatedBondingCurve = getAssociatedTokenAddressSync(
+        mintPk,
+        bondingCurveAddress,
+        true,
+        tokenProgram,
+      );
       const sourceTokenAccount = tokenAccounts.find(
         (account) => account.tokenProgram.equals(tokenProgram) && account.balance >= amountRaw,
       );
-      const setupInstructions: TransactionInstruction[] = [];
+      const setupInstructions: TransactionInstruction[] = [
+        createAssociatedTokenAccountIdempotentInstruction(
+          user,
+          associatedBondingCurve,
+          bondingCurveAddress,
+          mintPk,
+          tokenProgram,
+        ),
+      ];
 
       if (sourceTokenAccount && !sourceTokenAccount.account.equals(associatedUser)) {
         setupInstructions.push(
@@ -892,10 +904,10 @@ private async sellTokenForSolViaPump(
       );
       tx.sign([this.tradingKeypair]);
 
-      const signature = await this.connection.sendRawTransaction(Buffer.from(tx.serialize()), {
-        skipPreflight: true,
-        maxRetries: 3,
-      });
+      const signature = await this.sendRawTransactionAndAssertSuccess(
+        Buffer.from(tx.serialize()),
+        mint,
+      );
 
       log.info(`Pump.fun sell transaction sent: ${signature}`, {
         mint,
@@ -905,6 +917,7 @@ private async sellTokenForSolViaPump(
         tokenProgram: tokenProgram.toBase58(),
         sourceTokenAccount: sourceTokenAccount?.account.toBase58() ?? associatedUser.toBase58(),
         associatedUser: associatedUser.toBase58(),
+        associatedBondingCurve: associatedBondingCurve.toBase58(),
         setupInstructionCount: setupInstructions.length,
       });
 
@@ -924,6 +937,7 @@ private async sellTokenForSolViaPump(
           tokenProgram: tokenProgram.toBase58(),
           sourceTokenAccount: sourceTokenAccount?.account.toBase58() ?? associatedUser.toBase58(),
           associatedUser: associatedUser.toBase58(),
+          associatedBondingCurve: associatedBondingCurve.toBase58(),
           setupInstructionCount: setupInstructions.length,
         },
       };
@@ -958,6 +972,37 @@ private async sellTokenForSolViaPump(
       signedTransaction, 
       requestId 
     });
+  }
+
+  private async sendRawTransactionAndAssertSuccess(rawTx: Buffer, mint: string): Promise<string> {
+    const signature = await this.connection.sendRawTransaction(rawTx, {
+      skipPreflight: true,
+      maxRetries: 3,
+    });
+
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      const status = await this.connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: true,
+      });
+      const value = status.value[0];
+      if (value) {
+        if (value.err) {
+          throw new Error(
+            `Transaction ${signature} failed on-chain for ${mint}: ${JSON.stringify(value.err)}`,
+          );
+        }
+        if (
+          value.confirmationStatus === 'confirmed' ||
+          value.confirmationStatus === 'finalized'
+        ) {
+          return signature;
+        }
+      }
+      await sleep(500);
+    }
+
+    throw new Error(`Transaction ${signature} was not confirmed for ${mint} before timeout`);
   }
 
   // REPLACE lines 725-745 with:

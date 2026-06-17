@@ -449,7 +449,6 @@ export class InsiderBot extends EventEmitter {
     this.boughtMints.add(trigger.mint);
     this.phase = "holding";
     this.axiomTraderWatchActive = true;
-    this.clearAxiomWatchedWallets();
 
     const wallets = this.matchedBundlers.map((b) => b.address);
     if (wallets.length >= REQUIRED_BUNDLER_MATCHES) {
@@ -1259,6 +1258,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     wallets: Array<{ address: string; buyUsd: number; tags: string[] }>,
   ): void {
+    let added = 0;
     for (const wallet of wallets) {
       if (this.axiomWatchedWallets.has(wallet.address)) continue;
       this.axiomWatchedWallets.set(wallet.address, {
@@ -1269,7 +1269,13 @@ export class InsiderBot extends EventEmitter {
           true,
         ),
       });
+      added += 1;
     }
+    log.info("Axiom cumulative watched wallets updated", {
+      mint,
+      addedFromScan: added,
+      cumulativeValidWallets: this.axiomWatchedWallets.size,
+    });
   }
 
   private async checkAxiomWatchedWalletAtaExits(mint: string): Promise<boolean> {
@@ -1385,7 +1391,10 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    this.logAxiomSingleBuyTraderScan(mint, "pre_buy", list);
+    const stats = this.logAxiomSingleBuyTraderScan(mint, "pre_buy", list);
+    if (stats && stats.validCount > 0) {
+      this.rememberAxiomWatchedWallets(mint, stats.matchingWallets);
+    }
   }
 
   private async scanAxiomSingleBuyTradersPostBuy(mint: string): Promise<void> {

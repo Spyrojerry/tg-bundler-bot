@@ -224,7 +224,6 @@ async function main(): Promise<void> {
             const cached = activePositionCache.get(mint);
             if (cached) {
               tokenBalance = cached.balance;
-              currentPrice = cached.quote;
               balanceIsZero = cached.balance <= 0n;
             }
 
@@ -247,9 +246,7 @@ async function main(): Promise<void> {
                 : Promise.resolve(tokenBalance);
 
             const quotePromise = config.tradingWalletAddress
-              ? (currentPrice
-                  ? Promise.resolve(currentPrice)
-                  : client
+              ? client
                   .quoteTokenSellForSol(config.tradingWalletAddress, mint, 100)
                   .catch(async (err) => {
                     const message =
@@ -260,7 +257,7 @@ async function main(): Promise<void> {
                       quoteError = message;
                     }
                     return null;
-                  }))
+                  })
               : Promise.resolve(null);
 
             [currentMarketCapUsd, athMarketCapUsd, currentPrice] =
@@ -328,15 +325,15 @@ async function main(): Promise<void> {
               ? (profitSol / buySol) * 100
               : null;
 
-          let profitDisplay = "Profit/Loss: <b>Calculating...</b>";
+          let profitDisplay = "Quoted P/L: <b>Calculating...</b>";
           if (profitSol !== null) {
-            profitDisplay = `Profit/Loss: <b>${profitSol.toFixed(4)} SOL</b> (${profitPct?.toFixed(2)}%)`;
+            profitDisplay = `Quoted P/L: <b>${profitSol.toFixed(4)} SOL</b> (${profitPct?.toFixed(2)}%)`;
           } else if (balanceIsZero) {
-            profitDisplay = "Profit/Loss: <b>Position Closed (0 balance)</b>";
+            profitDisplay = "Quoted P/L: <b>Position Closed (0 balance)</b>";
           } else if (!config.tradingWalletAddress) {
-            profitDisplay = "Profit/Loss: <b>N/A (No trading wallet)</b>";
+            profitDisplay = "Quoted P/L: <b>N/A (No trading wallet)</b>";
           } else if (quoteError) {
-            profitDisplay = `Profit/Loss: <b>Quote unavailable</b> (${html(quoteError)})`;
+            profitDisplay = `Quoted P/L: <b>Quote unavailable</b> (${html(quoteError)})`;
           }
 
           const tokenBalanceLine =
@@ -2667,10 +2664,26 @@ async function main(): Promise<void> {
           );
           lastError = null;
 
-          // If Jupiter returns success, we still verify balance quickly
           if (lastResult.status === "confirmed") {
-            sold = true;
-            break;
+            await sleep(750);
+            const remainingBalance = await getTokenRawBalance(
+              owner,
+              mintPk,
+            ).catch(() => null);
+            if (remainingBalance !== null && remainingBalance <= 0n) {
+              sold = true;
+              break;
+            }
+            lastError = new Error(
+              `Sell transaction confirmed but token balance remains ${remainingBalance ?? "unknown"}`,
+            );
+            log.warn(
+              `Sell transaction confirmed but balance not cleared for ${currentPending.event.mint}`,
+              {
+                hash: lastResult.hash,
+                remainingBalance: remainingBalance?.toString() ?? "unknown",
+              },
+            );
           }
         } catch (err) {
           lastError = err;
