@@ -1247,6 +1247,7 @@ export class InsiderBot extends EventEmitter {
         tag: null,
         buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
         limit: AXIOM_TRADER_SCAN_LIMIT,
+        responseShape: this.describeTraderResponseShape(traders),
       });
       return;
     }
@@ -1277,6 +1278,7 @@ export class InsiderBot extends EventEmitter {
         tag: null,
         buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
         limit: AXIOM_TRADER_SCAN_LIMIT,
+        responseShape: this.describeTraderResponseShape(traders),
       });
       return;
     }
@@ -1513,15 +1515,43 @@ export class InsiderBot extends EventEmitter {
 
   private extractTraderList(traders: Record<string, unknown> | null): Array<Record<string, unknown>> {
     if (!traders) return [];
+    if (Array.isArray(traders)) return traders as Array<Record<string, unknown>>;
     let list = traders.list;
     if (!Array.isArray(list)) {
       list =
         traders.traders ||
         (traders.data as { list?: unknown })?.list ||
         (traders.data as { traders?: unknown })?.traders ||
+        (traders.data as { items?: unknown })?.items ||
         traders.items;
     }
+    if (!Array.isArray(list) && Array.isArray(traders.data)) {
+      list = traders.data;
+    }
     return Array.isArray(list) ? list : [];
+  }
+
+  private describeTraderResponseShape(traders: Record<string, unknown> | null): Record<string, unknown> {
+    if (!traders) return { type: "null" };
+    if (Array.isArray(traders)) return { type: "array", length: traders.length };
+
+    const data = traders.data;
+    const dataRecord =
+      data && typeof data === "object" && !Array.isArray(data)
+        ? (data as Record<string, unknown>)
+        : {};
+
+    return {
+      type: "object",
+      keys: Object.keys(traders).slice(0, 12),
+      source: traders.source ?? null,
+      listLength: Array.isArray(traders.list) ? traders.list.length : null,
+      tradersLength: Array.isArray(traders.traders) ? traders.traders.length : null,
+      itemsLength: Array.isArray(traders.items) ? traders.items.length : null,
+      dataIsArray: Array.isArray(data),
+      dataLength: Array.isArray(data) ? data.length : null,
+      dataKeys: Object.keys(dataRecord).slice(0, 12),
+    };
   }
 
   private parseBuyVolumeUsd(entry: Record<string, unknown>): number | null {

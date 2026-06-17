@@ -14,13 +14,19 @@ import {
   Connection,
   Keypair,
   PublicKey,
+  TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
   ParsedAccountData,
 } from '@solana/web3.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { PUMP_SDK, OnlinePumpSdk, getSellSolAmountFromTokenAmount } from '@pump-fun/pump-sdk';
+import { PUMP_SDK, OnlinePumpSdk, bondingCurvePda, getSellSolAmountFromTokenAmount } from '@pump-fun/pump-sdk';
+import {
+  createAssociatedTokenAccountIdempotentInstruction,
+  createTransferInstruction,
+  getAssociatedTokenAddressSync,
+} from '@solana/spl-token';
 import {
   BundlerMetrics,
   FetchResult,
@@ -348,8 +354,14 @@ export class GmgnClient {
           limit,
           orderBy: 'buy_volume_cur',
         });
-        if (data) return data;
-        log.debug(`GMGN CLI buy-volume traders returned no data for ${mint}, falling back to API`);
+        if (data && this.hasTraderEntries(data)) return data;
+        if (data) {
+          log.info(`GMGN CLI buy-volume traders returned no trader rows for ${mint}, falling back to API`, {
+            shape: this.describeResponseShape(data),
+          });
+        } else {
+          log.debug(`GMGN CLI buy-volume traders returned no data for ${mint}, falling back to API`);
+        }
       }
 
       const endpoint =
@@ -375,8 +387,14 @@ export class GmgnClient {
           orderBy: 'buy_volume_cur',
           tag: 'bundler',
         });
-        if (data) return data;
-        log.debug(`GMGN CLI bundler traders returned no data for ${mint}, falling back to API`);
+        if (data && this.hasTraderEntries(data)) return data;
+        if (data) {
+          log.info(`GMGN CLI bundler traders returned no trader rows for ${mint}, falling back to API`, {
+            shape: this.describeResponseShape(data),
+          });
+        } else {
+          log.debug(`GMGN CLI bundler traders returned no data for ${mint}, falling back to API`);
+        }
       }
 
       const endpoint =
@@ -401,8 +419,14 @@ export class GmgnClient {
       if (this.fetchMode !== 'direct') {
         // CLI calls are local and shouldn't be bottlenecked by API rate limits
         const data = await this.fetchCliData('traders', mint, { limit, orderBy, tag });
-        if (data) return data;
-        log.debug(`GMGN CLI traders returned no data for ${mint}, falling back to API`);
+        if (data && this.hasTraderEntries(data)) return data;
+        if (data) {
+          log.info(`GMGN CLI traders returned no trader rows for ${mint}, falling back to API`, {
+            shape: this.describeResponseShape(data),
+          });
+        } else {
+          log.debug(`GMGN CLI traders returned no data for ${mint}, falling back to API`);
+        }
       }
       
       const endpoint = `v1/token/traders/sol/${mint}?limit=${limit}&tag=${tag}&orderby=${orderBy}&direction=desc`;
@@ -761,90 +785,157 @@ private async sellTokenForSolViaPump(
   const user = new PublicKey(walletAddress);
   const mintPk = new PublicKey(mint);
   const amount = new BN(amountRaw.toString());
+  const tokenAccounts = await this.getTokenAccountsWithBalance(user, mintPk);
+  const tokenPrograms = tokenAccounts.length > 0
+    ? [...new Map(tokenAccounts.map((account) => [account.tokenProgram.toBase58(), account.tokenProgram])).values()]
+    : TOKEN_PROGRAM_IDS;
 
-  const [global, feeConfig, sellState, supplyResp] = await Promise.all([
+  const [global, feeConfig, supplyResp] = await Promise.all([
     this.pumpSdk.fetchGlobal(),
     this.pumpSdk.fetchFeeConfig().catch(() => null),
-    this.pumpSdk.fetchSellState(mintPk, user),
     this.connection.getTokenSupply(mintPk, 'confirmed'),
   ]);
 
   const mintSupply = new BN(supplyResp.value.amount);
-  const quotedSolAmount = getSellSolAmountFromTokenAmount({
-    global,
-    feeConfig,
-    mintSupply,
-    bondingCurve: sellState.bondingCurve,
-    amount,
-  });
+  let lastError: unknown = null;
 
-  if (quotedSolAmount.lte(new BN(0))) {
-    throw new Error('Pump.fun quote returned 0 SOL; token may be migrated or curve has no liquidity');
+  for (const tokenProgram of tokenPrograms) {
+    try {
+      const bondingCurveAccountInfo = await this.connection.getAccountInfo(
+        bondingCurvePda(mintPk),
+        'confirmed',
+      );
+      if (!bondingCurveAccountInfo) {
+        throw new Error(`Bonding curve account not found for mint: ${mint}`);
+      }
+
+      const bondingCurve = PUMP_SDK.decodeBondingCurve(bondingCurveAccountInfo);
+      const quotedSolAmount = getSellSolAmountFromTokenAmount({
+        global,
+        feeConfig,
+        mintSupply,
+        bondingCurve,
+        amount,
+      });
+
+      if (quotedSolAmount.lte(new BN(0))) {
+        throw new Error('Pump.fun quote returned 0 SOL; token may be migrated or curve has no liquidity');
+      }
+
+      const slippage = this.toPumpSlippagePercent(options);
+      const associatedUser = getAssociatedTokenAddressSync(
+        mintPk,
+        user,
+        true,
+        tokenProgram,
+      );
+      const sourceTokenAccount = tokenAccounts.find(
+        (account) => account.tokenProgram.equals(tokenProgram) && account.balance >= amountRaw,
+      );
+      const setupInstructions: TransactionInstruction[] = [];
+
+      if (sourceTokenAccount && !sourceTokenAccount.account.equals(associatedUser)) {
+        setupInstructions.push(
+          createAssociatedTokenAccountIdempotentInstruction(
+            user,
+            associatedUser,
+            user,
+            mintPk,
+            tokenProgram,
+          ),
+          createTransferInstruction(
+            sourceTokenAccount.account,
+            associatedUser,
+            user,
+            amountRaw,
+            [],
+            tokenProgram,
+          ),
+        );
+      }
+
+      const instructions = [
+        ...setupInstructions,
+        ...(await PUMP_SDK.sellInstructions({
+          global,
+          bondingCurveAccountInfo,
+          bondingCurve,
+          mint: mintPk,
+          user,
+          amount,
+          solAmount: quotedSolAmount,
+          slippage,
+          tokenProgram,
+          mayhemMode: Boolean(bondingCurve.isMayhemMode),
+          cashback: Boolean(bondingCurve.isCashbackCoin),
+        })),
+      ];
+
+      const computeUnitLimit = 300_000;
+      const priorityFeeLamports = Math.floor(options.priorityFeeSol * 1e9);
+      if (priorityFeeLamports > 0) {
+        instructions.unshift(
+          ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
+          ComputeBudgetProgram.setComputeUnitPrice({
+            microLamports: Math.max(1, Math.floor((priorityFeeLamports * 1_000_000) / computeUnitLimit)),
+          }),
+        );
+      }
+
+      const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+      const tx = new VersionedTransaction(
+        new TransactionMessage({
+          payerKey: user,
+          recentBlockhash: latestBlockhash.blockhash,
+          instructions,
+        }).compileToV0Message(),
+      );
+      tx.sign([this.tradingKeypair]);
+
+      const signature = await this.connection.sendRawTransaction(Buffer.from(tx.serialize()), {
+        skipPreflight: true,
+        maxRetries: 3,
+      });
+
+      log.info(`Pump.fun sell transaction sent: ${signature}`, {
+        mint,
+        amount: amountRaw.toString(),
+        quotedSolLamports: quotedSolAmount.toString(),
+        slippage,
+        tokenProgram: tokenProgram.toBase58(),
+        sourceTokenAccount: sourceTokenAccount?.account.toBase58() ?? associatedUser.toBase58(),
+        associatedUser: associatedUser.toBase58(),
+        setupInstructionCount: setupInstructions.length,
+      });
+
+      return {
+        orderId: null,
+        hash: signature,
+        status: 'confirmed',
+        inputToken: mint,
+        outputToken: SOL_MINT,
+        soldPercent: options.percent,
+        filledInputAmount: amountRaw.toString(),
+        filledOutputAmount: quotedSolAmount.toString(),
+        raw: {
+          route: 'pump.fun',
+          quotedSolLamports: quotedSolAmount.toString(),
+          slippage,
+          tokenProgram: tokenProgram.toBase58(),
+          sourceTokenAccount: sourceTokenAccount?.account.toBase58() ?? associatedUser.toBase58(),
+          associatedUser: associatedUser.toBase58(),
+          setupInstructionCount: setupInstructions.length,
+        },
+      };
+    } catch (err) {
+      lastError = err;
+      log.warn(`Pump.fun sell attempt failed with token program ${tokenProgram.toBase58()} for ${mint}`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
-  const slippage = this.toPumpSlippagePercent(options);
-  const instructions = await PUMP_SDK.sellInstructions({
-    global,
-    bondingCurveAccountInfo: sellState.bondingCurveAccountInfo,
-    bondingCurve: sellState.bondingCurve,
-    mint: mintPk,
-    user,
-    amount,
-    solAmount: quotedSolAmount,
-    slippage,
-    tokenProgram: new PublicKey(TOKEN_PROGRAM_ID),
-    mayhemMode: Boolean(sellState.bondingCurve.isMayhemMode),
-    cashback: Boolean(sellState.bondingCurve.isCashbackCoin),
-  });
-
-  const computeUnitLimit = 300_000;
-  const priorityFeeLamports = Math.floor(options.priorityFeeSol * 1e9);
-  if (priorityFeeLamports > 0) {
-    instructions.unshift(
-      ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
-      ComputeBudgetProgram.setComputeUnitPrice({
-        microLamports: Math.max(1, Math.floor((priorityFeeLamports * 1_000_000) / computeUnitLimit)),
-      }),
-    );
-  }
-
-  const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
-  const tx = new VersionedTransaction(
-    new TransactionMessage({
-      payerKey: user,
-      recentBlockhash: latestBlockhash.blockhash,
-      instructions,
-    }).compileToV0Message(),
-  );
-  tx.sign([this.tradingKeypair]);
-
-  const signature = await this.connection.sendRawTransaction(Buffer.from(tx.serialize()), {
-    skipPreflight: true,
-    maxRetries: 3,
-  });
-
-  log.info(`Pump.fun sell transaction sent: ${signature}`, {
-    mint,
-    amount: amountRaw.toString(),
-    quotedSolLamports: quotedSolAmount.toString(),
-    slippage,
-  });
-
-  return {
-    orderId: null,
-    hash: signature,
-    status: 'confirmed',
-    inputToken: mint,
-    outputToken: SOL_MINT,
-    soldPercent: options.percent,
-    filledInputAmount: amountRaw.toString(),
-    filledOutputAmount: quotedSolAmount.toString(),
-    raw: {
-      route: 'pump.fun',
-      quotedSolLamports: quotedSolAmount.toString(),
-      slippage,
-    },
-  };
+  throw lastError ?? new Error(`Pump.fun sell failed for ${mint}`);
 }
 
   // ── Jupiter Helpers ───────────────────────────────────────────────────────
@@ -966,6 +1057,51 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
     return total;
   }
 
+  private async getTokenProgramsWithBalance(owner: PublicKey, mint: PublicKey): Promise<PublicKey[]> {
+    const programs: PublicKey[] = [];
+    for (const programId of TOKEN_PROGRAM_IDS) {
+      const { value } = await this.connection.getParsedTokenAccountsByOwner(
+        owner,
+        { programId, mint },
+      );
+      const hasBalance = value.some(({ account }) => {
+        const parsed = account.data as ParsedAccountData;
+        const amount = parsed?.parsed?.info?.tokenAmount?.amount;
+        return typeof amount === 'string' && /^\d+$/.test(amount) && BigInt(amount) > 0n;
+      });
+      if (hasBalance) programs.push(programId);
+    }
+    return programs;
+  }
+
+  private async getTokenAccountsWithBalance(
+    owner: PublicKey,
+    mint: PublicKey,
+  ): Promise<Array<{ tokenProgram: PublicKey; account: PublicKey; balance: bigint }>> {
+    const tokenAccounts: Array<{ tokenProgram: PublicKey; account: PublicKey; balance: bigint }> = [];
+    for (const programId of TOKEN_PROGRAM_IDS) {
+      const { value } = await this.connection.getParsedTokenAccountsByOwner(
+        owner,
+        { programId, mint },
+      );
+      for (const entry of value) {
+        const parsed = entry.account.data as ParsedAccountData;
+        const amount = parsed?.parsed?.info?.tokenAmount?.amount;
+        if (typeof amount === 'string' && /^\d+$/.test(amount)) {
+          const balance = BigInt(amount);
+          if (balance > 0n) {
+            tokenAccounts.push({
+              tokenProgram: programId,
+              account: entry.pubkey,
+              balance,
+            });
+          }
+        }
+      }
+    }
+    return tokenAccounts;
+  }
+
   private validateSolAddress(value: string, label: string): void {
     if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) {
       throw new Error(`Invalid ${label}: ${value}`);
@@ -974,6 +1110,51 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
 
   private unwrapResponseData(json: any): Record<string, unknown> {
     return (json.data ?? json) as Record<string, unknown>;
+  }
+
+  private hasTraderEntries(data: unknown): boolean {
+    return this.extractTraderEntries(data).length > 0;
+  }
+
+  private extractTraderEntries(data: unknown): unknown[] {
+    if (Array.isArray(data)) return data;
+    if (!data || typeof data !== 'object') return [];
+
+    const record = data as Record<string, unknown>;
+    const candidates = [
+      record.list,
+      record.traders,
+      record.items,
+      this.asRecord(record.data).list,
+      this.asRecord(record.data).traders,
+      this.asRecord(record.data).items,
+    ];
+
+    const nestedData = record.data;
+    if (Array.isArray(nestedData)) candidates.push(nestedData);
+
+    for (const candidate of candidates) {
+      if (Array.isArray(candidate)) return candidate;
+    }
+    return [];
+  }
+
+  private describeResponseShape(data: unknown): Record<string, unknown> {
+    if (Array.isArray(data)) return { type: 'array', length: data.length };
+    if (!data || typeof data !== 'object') return { type: typeof data };
+
+    const record = data as Record<string, unknown>;
+    const dataRecord = this.asRecord(record.data);
+    return {
+      type: 'object',
+      keys: Object.keys(record).slice(0, 12),
+      listLength: Array.isArray(record.list) ? record.list.length : null,
+      tradersLength: Array.isArray(record.traders) ? record.traders.length : null,
+      itemsLength: Array.isArray(record.items) ? record.items.length : null,
+      dataKeys: Object.keys(dataRecord).slice(0, 12),
+      dataIsArray: Array.isArray(record.data),
+      dataLength: Array.isArray(record.data) ? record.data.length : null,
+    };
   }
 
   private getRetryDelayMs(resp: Response): number | undefined {
