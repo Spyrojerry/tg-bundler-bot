@@ -781,7 +781,6 @@ private async sellTokenForSolViaPump(
 
   const user = new PublicKey(walletAddress);
   const mintPk = new PublicKey(mint);
-  const amount = new BN(amountRaw.toString());
   const tokenAccounts = await this.getTokenAccountsWithBalance(user, mintPk);
   const tokenPrograms = tokenAccounts.length > 0
     ? [...new Map(tokenAccounts.map((account) => [account.tokenProgram.toBase58(), account.tokenProgram])).values()]
@@ -798,6 +797,17 @@ private async sellTokenForSolViaPump(
 
   for (const tokenProgram of tokenPrograms) {
     try {
+      const programBalance = tokenAccounts
+        .filter((account) => account.tokenProgram.equals(tokenProgram))
+        .reduce((sum, account) => sum + account.balance, 0n);
+      const amountRawForProgram = programBalance > 0n
+        ? (programBalance * BigInt(Math.round(options.percent))) / 100n
+        : amountRaw;
+      if (amountRawForProgram <= 0n) {
+        throw new Error(`No token balance found for token program ${tokenProgram.toBase58()}`);
+      }
+      const amount = new BN(amountRawForProgram.toString());
+
       const bondingCurveAccountInfo = await this.connection.getAccountInfo(
         bondingCurvePda(mintPk),
         'confirmed',
@@ -834,7 +844,7 @@ private async sellTokenForSolViaPump(
         tokenProgram,
       );
       const sourceTokenAccount = tokenAccounts.find(
-        (account) => account.tokenProgram.equals(tokenProgram) && account.balance >= amountRaw,
+        (account) => account.tokenProgram.equals(tokenProgram) && account.balance >= amountRawForProgram,
       );
       const setupInstructions: TransactionInstruction[] = [
         createAssociatedTokenAccountIdempotentInstruction(
@@ -859,7 +869,7 @@ private async sellTokenForSolViaPump(
             sourceTokenAccount.account,
             associatedUser,
             user,
-            amountRaw,
+            amountRawForProgram,
             [],
             tokenProgram,
           ),
@@ -911,7 +921,8 @@ private async sellTokenForSolViaPump(
 
       log.info(`Pump.fun sell transaction sent: ${signature}`, {
         mint,
-        amount: amountRaw.toString(),
+        amount: amountRawForProgram.toString(),
+        walletTotalRequestedAmount: amountRaw.toString(),
         quotedSolLamports: quotedSolAmount.toString(),
         slippage,
         tokenProgram: tokenProgram.toBase58(),
@@ -928,10 +939,11 @@ private async sellTokenForSolViaPump(
         inputToken: mint,
         outputToken: SOL_MINT,
         soldPercent: options.percent,
-        filledInputAmount: amountRaw.toString(),
+        filledInputAmount: amountRawForProgram.toString(),
         filledOutputAmount: quotedSolAmount.toString(),
         raw: {
           route: 'pump.fun',
+          walletTotalRequestedAmount: amountRaw.toString(),
           quotedSolLamports: quotedSolAmount.toString(),
           slippage,
           tokenProgram: tokenProgram.toBase58(),
@@ -980,7 +992,7 @@ private async sellTokenForSolViaPump(
       maxRetries: 3,
     });
 
-    const deadline = Date.now() + 20_000;
+    const deadline = Date.now() + 45_000;
     while (Date.now() < deadline) {
       const status = await this.connection.getSignatureStatuses([signature], {
         searchTransactionHistory: true,

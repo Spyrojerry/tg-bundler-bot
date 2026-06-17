@@ -1311,8 +1311,9 @@ export class InsiderBot extends EventEmitter {
       }
     }
 
-    log.info("Axiom watched-wallet ATA poll", {
+    log.info(`Axiom watched-wallet ATA poll — ${soldWallets.length}/${watched.length} sold/no ATA`, {
       mint,
+      soldPositionRatio: `${soldWallets.length}/${watched.length}`,
       watchedCount: watched.length,
       soldAllCount: soldWallets.length,
       holdingCount: holdingWallets.length,
