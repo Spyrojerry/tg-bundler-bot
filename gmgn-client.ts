@@ -59,6 +59,8 @@ const TOKEN_PROGRAM_IDS = [
   new PublicKey(TOKEN_PROGRAM_ID),
   new PublicKey(TOKEN_2022_PROGRAM_ID),
 ];
+const PUMP_PORTAL_LOCAL_URL = 'https://pumpportal.fun/api/trade-local';
+const PUMP_PORTAL_POOLS = ['pump', 'auto'] as const;
 
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 
@@ -709,6 +711,14 @@ async sellTokenForSol(
   if (amountRaw <= 0n) throw new Error(`Sell amount is zero for ${mint}`);
 
   try {
+    return await this.sellTokenForSolViaPumpPortalLocal(walletAddress, mint, amountRaw, options);
+  } catch (err) {
+    log.warn(`PumpPortal local sell path failed for ${mint}; falling back to Pump.fun SDK`, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  try {
     return await this.sellTokenForSolViaPump(walletAddress, mint, amountRaw, options);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -776,6 +786,110 @@ async sellTokenForSol(
     filledOutputAmount: String(quote.outAmount),
     raw: { quote, swapResp },
   };
+}
+
+private async sellTokenForSolViaPumpPortalLocal(
+  walletAddress: string,
+  mint: string,
+  amountRaw: bigint,
+  options: SellOptions
+): Promise<SellResult> {
+  if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
+
+  const signerPublicKey = this.tradingKeypair.publicKey.toBase58();
+  if (walletAddress !== signerPublicKey) {
+    log.warn('Sell wallet differs from trading keypair; using trading keypair for PumpPortal local sell', {
+      requestedWallet: walletAddress,
+      signerPublicKey,
+      mint,
+    });
+  }
+
+  const sellPercent = Math.min(Math.max(options.percent, 0), 100);
+  const amount =
+    sellPercent >= 99.999
+      ? '100%'
+      : `${sellPercent.toFixed(4).replace(/\.?0+$/, '')}%`;
+  const slippage = this.toPumpSlippagePercent(options);
+  let lastError: unknown = null;
+
+  for (const pool of PUMP_PORTAL_POOLS) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+      let resp: Response;
+      try {
+        resp = await fetch(PUMP_PORTAL_LOCAL_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            publicKey: signerPublicKey,
+            action: 'sell',
+            mint,
+            amount,
+            denominatedInSol: 'false',
+            slippage,
+            priorityFee: options.priorityFeeSol,
+            pool,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        throw new Error(`PumpPortal error: ${resp.status}${text ? ` ${text}` : ''}`);
+      }
+
+      const tx = VersionedTransaction.deserialize(
+        Buffer.from(await resp.arrayBuffer()),
+      );
+      tx.sign([this.tradingKeypair]);
+
+      const signature = await this.sendRawTransactionAndAssertSuccess(
+        Buffer.from(tx.serialize()),
+        mint,
+        { maxRetries: 0 },
+      );
+
+      log.info(`PumpPortal local sell transaction sent: ${signature}`, {
+        mint,
+        amount,
+        walletTotalRequestedAmount: amountRaw.toString(),
+        slippage,
+        priorityFeeSol: options.priorityFeeSol,
+        pool,
+      });
+
+      return {
+        orderId: null,
+        hash: signature,
+        status: 'confirmed',
+        inputToken: mint,
+        outputToken: SOL_MINT,
+        soldPercent: options.percent,
+        filledInputAmount: amountRaw.toString(),
+        filledOutputAmount: '0',
+        raw: {
+          route: 'pumpportal-local',
+          amount,
+          walletTotalRequestedAmount: amountRaw.toString(),
+          slippage,
+          priorityFeeSol: options.priorityFeeSol,
+          pool,
+        },
+      };
+    } catch (err) {
+      lastError = err;
+      log.warn(`PumpPortal local sell attempt failed with pool ${pool} for ${mint}`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  throw lastError ?? new Error(`PumpPortal local sell failed for ${mint}`);
 }
 
 private async sellTokenForSolViaPump(
@@ -1000,13 +1114,17 @@ private isPumpOnlySellFailure(message: string): boolean {
     });
   }
 
-  private async sendRawTransactionAndAssertSuccess(rawTx: Buffer, mint: string): Promise<string> {
+  private async sendRawTransactionAndAssertSuccess(
+    rawTx: Buffer,
+    mint: string,
+    options: { maxRetries?: number; timeoutMs?: number } = {},
+  ): Promise<string> {
     const signature = await this.connection.sendRawTransaction(rawTx, {
       skipPreflight: true,
-      maxRetries: 3,
+      maxRetries: options.maxRetries ?? 3,
     });
 
-    const deadline = Date.now() + 12_000;
+    const deadline = Date.now() + (options.timeoutMs ?? 12_000);
     while (Date.now() < deadline) {
       const status = await this.connection.getSignatureStatuses([signature], {
         searchTransactionHistory: true,
