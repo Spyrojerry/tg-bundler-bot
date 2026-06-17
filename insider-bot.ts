@@ -1,5 +1,6 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import { EventEmitter } from "events";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { createLogger } from "./logger";
 import { HeliusClient, HeliusTransaction } from "./helius-client";
 import { GmgnClient } from "./gmgn-client";
@@ -104,6 +105,13 @@ interface EarlyInsiderBuy {
   buySol: number | null;
 }
 
+interface AxiomWatchedWallet {
+  address: string;
+  buyUsd: number;
+  tags: string[];
+  ata: PublicKey;
+}
+
 export class InsiderBot extends EventEmitter {
    private readonly config: ServiceConfig;
   private readonly connection: Connection;
@@ -148,6 +156,7 @@ export class InsiderBot extends EventEmitter {
   /** Token dev wallet (CREATE tx fee payer) — fixed at flow start for trader-scan exclusions. */
   private devWallet: string | null = null;
   private axiomTraderWatchActive = false;
+  private axiomWatchedWallets = new Map<string, AxiomWatchedWallet>();
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private insiderSellsReady = false;
@@ -410,6 +419,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderState = null;
     this.bundlerWatch = null;
     this.clearBundlerAccumulation();
+    this.clearAxiomWatchedWallets();
   }
 
   pause(): void {
@@ -432,6 +442,7 @@ export class InsiderBot extends EventEmitter {
     this.boughtMints.add(trigger.mint);
     this.phase = "holding";
     this.axiomTraderWatchActive = true;
+    this.clearAxiomWatchedWallets();
 
     const wallets = this.matchedBundlers.map((b) => b.address);
     if (wallets.length >= REQUIRED_BUNDLER_MATCHES) {
@@ -503,6 +514,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
     this.clearBundlerAccumulation();
+    this.clearAxiomWatchedWallets();
 
     const swaps = await this.heliusClient.getEarlyInsiderSwaps(mint, 4);
     const earlyInsiderBuys = this.extractEarlyInsiderBuys(swaps, mint);
@@ -843,6 +855,7 @@ export class InsiderBot extends EventEmitter {
     await this.stopInsiderMonitoring();
     await this.stopBundlerMonitoring();
     this.axiomTraderWatchActive = false;
+    this.clearAxiomWatchedWallets();
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
@@ -1004,6 +1017,10 @@ export class InsiderBot extends EventEmitter {
     this.accumulatedMultiBuyBundlers = [];
     this.matchedBundlers = [];
     this.bundlerMatchType = null;
+  }
+
+  private clearAxiomWatchedWallets(): void {
+    this.axiomWatchedWallets.clear();
   }
 
   private bundlerMatchTypeLabel(type: BundlerMatchType): string {
@@ -1224,6 +1241,108 @@ export class InsiderBot extends EventEmitter {
     return stats;
   }
 
+  private rememberAxiomWatchedWallets(
+    mint: string,
+    wallets: Array<{ address: string; buyUsd: number; tags: string[] }>,
+  ): void {
+    for (const wallet of wallets) {
+      if (this.axiomWatchedWallets.has(wallet.address)) continue;
+      this.axiomWatchedWallets.set(wallet.address, {
+        ...wallet,
+        ata: getAssociatedTokenAddressSync(
+          new PublicKey(mint),
+          new PublicKey(wallet.address),
+          true,
+        ),
+      });
+    }
+  }
+
+  private async checkAxiomWatchedWalletAtaExits(mint: string): Promise<boolean> {
+    if (this.axiomWatchedWallets.size === 0) return false;
+
+    const watched = [...this.axiomWatchedWallets.values()];
+    const soldWallets: AxiomWatchedWallet[] = [];
+    const holdingWallets: AxiomWatchedWallet[] = [];
+    const chunkSize = 100;
+
+    for (let start = 0; start < watched.length; start += chunkSize) {
+      const chunk = watched.slice(start, start + chunkSize);
+      const infos = await this.connection.getMultipleAccountsInfo(
+        chunk.map((wallet) => wallet.ata),
+        "processed",
+      );
+
+      for (let i = 0; i < chunk.length; i++) {
+        const wallet = chunk[i];
+        const info = infos[i];
+        if (!info) {
+          soldWallets.push(wallet);
+          continue;
+        }
+
+        const amount =
+          info.data.length >= 72 ? info.data.readBigUInt64LE(64) : 1n;
+        if (amount === 0n) {
+          soldWallets.push(wallet);
+        } else {
+          holdingWallets.push(wallet);
+        }
+      }
+    }
+
+    log.info("Axiom watched-wallet ATA poll", {
+      mint,
+      watchedCount: watched.length,
+      soldAllCount: soldWallets.length,
+      holdingCount: holdingWallets.length,
+      rule: `watched >= ${AXIOM_EXIT_VALID_WALLET_THRESHOLD}, sold >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
+      soldWallets: soldWallets.map((wallet) => wallet.address),
+      holdingWallets: holdingWallets.map((wallet) => wallet.address),
+    });
+
+    if (
+      watched.length < AXIOM_EXIT_VALID_WALLET_THRESHOLD ||
+      soldWallets.length < AXIOM_EXIT_SOLD_WALLET_THRESHOLD
+    ) {
+      return false;
+    }
+
+    const walletLines = soldWallets
+      .slice(0, AXIOM_EXIT_SOLD_WALLET_THRESHOLD)
+      .map(
+        (wallet, i) =>
+          `${i + 1}. <code>${wallet.address}</code> buy: <b>$${wallet.buyUsd.toFixed(2)}</b> tags: <b>${wallet.tags.length ? wallet.tags.join(", ") : "[]"}</b>`,
+      )
+      .join("\n");
+
+    log.warn(
+      "Axiom watched-wallet ATA sold threshold reached — triggering position sell",
+      {
+        mint,
+        watchedCount: watched.length,
+        soldAllCount: soldWallets.length,
+        soldWallets: soldWallets.map((wallet) => wallet.address),
+      },
+    );
+
+    await this.triggerPositionSell(
+      mint,
+      `${soldWallets.length}/${watched.length} cumulative axiom/empty single-buy wallets have zero ATA balance`,
+      [
+        "<b>🚨 Axiom ATA Exit Threshold</b>",
+        `Token: <code>${mint}</code>`,
+        `Sold all / no ATA: <b>${soldWallets.length}</b> / <b>${watched.length}</b>`,
+        `Rule: watched wallets >= <b>${AXIOM_EXIT_VALID_WALLET_THRESHOLD}</b> and sold/no-ATA wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b>.`,
+        "",
+        "<b>First sold wallets:</b>",
+        walletLines,
+      ],
+      "AXIOM_SINGLE_BUY_ATA_EXIT_TRIGGER",
+    );
+    return true;
+  }
+
   private async scanAxiomSingleBuyTradersPreBuy(mint: string): Promise<void> {
     if (
       this.phase !== "pre_buy" ||
@@ -1280,90 +1399,18 @@ export class InsiderBot extends EventEmitter {
         limit: AXIOM_TRADER_SCAN_LIMIT,
         responseShape: this.describeTraderResponseShape(traders),
       });
+      await this.checkAxiomWatchedWalletAtaExits(mint);
       return;
     }
 
     const stats = this.logAxiomSingleBuyTraderScan(mint, "post_buy", list);
-    if (!stats || stats.validCount === 0) return;
-
-    const reachedSoldWalletThreshold =
-      stats.validCount > AXIOM_EXIT_VALID_WALLET_THRESHOLD &&
-      stats.soldAmongValid >= AXIOM_EXIT_SOLD_WALLET_THRESHOLD;
-    if (reachedSoldWalletThreshold) {
-      const walletLines = stats.matchingWallets
-        .filter((w) => w.sold)
-        .map(
-          (w, i) =>
-            `${i + 1}. <code>${w.address}</code> buy: <b>$${w.buyUsd.toFixed(2)}</b> tags: <b>${w.tags.length ? w.tags.join(", ") : "[]"}</b>`,
-        )
-        .join("\n");
-
-      log.warn(
-        "Axiom/empty single-buy sold-wallet threshold reached — triggering position sell",
-        {
-          mint,
-          validCount: stats.validCount,
-          soldAmongValid: stats.soldAmongValid,
-          soldPositionRatio: stats.soldPositionRatio,
-          validWalletThreshold: AXIOM_EXIT_VALID_WALLET_THRESHOLD,
-          soldWalletThreshold: AXIOM_EXIT_SOLD_WALLET_THRESHOLD,
-          soldWallets: stats.matchingWallets
-            .filter((w) => w.sold)
-            .map((w) => w.address),
-        },
-      );
-
-      await this.triggerPositionSell(
-        mint,
-        `${stats.soldAmongValid}/${stats.validCount} axiom/empty single-buy wallets sold all positions`,
-        [
-          "<b>🚨 Axiom Sold-Wallet Threshold</b>",
-          `Token: <code>${mint}</code>`,
-          `Sold all position: <b>${stats.soldAmongValid}</b> / <b>${stats.validCount}</b>`,
-          `Rule: valid wallets > <b>${AXIOM_EXIT_VALID_WALLET_THRESHOLD}</b> and sold wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b>.`,
-          "",
-          "<b>Sold wallets:</b>",
-          walletLines,
-        ],
-        "AXIOM_SINGLE_BUY_SOLD_THRESHOLD_TRIGGER",
-      );
+    if (!stats || stats.validCount === 0) {
+      await this.checkAxiomWatchedWalletAtaExits(mint);
       return;
     }
 
-    const allSold =
-      stats.soldAmongValid === stats.validCount && stats.validCount > 0;
-    if (!allSold) return;
-
-    const walletLines = stats.matchingWallets
-      .map(
-        (w, i) =>
-          `${i + 1}. <code>${w.address}</code> buy: <b>$${w.buyUsd.toFixed(2)}</b> tags: <b>${w.tags.length ? w.tags.join(", ") : "[]"}</b>`,
-      )
-      .join("\n");
-
-    log.warn(
-      "All axiom/empty single-buy wallets in range fully exited — triggering position sell",
-      {
-        mint,
-        validCount: stats.validCount,
-        wallets: stats.matchingWallets.map((w) => w.address),
-      },
-    );
-
-    await this.triggerPositionSell(
-      mint,
-      `All ${stats.validCount} axiom/empty single-buy wallets ($${this.bundlerBuyMinUsd}-$${this.bundlerBuyMaxUsd}) have sold all positions`,
-      [
-        "<b>🚨 Axiom Single-Buy Exit Signal</b>",
-        `Token: <code>${mint}</code>`,
-        `All <b>${stats.validCount}</b> axiom/empty single-buy wallets in buy range have fully exited.`,
-        "Dev wallet, initial 4 insiders, and insider/dev transfer-in recipients were excluded.",
-        "",
-        "<b>Tracked wallets:</b>",
-        walletLines,
-      ],
-      "AXIOM_SINGLE_BUY_EXIT_TRIGGER",
-    );
+    this.rememberAxiomWatchedWallets(mint, stats.matchingWallets);
+    await this.checkAxiomWatchedWalletAtaExits(mint);
   }
 
   private async scanBundlerTraders(mint: string): Promise<void> {
@@ -1698,6 +1745,7 @@ export class InsiderBot extends EventEmitter {
     this.initialInsiderWallets.clear();
     this.devWallet = null;
     this.axiomTraderWatchActive = false;
+    this.clearAxiomWatchedWallets();
     this.preBuyStopped = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
@@ -1732,6 +1780,7 @@ export class InsiderBot extends EventEmitter {
     this.initialInsiderWallets.clear();
     this.devWallet = null;
     this.axiomTraderWatchActive = false;
+    this.clearAxiomWatchedWallets();
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.insiderSellsReady = false;
