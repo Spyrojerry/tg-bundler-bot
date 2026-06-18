@@ -16,10 +16,9 @@ import {
   TokenAccountBalancePair,
 } from '@solana/web3.js';
 import { EventEmitter } from 'events';
-import { createLogger } from './logger';
+import { createLogger, Logger } from './logger';
 import { NewTokenEvent, ServiceConfig, TokenExitEvent, TokenHolding } from './types';
 
-const log = createLogger('WALLET');
 const WALLET_COMMITMENT = 'processed';
 
 const TOKEN_PROGRAM_IDS = [
@@ -30,6 +29,7 @@ const TOKEN_PROGRAM_IDS = [
 // ── WalletMonitor ─────────────────────────────────────────────────────────────
 
 export class WalletMonitor extends EventEmitter {
+  private readonly log: Logger;
   private readonly connection: Connection;
   private readonly walletPubkey: PublicKey;
   private readonly pollInterval: number;
@@ -64,9 +64,11 @@ export class WalletMonitor extends EventEmitter {
       minBuySol?: number;
       rpcUrl?: string;
       wsUrl?: string;
+      logLabel?: string;
     } = {}
   ) {
     super();
+    this.log = createLogger(options.logLabel ?? 'WALLET GENERAL 1');
 
     if (!walletAddress) {
       throw new Error('WalletMonitor requires a wallet address');
@@ -92,7 +94,7 @@ export class WalletMonitor extends EventEmitter {
     } else {
       this.minBuySol = options.enforceMinBuySol === false ? 0 : config.minBuySol;
     }
-    this.wsEndpoint = config.solanaWsUrl;
+    this.wsEndpoint = wsUrl;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -101,9 +103,9 @@ export class WalletMonitor extends EventEmitter {
     if (this.running) return;
     this.running = true;
 
-    log.info(`Starting wallet monitor for ${this.walletPubkey.toBase58()}`);
-    log.info(`Poll interval: ${this.pollInterval}ms`);
-    log.info(`Websocket endpoint: ${this.wsEndpoint}`);
+    this.log.info(`Starting wallet monitor for ${this.walletPubkey.toBase58()}`);
+    this.log.info(`Poll interval: ${this.pollInterval}ms`);
+    this.log.info(`Websocket endpoint: ${this.wsEndpoint}`);
 
     // Snapshot existing holdings — these are NOT monitored
     const initial = await this.fetchHoldings();
@@ -114,7 +116,7 @@ export class WalletMonitor extends EventEmitter {
       this.heldMints.add(h.mint);
     }
 
-    log.info(
+    this.log.info(
       `Snapshot taken: ${this.existingTokens.size} existing token(s) — these will NOT be monitored`,
       { mints: [...this.existingTokens] }
     );
@@ -134,9 +136,9 @@ export class WalletMonitor extends EventEmitter {
       this.logsSubscriptionId = null;
       this.connection
         .removeOnLogsListener(subscriptionId)
-        .catch((err) => log.warn('Failed to remove logs subscription', err));
+        .catch((err) => this.log.warn('Failed to remove logs subscription', err));
     }
-    log.info('Wallet monitor stopped');
+    this.log.info('Wallet monitor stopped');
   }
 
   // ── Snapshot accessor (for DB pre-population) ─────────────────────────────
@@ -150,18 +152,18 @@ export class WalletMonitor extends EventEmitter {
   private schedulePoll(): void {
     if (!this.running) return;
     this.pollTimer = setTimeout(() => {
-      this.poll().catch((err) => log.error('Poll error', err));
+      this.poll().catch((err) => this.log.error('Poll error', err));
     }, this.pollInterval);
   }
 
   private startLogsSubscription(): void {
-    log.info(`WS subscribing to wallet logs for ${this.walletPubkey.toBase58()}`);
+    this.log.info(`WS subscribing to wallet logs for ${this.walletPubkey.toBase58()}`);
 
     this.logsSubscriptionId = this.connection.onLogs(
       this.walletPubkey,
       (logInfo) => {
         if (logInfo.err) {
-          log.debug(`Wallet logs notification had tx error: ${logInfo.signature}`);
+          this.log.debug(`Wallet logs notification had tx error: ${logInfo.signature}`);
           return;
         }
 
@@ -179,19 +181,19 @@ export class WalletMonitor extends EventEmitter {
         );
 
         if (!isLikelyTokenTx) {
-          log.debug(`[WS SKIP] ${logInfo.signature} (non-token tx)`);
+          this.log.debug(`[WS SKIP] ${logInfo.signature} (non-token tx)`);
           return;
         }
 
-        log.info(`[WS TX] ${logInfo.signature}`);
+        this.log.info(`[WS TX] ${logInfo.signature}`);
         this.processSignature(logInfo.signature, 'logsSubscribe').catch((err) =>
-          log.error(`Failed to process logs signature ${logInfo.signature}`, err)
+          this.log.error(`Failed to process logs signature ${logInfo.signature}`, err)
         );
       },
       WALLET_COMMITMENT
     );
 
-    log.info(`WS logsSubscribe active (id=${this.logsSubscriptionId})`);
+    this.log.info(`WS logsSubscribe active (id=${this.logsSubscriptionId})`);
   }
 
   private async poll(): Promise<void> {
@@ -200,11 +202,11 @@ export class WalletMonitor extends EventEmitter {
       const now = Date.now();
       const currentlyHeld = new Set<string>();
 
-      log.debug(`Poll complete: ${holdings.length} holding(s)`);
+      this.log.debug(`Poll complete: ${holdings.length} holding(s)`);
 
       for (const holding of holdings) {
         if (!this.hasPositiveBalance(holding)) {
-          log.debug(`Skipping zero-balance mint ${holding.mint}; will keep watching`);
+          this.log.debug(`Skipping zero-balance mint ${holding.mint}; will keep watching`);
           continue;
         }
         currentlyHeld.add(holding.mint);
@@ -213,7 +215,7 @@ export class WalletMonitor extends EventEmitter {
       }
       this.detectExitedTokens(currentlyHeld, now, 'account-poll');
     } catch (err) {
-      log.error('Failed to poll wallet holdings', err);
+      this.log.error('Failed to poll wallet holdings', err);
     } finally {
       this.schedulePoll();
     }
@@ -269,7 +271,7 @@ export class WalletMonitor extends EventEmitter {
       if (!boughtMints) return;
 
       if (boughtMints.length === 0) {
-        log.debug(`[WS TX] ${signature} parsed: no wallet token balance increase`);
+        this.log.debug(`[WS TX] ${signature} parsed: no wallet token balance increase`);
       }
 
       for (const buy of boughtMints) {
@@ -280,7 +282,7 @@ export class WalletMonitor extends EventEmitter {
         }
 
         // New token detected!
-        log.info(`[WS BUY] ${signature} -> ${buy.mint}`, { buySol: buy.buySol });
+        this.log.info(`[WS BUY] ${signature} -> ${buy.mint}`, { buySol: buy.buySol });
         
         // Emit general buy event for any detected balance increase
         this.emit('buyDetected', {
@@ -314,7 +316,7 @@ export class WalletMonitor extends EventEmitter {
     }
 
     if (!tx) {
-      log.debug(`Transaction ${signature} was not parsed after retries`);
+      this.log.debug(`Transaction ${signature} was not parsed after retries`);
       return null;
     }
 
@@ -365,7 +367,7 @@ export class WalletMonitor extends EventEmitter {
       this.knownMints.delete(mint);
       this.existingTokens.delete(mint);
       this.minBuyUnknownLogged.delete(mint);
-      log.info(`[TOKEN EXITED] Mint: ${mint}  Source: ${source}`);
+      this.log.info(`[TOKEN EXITED] Mint: ${mint}  Source: ${source}`);
       const event: TokenExitEvent = {
         walletAddress: this.walletPubkey.toBase58(),
         mint,
@@ -391,7 +393,7 @@ export class WalletMonitor extends EventEmitter {
     if (this.minBuySol > 0) {
       if (buySol === null) {
         if (!this.minBuyUnknownLogged.has(mint)) {
-          log.info(
+          this.log.info(
             `[WAIT TOKEN] Mint: ${mint}  Source: ${source}  ` +
             `Reason: buy SOL unknown, waiting for tx parse to check min ${this.minBuySol} SOL`
           );
@@ -400,7 +402,7 @@ export class WalletMonitor extends EventEmitter {
         return;
       }
       if (buySol < this.minBuySol) {
-        log.info(
+        this.log.info(
           `[SKIP TOKEN] Mint: ${mint}  Buy: ${buySol} SOL  ` +
           `Min: ${this.minBuySol} SOL  Source: ${source}`
         );
@@ -410,7 +412,7 @@ export class WalletMonitor extends EventEmitter {
     }
 
     this.knownMints.add(mint);
-    log.info(`[NEW TOKEN] Mint: ${mint}  Amount: ${amount}  Source: ${source}  BuySOL: ${buySol ?? 'unknown'}`);
+    this.log.info(`[NEW TOKEN] Mint: ${mint}  Amount: ${amount}  Source: ${source}  BuySOL: ${buySol ?? 'unknown'}`);
 
     const event: NewTokenEvent = {
       walletAddress: this.walletPubkey.toBase58(),

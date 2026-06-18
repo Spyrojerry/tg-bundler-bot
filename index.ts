@@ -2014,6 +2014,7 @@ async function main(): Promise<void> {
     const monitor = new WalletMonitor(config, normalized, {
       enforceMinBuySol: true,
       minBuySol,
+      logLabel: `WALLET WATCHED ${normalized.slice(0, 6)}`,
     });
     wireWatchedWalletMonitor(monitor);
     pausedWallets.delete(normalized);
@@ -2121,7 +2122,10 @@ async function main(): Promise<void> {
       tradingWalletMonitor = new WalletMonitor(
         config,
         config.tradingWalletAddress,
-        { enforceMinBuySol: false },
+        {
+          enforceMinBuySol: false,
+          logLabel: 'WALLET TRADING 1',
+        },
       );
       wireTradingWalletMonitor(tradingWalletMonitor);
       await tradingWalletMonitor.start();

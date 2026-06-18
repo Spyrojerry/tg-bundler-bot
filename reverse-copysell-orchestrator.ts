@@ -78,7 +78,14 @@ export class ReverseCopySellOrchestrator extends EventEmitter {
 
     // Start monitoring the target wallet
     try {
-      this.targetWalletMonitor = new WalletMonitor(this.config, this.config.reverseCopySellTargetWallet, { enforceMinBuySol: false });
+      this.targetWalletMonitor = new WalletMonitor(
+        this.config,
+        this.config.reverseCopySellTargetWallet,
+        {
+          enforceMinBuySol: false,
+          logLabel: 'WALLET REVERSE COPYSELL 1',
+        },
+      );
       
       this.targetWalletMonitor.on('buyDetected', async (targetEvent: NewTokenEvent) => {
         if (!this.activePosition || targetEvent.mint !== this.activePosition.mint) return;

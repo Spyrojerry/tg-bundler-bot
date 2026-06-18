@@ -391,6 +391,7 @@ export class InsiderBot extends EventEmitter {
       enforceMinBuySol: false,
       rpcUrl: this.rpcUrl,
       wsUrl: this.wsUrl,
+      logLabel: `WALLET ${this.label.toUpperCase()}`,
     });
     this.followMonitor.on("newToken", (event) => {
       void this.handleFollowWalletBuy(event.mint, event.signature);

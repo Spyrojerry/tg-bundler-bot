@@ -178,7 +178,10 @@ export class EarlyBundlerOrchestrator extends EventEmitter {
   private async startFollowMonitor(): Promise<void> {
     if (!this.isEnabled || this.isShuttingDown || !this.followedWallet || this.followMonitor) return;
 
-    this.followMonitor = new WalletMonitor(this.config, this.followedWallet, { enforceMinBuySol: false });
+    this.followMonitor = new WalletMonitor(this.config, this.followedWallet, {
+      enforceMinBuySol: false,
+      logLabel: 'WALLET BUNDLER 1',
+    });
     this.followMonitor.on('newToken', (event) => {
       this.handleFollowWalletBuy(event).catch((err) => {
         log.error('Failed to handle bundler follow-wallet buy', err);
