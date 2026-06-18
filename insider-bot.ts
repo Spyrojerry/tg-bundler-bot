@@ -5,14 +5,13 @@ import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
-import { createLogger } from "./logger";
+import { createLogger, Logger } from "./logger";
 import { HeliusClient, HeliusTransaction } from "./helius-client";
 import { GmgnClient } from "./gmgn-client";
 import type { ServiceConfig } from "./types";
 import { TelegramBot } from "./telegram-bot";
 import { WalletMonitor } from "./wallet-monitor";
 
-const log = createLogger("INSIDER");
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
@@ -126,6 +125,7 @@ interface AxiomWatchedWallet {
 }
 
 export class InsiderBot extends EventEmitter {
+  private readonly log: Logger;
    private readonly config: ServiceConfig;
   private readonly connection: Connection;
   private readonly telegramBot: TelegramBot | null;
@@ -224,6 +224,7 @@ export class InsiderBot extends EventEmitter {
     this.claimMint = claimMint;
     this.releaseMint = releaseMint;
     this.label = label;
+    this.log = createLogger(label.toUpperCase());
     this.buySol = config.insiderBuySol;
     this.entryMc = config.insiderEntryMc;
     this.exitMc = config.insiderExitMc;
@@ -400,7 +401,7 @@ export class InsiderBot extends EventEmitter {
       this.boughtMints.add(mint);
     }
 
-    log.info("Insider follow wallet monitoring started", {
+    this.log.info("Insider follow wallet monitoring started", {
       followedWallet: normalized,
       buySol: this.buySol,
       bundlerUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
@@ -481,7 +482,7 @@ export class InsiderBot extends EventEmitter {
     } else {
       this.tokenSellCount += 1;
     }
-    log.info(`Token ${kind} tx processed`, {
+    this.log.info(`Token ${kind} tx processed`, {
       mint,
       context,
       wallet,
@@ -495,7 +496,7 @@ export class InsiderBot extends EventEmitter {
     if (this.boughtMints.has(mint)) return;
     if (this.activePosition || this.watchingMint) return;
     if (this.claimMint && !this.claimMint(mint)) {
-      log.info("Mint active on other insider bot; ignoring follow-wallet buy", {
+      this.log.info("Mint active on other insider bot; ignoring follow-wallet buy", {
         mint,
         signature,
       });
@@ -517,12 +518,12 @@ export class InsiderBot extends EventEmitter {
     } catch (err) {
       this.releaseMint?.(mint);
       if (err instanceof InsiderMinBuySolFilterError) {
-        log.info("Insider flow skipped by min-buy SOL filter; resetting", {
+        this.log.info("Insider flow skipped by min-buy SOL filter; resetting", {
           mint,
           reason: err.message,
         });
       } else {
-        log.error("Failed to start insider flow; resetting", err);
+        this.log.error("Failed to start insider flow; resetting", err);
         this.emit("error", err instanceof Error ? err : new Error(String(err)));
       }
       await this.resetForNewToken(true);
@@ -553,7 +554,7 @@ export class InsiderBot extends EventEmitter {
     const createTx = await this.heliusClient.getMintCreateTransaction(mint);
     this.devWallet = createTx?.feePayer ?? null;
     if (this.devWallet) {
-      log.info("Dev wallet identified for trader-scan exclusions", {
+      this.log.info("Dev wallet identified for trader-scan exclusions", {
         mint,
         devWallet: this.devWallet,
       });
@@ -623,7 +624,7 @@ export class InsiderBot extends EventEmitter {
 
     const failing = buys.filter((buy) => buy.buySol === null || buy.buySol < minBuySol);
     if (!failing.length) {
-      log.info("Early insider min-buy SOL check passed", {
+      this.log.info("Early insider min-buy SOL check passed", {
         mint,
         minBuySol,
         insiderBuys: buys.map((buy) => ({
@@ -636,7 +637,7 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    log.warn("Early insider min-buy SOL check failed; resetting token flow", {
+    this.log.warn("Early insider min-buy SOL check failed; resetting token flow", {
       mint,
       minBuySol,
       failingInsiders: failing.map((buy) => ({
@@ -735,7 +736,7 @@ export class InsiderBot extends EventEmitter {
         triggerSell: phase === "post_buy",
       });
     } catch (err) {
-      log.warn(`Independent Axiom ATA poll [${phase}] failed`, {
+      this.log.warn(`Independent Axiom ATA poll [${phase}] failed`, {
         mint,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -833,7 +834,7 @@ export class InsiderBot extends EventEmitter {
       await this.syncWalletHistory(wallet, mint, undefined, INSIDER_HISTORY_LIMIT, "bundler");
     }
 
-    log.info("Started post-buy bundler monitoring", { mint, wallets });
+    this.log.info("Started post-buy bundler monitoring", { mint, wallets });
   }
 
   private async stopBundlerMonitoring(): Promise<void> {
@@ -891,7 +892,7 @@ export class InsiderBot extends EventEmitter {
         }
       }
     } catch (err) {
-      log.error("Failed to process signature batch", err);
+      this.log.error("Failed to process signature batch", err);
     }
   }
 
@@ -899,7 +900,7 @@ export class InsiderBot extends EventEmitter {
     if (this.preBuyStopped) return;
     this.preBuyStopped = true;
     await this.stopInsiderMonitoring();
-    log.info("Pre-buy monitoring stopped", {
+    this.log.info("Pre-buy monitoring stopped", {
       mint: this.watchingMint ?? this.activePosition?.mint,
       initialInsiderWallets: [...this.initialInsiderWallets],
       devWallet: this.devWallet,
@@ -1021,7 +1022,7 @@ export class InsiderBot extends EventEmitter {
     if (this.insiderSellsReady) return;
     this.insiderSellsReady = true;
     await this.stopInsiderMonitoring();
-    log.info(
+    this.log.info(
       "Insider sell threshold reached — stopped insider monitoring",
       {
         mint,
@@ -1104,7 +1105,7 @@ export class InsiderBot extends EventEmitter {
     this.matchedBundlers = source.slice(0, REQUIRED_BUNDLER_MATCHES);
     this.bundlerMatchType = matchType;
     this.bundlerMatchesReady = true;
-    log.info(
+    this.log.info(
       `Bundler match threshold reached (${this.bundlerMatchTypeLabel(matchType)}) — stopped GMGN bundler scan`,
       {
         mint,
@@ -1266,7 +1267,7 @@ export class InsiderBot extends EventEmitter {
       .filter((w) => !w.sold)
       .map((w) => w.address);
 
-    log.info(
+    this.log.info(
       `Axiom/empty single-buy GMGN scan [${phase}] — ${stats.soldPositionRatio} sold all position (skip-list excl., buy $${this.bundlerBuyMinUsd}-$${this.bundlerBuyMaxUsd}, tag axiom or []; order buy_volume_cur; limit ${AXIOM_TRADER_SCAN_LIMIT})`,
       {
         mint,
@@ -1311,7 +1312,7 @@ export class InsiderBot extends EventEmitter {
       });
       added += 1;
     }
-    log.info("Axiom cumulative watched wallets updated", {
+    this.log.info("Axiom cumulative watched wallets updated", {
       mint,
       addedFromScan: added,
       cumulativeValidWallets: this.axiomWatchedWallets.size,
@@ -1375,7 +1376,7 @@ export class InsiderBot extends EventEmitter {
     const existingAtaWalletCount = soldWallets.length + holdingWallets.length;
 
     if (existingAtaWalletCount === 0) {
-      log.warn(
+      this.log.warn(
         `Axiom watched-wallet ATA poll [${options.phase}] found no SPL or Token-2022 ATAs for any watched wallet; skipping sell trigger`,
         {
           mint,
@@ -1390,7 +1391,7 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${soldWallets.length}/${existingAtaWalletCount} sold existing ATA wallets`, {
+    this.log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${soldWallets.length}/${existingAtaWalletCount} sold existing ATA wallets`, {
       mint,
       phase: options.phase,
       soldPositionRatio: `${soldWallets.length}/${existingAtaWalletCount}`,
@@ -1437,7 +1438,7 @@ export class InsiderBot extends EventEmitter {
       )
       .join("\n");
 
-    log.warn(
+    this.log.warn(
       "Axiom watched-wallet ATA sold threshold reached — triggering position sell",
       {
         mint,
@@ -1494,7 +1495,7 @@ export class InsiderBot extends EventEmitter {
 
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
       if (currentMc === null) {
-        log.warn("Could not fetch MC for Axiom ATA buy gate", { mint });
+        this.log.warn("Could not fetch MC for Axiom ATA buy gate", { mint });
         this.preBuyStopped = false;
         if (this.monitoredWallet && !this.insiderSellsReady) {
           this.startInsiderMonitoring();
@@ -1503,7 +1504,7 @@ export class InsiderBot extends EventEmitter {
       }
 
       if (currentMc >= MAX_BUY_MARKET_CAP_USD) {
-        log.warn("Axiom ATA buy gate rejected — market cap at or above buy ceiling", {
+        this.log.warn("Axiom ATA buy gate rejected — market cap at or above buy ceiling", {
           mint,
           currentMc,
           maxBuyMarketCapUsd: MAX_BUY_MARKET_CAP_USD,
@@ -1528,7 +1529,7 @@ export class InsiderBot extends EventEmitter {
       this.setBuyExecuting(true);
       this.buySubmitted = true;
 
-      log.warn("Axiom ATA buy gate passed — triggering buy", {
+      this.log.warn("Axiom ATA buy gate passed — triggering buy", {
         mint,
         existingAtaWalletCount,
         soldAllCount,
@@ -1575,7 +1576,7 @@ export class InsiderBot extends EventEmitter {
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
-      log.info("Axiom/empty single-buy GMGN scan [pre_buy] — no traders returned", {
+      this.log.info("Axiom/empty single-buy GMGN scan [pre_buy] — no traders returned", {
         mint,
         phase: "pre_buy",
         orderBy: "buy_volume_cur",
@@ -1609,7 +1610,7 @@ export class InsiderBot extends EventEmitter {
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
-      log.info("Axiom/empty single-buy GMGN scan [post_buy] — no traders returned", {
+      this.log.info("Axiom/empty single-buy GMGN scan [post_buy] — no traders returned", {
         mint,
         phase: "post_buy",
         orderBy: "buy_volume_cur",
@@ -1707,7 +1708,7 @@ export class InsiderBot extends EventEmitter {
       const recipient = (tx.tokenTransfers ?? []).find(
         (t) => t.mint === mint && t.fromUserAccount === wallet,
       )?.toUserAccount;
-      log.warn("Bundler wallet transfer-out detected (post-buy) — selling ASAP", {
+      this.log.warn("Bundler wallet transfer-out detected (post-buy) — selling ASAP", {
         mint,
         wallet,
         recipient,
@@ -1737,7 +1738,7 @@ export class InsiderBot extends EventEmitter {
     const current = this.bundlerWatch.sellCounts.get(wallet) ?? 0;
     this.bundlerWatch.sellCounts.set(wallet, current + 1);
 
-    log.info("Bundler wallet sell detected (post-buy)", {
+    this.log.info("Bundler wallet sell detected (post-buy)", {
       mint,
       wallet,
       walletSellCount: current + 1,
@@ -1828,7 +1829,7 @@ export class InsiderBot extends EventEmitter {
     this.isBuyGateEvaluating = false;
     this.resetTokenTxCounts();
 
-    log.info("InsiderBot reset; resuming followed wallet monitoring");
+    this.log.info("InsiderBot reset; resuming followed wallet monitoring");
     if (this.followedWallet && !this.followMonitor) {
       await this.followWallet(this.followedWallet);
     }
