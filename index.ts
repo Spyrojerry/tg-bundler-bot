@@ -47,10 +47,16 @@ async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
   const config = loadConfig();
   setLogLevel(config.logLevel);
+  const hasEnvValue = (key: string): boolean =>
+    Boolean(process.env[key]?.trim());
   const insiderBotDefinitions = [
     {
       botNumber: 1,
-      enabled: true,
+      enabled:
+        hasEnvValue("GMGN_API_KEY") &&
+        hasEnvValue("INSIDER_HELIUS_API_KEY") &&
+        hasEnvValue("INSIDER_SOLANA_RPC_URL") &&
+        hasEnvValue("INSIDER_SOLANA_WS_URL"),
       gmgnApiKey: config.gmgnApiKey,
       heliusApiKey: config.insiderHeliusApiKey || config.heliusApiKey,
       rpcUrl: config.insiderSolanaRpcUrl,
@@ -59,7 +65,11 @@ async function main(): Promise<void> {
     },
     {
       botNumber: 2,
-      enabled: Boolean(process.env.GMGN_API_KEY_2?.trim()),
+      enabled:
+        hasEnvValue("GMGN_API_KEY_2") &&
+        hasEnvValue("INSIDER_HELIUS_API_KEY_2") &&
+        hasEnvValue("INSIDER_SOLANA_RPC_URL_2") &&
+        hasEnvValue("INSIDER_SOLANA_WS_URL_2"),
       gmgnApiKey: config.gmgnApiKey2,
       heliusApiKey: config.insiderHeliusApiKey2 || config.heliusApiKey,
       rpcUrl: config.insiderSolanaRpcUrl2,
@@ -68,7 +78,11 @@ async function main(): Promise<void> {
     },
     {
       botNumber: 3,
-      enabled: Boolean(process.env.GMGN_API_KEY_3?.trim()),
+      enabled:
+        hasEnvValue("GMGN_API_KEY_3") &&
+        hasEnvValue("INSIDER_HELIUS_API_KEY_3") &&
+        hasEnvValue("INSIDER_SOLANA_RPC_URL_3") &&
+        hasEnvValue("INSIDER_SOLANA_WS_URL_3"),
       gmgnApiKey: config.gmgnApiKey3,
       heliusApiKey: config.insiderHeliusApiKey3 || config.heliusApiKey,
       rpcUrl: config.insiderSolanaRpcUrl3,
@@ -77,7 +91,11 @@ async function main(): Promise<void> {
     },
     {
       botNumber: 4,
-      enabled: Boolean(process.env.GMGN_API_KEY_4?.trim()),
+      enabled:
+        hasEnvValue("GMGN_API_KEY_4") &&
+        hasEnvValue("INSIDER_HELIUS_API_KEY_4") &&
+        hasEnvValue("INSIDER_SOLANA_RPC_URL_4") &&
+        hasEnvValue("INSIDER_SOLANA_WS_URL_4"),
       gmgnApiKey: config.gmgnApiKey4,
       heliusApiKey: config.insiderHeliusApiKey4 || config.heliusApiKey,
       rpcUrl: config.insiderSolanaRpcUrl4,
@@ -363,24 +381,16 @@ async function main(): Promise<void> {
             }
           }
 
-          const profitSol = currentPrice
-            ? currentPrice.estimatedOutputSol - buySol
-            : null;
-          const profitPct =
-            profitSol !== null && buySol > 0
-              ? (profitSol / buySol) * 100
+          const marketCapPnlPct =
+            entryMc !== null &&
+            entryMc > 0 &&
+            currentMarketCapUsd !== null
+              ? ((currentMarketCapUsd - entryMc) / entryMc) * 100
               : null;
-
-          let profitDisplay = "Quoted P/L: <b>Calculating...</b>";
-          if (profitSol !== null) {
-            profitDisplay = `Quoted P/L: <b>${profitSol.toFixed(4)} SOL</b> (${profitPct?.toFixed(2)}%)`;
-          } else if (balanceIsZero) {
-            profitDisplay = "Quoted P/L: <b>Position Closed (0 balance)</b>";
-          } else if (!config.tradingWalletAddress) {
-            profitDisplay = "Quoted P/L: <b>N/A (No trading wallet)</b>";
-          } else if (quoteError) {
-            profitDisplay = `Quoted P/L: <b>Quote unavailable</b> (${html(quoteError)})`;
-          }
+          const profitDisplay =
+            marketCapPnlPct !== null
+              ? `P/L by MC: <b>${marketCapPnlPct >= 0 ? "+" : ""}${marketCapPnlPct.toFixed(2)}%</b>`
+              : "P/L by MC: <b>N/A</b>";
 
           const tokenBalanceLine =
             tokenBalance !== null
@@ -415,7 +425,6 @@ async function main(): Promise<void> {
                 : null,
             profitDisplay,
             tokenBalanceLine,
-            buySol > 0 ? `Cost Basis: <b>${buySol.toFixed(4)} SOL</b>` : null,
             "",
             `Last Updated: ${new Date().toISOString()}`,
           ].filter(Boolean) as string[];
@@ -1326,6 +1335,8 @@ async function main(): Promise<void> {
         return;
       }
 
+      const entryMc = bot.getEntryMc();
+
       // Clear active position immediately on sell trigger to prevent checker from firing
       bot.clearActivePosition();
 
@@ -1348,6 +1359,8 @@ async function main(): Promise<void> {
         },
         buySol: bot.getBuySol(),
         matchingWallets: [],
+        entryMc,
+        insiderBotIndex: index,
       };
 
       const sellId = randomBytes(5).toString("hex");
@@ -2565,22 +2578,20 @@ async function main(): Promise<void> {
 
   function sellReceipt(event: FilterFailEvent, result: SellResult): string {
     const receivedSol = lamportsToSol(result.filledOutputAmount);
-    const costBasis =
-      event.buySol !== null ? event.buySol * (result.soldPercent / 100) : null;
-    const pnl =
-      receivedSol !== null && costBasis !== null
-        ? receivedSol - costBasis
-        : null;
     const pnlPct =
-      pnl !== null && costBasis !== null && costBasis > 0
-        ? (pnl / costBasis) * 100
+      event.entryMc !== null &&
+      event.entryMc !== undefined &&
+      event.entryMc > 0 &&
+      event.sellMc !== null &&
+      event.sellMc !== undefined
+        ? ((event.sellMc - event.entryMc) / event.entryMc) * 100
         : null;
     const fmtSol = (value: number | null): string =>
       value === null ? "N/A" : `${parseFloat(value.toFixed(6))} SOL`;
     const pnlLine =
-      pnl === null
-        ? "P/L: N/A (original buy SOL unknown)"
-        : `P/L: <b>${fmtSol(pnl)}</b> (${parseFloat((pnlPct ?? 0).toFixed(2))}%)`;
+      pnlPct === null
+        ? "P/L by MC: <b>N/A</b>"
+        : `P/L by MC: <b>${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</b>`;
 
     return [
       result.status === "confirmed"
@@ -2593,7 +2604,12 @@ async function main(): Promise<void> {
       `Matched watched wallets: <b>${event.matchingWallets.length}</b>`,
       `Token amount sold: <code>${html(result.filledInputAmount ?? "pending")}</code>`,
       `Received: <b>${fmtSol(receivedSol)}</b>`,
-      `Cost basis sold: ${fmtSol(costBasis)}`,
+      event.entryMc !== null && event.entryMc !== undefined
+        ? `Entry MC: <b>$${event.entryMc.toLocaleString()}</b>`
+        : null,
+      event.sellMc !== null && event.sellMc !== undefined
+        ? `Sell MC: <b>$${event.sellMc.toLocaleString()}</b>`
+        : null,
       pnlLine,
       result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : "",
       result.orderId ? `Order ID: <code>${html(result.orderId)}</code>` : "",
@@ -2766,6 +2782,18 @@ async function main(): Promise<void> {
             filledOutputAmount: null,
             raw: {},
           };
+      if (
+        currentPending.event.entryMc !== null &&
+        currentPending.event.entryMc !== undefined
+      ) {
+        const sellMcClient =
+          currentPending.event.insiderBotIndex !== undefined
+            ? gmgnClients[currentPending.event.insiderBotIndex]
+            : gmgnClients[0];
+        currentPending.event.sellMc = await sellMcClient
+          .fetchTokenMarketCapUsd(currentPending.event.mint)
+          .catch(() => null);
+      }
       const receipt = sellReceipt(currentPending.event, receiptResult);
       if (chatId && telegramBot) {
         await telegramBot.sendChat(chatId, receipt);

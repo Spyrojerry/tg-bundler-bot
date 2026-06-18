@@ -21,6 +21,7 @@ const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 10;
 const AXIOM_BUY_MAX_EXISTING_ATA_WALLETS = 15;
 const AXIOM_BUY_MAX_SOLD_WALLETS = 2;
 const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
+const MAX_BUY_MARKET_CAP_USD = 50_000;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 type FlowPhase = "pre_buy" | "holding";
@@ -1498,6 +1499,26 @@ export class InsiderBot extends EventEmitter {
         if (this.monitoredWallet && !this.insiderSellsReady) {
           this.startInsiderMonitoring();
         }
+        return;
+      }
+
+      if (currentMc >= MAX_BUY_MARKET_CAP_USD) {
+        log.warn("Axiom ATA buy gate rejected — market cap at or above buy ceiling", {
+          mint,
+          currentMc,
+          maxBuyMarketCapUsd: MAX_BUY_MARKET_CAP_USD,
+          action: "reset token flow",
+        });
+        await this.telegramBot?.sendDefault(
+          [
+            `<b>⏭️ ${this.label} Token Skipped</b>`,
+            `Token: <code>${mint}</code>`,
+            `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+            `Buy ceiling: <b>below $${MAX_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
+            "Flow reset — waiting for the next token.",
+          ].join("\n"),
+        );
+        await this.resetForNewToken(true);
         return;
       }
 

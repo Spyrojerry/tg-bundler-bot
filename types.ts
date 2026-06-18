@@ -228,6 +228,9 @@ export interface FilterFailEvent {
   metrics: BundlerMetrics;
   buySol: number | null;
   matchingWallets: string[];
+  entryMc?: number | null;
+  sellMc?: number | null;
+  insiderBotIndex?: number;
 }
 
 export interface FilterPassEvent {
