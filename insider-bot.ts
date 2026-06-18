@@ -14,11 +14,12 @@ import { WalletMonitor } from "./wallet-monitor";
 
 const log = createLogger("INSIDER");
 const SOL_MINT = "So11111111111111111111111111111111111111112";
-const POLL_MS = 2_000;
 const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const AXIOM_TRADER_SCAN_LIMIT = 50;
-const AXIOM_EXIT_VALID_WALLET_THRESHOLD = 10;
+const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 10;
+const AXIOM_BUY_MAX_EXISTING_ATA_WALLETS = 15;
+const AXIOM_BUY_MAX_SOLD_WALLETS = 2;
 const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
@@ -183,6 +184,7 @@ export class InsiderBot extends EventEmitter {
   private pendingSignaturesBatch: string[] = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private axiomAtaPollTimer: ReturnType<typeof setInterval> | null = null;
 
   private readonly BATCH_WINDOW_MS = 1000;
   private readonly MAX_BATCH_SIZE = 100;
@@ -192,7 +194,9 @@ export class InsiderBot extends EventEmitter {
   private claimedMint: string | null = null;
   private buySubmitted = false;
   private isBuyExecuting = false;
+  private isBuyGateEvaluating = false;
   private isProcessing = false;
+  private isAxiomAtaPolling = false;
 
   constructor(
     config: ServiceConfig,
@@ -344,13 +348,14 @@ export class InsiderBot extends EventEmitter {
 
   resetBuyAttempt(): void {
     this.isBuyExecuting = false;
+    this.isBuyGateEvaluating = false;
     this.buySubmitted = false;
     if (!this.activePosition && this.watchingMint) {
       this.phase = "pre_buy";
+      this.preBuyStopped = false;
       if (this.monitoredWallet && !this.insiderSellsReady) {
         this.startInsiderMonitoring();
       }
-      void this.evaluateBuyGate(this.watchingMint);
     }
   }
 
@@ -363,7 +368,8 @@ export class InsiderBot extends EventEmitter {
       this.followMonitor !== null ||
       this.insiderLogsSubId !== null ||
       this.bundlerLogsSubIds.size > 0 ||
-      this.pollTimer !== null
+      this.pollTimer !== null ||
+      this.axiomAtaPollTimer !== null
     );
   }
 
@@ -588,9 +594,9 @@ export class InsiderBot extends EventEmitter {
 
     this.startInsiderMonitoring();
     this.startPollLoop();
+    this.startAxiomAtaPollLoop();
     await this.scanBundlerTraders(mint);
     await this.scanAxiomSingleBuyTradersPreBuy(mint);
-    await this.evaluateBuyGate(mint);
   }
 
   private extractEarlyInsiderBuys(swaps: HeliusTransaction[], mint: string): EarlyInsiderBuy[] {
@@ -686,13 +692,60 @@ export class InsiderBot extends EventEmitter {
     this.stopPollLoop();
     this.pollTimer = setInterval(() => {
       void this.runPollTick();
-    }, POLL_MS);
+    }, this.config.monitorInterval);
   }
 
   private stopPollLoop(): void {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
+    }
+  }
+
+  private startAxiomAtaPollLoop(): void {
+    this.stopAxiomAtaPollLoop();
+    this.axiomAtaPollTimer = setInterval(() => {
+      void this.runAxiomAtaPollTick();
+    }, this.config.monitorInterval);
+  }
+
+  private stopAxiomAtaPollLoop(): void {
+    if (this.axiomAtaPollTimer) {
+      clearInterval(this.axiomAtaPollTimer);
+      this.axiomAtaPollTimer = null;
+    }
+    this.isAxiomAtaPolling = false;
+  }
+
+  private async runAxiomAtaPollTick(): Promise<void> {
+    if (this.isAxiomAtaPolling || this.axiomWatchedWallets.size === 0) return;
+
+    const mint = this.watchingMint ?? this.activePosition?.mint;
+    if (!mint) return;
+
+    const phase =
+      this.phase === "pre_buy"
+        ? "pre_buy"
+        : this.phase === "holding"
+          ? "post_buy"
+          : null;
+    if (!phase) return;
+    if (phase === "pre_buy" && (this.preBuyStopped || this.buySubmitted)) return;
+    if (phase === "post_buy" && this.positionSellTriggered) return;
+
+    this.isAxiomAtaPolling = true;
+    try {
+      await this.checkAxiomWatchedWalletAtaExits(mint, {
+        phase,
+        triggerSell: phase === "post_buy",
+      });
+    } catch (err) {
+      log.warn(`Independent Axiom ATA poll [${phase}] failed`, {
+        mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.isAxiomAtaPolling = false;
     }
   }
 
@@ -868,6 +921,7 @@ export class InsiderBot extends EventEmitter {
 
   private async stopFlowMonitoring(): Promise<void> {
     this.stopPollLoop();
+    this.stopAxiomAtaPollLoop();
     await this.stopPreBuyMonitoring();
     await this.stopInsiderMonitoring();
     await this.stopBundlerMonitoring();
@@ -981,7 +1035,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderSellsReady = true;
     await this.stopInsiderMonitoring();
     log.info(
-      "Insider sell threshold reached — stopped insider monitoring, waiting for bundler matches",
+      "Insider sell threshold reached — stopped insider monitoring",
       {
         mint,
         sellCount: this.insiderState?.sellCount,
@@ -989,7 +1043,6 @@ export class InsiderBot extends EventEmitter {
         bundlerMatchesReady: this.bundlerMatchesReady,
       },
     );
-    await this.evaluateBuyGate(mint);
   }
 
   private async switchToTransferredWallet(
@@ -1018,15 +1071,10 @@ export class InsiderBot extends EventEmitter {
         `Now monitoring: <code>${newWallet}</code>`,
         `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
         `Bundler matches: <b>${this.matchedBundlers.length}</b> / ${REQUIRED_BUNDLER_MATCHES}`,
-        this.bundlerMatchesReady
-          ? "Bundler scan already met — waiting for insider sells on new wallet."
-          : "",
       ]
         .filter(Boolean)
         .join("\n"),
     );
-
-    await this.evaluateBuyGate(mint);
   }
 
   private clearBundlerAccumulation(): void {
@@ -1081,7 +1129,6 @@ export class InsiderBot extends EventEmitter {
         requiredInsiderSells: this.requiredInsiderSells,
       },
     );
-    await this.evaluateBuyGate(mint);
     return true;
   }
 
@@ -1368,20 +1415,31 @@ export class InsiderBot extends EventEmitter {
       existingAtaCount,
       positiveAtaCount,
       missingAtaWalletCount: missingAtaWallets.length,
-      rule: `existing ATA wallets >= ${AXIOM_EXIT_VALID_WALLET_THRESHOLD}, sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
+      rule:
+        options.phase === "pre_buy"
+          ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS} and < ${AXIOM_BUY_MAX_EXISTING_ATA_WALLETS}, sold < ${AXIOM_BUY_MAX_SOLD_WALLETS}`
+          : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
       soldWallets: soldWallets.map((wallet) => wallet.address),
       holdingWallets: holdingWallets.map((wallet) => wallet.address),
       missingAtaWallets: missingAtaWallets.map((wallet) => wallet.address),
     });
 
+    if (options.phase === "pre_buy") {
+      await this.evaluateAxiomAtaBuyGate(
+        mint,
+        existingAtaWalletCount,
+        soldWallets.length,
+        watched.length,
+        missingAtaWallets.length,
+      );
+      return false;
+    }
+
     if (!options.triggerSell) {
       return false;
     }
 
-    if (
-      existingAtaWalletCount < AXIOM_EXIT_VALID_WALLET_THRESHOLD ||
-      soldWallets.length < AXIOM_EXIT_SOLD_WALLET_THRESHOLD
-    ) {
+    if (soldWallets.length < AXIOM_EXIT_SOLD_WALLET_THRESHOLD) {
       return false;
     }
 
@@ -1413,7 +1471,7 @@ export class InsiderBot extends EventEmitter {
         `Sold all / existing ATA wallets: <b>${soldWallets.length}</b> / <b>${existingAtaWalletCount}</b>`,
         `Cumulative valid wallets watched: <b>${watched.length}</b>`,
         `Missing ATA wallets ignored: <b>${missingAtaWallets.length}</b>`,
-        `Rule: existing ATA wallets >= <b>${AXIOM_EXIT_VALID_WALLET_THRESHOLD}</b> and sold existing ATA wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b>.`,
+        `Rule: sold existing ATA wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b>.`,
         "",
         "<b>First sold wallets:</b>",
         walletLines,
@@ -1421,6 +1479,78 @@ export class InsiderBot extends EventEmitter {
       "AXIOM_SINGLE_BUY_ATA_EXIT_TRIGGER",
     );
     return true;
+  }
+
+  private async evaluateAxiomAtaBuyGate(
+    mint: string,
+    existingAtaWalletCount: number,
+    soldAllCount: number,
+    watchedCount: number,
+    missingAtaWalletCount: number,
+  ): Promise<void> {
+    if (
+      this.phase !== "pre_buy" ||
+      this.preBuyStopped ||
+      this.buySubmitted ||
+      this.isBuyExecuting ||
+      this.isBuyGateEvaluating ||
+      this.buyDisabled ||
+      existingAtaWalletCount < AXIOM_BUY_MIN_EXISTING_ATA_WALLETS ||
+      existingAtaWalletCount >= AXIOM_BUY_MAX_EXISTING_ATA_WALLETS ||
+      soldAllCount >= AXIOM_BUY_MAX_SOLD_WALLETS
+    ) {
+      return;
+    }
+
+    this.isBuyGateEvaluating = true;
+    try {
+      await this.stopPreBuyMonitoring();
+
+      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
+      if (currentMc === null) {
+        log.warn("Could not fetch MC for Axiom ATA buy gate", { mint });
+        this.preBuyStopped = false;
+        if (this.monitoredWallet && !this.insiderSellsReady) {
+          this.startInsiderMonitoring();
+        }
+        return;
+      }
+
+      const newExitMc = currentMc * (1 + this.exitPercent / 100);
+      this.setExitMc(newExitMc);
+      this.setEntryMc(currentMc);
+      this.setBuyExecuting(true);
+      this.buySubmitted = true;
+
+      log.warn("Axiom ATA buy gate passed — triggering buy", {
+        mint,
+        existingAtaWalletCount,
+        soldAllCount,
+        watchedCount,
+        missingAtaWalletCount,
+        currentMc,
+        exitMc: newExitMc,
+      });
+
+      this.emit("buyTrigger", {
+        followedWallet: this.followedWallet!,
+        mint,
+        signature: "AXIOM_ATA_BUY_TRIGGER",
+        buySol: this.buySol,
+        entryMc: currentMc,
+        monitoredWallet: this.monitoredWallet ?? undefined,
+        tradersListStr: [
+          "<b>Axiom ATA Buy Gate Passed</b>",
+          `Existing ATA wallets: <b>${existingAtaWalletCount}</b>`,
+          `Sold all: <b>${soldAllCount}</b>`,
+          `Cumulative valid wallets: <b>${watchedCount}</b>`,
+          `Missing ATA wallets ignored: <b>${missingAtaWalletCount}</b>`,
+          `Rule: existing ATA wallets >= <b>${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}</b> and < <b>${AXIOM_BUY_MAX_EXISTING_ATA_WALLETS}</b>, sold all < <b>${AXIOM_BUY_MAX_SOLD_WALLETS}</b>.`,
+        ].join("\n"),
+      });
+    } finally {
+      this.isBuyGateEvaluating = false;
+    }
   }
 
   private async scanAxiomSingleBuyTradersPreBuy(mint: string): Promise<void> {
@@ -1454,10 +1584,6 @@ export class InsiderBot extends EventEmitter {
     const stats = this.logAxiomSingleBuyTraderScan(mint, "pre_buy", list);
     if (stats && stats.validCount > 0) {
       this.rememberAxiomWatchedWallets(mint, stats.matchingWallets);
-      await this.checkAxiomWatchedWalletAtaExits(mint, {
-        phase: "pre_buy",
-        triggerSell: false,
-      });
     }
   }
 
@@ -1486,27 +1612,15 @@ export class InsiderBot extends EventEmitter {
         limit: AXIOM_TRADER_SCAN_LIMIT,
         responseShape: this.describeTraderResponseShape(traders),
       });
-      await this.checkAxiomWatchedWalletAtaExits(mint, {
-        phase: "post_buy",
-        triggerSell: true,
-      });
       return;
     }
 
     const stats = this.logAxiomSingleBuyTraderScan(mint, "post_buy", list);
     if (!stats || stats.validCount === 0) {
-      await this.checkAxiomWatchedWalletAtaExits(mint, {
-        phase: "post_buy",
-        triggerSell: true,
-      });
       return;
     }
 
     this.rememberAxiomWatchedWallets(mint, stats.matchingWallets);
-    await this.checkAxiomWatchedWalletAtaExits(mint, {
-      phase: "post_buy",
-      triggerSell: true,
-    });
   }
 
   private async scanBundlerTraders(mint: string): Promise<void> {
@@ -1582,78 +1696,6 @@ export class InsiderBot extends EventEmitter {
 
       if (await this.tryCompleteBundlerGate(mint)) return;
     }
-  }
-
-  private async evaluateBuyGate(mint: string): Promise<void> {
-    if (
-      this.phase !== "pre_buy" ||
-      !this.insiderSellsReady ||
-      !this.bundlerMatchesReady ||
-      this.buySubmitted ||
-      this.isBuyExecuting ||
-      this.buyDisabled
-    ) {
-      return;
-    }
-
-    if (this.matchedBundlers.length < REQUIRED_BUNDLER_MATCHES) return;
-    if (!this.bundlerMatchType) return;
-
-    await this.stopPreBuyMonitoring();
-
-    const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
-    if (currentMc === null) {
-      log.warn("Could not fetch MC for buy gate", { mint });
-      this.preBuyStopped = false;
-      if (this.monitoredWallet) this.startInsiderMonitoring();
-      return;
-    }
-
-    const newExitMc = currentMc * (1 + this.exitPercent / 100);
-    this.setExitMc(newExitMc);
-    this.setEntryMc(currentMc);
-
-    const tradersListStr = this.matchedBundlers
-      .map(
-        (b, i) =>
-          `${i + 1}. <code>${b.address}</code> buy: <b>$${b.buyUsd.toFixed(2)}</b> (${b.buyTxCount} buy tx)`,
-      )
-      .join("\n");
-
-    log.warn("Buy gate passed — both insider sells and bundler matches ready", {
-      mint,
-      bundlerMatchType: this.bundlerMatchType,
-      insiderSells: this.insiderState?.sellCount,
-      bundlers: this.matchedBundlers.map((b) => b.address),
-      totalBuyTxs: this.tokenBuyCount,
-      totalSellTxs: this.tokenSellCount,
-      currentMc,
-      exitMc: newExitMc,
-    });
-
-    this.setBuyExecuting(true);
-    this.buySubmitted = true;
-
-    log.info("Buy gate complete — both pre-buy monitors stopped, triggering buy", {
-      mint,
-      insiderSells: this.insiderState?.sellCount,
-      bundlers: this.matchedBundlers.map((b) => b.address),
-    });
-
-    this.emit("buyTrigger", {
-      followedWallet: this.followedWallet!,
-      mint,
-      signature: "BUY_GATE_TRIGGER",
-      buySol: this.buySol,
-      entryMc: currentMc,
-      monitoredWallet: this.monitoredWallet ?? undefined,
-      tradersListStr: [
-        "<b>Buy Gate Passed</b>",
-        `Bundler trigger: <b>${this.bundlerMatchTypeLabel(this.bundlerMatchType)}</b>`,
-        `Insider sells: <b>${this.insiderState?.sellCount ?? 0}</b>`,
-        tradersListStr,
-      ].join("\n"),
-    });
   }
 
   private extractTraderList(traders: Record<string, unknown> | null): Array<Record<string, unknown>> {
@@ -1772,37 +1814,6 @@ export class InsiderBot extends EventEmitter {
       totalSellTxs: this.tokenSellCount,
       signature: tx.signature,
     });
-
-    await this.checkBundlerSellTrigger(mint);
-  }
-
-  private async checkBundlerSellTrigger(mint: string): Promise<void> {
-    if (!this.bundlerWatch || !this.activePosition) return;
-
-    const allSold = this.bundlerWatch.wallets.every(
-      (w) => (this.bundlerWatch!.sellCounts.get(w) ?? 0) >= 1,
-    );
-    if (!allSold) return;
-
-    log.warn("Both bundler wallets sold — triggering position sell", {
-      mint,
-      wallets: this.bundlerWatch.wallets,
-      sellCounts: Object.fromEntries(this.bundlerWatch.sellCounts),
-      totalBuyTxs: this.tokenBuyCount,
-      totalSellTxs: this.tokenSellCount,
-    });
-
-    await this.triggerPositionSell(
-      mint,
-      "Both tracked bundler wallets have sold at least once",
-      [
-        "<b>🚨 Bundler Sell Signal</b>",
-        `Token: <code>${mint}</code>`,
-        "Both tracked bundler wallets have sold at least once.",
-        `Total sell txs seen: <b>${this.tokenSellCount}</b>`,
-      ],
-      "BUNDLER_SELL_TRIGGER",
-    );
   }
 
   private async triggerPositionSell(
@@ -1834,6 +1845,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     await this.stopBundlerMonitoring();
+    this.stopAxiomAtaPollLoop();
     this.watchingMint = null;
     this.monitoredWallet = null;
     this.insiderState = null;
@@ -1882,6 +1894,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
     this.buySubmitted = false;
+    this.isBuyGateEvaluating = false;
     this.resetTokenTxCounts();
 
     log.info("InsiderBot reset; resuming followed wallet monitoring");
