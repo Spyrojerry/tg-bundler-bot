@@ -78,12 +78,20 @@ export class GmgnClient {
   private readonly connection: Connection;
   private readonly chain  = 'sol';
   private readonly limiter: RateLimiter;
+  private readonly fallbackApiKey: string | null;
+  private readonly fallbackLimiter: RateLimiter | null;
   private readonly baselineMinTime: number;
   private readonly fetchMode: 'auto' | 'direct' | 'cli';
   private readonly pumpSdk: OnlinePumpSdk;
   private readonly tradingKeypair: Keypair | null = null;
 
-  constructor(config: ServiceConfig, limiter: RateLimiter, rpcUrlOverride?: string) {
+  constructor(
+    config: ServiceConfig,
+    limiter: RateLimiter,
+    rpcUrlOverride?: string,
+    fallbackApiKey?: string,
+    fallbackLimiter?: RateLimiter,
+  ) {
     this.baseUrl          = config.gmgnApiBaseUrl.replace(/\/$/, '');
     this.apiKey           = config.gmgnApiKey;
     this.jupiterSwapBaseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, '');
@@ -92,6 +100,11 @@ export class GmgnClient {
     this.connection       = new Connection(rpcUrlOverride || config.solanaRpcUrl, 'confirmed');
     this.pumpSdk          = new OnlinePumpSdk(this.connection);
     this.limiter          = limiter;
+    this.fallbackApiKey =
+      fallbackApiKey && fallbackApiKey !== this.apiKey ? fallbackApiKey : null;
+    this.fallbackLimiter = this.fallbackApiKey
+      ? fallbackLimiter ?? limiter
+      : null;
     this.baselineMinTime  = config.rateLimitMinTime;
     this.fetchMode        = config.gmgnFetchMode;
 
@@ -552,37 +565,114 @@ export class GmgnClient {
     const separator = endpoint.includes('?') ? '&' : '?';
     const url = `${this.baseUrl}/${endpoint}${separator}chain=${this.chain}&address=${mint}`;
 
+    const primary = await this.fetchRawTokenDataWithKey(
+      url,
+      this.apiKey,
+      this.limiter,
+      'primary',
+    );
+    if (primary.data || !primary.shouldFallback) {
+      return primary.data;
+    }
+
+    if (!this.fallbackApiKey || !this.fallbackLimiter) {
+      return null;
+    }
+
+    log.warn(`GMGN primary request failed; trying GMGN_FALLBACK_API_KEY`, {
+      mint,
+      endpoint,
+      reason: primary.reason,
+    });
+
+    const fallback = await this.fallbackLimiter.schedule(() =>
+      this.fetchRawTokenDataWithKey(
+        url,
+        this.fallbackApiKey!,
+        this.fallbackLimiter!,
+        'fallback',
+      ),
+    );
+    return fallback.data;
+  }
+
+  private async fetchRawTokenDataWithKey(
+    url: string,
+    apiKey: string,
+    limiter: RateLimiter,
+    keyRole: 'primary' | 'fallback',
+  ): Promise<{
+    data: Record<string, unknown> | null;
+    shouldFallback: boolean;
+    reason: string;
+  }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
       const resp = await fetch(url, {
         method: 'GET',
         headers: {
-          'X-API-KEY': this.apiKey,
+          'X-API-KEY': apiKey,
           Accept: 'application/json',
           'User-Agent': 'gmgn-monitor/1.0',
         },
         signal: controller.signal,
       });
-      clearTimeout(timer);
 
       if (resp.status === 429) {
         const retryMs = this.getRetryDelayMs(resp) ?? BLOCKED_RETRY_MS;
-        this.limiter.onRateLimited(retryMs);
-        return null;
+        limiter.onRateLimited(retryMs);
+        return {
+          data: null,
+          shouldFallback: keyRole === 'primary',
+          reason: 'HTTP 429 rate limited',
+        };
       }
-      if (!resp.ok) return null;
+
+      if (resp.status === 401 || resp.status === 403 || resp.status >= 500) {
+        return {
+          data: null,
+          shouldFallback: keyRole === 'primary',
+          reason: `HTTP ${resp.status}`,
+        };
+      }
+
+      if (!resp.ok) {
+        return {
+          data: null,
+          shouldFallback: false,
+          reason: `HTTP ${resp.status}`,
+        };
+      }
 
       const json = (await resp.json()) as GmgnSecurityResponse;
-      if (json.code !== undefined && json.code !== 0) return null;
+      if (json.code !== undefined && json.code !== 0) {
+        return {
+          data: null,
+          shouldFallback: false,
+          reason: `GMGN response code ${json.code}`,
+        };
+      }
 
+      limiter.onSuccess(this.baselineMinTime);
       const unwrapped = this.unwrapResponseData(json);
       if (unwrapped) {
-        unwrapped.source = 'api';
+        unwrapped.source = keyRole === 'primary' ? 'api' : 'api-fallback';
       }
-      return unwrapped;
-    } catch {
-      return null;
+      return {
+        data: unwrapped,
+        shouldFallback: false,
+        reason: unwrapped ? 'success' : 'empty response',
+      };
+    } catch (err) {
+      return {
+        data: null,
+        shouldFallback: keyRole === 'primary',
+        reason: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      clearTimeout(timer);
     }
   }
 

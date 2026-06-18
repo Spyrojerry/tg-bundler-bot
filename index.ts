@@ -47,6 +47,47 @@ async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
   const config = loadConfig();
   setLogLevel(config.logLevel);
+  const insiderBotDefinitions = [
+    {
+      botNumber: 1,
+      enabled: true,
+      gmgnApiKey: config.gmgnApiKey,
+      heliusApiKey: config.insiderHeliusApiKey || config.heliusApiKey,
+      rpcUrl: config.insiderSolanaRpcUrl,
+      wsUrl: config.insiderSolanaWsUrl,
+      followWallet: config.insiderFollowWallet,
+    },
+    {
+      botNumber: 2,
+      enabled: Boolean(process.env.GMGN_API_KEY_2?.trim()),
+      gmgnApiKey: config.gmgnApiKey2,
+      heliusApiKey: config.insiderHeliusApiKey2 || config.heliusApiKey,
+      rpcUrl: config.insiderSolanaRpcUrl2,
+      wsUrl: config.insiderSolanaWsUrl2,
+      followWallet: config.insiderFollowWallet2,
+    },
+    {
+      botNumber: 3,
+      enabled: Boolean(process.env.GMGN_API_KEY_3?.trim()),
+      gmgnApiKey: config.gmgnApiKey3,
+      heliusApiKey: config.insiderHeliusApiKey3 || config.heliusApiKey,
+      rpcUrl: config.insiderSolanaRpcUrl3,
+      wsUrl: config.insiderSolanaWsUrl3,
+      followWallet: config.insiderFollowWallet3,
+    },
+    {
+      botNumber: 4,
+      enabled: Boolean(process.env.GMGN_API_KEY_4?.trim()),
+      gmgnApiKey: config.gmgnApiKey4,
+      heliusApiKey: config.insiderHeliusApiKey4 || config.heliusApiKey,
+      rpcUrl: config.insiderSolanaRpcUrl4,
+      wsUrl: config.insiderSolanaWsUrl4,
+      followWallet: config.insiderFollowWallet4,
+    },
+  ].filter((definition) => definition.enabled);
+
+  const getInsiderBotNumber = (index: number): number =>
+    insiderBotDefinitions[index]?.botNumber ?? index + 1;
 
   log.info("═══════════════════════════════════════");
   log.info("  GMGN Bundler Monitor  — starting up");
@@ -65,11 +106,12 @@ async function main(): Promise<void> {
     f1Rpc: config.f1SolanaRpcUrl,
     f1Ws: config.f1SolanaWsUrl,
 
-    // Insider endpoints (used by Insider Bot 1 & 2)
-    insider1Rpc: config.insiderSolanaRpcUrl,
-    insider1Ws: config.insiderSolanaWsUrl,
-    insider2Rpc: config.insiderSolanaRpcUrl2,
-    insider2Ws: config.insiderSolanaWsUrl2,
+    insiderBots: insiderBotDefinitions.map((definition) => ({
+      bot: definition.botNumber,
+      rpc: definition.rpcUrl,
+      ws: definition.wsUrl,
+      followWallet: definition.followWallet,
+    })),
 
     insiderEntryMc: config.insiderEntryMc,
     insiderExitMc: config.insiderExitMc,
@@ -84,23 +126,27 @@ async function main(): Promise<void> {
   // ── 2. Database ────────────────────────────────────────────────────────────
   const db = await MonitorDatabase.create(config.dbPath);
 
-  // ── 3. Rate limiter + GMGN client ─────────────────────────────────────────
-  const limiter = new RateLimiter(
+  // ── 3. Per-bot rate limiters + GMGN clients ────────────────────────────────
+  const gmgnLimiters = insiderBotDefinitions.map(
+    () =>
+      new RateLimiter(
+        config.rateLimitMinTime,
+        config.rateLimitMaxConcurrent,
+      ),
+  );
+  const gmgnFallbackLimiter = new RateLimiter(
     config.rateLimitMinTime,
     config.rateLimitMaxConcurrent,
   );
-  const gmgnClients = [
-    new GmgnClient(config, limiter, config.insiderSolanaRpcUrl),
-    new GmgnClient(
-      { ...config, gmgnApiKey: config.gmgnApiKey2 },
-      limiter,
-      config.insiderSolanaRpcUrl2,
-    ),
-  ];
-  const preBuyAxiomGmgnClient = new GmgnClient(
-    { ...config, gmgnApiKey: config.gmgnApiKey3 },
-    limiter,
-    config.insiderSolanaRpcUrl,
+  const gmgnClients = insiderBotDefinitions.map(
+    (definition, index) =>
+      new GmgnClient(
+        { ...config, gmgnApiKey: definition.gmgnApiKey },
+        gmgnLimiters[index],
+        definition.rpcUrl,
+        config.gmgnFallbackApiKey ?? undefined,
+        gmgnFallbackLimiter,
+      ),
   );
 
   let telegramBot: TelegramBot | null = null;
@@ -350,7 +396,7 @@ async function main(): Promise<void> {
 
           const lines = [
             context === "insider"
-              ? `<b>Insider ${effectiveBotIndex + 1} Position Update</b>`
+              ? `<b>Insider ${getInsiderBotNumber(effectiveBotIndex)} Position Update</b>`
               : context === "reverse_copysell"
                 ? "<b>Reverse CopySell Update</b>"
                 : "<b>Bundler Position Update</b>",
@@ -483,7 +529,15 @@ async function main(): Promise<void> {
           return homeReply(true);
         }
         if (data.startsWith("insider:select:")) {
-          activeInsiderIndex = parseInt(data.split(":")[2]);
+          const selectedIndex = parseInt(data.split(":")[2], 10);
+          if (
+            !Number.isInteger(selectedIndex) ||
+            selectedIndex < 0 ||
+            selectedIndex >= insiderBots.length
+          ) {
+            return "Invalid Insider bot selection.";
+          }
+          activeInsiderIndex = selectedIndex;
           return homeReply(true);
         }
         if (data === "insider:follow") {
@@ -492,7 +546,7 @@ async function main(): Promise<void> {
             index: activeInsiderIndex,
           });
           return {
-            text: `[Bot ${activeInsiderIndex + 1}] Send the wallet address for Insider Bot to follow.`,
+            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the wallet address for Insider Bot to follow.`,
             trackPrompt: true,
             editCurrent: true,
           };
@@ -503,7 +557,7 @@ async function main(): Promise<void> {
             index: activeInsiderIndex,
           });
           return {
-            text: `[Bot ${activeInsiderIndex + 1}] Send the SOL amount Insider Bot should buy with.`,
+            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the SOL amount Insider Bot should buy with.`,
             trackPrompt: true,
             editCurrent: true,
           };
@@ -514,7 +568,7 @@ async function main(): Promise<void> {
             index: activeInsiderIndex,
           });
           return {
-            text: `[Bot ${activeInsiderIndex + 1}] Send the Exit profit percentage increase.\nExample: <code>40</code> for a 40% ATH MC increase from your entry point.`,
+            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the Exit profit percentage increase.\nExample: <code>40</code> for a 40% ATH MC increase from your entry point.`,
             trackPrompt: true,
             editCurrent: true,
           };
@@ -525,7 +579,7 @@ async function main(): Promise<void> {
             index: activeInsiderIndex,
           });
           return {
-            text: `[Bot ${activeInsiderIndex + 1}] Send the minimum bundler buy USD.\nExample: <code>100</code>`,
+            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the minimum bundler buy USD.\nExample: <code>100</code>`,
             trackPrompt: true,
             editCurrent: true,
           };
@@ -536,7 +590,7 @@ async function main(): Promise<void> {
             index: activeInsiderIndex,
           });
           return {
-            text: `[Bot ${activeInsiderIndex + 1}] Send the maximum bundler buy USD.\nExample: <code>150</code>`,
+            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the maximum bundler buy USD.\nExample: <code>150</code>`,
             trackPrompt: true,
             editCurrent: true,
           };
@@ -559,7 +613,7 @@ async function main(): Promise<void> {
               index: activeInsiderIndex,
             });
             return {
-              text: `[Bot ${activeInsiderIndex + 1}] Send the wallet address for Insider Bot to follow.`,
+              text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the wallet address for Insider Bot to follow.`,
               trackPrompt: true,
               editCurrent: true,
             };
@@ -805,21 +859,13 @@ async function main(): Promise<void> {
     ? new TelegramBot(config, handleTelegramCommand)
     : null;
 
-  const insiderHeliusKeys = [
-    config.insiderHeliusApiKey || config.heliusApiKey,
-    config.insiderHeliusApiKey2 || config.heliusApiKey,
-  ];
-
-  const bundlerGmgnClient = gmgnClients[1];
-
   function claimInsiderMint(botIndex: number, mint: string): boolean {
-    if (botIndex > 1) return true;
-    const otherIndex = botIndex === 0 ? 1 : 0;
-    const otherBot = insiderBots[otherIndex];
-    if (!otherBot) return true;
-    if (otherBot.getPreBuyMint() === mint) return false;
-    if (otherBot.getActivePosition()?.mint === mint) return false;
-    return true;
+    return insiderBots.every((bot, index) => {
+      if (index === botIndex) return true;
+      if (bot.getPreBuyMint() === mint) return false;
+      if (bot.getActivePosition()?.mint === mint) return false;
+      return true;
+    });
   }
 
   const makeClaimFn =
@@ -827,40 +873,27 @@ async function main(): Promise<void> {
     (mint: string) =>
       claimInsiderMint(botIndex, mint);
 
-  insiderBots.push(
-    new InsiderBot(
-      config,
-      config.insiderSolanaRpcUrl,
-      config.insiderSolanaWsUrl,
-      gmgnClients[0],
-      bundlerGmgnClient,
-      preBuyAxiomGmgnClient,
-      insiderHeliusKeys[0],
-      telegramBot,
-      makeClaimFn(0),
-      () => undefined,
-      "Insider 1",
-    ),
-  );
-  insiderBots.push(
-    new InsiderBot(
-      config,
-      config.insiderSolanaRpcUrl2,
-      config.insiderSolanaWsUrl2,
-      gmgnClients[1],
-      bundlerGmgnClient,
-      preBuyAxiomGmgnClient,
-      insiderHeliusKeys[1],
-      telegramBot,
-      makeClaimFn(1),
-      () => undefined,
-      "Insider 2",
-    ),
-  );
+  insiderBotDefinitions.forEach((definition, index) => {
+    insiderBots.push(
+      new InsiderBot(
+        config,
+        definition.rpcUrl,
+        definition.wsUrl,
+        gmgnClients[index],
+        gmgnClients[index],
+        gmgnClients[index],
+        definition.heliusApiKey,
+        telegramBot,
+        makeClaimFn(index),
+        () => undefined,
+        `Insider ${definition.botNumber}`,
+      ),
+    );
+  });
 
  
   async function resumeAllInsiderBots(): Promise<void> {
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < insiderBots.length; i++) {
       const bot = insiderBots[i];
       const wallet = bot.getFollowedWallet();
       if (
@@ -870,7 +903,7 @@ async function main(): Promise<void> {
         !bot.getPreBuyMint()
       ) {
         await bot.followWallet(wallet);
-        log.info(`[INSIDER ${i + 1}] Resumed follow-wallet monitoring`, {
+        log.info(`[INSIDER ${getInsiderBotNumber(i)}] Resumed follow-wallet monitoring`, {
           wallet,
         });
       }
@@ -890,26 +923,20 @@ async function main(): Promise<void> {
 
   // Load default wallets from config as paused saved wallets. They do not start
   // monitoring until the user resumes or switches into the active mode.
-  if (config.insiderFollowWallet) {
+  insiderBotDefinitions.forEach((definition, index) => {
+    if (!definition.followWallet) return;
     try {
-      insiderBots[0].configureFollowWallet(config.insiderFollowWallet);
+      insiderBots[index].configureFollowWallet(definition.followWallet);
       log.info(
-        `[INSIDER 1] Loaded default follow wallet in paused state: ${config.insiderFollowWallet}`,
+        `[INSIDER ${definition.botNumber}] Loaded default follow wallet in paused state: ${definition.followWallet}`,
       );
     } catch (err) {
-      log.error("[INSIDER 1] Failed to load default follow wallet", err);
-    }
-  }
-  if (config.insiderFollowWallet2) {
-    try {
-      insiderBots[1].configureFollowWallet(config.insiderFollowWallet2);
-      log.info(
-        `[INSIDER 2] Loaded default follow wallet in paused state: ${config.insiderFollowWallet2}`,
+      log.error(
+        `[INSIDER ${definition.botNumber}] Failed to load default follow wallet`,
+        err,
       );
-    } catch (err) {
-      log.error("[INSIDER 2] Failed to load default follow wallet", err);
     }
-  }
+  });
 
   if (telegramBot) {
     telegramBot.start();
@@ -1176,6 +1203,7 @@ async function main(): Promise<void> {
 
   insiderBots.forEach((bot, index) => {
     const client = gmgnClients[index];
+    const botNumber = getInsiderBotNumber(index);
 
     bot.on("mintSeen", (mint: string) => {
       if (config.tradingWalletAddress) {
@@ -1186,13 +1214,13 @@ async function main(): Promise<void> {
     bot.on("buyTrigger", (trigger) => {
       if (!config.tradingWalletAddress) {
         log.warn(
-          `[INSIDER ${index + 1} BUY SKIP] No trading wallet configured`,
+          `[INSIDER ${botNumber} BUY SKIP] No trading wallet configured`,
           trigger,
         );
         return;
       }
 
-      log.warn(`[INSIDER ${index + 1} BUY TRIGGER]`, trigger);
+      log.warn(`[INSIDER ${botNumber} BUY TRIGGER]`, trigger);
 
       void (async () => {
         try {
@@ -1200,7 +1228,7 @@ async function main(): Promise<void> {
 
           await telegramBot?.sendDefault(
             [
-              `<b>🚀 Insider ${index + 1} Buy Executing</b>`,
+              `<b>🚀 Insider ${botNumber} Buy Executing</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
               `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
               `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
@@ -1237,7 +1265,7 @@ async function main(): Promise<void> {
 
           await telegramBot?.sendDefault(
             [
-              `<b>✅ Insider ${index + 1} Buy Completed</b>`,
+              `<b>✅ Insider ${botNumber} Buy Completed</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
               `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
               `Status: <b>${html(result.status)}</b>`,
@@ -1269,10 +1297,10 @@ async function main(): Promise<void> {
           );
         } catch (err) {
           bot.resetBuyAttempt();
-          log.error(`Insider ${index + 1} buy failed`, err);
+          log.error(`Insider ${botNumber} buy failed`, err);
           await telegramBot?.sendDefault(
             [
-              `<b>❌ Insider ${index + 1} Buy Failed</b>`,
+              `<b>❌ Insider ${botNumber} Buy Failed</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
               `Error: ${html(err instanceof Error ? err.message : String(err))}`,
             ].join("\n"),
@@ -1284,7 +1312,7 @@ async function main(): Promise<void> {
     bot.on("sellTrigger", (trigger) => {
       if (!config.tradingWalletAddress) {
         log.warn(
-          `[INSIDER ${index + 1} SELL SKIP] No trading wallet configured`,
+          `[INSIDER ${botNumber} SELL SKIP] No trading wallet configured`,
           trigger,
         );
         return;
@@ -1293,7 +1321,7 @@ async function main(): Promise<void> {
         hasPendingSellForMint(config.tradingWalletAddress, trigger.positionMint)
       ) {
         log.info(
-          `[INSIDER ${index + 1} SELL SKIP] Sell already pending for ${trigger.positionMint}`,
+          `[INSIDER ${botNumber} SELL SKIP] Sell already pending for ${trigger.positionMint}`,
         );
         return;
       }
@@ -1332,7 +1360,7 @@ async function main(): Promise<void> {
       telegramBot
         ?.sendDefault(
           [
-            `<b>🚨 Insider ${index + 1} Sell Triggered</b>`,
+            `<b>🚨 Insider ${botNumber} Sell Triggered</b>`,
             `Token: <code>${html(trigger.positionMint)}</code>`,
             `Reason: <b>${trigger.reason}</b>`,
             `Action: submit sell for <b>${config.sellPercent}%</b>.`,
@@ -1351,17 +1379,17 @@ async function main(): Promise<void> {
           },
         )
         .catch((err) =>
-          log.warn(`Telegram insider ${index + 1} sell alert failed`, err),
+          log.warn(`Telegram insider ${botNumber} sell alert failed`, err),
         );
 
       void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
     });
 
     bot.on("error", (err) => {
-      log.error(`Insider ${index + 1} error:`, err);
+      log.error(`Insider ${botNumber} error:`, err);
       telegramBot
         ?.sendDefault(
-          `<b>⚠️ Insider Bot ${index + 1} Error</b>\n${html(err.message)}`,
+          `<b>⚠️ Insider Bot ${botNumber} Error</b>\n${html(err.message)}`,
         )
         .catch((e) => log.warn("Telegram error alert failed", e));
     });
@@ -1703,6 +1731,7 @@ async function main(): Promise<void> {
   ): Promise<void> {
     const bot = insiderBots[index];
     const client = gmgnClients[index];
+    const botNumber = getInsiderBotNumber(index);
     const preBuyMint = bot.getPreBuyMint();
     const activePos = bot.getActivePosition();
 
@@ -1718,19 +1747,19 @@ async function main(): Promise<void> {
 
       if (currentMc === null) {
         log.debug(
-          `[INSIDER ${index + 1} MC SKIP] Could not fetch market cap for ${mint}`,
+          `[INSIDER ${botNumber} MC SKIP] Could not fetch market cap for ${mint}`,
         );
         return;
       }
 
       log.info(
-        `[INSIDER ${index + 1} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${preFetchedMc !== undefined ? "Prefetched" : "Client"})`,
+        `[INSIDER ${botNumber} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${preFetchedMc !== undefined ? "Prefetched" : "Client"})`,
       );
 
       if (currentMc < INSIDER_MIN_MARKET_CAP_USD) {
         const reason = `Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} (Rug)`;
         log.warn(
-          `[INSIDER ${index + 1} RUG] ${reason} for ${mint}. Resetting state.`,
+          `[INSIDER ${botNumber} RUG] ${reason} for ${mint}. Resetting state.`,
         );
 
         const preBuyOnly = !!preBuyMint && !activePos;
@@ -1749,7 +1778,7 @@ async function main(): Promise<void> {
             ?.sendDefault(
               [
                 "<b>🧹 Rug Reset — Token Skipped</b>",
-                `Bot: <b>${index + 1}</b>`,
+                `Bot: <b>${botNumber}</b>`,
                 `Token: <code>${html(mint)}</code>`,
                 `Market cap: <b>$${currentMc.toLocaleString()}</b>`,
                 `Rug threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
@@ -1772,7 +1801,7 @@ async function main(): Promise<void> {
         const athMc = await client.fetchTokenAthMarketCapUsd(mint);
         if (athMc !== null && athMc >= exitMc) {
           log.warn(
-            `[INSIDER ${index + 1} EXIT] ATH MC $${athMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`,
+            `[INSIDER ${botNumber} EXIT] ATH MC $${athMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`,
           );
           bot.emit("sellTrigger", {
             followedWallet: bot.getFollowedWallet()!,
@@ -1784,7 +1813,7 @@ async function main(): Promise<void> {
       }
     } catch (err) {
       log.error(
-        `Failed to check Insider MC flow for ${mint} (Bot ${index + 1})`,
+        `Failed to check Insider MC flow for ${mint} (Bot ${botNumber})`,
         err,
       );
     }
@@ -1835,7 +1864,7 @@ async function main(): Promise<void> {
                 const mintPk = new PublicKey(activePos.mint);
 
                 log.debug(
-                  `[INSIDER ${i + 1} BACKGROUND] Refreshing balance/quote for ${activePos.mint}`,
+                  `[INSIDER ${getInsiderBotNumber(i)} BACKGROUND] Refreshing balance/quote for ${activePos.mint}`,
                 );
                 Promise.all([
                   getTokenRawBalance(owner, mintPk),
@@ -1884,7 +1913,7 @@ async function main(): Promise<void> {
 
             await Promise.all(tasks);
           } catch (err) {
-            log.error(`Error in Insider Bot ${i + 1} MC loop`, err);
+            log.error(`Error in Insider Bot ${getInsiderBotNumber(i)} MC loop`, err);
           } finally {
             isChecking = false;
           }
@@ -2279,20 +2308,25 @@ async function main(): Promise<void> {
 
       const monitoredWallet = bot.getMonitoredWallet();
 
-      const botSelectionRow = [
-        {
-          text: activeInsiderIndex === 0 ? "🟢 Bot 1" : "Bot 1",
-          callback_data: "insider:select:0",
-        },
-        {
-          text: activeInsiderIndex === 1 ? "🟢 Bot 2" : "Bot 2",
-          callback_data: "insider:select:1",
-        },
-      ];
+      const botSelectionRows = insiderBots.reduce<
+        Array<Array<{ text: string; callback_data: string }>>
+      >((rows, _insiderBot, index) => {
+        const rowIndex = Math.floor(index / 2);
+        const botNumber = getInsiderBotNumber(index);
+        rows[rowIndex] ??= [];
+        rows[rowIndex].push({
+          text:
+            activeInsiderIndex === index
+              ? `🟢 Bot ${botNumber}`
+              : `Bot ${botNumber}`,
+          callback_data: `insider:select:${index}`,
+        });
+        return rows;
+      }, []);
 
       return {
         text: [
-          `<b>Insider Bot ${activeInsiderIndex + 1}</b>`,
+          `<b>Insider Bot ${getInsiderBotNumber(activeInsiderIndex)}</b>`,
           "",
           `Mode: <b>Insider</b>`,
           `Status: <b>${status}</b>`,
@@ -2301,16 +2335,15 @@ async function main(): Promise<void> {
             ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
             : "",
           `Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
-          `Bundler buy USD: <b>$${html(String(bot.getBundlerBuyMinUsd()))} – $${html(String(bot.getBundlerBuyMaxUsd()))}</b>`,
           `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% ATH MC from Entry</b>`,
           `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
           "",
           "<b>Flow</b>",
-          "1. Bot 1 & 2 run in parallel on their own follow wallets (same mint blocked).",
+          "1. Bots 1–4 run in parallel on their own follow wallets (same mint blocked).",
           "2. GMGN discovers cumulative axiom/empty single-buy wallets; their ATAs are polled independently.",
           "3. Buy when 10–14 existing ATA wallets are found and fewer than 2 have sold all.",
-          "4. After buy: continue ATA polling and watch matched bundlers for transfer-out.",
-          "5. Sell when 5 ATA wallets sold all, on bundler transfer-out, ATH MC target, rug threshold, or manual sell.",
+          "4. After buy: continue Axiom discovery and independent ATA polling.",
+          "5. Sell when 5 ATA wallets sold all, on ATH MC target, rug threshold, or manual sell.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
         ].join("\n"),
         replyMarkup: {
@@ -2319,7 +2352,7 @@ async function main(): Promise<void> {
               { text: "Insider", callback_data: "mode:insider" },
               { text: "Bundler", callback_data: "mode:bundler" },
             ],
-            botSelectionRow,
+            ...botSelectionRows,
             [
               { text: "Follow wallet", callback_data: "insider:follow" },
               { text: "Buy SOL", callback_data: "insider:buysol" },
@@ -2484,7 +2517,7 @@ async function main(): Promise<void> {
               ? "Paused"
               : "Idle";
           return [
-            `<b>Insider Bot ${i + 1}</b>`,
+            `<b>Insider Bot ${getInsiderBotNumber(i)}</b>`,
             `Status: ${status}`,
             `Follow: ${followed ?? "not set"}`,
             `Buy: ${bot.getBuySol()} SOL`,
@@ -2788,7 +2821,20 @@ async function main(): Promise<void> {
     await earlyBundlerOrchestrator.shutdown();
     await reverseCopySellOrchestrator.shutdown();
 
-    await limiter.drain().catch((e) => log.warn("Limiter drain error", e));
+    await Promise.all(
+      [...gmgnLimiters, gmgnFallbackLimiter].map((limiter, index) =>
+        limiter
+          .drain()
+          .catch((e) =>
+            log.warn(
+              index < gmgnLimiters.length
+                ? `GMGN limiter ${index + 1} drain error`
+                : "GMGN fallback limiter drain error",
+              e,
+            ),
+          ),
+      ),
+    );
     db.close();
 
     log.info("Shutdown complete");

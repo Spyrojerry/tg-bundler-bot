@@ -131,7 +131,7 @@ export class InsiderBot extends EventEmitter {
   private readonly heliusClient: HeliusClient;
   private readonly gmgnClient: GmgnClient;
   private readonly bundlerGmgnClient: GmgnClient;
-  /** GMGN_API_KEY_3 — pre-buy axiom/empty single-buy scan only. */
+  /** This bot's GMGN client for pre-buy axiom/empty single-buy discovery. */
   private readonly preBuyAxiomGmgnClient: GmgnClient;
   private readonly claimMint: InsiderMintClaimFn | null;
   private readonly releaseMint: InsiderMintReleaseFn | null;
@@ -460,10 +460,6 @@ export class InsiderBot extends EventEmitter {
     this.phase = "holding";
     this.axiomTraderWatchActive = true;
 
-    const wallets = this.matchedBundlers.map((b) => b.address);
-    if (wallets.length >= REQUIRED_BUNDLER_MATCHES) {
-      void this.startBundlerMonitoring(wallets, trigger.mint);
-    }
     void this.scanAxiomSingleBuyTradersPostBuy(trigger.mint);
   }
 
@@ -586,16 +582,14 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `Lowest insider: <code>${lowest.wallet}</code>`,
         `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
-        `Bundler matches: <b>${this.matchedBundlers.length}</b> / ${REQUIRED_BUNDLER_MATCHES}`,
         "",
-        "Monitoring insider + scanning GMGN bundlers in parallel (each stops when its target is met)...",
+        "Monitoring insider while discovering cumulative Axiom/empty single-buy wallets...",
       ].join("\n"),
     );
 
     this.startInsiderMonitoring();
     this.startPollLoop();
     this.startAxiomAtaPollLoop();
-    await this.scanBundlerTraders(mint);
     await this.scanAxiomSingleBuyTradersPreBuy(mint);
   }
 
@@ -760,18 +754,10 @@ export class InsiderBot extends EventEmitter {
         if (this.monitoredWallet && !this.insiderSellsReady) {
           await this.pollWallet(this.monitoredWallet, mint, "insider");
         }
-        if (!this.bundlerMatchesReady && !this.buySubmitted) {
-          await this.scanBundlerTraders(mint);
-        }
         await this.scanAxiomSingleBuyTradersPreBuy(mint);
       }
 
       if (this.phase === "holding") {
-        if (this.bundlerWatch) {
-          for (const wallet of this.bundlerWatch.wallets) {
-            await this.pollWallet(wallet, mint, "bundler");
-          }
-        }
         if (this.axiomTraderWatchActive) {
           await this.scanAxiomSingleBuyTradersPostBuy(mint);
         }
@@ -912,7 +898,7 @@ export class InsiderBot extends EventEmitter {
     if (this.preBuyStopped) return;
     this.preBuyStopped = true;
     await this.stopInsiderMonitoring();
-    log.info("Pre-buy monitoring stopped (insider + GMGN bundler scan)", {
+    log.info("Pre-buy monitoring stopped", {
       mint: this.watchingMint ?? this.activePosition?.mint,
       initialInsiderWallets: [...this.initialInsiderWallets],
       devWallet: this.devWallet,
@@ -1070,7 +1056,6 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `Now monitoring: <code>${newWallet}</code>`,
         `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
-        `Bundler matches: <b>${this.matchedBundlers.length}</b> / ${REQUIRED_BUNDLER_MATCHES}`,
       ]
         .filter(Boolean)
         .join("\n"),
@@ -1621,81 +1606,6 @@ export class InsiderBot extends EventEmitter {
     }
 
     this.rememberAxiomWatchedWallets(mint, stats.matchingWallets);
-  }
-
-  private async scanBundlerTraders(mint: string): Promise<void> {
-    if (
-      this.phase !== "pre_buy" ||
-      this.preBuyStopped ||
-      this.bundlerMatchesReady ||
-      this.buySubmitted ||
-      this.buyDisabled
-    ) {
-      return;
-    }
-
-    const traders = await this.bundlerGmgnClient.fetchBundlerTraders(mint, 20);
-    const list = this.extractTraderList(traders);
-    if (!list.length) {
-      log.debug("No bundler traders returned from GMGN", { mint });
-      return;
-    }
-
-    const known = this.knownBundlerAddresses();
-
-    log.info("Bundler GMGN scan", {
-      mint,
-      totalTraders: list.length,
-      lockedSingleBuy: this.accumulatedSingleBuyBundlers.length,
-      lockedMultiBuy: this.accumulatedMultiBuyBundlers.length,
-      range: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
-      insiderSellsReady: this.insiderSellsReady,
-      insiderSellCount: this.insiderState?.sellCount ?? 0,
-    });
-
-    for (const entry of list) {
-      const candidate = this.parseBundlerCandidate(entry);
-      if (!candidate || known.has(candidate.address)) continue;
-
-      if (candidate.buyTxCount <= 1) {
-        if (this.accumulatedSingleBuyBundlers.length < REQUIRED_BUNDLER_MATCHES) {
-          this.accumulatedSingleBuyBundlers.push(candidate);
-          known.add(candidate.address);
-          if (
-            this.accumulatedSingleBuyBundlers.length >=
-            this.accumulatedMultiBuyBundlers.length
-          ) {
-            this.matchedBundlers = [...this.accumulatedSingleBuyBundlers];
-          }
-          log.info("Locked single-buy bundler (first-seen snapshot)", {
-            mint,
-            wallet: candidate.address,
-            buyUsd: candidate.buyUsd,
-            buyTxCount: candidate.buyTxCount,
-            locked: this.accumulatedSingleBuyBundlers.length,
-            required: REQUIRED_BUNDLER_MATCHES,
-          });
-        }
-      } else if (this.accumulatedMultiBuyBundlers.length < REQUIRED_BUNDLER_MATCHES) {
-        this.accumulatedMultiBuyBundlers.push(candidate);
-        known.add(candidate.address);
-        if (
-          this.accumulatedMultiBuyBundlers.length >
-          this.accumulatedSingleBuyBundlers.length
-        ) {
-          this.matchedBundlers = [...this.accumulatedMultiBuyBundlers];
-        }
-        log.info("Locked multi-buy bundler in range (first-seen snapshot)", {
-          mint,
-          wallet: candidate.address,
-          buyUsd: candidate.buyUsd,
-          buyTxCount: candidate.buyTxCount,
-          locked: this.accumulatedMultiBuyBundlers.length,
-        });
-      }
-
-      if (await this.tryCompleteBundlerGate(mint)) return;
-    }
   }
 
   private extractTraderList(traders: Record<string, unknown> | null): Array<Record<string, unknown>> {

@@ -135,6 +135,8 @@ export interface ServiceConfig {
   gmgnApiKey: string;
   gmgnApiKey2: string;
   gmgnApiKey3: string;
+  gmgnApiKey4: string;
+  gmgnFallbackApiKey: string | null;
   gmgnApiBaseUrl: string;
   gmgnFetchMode: 'auto' | 'direct' | 'cli';
   jupiterSwapBaseUrl: string;
@@ -154,10 +156,16 @@ export interface ServiceConfig {
   f1SolanaWsUrl: string;
   insiderHeliusApiKey: string;
   insiderHeliusApiKey2: string;
+  insiderHeliusApiKey3: string;
+  insiderHeliusApiKey4: string;
   insiderSolanaRpcUrl: string;
   insiderSolanaWsUrl: string;
   insiderSolanaRpcUrl2: string;
   insiderSolanaWsUrl2: string;
+  insiderSolanaRpcUrl3: string;
+  insiderSolanaWsUrl3: string;
+  insiderSolanaRpcUrl4: string;
+  insiderSolanaWsUrl4: string;
   insiderBuySol: number;
   insiderEntryMc: number;
   insiderExitMc: number;
@@ -168,6 +176,8 @@ export interface ServiceConfig {
   insiderRequiredSells: number;
   insiderFollowWallet: string | null;
   insiderFollowWallet2: string | null;
+  insiderFollowWallet3: string | null;
+  insiderFollowWallet4: string | null;
   defaultBotMode: 'insider' | 'bundler';
   reverseCopySellTargetWallet: string | null;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
