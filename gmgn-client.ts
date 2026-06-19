@@ -28,6 +28,11 @@ import {
   getBuyTokenAmountFromSolAmount,
 } from '@pump-fun/pump-sdk';
 import {
+  OnlinePumpAmmSdk,
+  PUMP_AMM_SDK,
+  canonicalPumpPoolPda,
+} from '@pump-fun/pump-swap-sdk';
+import {
   createAssociatedTokenAccountIdempotentInstruction,
   createTransferInstruction,
   getAssociatedTokenAddressSync,
@@ -86,6 +91,7 @@ export class GmgnClient {
   private readonly baselineMinTime: number;
   private readonly fetchMode: 'auto' | 'direct' | 'cli';
   private readonly pumpSdk: OnlinePumpSdk;
+  private readonly pumpAmmSdk: OnlinePumpAmmSdk;
   private readonly tradingKeypair: Keypair | null = null;
 
   constructor(
@@ -102,6 +108,7 @@ export class GmgnClient {
     this.jupiterPriceApiKey = config.jupiterPriceApiKey;
     this.connection       = new Connection(rpcUrlOverride || config.solanaRpcUrl, 'confirmed');
     this.pumpSdk          = new OnlinePumpSdk(this.connection);
+    this.pumpAmmSdk       = new OnlinePumpAmmSdk(this.connection);
     this.limiter          = limiter;
     this.fallbackApiKey =
       fallbackApiKey && fallbackApiKey !== this.apiKey ? fallbackApiKey : null;
@@ -769,7 +776,27 @@ export class GmgnClient {
         );
         throw err;
       }
-      log.warn(`Custom Pump.fun buy path failed for ${mint}; falling back to Jupiter`, {
+      log.warn(`Custom Pump.fun bonding-curve buy path failed for ${mint}; trying PumpSwap AMM`, {
+        error: errorMessage,
+      });
+    }
+
+    try {
+      return await this.buyTokenWithSolViaPumpSwap(
+        walletAddress,
+        mint,
+        options,
+      );
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      if (errorMessage.includes('was not confirmed')) {
+        log.warn(
+          `Custom PumpSwap buy was submitted but confirmation is uncertain for ${mint}; skipping Jupiter fallback to avoid a duplicate buy`,
+          { error: errorMessage },
+        );
+        throw err;
+      }
+      log.warn(`Custom PumpSwap AMM buy path failed for ${mint}; falling back to Jupiter`, {
         error: errorMessage,
       });
     }
@@ -833,9 +860,27 @@ async sellTokenForSol(
       });
       throw err;
     }
-    log.warn(`Pump.fun sell path failed for ${mint}; falling back to Jupiter`, {
+    log.warn(`Pump.fun bonding-curve sell path failed for ${mint}; trying PumpSwap AMM`, {
       error: errorMessage,
     });
+  }
+
+  const pumpSwapBalance = await this.getTokenBalance(walletAddress, mint);
+  const pumpSwapAmount =
+    (pumpSwapBalance * BigInt(Math.round(options.percent))) / 100n;
+  if (pumpSwapAmount > 0n) {
+    try {
+      return await this.sellTokenForSolViaPumpSwap(
+        walletAddress,
+        mint,
+        pumpSwapAmount,
+        options,
+      );
+    } catch (err) {
+      log.warn(`Direct PumpSwap AMM sell path failed for ${mint}; falling back to Jupiter`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   const refreshedBalance = await this.getTokenBalance(walletAddress, mint);
@@ -898,6 +943,115 @@ async sellTokenForSol(
     filledOutputAmount: String(quote.outAmount),
     raw: { quote, swapResp },
   };
+}
+
+private async sellTokenForSolViaPumpSwap(
+  walletAddress: string,
+  mint: string,
+  amountRaw: bigint,
+  options: SellOptions,
+): Promise<SellResult> {
+  if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
+
+  const user = new PublicKey(walletAddress);
+  const mintPk = new PublicKey(mint);
+  const tokenAccounts = (await this.getTokenAccountsWithBalance(user, mintPk))
+    .sort((a, b) => (a.balance === b.balance ? 0 : a.balance > b.balance ? -1 : 1));
+  if (tokenAccounts.length === 0) {
+    throw new Error(`No token accounts with balance found for PumpSwap sell: ${mint}`);
+  }
+
+  const pool = canonicalPumpPoolPda(mintPk, new PublicKey(SOL_MINT));
+  let lastError: unknown = null;
+
+  for (const sourceTokenAccount of tokenAccounts) {
+    try {
+      const amountRawForAccount =
+        (sourceTokenAccount.balance * BigInt(Math.round(options.percent))) / 100n;
+      if (amountRawForAccount <= 0n) continue;
+
+      const swapState = await this.pumpAmmSdk.swapSolanaState(
+        pool,
+        user,
+        sourceTokenAccount.account,
+      );
+      const slippage = this.toPumpSlippagePercent(options);
+      const instructions = await PUMP_AMM_SDK.sellBaseInput(
+        swapState,
+        new BN(amountRawForAccount.toString()),
+        slippage,
+      );
+
+      const computeUnitLimit = 350_000;
+      const priorityFeeLamports = Math.floor(options.priorityFeeSol * 1e9);
+      if (priorityFeeLamports > 0) {
+        instructions.unshift(
+          ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
+          ComputeBudgetProgram.setComputeUnitPrice({
+            microLamports: Math.max(
+              1,
+              Math.floor((priorityFeeLamports * 1_000_000) / computeUnitLimit),
+            ),
+          }),
+        );
+      }
+
+      const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+      const tx = new VersionedTransaction(
+        new TransactionMessage({
+          payerKey: user,
+          recentBlockhash: latestBlockhash.blockhash,
+          instructions,
+        }).compileToV0Message(),
+      );
+      tx.sign([this.tradingKeypair]);
+
+      const signature = await this.sendRawTransactionAndAssertSuccess(
+        Buffer.from(tx.serialize()),
+        mint,
+        { maxRetries: 3, timeoutMs: 20_000 },
+      );
+
+      log.info(`Custom direct PumpSwap sell transaction confirmed: ${signature}`, {
+        mint,
+        pool: pool.toBase58(),
+        amount: amountRawForAccount.toString(),
+        walletTotalRequestedAmount: amountRaw.toString(),
+        slippage,
+        tokenProgram: sourceTokenAccount.tokenProgram.toBase58(),
+        sourceTokenAccount: sourceTokenAccount.account.toBase58(),
+      });
+
+      return {
+        orderId: null,
+        hash: signature,
+        status: 'confirmed',
+        inputToken: mint,
+        outputToken: SOL_MINT,
+        soldPercent: options.percent,
+        filledInputAmount: amountRawForAccount.toString(),
+        filledOutputAmount: null,
+        raw: {
+          route: 'pump-swap-custom-direct',
+          pool: pool.toBase58(),
+          walletTotalRequestedAmount: amountRaw.toString(),
+          slippage,
+          tokenProgram: sourceTokenAccount.tokenProgram.toBase58(),
+          sourceTokenAccount: sourceTokenAccount.account.toBase58(),
+        },
+      };
+    } catch (err) {
+      lastError = err;
+      log.warn(`PumpSwap AMM sell attempt failed for ${mint}`, {
+        pool: pool.toBase58(),
+        tokenProgram: sourceTokenAccount.tokenProgram.toBase58(),
+        sourceTokenAccount: sourceTokenAccount.account.toBase58(),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  throw lastError ?? new Error(`PumpSwap AMM sell failed for ${mint}`);
 }
 
 private async sellTokenForSolViaPump(
@@ -1407,6 +1561,11 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
 
     const solAmount = new BN(amountLamports);
     const mintSupply = new BN(supplyResp.value.amount);
+    if (buyState.bondingCurve.complete) {
+      throw new Error(
+        `Pump.fun bonding curve is complete for ${mint}; token has migrated`,
+      );
+    }
     const tokenAmount = getBuyTokenAmountFromSolAmount({
       global,
       feeConfig,
@@ -1534,6 +1693,135 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
               slippage,
               priorityFeeSol: options.priorityFeeSol,
               tokenProgram: tokenProgram.toBase58(),
+            },
+          };
+        }
+      }
+      throw err;
+    }
+  }
+
+  private async buyTokenWithSolViaPumpSwap(
+    walletAddress: string,
+    mint: string,
+    options: BuyOptions,
+  ): Promise<SellResult> {
+    if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
+
+    const user = new PublicKey(walletAddress);
+    const mintPk = new PublicKey(mint);
+    const amountLamports = Math.floor(options.solAmount * 1e9);
+    if (amountLamports <= 0) {
+      throw new Error(`Custom PumpSwap buy amount is zero for ${mint}`);
+    }
+
+    const pool = canonicalPumpPoolPda(mintPk, new PublicKey(SOL_MINT));
+    const balanceBefore = await this.getTokenBalance(walletAddress, mint);
+    const swapState = await this.pumpAmmSdk.swapSolanaState(pool, user);
+    const slippage = this.toPumpSlippagePercent(options);
+    const instructions = await PUMP_AMM_SDK.buyQuoteInput(
+      swapState,
+      new BN(amountLamports),
+      slippage,
+    );
+
+    const computeUnitLimit = 350_000;
+    const priorityFeeLamports = Math.floor(options.priorityFeeSol * 1e9);
+    if (priorityFeeLamports > 0) {
+      instructions.unshift(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
+        ComputeBudgetProgram.setComputeUnitPrice({
+          microLamports: Math.max(
+            1,
+            Math.floor((priorityFeeLamports * 1_000_000) / computeUnitLimit),
+          ),
+        }),
+      );
+    }
+
+    const latestBlockhash = await this.connection.getLatestBlockhash('confirmed');
+    const tx = new VersionedTransaction(
+      new TransactionMessage({
+        payerKey: user,
+        recentBlockhash: latestBlockhash.blockhash,
+        instructions,
+      }).compileToV0Message(),
+    );
+    tx.sign([this.tradingKeypair]);
+
+    try {
+      const signature = await this.sendRawTransactionAndAssertSuccess(
+        Buffer.from(tx.serialize()),
+        mint,
+        { maxRetries: 3, timeoutMs: 30_000 },
+      );
+      const balanceAfter = await this.getTokenBalance(walletAddress, mint)
+        .catch(() => balanceBefore);
+      const filledOutputAmount =
+        balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0n;
+
+      log.info(`Custom direct PumpSwap buy transaction confirmed: ${signature}`, {
+        mint,
+        pool: pool.toBase58(),
+        solAmount: options.solAmount,
+        amountLamports,
+        filledOutputAmount: filledOutputAmount.toString(),
+        slippage,
+      });
+
+      return {
+        orderId: null,
+        hash: signature,
+        status: 'confirmed',
+        inputToken: SOL_MINT,
+        outputToken: mint,
+        soldPercent: 100,
+        filledInputAmount: amountLamports.toString(),
+        filledOutputAmount: filledOutputAmount.toString(),
+        raw: {
+          route: 'pump-swap-custom-direct',
+          pool: pool.toBase58(),
+          solAmount: options.solAmount,
+          amountLamports,
+          filledOutputAmount: filledOutputAmount.toString(),
+          slippage,
+        },
+      };
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      if (errorMessage.includes('was not confirmed')) {
+        const recoveredBalance = await this.getTokenBalance(walletAddress, mint)
+          .catch(() => balanceBefore);
+        if (recoveredBalance > balanceBefore) {
+          const signature =
+            errorMessage.match(/Transaction ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ??
+            null;
+          const filledOutputAmount = recoveredBalance - balanceBefore;
+          log.warn(
+            'Custom PumpSwap buy confirmation timed out but token balance increased; treating buy as confirmed',
+            {
+              mint,
+              pool: pool.toBase58(),
+              signature,
+              filledOutputAmount: filledOutputAmount.toString(),
+            },
+          );
+          return {
+            orderId: null,
+            hash: signature,
+            status: 'confirmed',
+            inputToken: SOL_MINT,
+            outputToken: mint,
+            soldPercent: 100,
+            filledInputAmount: amountLamports.toString(),
+            filledOutputAmount: filledOutputAmount.toString(),
+            raw: {
+              route: 'pump-swap-custom-direct-balance-recovered',
+              pool: pool.toBase58(),
+              solAmount: options.solAmount,
+              amountLamports,
+              filledOutputAmount: filledOutputAmount.toString(),
+              slippage,
             },
           };
         }

@@ -1872,8 +1872,19 @@ async function main(): Promise<void> {
 
       if (currentMc < INSIDER_MIN_MARKET_CAP_USD) {
         const reason = `Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} (Rug)`;
+        if (
+          activePos &&
+          config.tradingWalletAddress &&
+          hasPendingSellForMint(config.tradingWalletAddress, mint)
+        ) {
+          log.info(
+            `[INSIDER ${botNumber} RUG] Sell already pending for ${mint}; MC monitoring remains active`,
+            { currentMc },
+          );
+          return;
+        }
         log.warn(
-          `[INSIDER ${botNumber} RUG] ${reason} for ${mint}. Resetting state.`,
+          `[INSIDER ${botNumber} RUG] ${reason} for ${mint}. ${activePos ? "Triggering sell." : "Resetting pre-buy state."}`,
         );
 
         const preBuyOnly = !!preBuyMint && !activePos;
@@ -2460,7 +2471,7 @@ async function main(): Promise<void> {
           "1. Bots 1–4 run in parallel on their own follow wallets (same mint blocked).",
           "2. Skip immediately when the follow-wallet buy MC is above $50,000.",
           "3. GMGN discovers cumulative axiom/empty single-buy wallets; their ATAs are polled independently.",
-          "4. Buy when at least 15 existing ATA wallets are found, no more than 3 sold all, and at least 10 unique multi-buy wallets were cumulatively skipped.",
+          "4. Buy when at least 10 existing ATA wallets are found, ATA conversion is at least 80%, multi-buy/ATA is 0.8–1.5, no more than 1 sold all, and sold ratio is below 10%.",
           "5. After buy: continue Axiom discovery and independent ATA polling.",
           "6. Sell when 5 ATA wallets sold all, the post-buy existing ATA count collapses to 2, on ATH MC target, rug threshold, or manual sell.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
