@@ -19,6 +19,7 @@ const AXIOM_TRADER_SCAN_LIMIT = 50;
 const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 10;
 const AXIOM_BUY_MAX_EXISTING_ATA_WALLETS = 15;
 const AXIOM_BUY_MAX_SOLD_WALLETS = 2;
+const AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS = 10;
 const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 50_000;
 
@@ -170,6 +171,7 @@ export class InsiderBot extends EventEmitter {
   private devWallet: string | null = null;
   private axiomTraderWatchActive = false;
   private axiomWatchedWallets = new Map<string, AxiomWatchedWallet>();
+  private axiomSkippedMultiBuyWallets = new Set<string>();
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private insiderSellsReady = false;
@@ -532,7 +534,7 @@ export class InsiderBot extends EventEmitter {
             action: "reset token flow",
           },
         );
-        await this.telegramBot?.sendDefault(
+        void this.sendTelegramSafe(
           [
             `<b>⏭️ ${this.label} Token Skipped</b>`,
             `Token: <code>${mint}</code>`,
@@ -540,6 +542,7 @@ export class InsiderBot extends EventEmitter {
             `Monitoring ceiling: <b>$${MAX_FOLLOW_WALLET_START_MARKET_CAP_USD.toLocaleString()}</b>`,
             "Flow reset — waiting for the next token.",
           ].join("\n"),
+          "high-MC skip notification",
         );
         await this.resetForNewToken(true);
         return;
@@ -623,7 +626,7 @@ export class InsiderBot extends EventEmitter {
       "insider",
     );
 
-    await this.telegramBot?.sendDefault(
+    void this.sendTelegramSafe(
       [
         `<b>🔍 ${this.label} Flow Started</b>`,
         `Token: <code>${mint}</code>`,
@@ -632,6 +635,7 @@ export class InsiderBot extends EventEmitter {
         "",
         "Monitoring insider while discovering cumulative Axiom/empty single-buy wallets...",
       ].join("\n"),
+      "flow-start notification",
     );
 
     this.startInsiderMonitoring();
@@ -1097,7 +1101,7 @@ export class InsiderBot extends EventEmitter {
     await this.syncWalletHistory(newWallet, mint, transferSignature, INSIDER_HISTORY_LIMIT, "insider");
     this.startInsiderMonitoring();
 
-    await this.telegramBot?.sendDefault(
+    void this.sendTelegramSafe(
       [
         `<b>🔀 ${this.label} Transfer Detected</b>`,
         `Token: <code>${mint}</code>`,
@@ -1106,6 +1110,7 @@ export class InsiderBot extends EventEmitter {
       ]
         .filter(Boolean)
         .join("\n"),
+      "transfer notification",
     );
   }
 
@@ -1118,6 +1123,7 @@ export class InsiderBot extends EventEmitter {
 
   private clearAxiomWatchedWallets(): void {
     this.axiomWatchedWallets.clear();
+    this.axiomSkippedMultiBuyWallets.clear();
   }
 
   private bundlerMatchTypeLabel(type: BundlerMatchType): string {
@@ -1242,6 +1248,7 @@ export class InsiderBot extends EventEmitter {
     apiTotal: number;
     excludedCount: number;
     skippedMultiBuy: number;
+    skippedMultiBuyWallets: string[];
     validCount: number;
     soldAmongValid: number;
     soldPositionRatio: string;
@@ -1250,6 +1257,7 @@ export class InsiderBot extends EventEmitter {
     let skippedMultiBuy = 0;
     let validCount = 0;
     let soldAmongValid = 0;
+    const skippedMultiBuyWallets: string[] = [];
     const matchingWallets: Array<{
       address: string;
       buyUsd: number;
@@ -1265,7 +1273,10 @@ export class InsiderBot extends EventEmitter {
 
       const buyTxCount = this.parseBuyTxCount(entry);
       if (buyTxCount !== 1) {
-        if (buyTxCount !== null && buyTxCount > 1) skippedMultiBuy += 1;
+        if (buyTxCount !== null && buyTxCount > 1) {
+          skippedMultiBuy += 1;
+          skippedMultiBuyWallets.push(entry.address as string);
+        }
         continue;
       }
 
@@ -1291,6 +1302,7 @@ export class InsiderBot extends EventEmitter {
       apiTotal: list.length,
       excludedCount,
       skippedMultiBuy,
+      skippedMultiBuyWallets,
       validCount,
       soldAmongValid,
       soldPositionRatio,
@@ -1305,6 +1317,12 @@ export class InsiderBot extends EventEmitter {
     if (!list.length) return null;
 
     const stats = this.collectAxiomSingleBuyMatches(list);
+    let addedMultiBuyWallets = 0;
+    for (const address of stats.skippedMultiBuyWallets) {
+      if (this.axiomSkippedMultiBuyWallets.has(address)) continue;
+      this.axiomSkippedMultiBuyWallets.add(address);
+      addedMultiBuyWallets += 1;
+    }
     const soldWallets = stats.matchingWallets
       .filter((w) => w.sold)
       .map((w) => w.address);
@@ -1323,6 +1341,13 @@ export class InsiderBot extends EventEmitter {
         apiTotal: stats.apiTotal,
         excludedCount: stats.excludedCount,
         skippedMultiBuy: stats.skippedMultiBuy,
+        skippedMultiBuyWallets: stats.skippedMultiBuyWallets,
+        addedCumulativeMultiBuyWallets: addedMultiBuyWallets,
+        cumulativeSkippedMultiBuy:
+          this.axiomSkippedMultiBuyWallets.size,
+        cumulativeSkippedMultiBuyWallets: [
+          ...this.axiomSkippedMultiBuyWallets,
+        ],
         validCount: stats.validCount,
         soldAmongValid: stats.soldAmongValid,
         soldPositionRatio: stats.soldPositionRatio,
@@ -1419,6 +1444,8 @@ export class InsiderBot extends EventEmitter {
     }
 
     const existingAtaWalletCount = soldWallets.length + holdingWallets.length;
+    const cumulativeSkippedMultiBuy =
+      this.axiomSkippedMultiBuyWallets.size;
 
     if (existingAtaWalletCount === 0) {
       this.log.warn(
@@ -1430,6 +1457,7 @@ export class InsiderBot extends EventEmitter {
           existingAtaWalletCount,
           existingAtaCount,
           positiveAtaCount,
+          cumulativeSkippedMultiBuy,
           note: "Skipping to avoid a false positive from token-program mismatch or stale GMGN discovery.",
         },
       );
@@ -1447,9 +1475,13 @@ export class InsiderBot extends EventEmitter {
       existingAtaCount,
       positiveAtaCount,
       missingAtaWalletCount: missingAtaWallets.length,
+      cumulativeSkippedMultiBuy,
+      cumulativeSkippedMultiBuyWallets: [
+        ...this.axiomSkippedMultiBuyWallets,
+      ],
       rule:
         options.phase === "pre_buy"
-          ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS} and < ${AXIOM_BUY_MAX_EXISTING_ATA_WALLETS}, sold < ${AXIOM_BUY_MAX_SOLD_WALLETS}`
+          ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS} and < ${AXIOM_BUY_MAX_EXISTING_ATA_WALLETS}, sold < ${AXIOM_BUY_MAX_SOLD_WALLETS}, cumulative skipped multi-buy >= ${AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS}`
           : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
       soldWallets: soldWallets.map((wallet) => wallet.address),
       holdingWallets: holdingWallets.map((wallet) => wallet.address),
@@ -1463,6 +1495,7 @@ export class InsiderBot extends EventEmitter {
         soldWallets.length,
         watched.length,
         missingAtaWallets.length,
+        cumulativeSkippedMultiBuy,
       );
       return false;
     }
@@ -1519,6 +1552,7 @@ export class InsiderBot extends EventEmitter {
     soldAllCount: number,
     watchedCount: number,
     missingAtaWalletCount: number,
+    cumulativeSkippedMultiBuy: number,
   ): Promise<void> {
     if (
       this.phase !== "pre_buy" ||
@@ -1529,7 +1563,9 @@ export class InsiderBot extends EventEmitter {
       this.buyDisabled ||
       existingAtaWalletCount < AXIOM_BUY_MIN_EXISTING_ATA_WALLETS ||
       existingAtaWalletCount >= AXIOM_BUY_MAX_EXISTING_ATA_WALLETS ||
-      soldAllCount >= AXIOM_BUY_MAX_SOLD_WALLETS
+      soldAllCount >= AXIOM_BUY_MAX_SOLD_WALLETS ||
+      cumulativeSkippedMultiBuy <
+        AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS
     ) {
       return;
     }
@@ -1560,6 +1596,7 @@ export class InsiderBot extends EventEmitter {
         soldAllCount,
         watchedCount,
         missingAtaWalletCount,
+        cumulativeSkippedMultiBuy,
         currentMc,
         exitMc: newExitMc,
       });
@@ -1577,7 +1614,9 @@ export class InsiderBot extends EventEmitter {
           `Sold all: <b>${soldAllCount}</b>`,
           `Cumulative valid wallets: <b>${watchedCount}</b>`,
           `Missing ATA wallets ignored: <b>${missingAtaWalletCount}</b>`,
-          `Rule: existing ATA wallets >= <b>${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}</b> and < <b>${AXIOM_BUY_MAX_EXISTING_ATA_WALLETS}</b>, sold all < <b>${AXIOM_BUY_MAX_SOLD_WALLETS}</b>.`,
+          `Cumulative skipped multi-buy wallets: <b>${cumulativeSkippedMultiBuy}</b>`,
+          `Rule: existing ATA wallets &gt;= <b>${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}</b> and &lt; <b>${AXIOM_BUY_MAX_EXISTING_ATA_WALLETS}</b>, sold all &lt; <b>${AXIOM_BUY_MAX_SOLD_WALLETS}</b>.`,
+          `Multi-buy rule: cumulative skipped multi-buy wallets &gt;= <b>${AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS}</b>.`,
         ].join("\n"),
       });
     } finally {
@@ -1783,7 +1822,10 @@ export class InsiderBot extends EventEmitter {
     this.positionSellTriggered = true;
     this.axiomTraderWatchActive = false;
 
-    await this.telegramBot?.sendDefault(telegramLines.join("\n"));
+    void this.sendTelegramSafe(
+      telegramLines.join("\n"),
+      "sell-trigger notification",
+    );
 
     this.emit("sellTrigger", {
       followedWallet: this.followedWallet!,
@@ -1793,6 +1835,20 @@ export class InsiderBot extends EventEmitter {
     });
 
     await this.completeFlowCycle();
+  }
+
+  private async sendTelegramSafe(
+    text: string,
+    context: string,
+  ): Promise<void> {
+    if (!this.telegramBot) return;
+    try {
+      await this.telegramBot.sendDefault(text);
+    } catch (err) {
+      this.log.warn(`Telegram ${context} failed; continuing bot flow`, {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   private async completeFlowCycle(): Promise<void> {

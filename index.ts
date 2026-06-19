@@ -1232,10 +1232,9 @@ async function main(): Promise<void> {
       log.warn(`[INSIDER ${botNumber} BUY TRIGGER]`, trigger);
 
       void (async () => {
-        try {
-          const tradersListStr = trigger.tradersListStr || "";
-
-          await telegramBot?.sendDefault(
+        const tradersListStr = trigger.tradersListStr || "";
+        void telegramBot
+          ?.sendDefault(
             [
               `<b>🚀 Insider ${botNumber} Buy Executing</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
@@ -1243,14 +1242,21 @@ async function main(): Promise<void> {
               `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
               `Exit MC: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
               "",
-              tradersListStr ? tradersListStr : "",
+              tradersListStr,
               "",
               "Submitting swap...",
             ]
               .filter(Boolean)
               .join("\n"),
+          )
+          .catch((err) =>
+            log.warn(
+              `[INSIDER ${botNumber}] Buy-executing Telegram notification failed; continuing buy`,
+              { error: err instanceof Error ? err.message : String(err) },
+            ),
           );
 
+        try {
           // Mark that we are executing a buy to prevent cleanup logic from wiping state
           bot.setBuyExecuting(true);
 
@@ -1272,48 +1278,67 @@ async function main(): Promise<void> {
           }
           bot.setBuyExecuting(false); // Clear execution flag after state is saved
 
-          await telegramBot?.sendDefault(
-            [
-              `<b>✅ Insider ${botNumber} Buy Completed</b>`,
-              `Token: <code>${html(trigger.mint)}</code>`,
-              `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
-              `Status: <b>${html(result.status)}</b>`,
-              result.hash
-                ? `Tx: https://solscan.io/tx/${html(result.hash)}`
-                : "",
-              "",
-              "<b>Strategy: ATH MC Exit</b>",
-              `Exit when ATH MC reaches: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
-            ]
-              .filter(Boolean)
-              .join("\n"),
-            {
-              replyMarkup: {
-                inline_keyboard: [
-                  [
-                    {
-                      text: "🔴 Sell Position",
-                      callback_data: `sell:insider:${trigger.mint}:${index}`,
-                    },
-                    {
-                      text: "🔄 Refresh P/L & MC",
-                      callback_data: `r:m:${trigger.mint}:i${index}`,
-                    },
+          void telegramBot
+            ?.sendDefault(
+              [
+                `<b>✅ Insider ${botNumber} Buy Completed</b>`,
+                `Token: <code>${html(trigger.mint)}</code>`,
+                `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
+                `Status: <b>${html(result.status)}</b>`,
+                result.hash
+                  ? `Tx: https://solscan.io/tx/${html(result.hash)}`
+                  : "",
+                "",
+                "<b>Strategy: ATH MC Exit</b>",
+                `Exit when ATH MC reaches: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
+              ]
+                .filter(Boolean)
+                .join("\n"),
+              {
+                replyMarkup: {
+                  inline_keyboard: [
+                    [
+                      {
+                        text: "🔴 Sell Position",
+                        callback_data: `sell:insider:${trigger.mint}:${index}`,
+                      },
+                      {
+                        text: "🔄 Refresh P/L & MC",
+                        callback_data: `r:m:${trigger.mint}:i${index}`,
+                      },
+                    ],
                   ],
-                ],
+                },
               },
-            },
-          );
+            )
+            .catch((err) =>
+              log.warn(
+                `[INSIDER ${botNumber}] Buy-completed Telegram notification failed`,
+                { error: err instanceof Error ? err.message : String(err) },
+              ),
+            );
         } catch (err) {
           bot.resetBuyAttempt();
           log.error(`Insider ${botNumber} buy failed`, err);
-          await telegramBot?.sendDefault(
-            [
-              `<b>❌ Insider ${botNumber} Buy Failed</b>`,
-              `Token: <code>${html(trigger.mint)}</code>`,
-              `Error: ${html(err instanceof Error ? err.message : String(err))}`,
-            ].join("\n"),
-          );
+          void telegramBot
+            ?.sendDefault(
+              [
+                `<b>❌ Insider ${botNumber} Buy Failed</b>`,
+                `Token: <code>${html(trigger.mint)}</code>`,
+                `Error: ${html(err instanceof Error ? err.message : String(err))}`,
+              ].join("\n"),
+            )
+            .catch((notifyErr) =>
+              log.warn(
+                `[INSIDER ${botNumber}] Buy-failed Telegram notification also failed`,
+                {
+                  error:
+                    notifyErr instanceof Error
+                      ? notifyErr.message
+                      : String(notifyErr),
+                },
+              ),
+            );
         }
       })();
     });
@@ -2359,7 +2384,7 @@ async function main(): Promise<void> {
           "1. Bots 1–4 run in parallel on their own follow wallets (same mint blocked).",
           "2. Skip immediately when the follow-wallet buy MC is above $50,000.",
           "3. GMGN discovers cumulative axiom/empty single-buy wallets; their ATAs are polled independently.",
-          "4. Buy when 10–14 existing ATA wallets are found and fewer than 2 have sold all.",
+          "4. Buy when 10–14 existing ATA wallets are found, fewer than 2 sold all, and at least 10 unique multi-buy wallets were cumulatively skipped.",
           "5. After buy: continue Axiom discovery and independent ATA polling.",
           "6. Sell when 5 ATA wallets sold all, on ATH MC target, rug threshold, or manual sell.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,

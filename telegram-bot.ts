@@ -224,13 +224,32 @@ export class TelegramBot {
     text: string,
     replyMarkup?: InlineKeyboardMarkup
   ): Promise<TelegramMessageResponse> {
-    return await this.api<TelegramMessageResponse>('sendMessage', {
-      chat_id: chatId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-    });
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        return await this.api<TelegramMessageResponse>('sendMessage', {
+          chat_id: chatId,
+          text,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        });
+      } catch (err) {
+        lastError = err;
+        const message = err instanceof Error ? err.message : String(err);
+        const retryable =
+          message.includes('fetch failed') ||
+          message.includes('AbortError') ||
+          message.includes('failed (429)') ||
+          /\bfailed \(5\d\d\)/.test(message);
+        if (!retryable || attempt === 3) throw err;
+        log.warn(`Telegram sendMessage transient failure; retrying (${attempt}/3)`, {
+          error: message,
+        });
+        await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+      }
+    }
+    throw lastError;
   }
 
   private async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
