@@ -21,7 +21,13 @@ import {
 } from '@solana/web3.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { PUMP_SDK, OnlinePumpSdk, bondingCurvePda, getSellSolAmountFromTokenAmount } from '@pump-fun/pump-sdk';
+import {
+  PUMP_SDK,
+  OnlinePumpSdk,
+  bondingCurvePda,
+  getBuyTokenAmountFromSolAmount,
+  getSellSolAmountFromTokenAmount,
+} from '@pump-fun/pump-sdk';
 import {
   createAssociatedTokenAccountIdempotentInstruction,
   createTransferInstruction,
@@ -59,8 +65,6 @@ const TOKEN_PROGRAM_IDS = [
   new PublicKey(TOKEN_PROGRAM_ID),
   new PublicKey(TOKEN_2022_PROGRAM_ID),
 ];
-const PUMP_PORTAL_LOCAL_URL = 'https://pumpportal.fun/api/trade-local';
-const PUMP_PORTAL_POOLS = ['pump', 'auto'] as const;
 
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 
@@ -752,7 +756,7 @@ export class GmgnClient {
     if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
 
     try {
-      return await this.buyTokenWithSolViaPumpPortalLocal(
+      return await this.buyTokenWithSolViaPump(
         walletAddress,
         mint,
         options,
@@ -761,12 +765,12 @@ export class GmgnClient {
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (errorMessage.includes('was not confirmed')) {
         log.warn(
-          `PumpPortal buy was submitted but confirmation is uncertain for ${mint}; skipping Jupiter fallback to avoid a duplicate buy`,
+          `Custom Pump.fun buy was submitted but confirmation is uncertain for ${mint}; skipping Jupiter fallback to avoid a duplicate buy`,
           { error: errorMessage },
         );
         throw err;
       }
-      log.warn(`PumpPortal local buy path failed for ${mint}; falling back to Jupiter`, {
+      log.warn(`Custom Pump.fun buy path failed for ${mint}; falling back to Jupiter`, {
         error: errorMessage,
       });
     }
@@ -819,14 +823,6 @@ async sellTokenForSol(
 
   const amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
   if (amountRaw <= 0n) throw new Error(`Sell amount is zero for ${mint}`);
-
-  try {
-    return await this.sellTokenForSolViaPumpPortalLocal(walletAddress, mint, amountRaw, options);
-  } catch (err) {
-    log.warn(`PumpPortal local sell path failed for ${mint}; falling back to Pump.fun SDK`, {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
 
   try {
     return await this.sellTokenForSolViaPump(walletAddress, mint, amountRaw, options);
@@ -896,110 +892,6 @@ async sellTokenForSol(
     filledOutputAmount: String(quote.outAmount),
     raw: { quote, swapResp },
   };
-}
-
-private async sellTokenForSolViaPumpPortalLocal(
-  walletAddress: string,
-  mint: string,
-  amountRaw: bigint,
-  options: SellOptions
-): Promise<SellResult> {
-  if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
-
-  const signerPublicKey = this.tradingKeypair.publicKey.toBase58();
-  if (walletAddress !== signerPublicKey) {
-    log.warn('Sell wallet differs from trading keypair; using trading keypair for PumpPortal local sell', {
-      requestedWallet: walletAddress,
-      signerPublicKey,
-      mint,
-    });
-  }
-
-  const sellPercent = Math.min(Math.max(options.percent, 0), 100);
-  const amount =
-    sellPercent >= 99.999
-      ? '100%'
-      : `${sellPercent.toFixed(4).replace(/\.?0+$/, '')}%`;
-  const slippage = this.toPumpSlippagePercent(options);
-  let lastError: unknown = null;
-
-  for (const pool of PUMP_PORTAL_POOLS) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-      let resp: Response;
-      try {
-        resp = await fetch(PUMP_PORTAL_LOCAL_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            publicKey: signerPublicKey,
-            action: 'sell',
-            mint,
-            amount,
-            denominatedInSol: 'false',
-            slippage,
-            priorityFee: options.priorityFeeSol,
-            pool,
-          }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => '');
-        throw new Error(`PumpPortal error: ${resp.status}${text ? ` ${text}` : ''}`);
-      }
-
-      const tx = VersionedTransaction.deserialize(
-        Buffer.from(await resp.arrayBuffer()),
-      );
-      tx.sign([this.tradingKeypair]);
-
-      const signature = await this.sendRawTransactionAndAssertSuccess(
-        Buffer.from(tx.serialize()),
-        mint,
-        { maxRetries: 0 },
-      );
-
-      log.info(`PumpPortal local sell transaction sent: ${signature}`, {
-        mint,
-        amount,
-        walletTotalRequestedAmount: amountRaw.toString(),
-        slippage,
-        priorityFeeSol: options.priorityFeeSol,
-        pool,
-      });
-
-      return {
-        orderId: null,
-        hash: signature,
-        status: 'confirmed',
-        inputToken: mint,
-        outputToken: SOL_MINT,
-        soldPercent: options.percent,
-        filledInputAmount: amountRaw.toString(),
-        filledOutputAmount: '0',
-        raw: {
-          route: 'pumpportal-local',
-          amount,
-          walletTotalRequestedAmount: amountRaw.toString(),
-          slippage,
-          priorityFeeSol: options.priorityFeeSol,
-          pool,
-        },
-      };
-    } catch (err) {
-      lastError = err;
-      log.warn(`PumpPortal local sell attempt failed with pool ${pool} for ${mint}`, {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  throw lastError ?? new Error(`PumpPortal local sell failed for ${mint}`);
 }
 
 private async sellTokenForSolViaPump(
@@ -1457,16 +1349,18 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
     };
   }
 
-  private async buyTokenWithSolViaPumpPortalLocal(
+  private async buyTokenWithSolViaPump(
     walletAddress: string,
     mint: string,
     options: BuyOptions,
   ): Promise<SellResult> {
     if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
 
+    const user = new PublicKey(walletAddress);
+    const mintPk = new PublicKey(mint);
     const signerPublicKey = this.tradingKeypair.publicKey.toBase58();
     if (walletAddress !== signerPublicKey) {
-      log.warn('Buy wallet differs from trading keypair; using trading keypair for PumpPortal local buy', {
+      log.warn('Buy wallet differs from trading keypair; using trading keypair for custom Pump.fun buy', {
         requestedWallet: walletAddress,
         signerPublicKey,
         mint,
@@ -1475,130 +1369,170 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
 
     const amountLamports = Math.floor(options.solAmount * 1e9);
     if (amountLamports <= 0) {
-      throw new Error(`PumpPortal buy amount is zero for ${mint}`);
+      throw new Error(`Custom Pump.fun buy amount is zero for ${mint}`);
+    }
+
+    const mintAccountInfo = await this.connection.getAccountInfo(
+      mintPk,
+      'confirmed',
+    );
+    if (!mintAccountInfo) {
+      throw new Error(`Mint account not found for ${mint}`);
+    }
+    const tokenProgram = mintAccountInfo.owner;
+    if (!TOKEN_PROGRAM_IDS.some((programId) => programId.equals(tokenProgram))) {
+      throw new Error(
+        `Unsupported token program ${tokenProgram.toBase58()} for ${mint}`,
+      );
+    }
+
+    const [
+      global,
+      feeConfig,
+      supplyResp,
+      buyState,
+    ] = await Promise.all([
+      this.pumpSdk.fetchGlobal(),
+      this.pumpSdk.fetchFeeConfig().catch(() => null),
+      this.connection.getTokenSupply(mintPk, 'confirmed'),
+      this.pumpSdk.fetchBuyState(mintPk, user, tokenProgram),
+    ]);
+
+    const solAmount = new BN(amountLamports);
+    const mintSupply = new BN(supplyResp.value.amount);
+    const tokenAmount = getBuyTokenAmountFromSolAmount({
+      global,
+      feeConfig,
+      mintSupply,
+      bondingCurve: buyState.bondingCurve,
+      amount: solAmount,
+      quoteMint: new PublicKey(SOL_MINT),
+    });
+    if (tokenAmount.lte(new BN(0))) {
+      throw new Error(
+        `Custom Pump.fun quote returned 0 tokens for ${mint}; token may be migrated or curve has no liquidity`,
+      );
     }
 
     const slippage = this.toPumpSlippagePercent(options);
-    let lastError: unknown = null;
+    const instructions = await PUMP_SDK.buyInstructions({
+      global,
+      bondingCurveAccountInfo: buyState.bondingCurveAccountInfo,
+      bondingCurve: buyState.bondingCurve,
+      associatedUserAccountInfo: buyState.associatedUserAccountInfo,
+      mint: mintPk,
+      user,
+      amount: tokenAmount,
+      solAmount,
+      slippage,
+      tokenProgram,
+    });
 
-    for (const pool of PUMP_PORTAL_POOLS) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
-        let resp: Response;
-        try {
-          resp = await fetch(PUMP_PORTAL_LOCAL_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              publicKey: signerPublicKey,
-              action: 'buy',
-              mint,
-              amount: options.solAmount,
-              denominatedInSol: 'true',
-              slippage,
-              priorityFee: options.priorityFeeSol,
-              pool,
-            }),
-            signal: controller.signal,
-          });
-        } finally {
-          clearTimeout(timer);
-        }
-
-        if (!resp.ok) {
-          const text = await resp.text().catch(() => '');
-          throw new Error(`PumpPortal error: ${resp.status}${text ? ` ${text}` : ''}`);
-        }
-
-        const tx = VersionedTransaction.deserialize(
-          Buffer.from(await resp.arrayBuffer()),
-        );
-        tx.sign([this.tradingKeypair]);
-
-        const signature = await this.sendRawTransactionAndAssertSuccess(
-          Buffer.from(tx.serialize()),
-          mint,
-          { maxRetries: 3, timeoutMs: 30_000 },
-        );
-
-        log.info(`PumpPortal local buy transaction sent: ${signature}`, {
-          mint,
-          solAmount: options.solAmount,
-          amountLamports,
-          slippage,
-          priorityFeeSol: options.priorityFeeSol,
-          pool,
-        });
-
-        return {
-          orderId: null,
-          hash: signature,
-          status: 'confirmed',
-          inputToken: SOL_MINT,
-          outputToken: mint,
-          soldPercent: 100,
-          filledInputAmount: amountLamports.toString(),
-          filledOutputAmount: '0',
-          raw: {
-            route: 'pumpportal-local',
-            solAmount: options.solAmount,
-            amountLamports,
-            slippage,
-            priorityFeeSol: options.priorityFeeSol,
-            pool,
-          },
-        };
-      } catch (err) {
-        lastError = err;
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        log.warn(`PumpPortal local buy attempt failed with pool ${pool} for ${mint}`, {
-          error: errorMessage,
-        });
-        if (errorMessage.includes('was not confirmed')) {
-          const recoveredBalance = await this.getTokenBalance(
-            signerPublicKey,
-            mint,
-          ).catch(() => 0n);
-          if (recoveredBalance > 0n) {
-            const signature =
-              errorMessage.match(/Transaction ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ??
-              null;
-            log.warn(
-              'PumpPortal buy confirmation timed out but token balance is present; treating buy as confirmed',
-              {
-                mint,
-                signature,
-                recoveredBalance: recoveredBalance.toString(),
-                pool,
-              },
-            );
-            return {
-              orderId: null,
-              hash: signature,
-              status: 'confirmed',
-              inputToken: SOL_MINT,
-              outputToken: mint,
-              soldPercent: 100,
-              filledInputAmount: amountLamports.toString(),
-              filledOutputAmount: recoveredBalance.toString(),
-              raw: {
-                route: 'pumpportal-local-balance-recovered',
-                solAmount: options.solAmount,
-                amountLamports,
-                recoveredBalance: recoveredBalance.toString(),
-                slippage,
-                priorityFeeSol: options.priorityFeeSol,
-                pool,
-              },
-            };
-          }
-          throw err;
-        }
-      }
+    const computeUnitLimit = 300_000;
+    const priorityFeeLamports = Math.floor(options.priorityFeeSol * 1e9);
+    if (priorityFeeLamports > 0) {
+      instructions.unshift(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }),
+        ComputeBudgetProgram.setComputeUnitPrice({
+          microLamports: Math.max(
+            1,
+            Math.floor(
+              (priorityFeeLamports * 1_000_000) / computeUnitLimit,
+            ),
+          ),
+        }),
+      );
     }
 
-    throw lastError ?? new Error(`PumpPortal local buy failed for ${mint}`);
+    const latestBlockhash =
+      await this.connection.getLatestBlockhash('confirmed');
+    const tx = new VersionedTransaction(
+      new TransactionMessage({
+        payerKey: user,
+        recentBlockhash: latestBlockhash.blockhash,
+        instructions,
+      }).compileToV0Message(),
+    );
+    tx.sign([this.tradingKeypair]);
+
+    try {
+      const signature = await this.sendRawTransactionAndAssertSuccess(
+        Buffer.from(tx.serialize()),
+        mint,
+        { maxRetries: 3, timeoutMs: 30_000 },
+      );
+
+      log.info(`Custom Pump.fun buy transaction confirmed: ${signature}`, {
+        mint,
+        solAmount: options.solAmount,
+        amountLamports,
+        quotedTokenAmount: tokenAmount.toString(),
+        slippage,
+        priorityFeeSol: options.priorityFeeSol,
+        tokenProgram: tokenProgram.toBase58(),
+      });
+
+      return {
+        orderId: null,
+        hash: signature,
+        status: 'confirmed',
+        inputToken: SOL_MINT,
+        outputToken: mint,
+        soldPercent: 100,
+        filledInputAmount: amountLamports.toString(),
+        filledOutputAmount: tokenAmount.toString(),
+        raw: {
+          route: 'pump.fun-custom',
+          solAmount: options.solAmount,
+          amountLamports,
+          quotedTokenAmount: tokenAmount.toString(),
+          slippage,
+          priorityFeeSol: options.priorityFeeSol,
+          tokenProgram: tokenProgram.toBase58(),
+        },
+      };
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      if (errorMessage.includes('was not confirmed')) {
+        const recoveredBalance = await this.getTokenBalance(
+          signerPublicKey,
+          mint,
+        ).catch(() => 0n);
+        if (recoveredBalance > 0n) {
+          const signature =
+            errorMessage.match(/Transaction ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ??
+            null;
+          log.warn(
+            'Custom Pump.fun buy confirmation timed out but token balance is present; treating buy as confirmed',
+            {
+              mint,
+              signature,
+              recoveredBalance: recoveredBalance.toString(),
+            },
+          );
+          return {
+            orderId: null,
+            hash: signature,
+            status: 'confirmed',
+            inputToken: SOL_MINT,
+            outputToken: mint,
+            soldPercent: 100,
+            filledInputAmount: amountLamports.toString(),
+            filledOutputAmount: recoveredBalance.toString(),
+            raw: {
+              route: 'pump.fun-custom-balance-recovered',
+              solAmount: options.solAmount,
+              amountLamports,
+              recoveredBalance: recoveredBalance.toString(),
+              slippage,
+              priorityFeeSol: options.priorityFeeSol,
+              tokenProgram: tokenProgram.toBase58(),
+            },
+          };
+        }
+      }
+      throw err;
+    }
   }
 
   private getRetryDelayMs(resp: Response): number | undefined {
