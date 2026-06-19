@@ -26,7 +26,6 @@ import {
   OnlinePumpSdk,
   bondingCurvePda,
   getBuyTokenAmountFromSolAmount,
-  getSellSolAmountFromTokenAmount,
 } from '@pump-fun/pump-sdk';
 import {
   createAssociatedTokenAccountIdempotentInstruction,
@@ -821,7 +820,7 @@ async sellTokenForSol(
 
   if (balance === 0n) throw new Error(`No token balance found for ${mint}`);
 
-  const amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
+  let amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
   if (amountRaw <= 0n) throw new Error(`Sell amount is zero for ${mint}`);
 
   try {
@@ -837,6 +836,13 @@ async sellTokenForSol(
     log.warn(`Pump.fun sell path failed for ${mint}; falling back to Jupiter`, {
       error: errorMessage,
     });
+  }
+
+  const refreshedBalance = await this.getTokenBalance(walletAddress, mint);
+  amountRaw =
+    (refreshedBalance * BigInt(Math.round(options.percent))) / 100n;
+  if (amountRaw <= 0n) {
+    throw new Error(`No token balance remains for Jupiter fallback on ${mint}`);
   }
 
   // 1. QUOTE (v1 standard aggregator)
@@ -910,13 +916,7 @@ private async sellTokenForSolViaPump(
     throw new Error(`No token accounts with balance found for ${mint}`);
   }
 
-  const [global, feeConfig, supplyResp] = await Promise.all([
-    this.pumpSdk.fetchGlobal(),
-    this.pumpSdk.fetchFeeConfig().catch(() => null),
-    this.connection.getTokenSupply(mintPk, 'confirmed'),
-  ]);
-
-  const mintSupply = new BN(supplyResp.value.amount);
+  const global = await this.pumpSdk.fetchGlobal();
   let lastError: unknown = null;
 
   for (const sourceTokenAccount of tokenAccounts) {
@@ -938,18 +938,23 @@ private async sellTokenForSolViaPump(
       }
 
       const bondingCurve = PUMP_SDK.decodeBondingCurve(bondingCurveAccountInfo);
-      const quotedSolAmount = getSellSolAmountFromTokenAmount({
-        global,
-        feeConfig,
-        mintSupply,
-        bondingCurve,
-        amount,
-      });
-
-      if (quotedSolAmount.lte(new BN(0))) {
-        throw new Error('Pump.fun quote returned 0 SOL; token may be migrated or curve has no liquidity');
+      if (bondingCurve.complete) {
+        throw new Error(
+          `Pump.fun bonding curve is complete for ${mint}; token has migrated`,
+        );
       }
 
+      const grossSolAmount = amount
+        .mul(bondingCurve.virtualQuoteReserves)
+        .div(bondingCurve.virtualTokenReserves.add(amount));
+      if (grossSolAmount.lte(new BN(0))) {
+        throw new Error(
+          'Direct Pump.fun reserve quote returned 0 SOL; curve has no liquidity',
+        );
+      }
+
+      // Leave room for Pump protocol/creator fees before applying configured slippage.
+      const quotedSolAmount = grossSolAmount.muln(9_500).divn(10_000);
       const slippage = this.toPumpSlippagePercent(options);
       const associatedUser = getAssociatedTokenAddressSync(
         mintPk,
@@ -1037,10 +1042,11 @@ private async sellTokenForSolViaPump(
         mint,
       );
 
-      log.info(`Pump.fun sell transaction sent: ${signature}`, {
+      log.info(`Custom direct Pump.fun sell transaction confirmed: ${signature}`, {
         mint,
         amount: amountRawForProgram.toString(),
         walletTotalRequestedAmount: amountRaw.toString(),
+        grossSolLamports: grossSolAmount.toString(),
         quotedSolLamports: quotedSolAmount.toString(),
         slippage,
         tokenProgram: tokenProgram.toBase58(),
@@ -1061,8 +1067,9 @@ private async sellTokenForSolViaPump(
         filledInputAmount: amountRawForProgram.toString(),
         filledOutputAmount: quotedSolAmount.toString(),
         raw: {
-          route: 'pump.fun',
+          route: 'pump.fun-custom-direct',
           walletTotalRequestedAmount: amountRaw.toString(),
+          grossSolLamports: grossSolAmount.toString(),
           quotedSolLamports: quotedSolAmount.toString(),
           slippage,
           tokenProgram: tokenProgram.toBase58(),

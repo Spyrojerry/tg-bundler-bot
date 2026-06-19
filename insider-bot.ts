@@ -20,6 +20,7 @@ const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 15;
 const AXIOM_BUY_MAX_SOLD_WALLETS = 3;
 const AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS = 10;
 const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
+const AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS = 2;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 50_000;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
@@ -64,6 +65,7 @@ export interface InsiderBot {
   getPreBuyMint(): string | null;
   markPositionBought(trigger: InsiderBuyTrigger): void;
   clearActivePosition(): void;
+  rearmPositionMonitoringAfterSellFailure(mint: string): void;
   clearPreBuyMint(): void;
   getEntryMc(): number;
   getExitMc(): number;
@@ -171,6 +173,7 @@ export class InsiderBot extends EventEmitter {
   private axiomTraderWatchActive = false;
   private axiomWatchedWallets = new Map<string, AxiomWatchedWallet>();
   private axiomSkippedMultiBuyWallets = new Set<string>();
+  private maxObservedExistingAtaWalletCount = 0;
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private insiderSellsReady = false;
@@ -257,6 +260,19 @@ export class InsiderBot extends EventEmitter {
 
   clearActivePosition(): void {
     void this.resetForNewToken(true);
+  }
+
+  rearmPositionMonitoringAfterSellFailure(mint: string): void {
+    if (!this.activePosition || this.activePosition.mint !== mint) return;
+    this.positionSellTriggered = false;
+    this.axiomTraderWatchActive = true;
+    this.phase = "holding";
+    this.startPollLoop();
+    this.startAxiomAtaPollLoop();
+    this.log.warn("Sell failed; active position and monitoring retained", {
+      mint,
+      cumulativeAxiomWallets: this.axiomWatchedWallets.size,
+    });
   }
 
   clearPreBuyMint(): void {
@@ -1071,14 +1087,32 @@ export class InsiderBot extends EventEmitter {
     this.insiderSellsReady = true;
     await this.stopInsiderMonitoring();
     this.log.info(
-      "Insider sell threshold reached — stopped insider monitoring",
+      "Insider sell threshold reached — insider wallet tracking complete; Axiom monitoring continues",
       {
         mint,
         sellCount: this.insiderState?.sellCount,
         required: this.requiredInsiderSells,
         bundlerMatchesReady: this.bundlerMatchesReady,
+        phase: this.phase,
+        cumulativeAxiomWallets: this.axiomWatchedWallets.size,
       },
     );
+
+    // The legacy insider sell counter is not a buy gate. Keep the token's
+    // independent GMGN discovery and ATA polling alive after it completes.
+    this.startPollLoop();
+    this.startAxiomAtaPollLoop();
+    if (this.phase === "pre_buy" && !this.preBuyStopped && this.watchingMint) {
+      void this.scanAxiomSingleBuyTradersPreBuy(mint).catch((err) => {
+        this.log.warn(
+          "Immediate Axiom pre-buy scan after insider threshold failed; periodic scan remains active",
+          {
+            mint,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+      });
+    }
   }
 
   private async switchToTransferredWallet(
@@ -1123,6 +1157,7 @@ export class InsiderBot extends EventEmitter {
   private clearAxiomWatchedWallets(): void {
     this.axiomWatchedWallets.clear();
     this.axiomSkippedMultiBuyWallets.clear();
+    this.maxObservedExistingAtaWalletCount = 0;
   }
 
   private bundlerMatchTypeLabel(type: BundlerMatchType): string {
@@ -1443,6 +1478,12 @@ export class InsiderBot extends EventEmitter {
     }
 
     const existingAtaWalletCount = soldWallets.length + holdingWallets.length;
+    const previousMaxExistingAtaWalletCount =
+      this.maxObservedExistingAtaWalletCount;
+    this.maxObservedExistingAtaWalletCount = Math.max(
+      this.maxObservedExistingAtaWalletCount,
+      existingAtaWalletCount,
+    );
     const cumulativeSkippedMultiBuy =
       this.axiomSkippedMultiBuyWallets.size;
 
@@ -1481,7 +1522,9 @@ export class InsiderBot extends EventEmitter {
       rule:
         options.phase === "pre_buy"
           ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}, sold <= ${AXIOM_BUY_MAX_SOLD_WALLETS}, cumulative skipped multi-buy >= ${AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS}`
-          : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
+          : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}, or existing ATA wallets collapse to ${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}`,
+      maxObservedExistingAtaWalletCount:
+        this.maxObservedExistingAtaWalletCount,
       soldWallets: soldWallets.map((wallet) => wallet.address),
       holdingWallets: holdingWallets.map((wallet) => wallet.address),
       missingAtaWallets: missingAtaWallets.map((wallet) => wallet.address),
@@ -1501,6 +1544,37 @@ export class InsiderBot extends EventEmitter {
 
     if (!options.triggerSell) {
       return false;
+    }
+
+    const collapsedToTwo =
+      previousMaxExistingAtaWalletCount >
+        AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS &&
+      existingAtaWalletCount === AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS;
+    if (collapsedToTwo) {
+      this.log.warn(
+        "Axiom existing ATA wallet count collapsed to 2 — triggering position sell",
+        {
+          mint,
+          previousMaxExistingAtaWalletCount,
+          existingAtaWalletCount,
+          soldAllCount: soldWallets.length,
+          soldPositionRatio: `${soldWallets.length}/${existingAtaWalletCount}`,
+        },
+      );
+
+      await this.triggerPositionSell(
+        mint,
+        `Axiom existing ATA wallets collapsed from ${previousMaxExistingAtaWalletCount} to ${existingAtaWalletCount} (${soldWallets.length}/${existingAtaWalletCount} sold all)`,
+        [
+          "<b>🚨 Axiom ATA Count Collapse</b>",
+          `Token: <code>${mint}</code>`,
+          `Existing ATA wallets: <b>${previousMaxExistingAtaWalletCount}</b> → <b>${existingAtaWalletCount}</b>`,
+          `Sold all / existing ATA wallets: <b>${soldWallets.length}</b> / <b>${existingAtaWalletCount}</b>`,
+          `Rule: sell when the post-buy existing ATA count reaches <b>${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}</b>.`,
+        ],
+        "AXIOM_EXISTING_ATA_COUNT_COLLAPSE_TRIGGER",
+      );
+      return true;
     }
 
     if (soldWallets.length < AXIOM_EXIT_SOLD_WALLET_THRESHOLD) {
@@ -1831,8 +1905,6 @@ export class InsiderBot extends EventEmitter {
       signature,
       reason,
     });
-
-    await this.completeFlowCycle();
   }
 
   private async sendTelegramSafe(

@@ -1444,9 +1444,6 @@ async function main(): Promise<void> {
 
       const entryMc = bot.getEntryMc();
 
-      // Clear active position immediately on sell trigger to prevent checker from firing
-      bot.clearActivePosition();
-
       const event: FilterFailEvent = {
         walletAddress: config.tradingWalletAddress,
         mint: trigger.positionMint,
@@ -1711,12 +1708,9 @@ async function main(): Promise<void> {
           executing: true,
         });
 
-        // Clear active position immediately on sell trigger to prevent checker from firing again
         if (context === "insider") {
-          const bot = insiderBots.find(
-            (b) => b.getActivePosition()?.mint === mint,
-          );
-          if (bot) bot.clearActivePosition();
+          // Keep the active position until the sell is confirmed. The pending
+          // sell map suppresses duplicate MC-triggered attempts meanwhile.
         } else if (context === "bundler") {
           earlyBundlerOrchestrator.clearActivePosition();
           pendingTradingBuys.delete(mint);
@@ -1911,8 +1905,9 @@ async function main(): Promise<void> {
             );
         }
 
-        bot.clearActivePosition();
-        bot.clearPreBuyMint();
+        if (preBuyOnly) {
+          bot.clearPreBuyMint();
+        }
         return;
       }
 
@@ -1944,9 +1939,9 @@ async function main(): Promise<void> {
       `Starting independent market cap checkers (interval: ${MCAP_CHECK_INTERVAL_MS}ms)`,
     );
 
-    // 1. Insider Mode MC Flow (Independent loops per bot)
-    if (botMode === "insider") {
-      insiderBots.forEach((bot, i) => {
+    // 1. Insider MC flow. Keep these loops alive across mode changes; an
+    // inactive bot simply has no pre-buy mint or active position to inspect.
+    insiderBots.forEach((bot, i) => {
         let isChecking = false;
         setInterval(async () => {
           if (isChecking) return;
@@ -2038,8 +2033,7 @@ async function main(): Promise<void> {
             isChecking = false;
           }
         }, MCAP_CHECK_INTERVAL_MS);
-      });
-    }
+    });
 
     // 2. Bundler / Reverse Mode loop
     let isBundlerChecking = false;
@@ -2468,7 +2462,7 @@ async function main(): Promise<void> {
           "3. GMGN discovers cumulative axiom/empty single-buy wallets; their ATAs are polled independently.",
           "4. Buy when at least 15 existing ATA wallets are found, no more than 3 sold all, and at least 10 unique multi-buy wallets were cumulatively skipped.",
           "5. After buy: continue Axiom discovery and independent ATA polling.",
-          "6. Sell when 5 ATA wallets sold all, on ATH MC target, rug threshold, or manual sell.",
+          "6. Sell when 5 ATA wallets sold all, the post-buy existing ATA count collapses to 2, on ATH MC target, rug threshold, or manual sell.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
         ].join("\n"),
         replyMarkup: {
@@ -2876,6 +2870,9 @@ async function main(): Promise<void> {
 
       // Cleanup cache
       activePositionCache.delete(pending.event.mint);
+      if (pending.event.insiderBotIndex !== undefined) {
+        insiderBots[pending.event.insiderBotIndex]?.clearActivePosition();
+      }
 
       const receiptResult = lastResult
         ? {
@@ -2918,6 +2915,11 @@ async function main(): Promise<void> {
         });
       }
     } catch (err) {
+      if (pending.event.insiderBotIndex !== undefined) {
+        insiderBots[
+          pending.event.insiderBotIndex
+        ]?.rearmPositionMonitoringAfterSellFailure(pending.event.mint);
+      }
       if (chatId && telegramBot) {
         await telegramBot.sendChat(chatId, sellFailedReply(pending.event, err));
       } else {
