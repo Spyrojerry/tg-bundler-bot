@@ -18,10 +18,9 @@ const REQUIRED_BUNDLER_MATCHES = 2;
 const AXIOM_TRADER_SCAN_LIMIT = 50;
 const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 10;
 const AXIOM_BUY_MIN_ATA_CONVERSION_RATIO = 0.8;
-const AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO = 0.8;
-const AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO = 1.5;
-const AXIOM_BUY_MAX_SOLD_WALLETS = 1;
-const AXIOM_BUY_MAX_SOLD_RATIO = 0.1;
+const AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO = 1.2;
+const AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO = 2;
+const AXIOM_BUY_MAX_SOLD_WALLETS = 3;
 const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
 const AXIOM_EXIT_MIN_SOLD_RATIO = 0.2;
 const AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS = 2;
@@ -1538,7 +1537,7 @@ export class InsiderBot extends EventEmitter {
       ],
       rule:
         options.phase === "pre_buy"
-          ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}, ATA conversion >= ${AXIOM_BUY_MIN_ATA_CONVERSION_RATIO}, multi-buy/ATA ${AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO}-${AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO}, sold <= ${AXIOM_BUY_MAX_SOLD_WALLETS}, sold ratio < ${AXIOM_BUY_MAX_SOLD_RATIO}`
+          ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}, ATA conversion >= ${AXIOM_BUY_MIN_ATA_CONVERSION_RATIO}, multi-buy/ATA ${AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO}-${AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO}, sold <= ${AXIOM_BUY_MAX_SOLD_WALLETS}`
           : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD} and sold ratio >= ${AXIOM_EXIT_MIN_SOLD_RATIO}, or existing ATA wallets collapse to ${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}`,
       maxObservedExistingAtaWalletCount:
         this.maxObservedExistingAtaWalletCount,
@@ -1669,8 +1668,7 @@ export class InsiderBot extends EventEmitter {
       ataConversionRatio < AXIOM_BUY_MIN_ATA_CONVERSION_RATIO ||
       multiBuyToAtaRatio < AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO ||
       multiBuyToAtaRatio > AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO ||
-      soldAllCount > AXIOM_BUY_MAX_SOLD_WALLETS ||
-      soldRatio >= AXIOM_BUY_MAX_SOLD_RATIO
+      soldAllCount > AXIOM_BUY_MAX_SOLD_WALLETS
     ) {
       return;
     }
@@ -1725,10 +1723,9 @@ export class InsiderBot extends EventEmitter {
           `Cumulative skipped multi-buy wallets: <b>${cumulativeSkippedMultiBuy}</b>`,
           `ATA conversion: <b>${(ataConversionRatio * 100).toFixed(1)}%</b>`,
           `Multi-buy / ATA ratio: <b>${multiBuyToAtaRatio.toFixed(2)}</b>`,
-          `Sold ratio: <b>${(soldRatio * 100).toFixed(1)}%</b>`,
           `Rule: existing ATA wallets &gt;= <b>${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}</b>, ATA conversion &gt;= <b>${(AXIOM_BUY_MIN_ATA_CONVERSION_RATIO * 100).toFixed(0)}%</b>.`,
           `Multi-buy / ATA: <b>${AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO.toFixed(1)}-${AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO.toFixed(1)}</b>.`,
-          `Sold: &lt;= <b>${AXIOM_BUY_MAX_SOLD_WALLETS}</b> wallet and ratio &lt; <b>${(AXIOM_BUY_MAX_SOLD_RATIO * 100).toFixed(0)}%</b>.`,
+          `Sold all: &lt;= <b>${AXIOM_BUY_MAX_SOLD_WALLETS}</b> wallets.`,
         ].join("\n"),
       });
     } finally {
