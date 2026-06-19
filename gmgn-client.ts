@@ -70,6 +70,8 @@ const TOKEN_PROGRAM_IDS = [
   new PublicKey(TOKEN_2022_PROGRAM_ID),
 ];
 
+type PumpTradeVenue = 'bonding_curve' | 'pump_swap' | 'unknown';
+
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 
 const sleep = (ms: number): Promise<void> =>
@@ -761,23 +763,32 @@ export class GmgnClient {
   ): Promise<SellResult> {
     if (!this.tradingKeypair) throw new Error('No JUPITER_PRIVATE_KEY configured');
 
-    try {
-      return await this.buyTokenWithSolViaPump(
-        walletAddress,
-        mint,
-        options,
-      );
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      if (errorMessage.includes('was not confirmed')) {
-        log.warn(
-          `Custom Pump.fun buy was submitted but confirmation is uncertain for ${mint}; skipping Jupiter fallback to avoid a duplicate buy`,
-          { error: errorMessage },
+    const venue = await this.detectPumpTradeVenue(mint);
+
+    if (venue !== 'pump_swap') {
+      try {
+        return await this.buyTokenWithSolViaPump(
+          walletAddress,
+          mint,
+          options,
         );
-        throw err;
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        if (errorMessage.includes('was not confirmed')) {
+          log.warn(
+            `Custom Pump.fun buy was submitted but confirmation is uncertain for ${mint}; skipping Jupiter fallback to avoid a duplicate buy`,
+            { error: errorMessage },
+          );
+          throw err;
+        }
+        log.warn(`Custom Pump.fun bonding-curve buy path failed for ${mint}; trying PumpSwap AMM`, {
+          error: errorMessage,
+        });
       }
-      log.warn(`Custom Pump.fun bonding-curve buy path failed for ${mint}; trying PumpSwap AMM`, {
-        error: errorMessage,
+    } else {
+      log.info(`Token migration detected before buy; routing directly to PumpSwap AMM`, {
+        mint,
+        venue,
       });
     }
 
@@ -850,18 +861,27 @@ async sellTokenForSol(
   let amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
   if (amountRaw <= 0n) throw new Error(`Sell amount is zero for ${mint}`);
 
-  try {
-    return await this.sellTokenForSolViaPump(walletAddress, mint, amountRaw, options);
-  } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
-    if (this.isPumpOnlySellFailure(errorMessage)) {
-      log.warn(`Pump.fun sell path failed for ${mint}; skipping Jupiter fallback`, {
+  const venue = await this.detectPumpTradeVenue(mint);
+
+  if (venue !== 'pump_swap') {
+    try {
+      return await this.sellTokenForSolViaPump(walletAddress, mint, amountRaw, options);
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      if (this.isPumpOnlySellFailure(errorMessage)) {
+        log.warn(`Pump.fun sell path failed for ${mint}; skipping Jupiter fallback`, {
+          error: errorMessage,
+        });
+        throw err;
+      }
+      log.warn(`Pump.fun bonding-curve sell path failed for ${mint}; trying PumpSwap AMM`, {
         error: errorMessage,
       });
-      throw err;
     }
-    log.warn(`Pump.fun bonding-curve sell path failed for ${mint}; trying PumpSwap AMM`, {
-      error: errorMessage,
+  } else {
+    log.info(`Token migration detected before sell; routing directly to PumpSwap AMM`, {
+      mint,
+      venue,
     });
   }
 
@@ -1360,14 +1380,71 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
     if (options.autoSlippage) return null;
     // Treat slippage as a percentage (e.g., 0.3 means 0.3%, 10 means 10%)
     const bps = Math.round(options.slippage * 100);
-    // Cap at 50% (5000 bps) for safety
-    return Math.min(Math.max(bps, 0), 5000);
+    return Math.min(Math.max(bps, 0), 10_000);
   }
 
   private toPumpSlippagePercent(options: BuyOptions | SellOptions): number {
     if (options.autoSlippage) return 30;
     // Pump SDK expects percent-style slippage, same as SELL_SLIPPAGE.
-    return Math.min(Math.max(options.slippage, 0), 50);
+    return Math.min(Math.max(options.slippage, 0), 100);
+  }
+
+  private async detectPumpTradeVenue(mint: string): Promise<PumpTradeVenue> {
+    const mintPk = new PublicKey(mint);
+    const bondingCurve = bondingCurvePda(mintPk);
+    const pumpSwapPool = canonicalPumpPoolPda(
+      mintPk,
+      new PublicKey(SOL_MINT),
+    );
+
+    try {
+      const [bondingCurveInfo, pumpSwapPoolInfo] =
+        await this.connection.getMultipleAccountsInfo(
+          [bondingCurve, pumpSwapPool],
+          'confirmed',
+        );
+
+      if (bondingCurveInfo) {
+        const decoded = PUMP_SDK.decodeBondingCurve(bondingCurveInfo);
+        const venue: PumpTradeVenue = decoded.complete
+          ? 'pump_swap'
+          : 'bonding_curve';
+        log.info(`Pump trade venue detected for ${mint}`, {
+          mint,
+          venue,
+          bondingCurveComplete: decoded.complete,
+          bondingCurve: bondingCurve.toBase58(),
+          pumpSwapPool: pumpSwapPool.toBase58(),
+          pumpSwapPoolExists: pumpSwapPoolInfo !== null,
+        });
+        return venue;
+      }
+
+      if (pumpSwapPoolInfo) {
+        log.info(`Pump trade venue detected for ${mint}`, {
+          mint,
+          venue: 'pump_swap',
+          bondingCurve: bondingCurve.toBase58(),
+          bondingCurveExists: false,
+          pumpSwapPool: pumpSwapPool.toBase58(),
+          pumpSwapPoolExists: true,
+        });
+        return 'pump_swap';
+      }
+
+      log.warn(`Could not identify Pump trade venue for ${mint}`, {
+        mint,
+        bondingCurve: bondingCurve.toBase58(),
+        pumpSwapPool: pumpSwapPool.toBase58(),
+      });
+      return 'unknown';
+    } catch (err) {
+      log.warn(`Pump trade venue detection failed for ${mint}; using route fallback order`, {
+        mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return 'unknown';
+    }
   }
 
   // ── Utils ─────────────────────────────────────────────────────────────────

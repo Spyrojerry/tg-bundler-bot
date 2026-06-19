@@ -200,6 +200,9 @@ export function loadConfig(): ServiceConfig {
   if (sellPercent <= 0 || sellPercent > 100) {
     throw new Error('SELL_PERCENT must be greater than 0 and at most 100');
   }
+  if (sellSlippage < 0 || sellSlippage > 100) {
+    throw new Error('SELL_SLIPPAGE must be between 0 and 100');
+  }
   return {
     walletAddress,
     tradingWalletAddress,
