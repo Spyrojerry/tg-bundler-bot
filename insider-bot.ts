@@ -23,6 +23,7 @@ const AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO = 1.5;
 const AXIOM_BUY_MAX_SOLD_WALLETS = 1;
 const AXIOM_BUY_MAX_SOLD_RATIO = 0.1;
 const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
+const AXIOM_EXIT_MIN_SOLD_RATIO = 0.2;
 const AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS = 2;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 50_000;
 
@@ -1538,7 +1539,7 @@ export class InsiderBot extends EventEmitter {
       rule:
         options.phase === "pre_buy"
           ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}, ATA conversion >= ${AXIOM_BUY_MIN_ATA_CONVERSION_RATIO}, multi-buy/ATA ${AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO}-${AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO}, sold <= ${AXIOM_BUY_MAX_SOLD_WALLETS}, sold ratio < ${AXIOM_BUY_MAX_SOLD_RATIO}`
-          : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}, or existing ATA wallets collapse to ${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}`,
+          : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD} and sold ratio >= ${AXIOM_EXIT_MIN_SOLD_RATIO}, or existing ATA wallets collapse to ${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}`,
       maxObservedExistingAtaWalletCount:
         this.maxObservedExistingAtaWalletCount,
       soldWallets: soldWallets.map((wallet) => wallet.address),
@@ -1593,7 +1594,10 @@ export class InsiderBot extends EventEmitter {
       return true;
     }
 
-    if (soldWallets.length < AXIOM_EXIT_SOLD_WALLET_THRESHOLD) {
+    if (
+      soldWallets.length < AXIOM_EXIT_SOLD_WALLET_THRESHOLD ||
+      soldRatio < AXIOM_EXIT_MIN_SOLD_RATIO
+    ) {
       return false;
     }
 
@@ -1612,6 +1616,7 @@ export class InsiderBot extends EventEmitter {
         watchedCount: watched.length,
         existingAtaWalletCount,
         soldAllCount: soldWallets.length,
+        soldRatio,
         soldWallets: soldWallets.map((wallet) => wallet.address),
       },
     );
@@ -1623,9 +1628,10 @@ export class InsiderBot extends EventEmitter {
         "<b>🚨 Axiom ATA Exit Threshold</b>",
         `Token: <code>${mint}</code>`,
         `Sold all / existing ATA wallets: <b>${soldWallets.length}</b> / <b>${existingAtaWalletCount}</b>`,
+        `Sold ratio: <b>${(soldRatio * 100).toFixed(1)}%</b>`,
         `Cumulative valid wallets watched: <b>${watched.length}</b>`,
         `Missing ATA wallets ignored: <b>${missingAtaWallets.length}</b>`,
-        `Rule: sold existing ATA wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b>.`,
+        `Rule: sold existing ATA wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b> and sold ratio >= <b>${(AXIOM_EXIT_MIN_SOLD_RATIO * 100).toFixed(0)}%</b>.`,
         "",
         "<b>First sold wallets:</b>",
         walletLines,

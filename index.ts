@@ -2473,7 +2473,7 @@ async function main(): Promise<void> {
           "3. GMGN discovers cumulative axiom/empty single-buy wallets; their ATAs are polled independently.",
           "4. Buy when at least 10 existing ATA wallets are found, ATA conversion is at least 80%, multi-buy/ATA is 0.8–1.5, no more than 1 sold all, and sold ratio is below 10%.",
           "5. After buy: continue Axiom discovery and independent ATA polling.",
-          "6. Sell when 5 ATA wallets sold all, the post-buy existing ATA count collapses to 2, on ATH MC target, rug threshold, or manual sell.",
+          "6. Sell when at least 5 ATA wallets and at least 20% of existing ATA wallets sold all, the post-buy existing ATA count collapses to 2, on ATH MC target, rug threshold, or manual sell.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
         ].join("\n"),
         replyMarkup: {
