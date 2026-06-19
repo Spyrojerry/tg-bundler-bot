@@ -1331,6 +1331,10 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
     return accounts;
   }
 
+  async getTokenRawBalance(wallet: string, mint: string): Promise<bigint> {
+    return this.getTokenBalance(wallet, mint);
+  }
+
   private async getTokenBalance(wallet: string, mint: string): Promise<bigint> {
     const pubkey = new PublicKey(wallet);
     const mintPubkey = new PublicKey(mint);
@@ -1515,7 +1519,7 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
         const signature = await this.sendRawTransactionAndAssertSuccess(
           Buffer.from(tx.serialize()),
           mint,
-          { maxRetries: 0 },
+          { maxRetries: 3, timeoutMs: 30_000 },
         );
 
         log.info(`PumpPortal local buy transaction sent: ${signature}`, {
@@ -1552,6 +1556,43 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
           error: errorMessage,
         });
         if (errorMessage.includes('was not confirmed')) {
+          const recoveredBalance = await this.getTokenBalance(
+            signerPublicKey,
+            mint,
+          ).catch(() => 0n);
+          if (recoveredBalance > 0n) {
+            const signature =
+              errorMessage.match(/Transaction ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ??
+              null;
+            log.warn(
+              'PumpPortal buy confirmation timed out but token balance is present; treating buy as confirmed',
+              {
+                mint,
+                signature,
+                recoveredBalance: recoveredBalance.toString(),
+                pool,
+              },
+            );
+            return {
+              orderId: null,
+              hash: signature,
+              status: 'confirmed',
+              inputToken: SOL_MINT,
+              outputToken: mint,
+              soldPercent: 100,
+              filledInputAmount: amountLamports.toString(),
+              filledOutputAmount: recoveredBalance.toString(),
+              raw: {
+                route: 'pumpportal-local-balance-recovered',
+                solAmount: options.solAmount,
+                amountLamports,
+                recoveredBalance: recoveredBalance.toString(),
+                slippage,
+                priorityFeeSol: options.priorityFeeSol,
+                pool,
+              },
+            };
+          }
           throw err;
         }
       }

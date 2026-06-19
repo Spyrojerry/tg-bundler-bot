@@ -1318,6 +1318,88 @@ async function main(): Promise<void> {
               ),
             );
         } catch (err) {
+          const errorMessage =
+            err instanceof Error ? err.message : String(err);
+          if (errorMessage.includes("was not confirmed")) {
+            bot.setBuyExecuting(false);
+            const submittedSignature =
+              errorMessage.match(
+                /Transaction ([1-9A-HJ-NP-Za-km-z]+)/,
+              )?.[1] ?? null;
+            log.warn(
+              `[INSIDER ${botNumber}] Buy confirmation uncertain; locking buy gate while reconciling token balance`,
+              {
+                mint: trigger.mint,
+                signature: submittedSignature,
+                reconcileWindowMs: 60_000,
+              },
+            );
+
+            void (async () => {
+              const deadline = Date.now() + 60_000;
+              while (Date.now() < deadline) {
+                const balance = await client
+                  .getTokenRawBalance(
+                    config.tradingWalletAddress!,
+                    trigger.mint,
+                  )
+                  .catch(() => 0n);
+                if (balance > 0n) {
+                  bot.markPositionBought(trigger);
+                  db.addSeenMint(
+                    config.tradingWalletAddress!,
+                    trigger.mint,
+                  );
+                  log.warn(
+                    `[INSIDER ${botNumber}] Uncertain PumpPortal buy recovered from token balance`,
+                    {
+                      mint: trigger.mint,
+                      signature: submittedSignature,
+                      tokenBalance: balance.toString(),
+                    },
+                  );
+                  void telegramBot
+                    ?.sendDefault(
+                      [
+                        `<b>✅ Insider ${botNumber} Buy Confirmed by Balance</b>`,
+                        `Token: <code>${html(trigger.mint)}</code>`,
+                        `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
+                        submittedSignature
+                          ? `Tx: https://solscan.io/tx/${html(submittedSignature)}`
+                          : "",
+                        `Token balance: <code>${balance.toString()}</code>`,
+                      ]
+                        .filter(Boolean)
+                        .join("\n"),
+                    )
+                    .catch((notifyErr) =>
+                      log.warn(
+                        `[INSIDER ${botNumber}] Recovered-buy Telegram notification failed`,
+                        {
+                          error:
+                            notifyErr instanceof Error
+                              ? notifyErr.message
+                              : String(notifyErr),
+                        },
+                      ),
+                    );
+                  return;
+                }
+                await sleep(2_000);
+              }
+
+              log.error(
+                `[INSIDER ${botNumber}] PumpPortal buy remained unconfirmed with zero token balance; reopening buy gate`,
+                {
+                  mint: trigger.mint,
+                  signature: submittedSignature,
+                },
+              );
+              bot.resetBuyAttempt();
+            })();
+            return;
+          }
+
           bot.resetBuyAttempt();
           log.error(`Insider ${botNumber} buy failed`, err);
           void telegramBot
