@@ -2466,7 +2466,7 @@ async function main(): Promise<void> {
           "1. Bots 1–4 run in parallel on their own follow wallets (same mint blocked).",
           "2. Skip immediately when the follow-wallet buy MC is above $50,000.",
           "3. GMGN discovers cumulative axiom/empty single-buy wallets; their ATAs are polled independently.",
-          "4. Buy when 10–14 existing ATA wallets are found, fewer than 2 sold all, and at least 10 unique multi-buy wallets were cumulatively skipped.",
+          "4. Buy when at least 15 existing ATA wallets are found, no more than 3 sold all, and at least 10 unique multi-buy wallets were cumulatively skipped.",
           "5. After buy: continue Axiom discovery and independent ATA polling.",
           "6. Sell when 5 ATA wallets sold all, on ATH MC target, rug threshold, or manual sell.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,

@@ -16,9 +16,8 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const AXIOM_TRADER_SCAN_LIMIT = 50;
-const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 10;
-const AXIOM_BUY_MAX_EXISTING_ATA_WALLETS = 15;
-const AXIOM_BUY_MAX_SOLD_WALLETS = 2;
+const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 15;
+const AXIOM_BUY_MAX_SOLD_WALLETS = 3;
 const AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS = 10;
 const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 50_000;
@@ -1481,7 +1480,7 @@ export class InsiderBot extends EventEmitter {
       ],
       rule:
         options.phase === "pre_buy"
-          ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS} and < ${AXIOM_BUY_MAX_EXISTING_ATA_WALLETS}, sold < ${AXIOM_BUY_MAX_SOLD_WALLETS}, cumulative skipped multi-buy >= ${AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS}`
+          ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}, sold <= ${AXIOM_BUY_MAX_SOLD_WALLETS}, cumulative skipped multi-buy >= ${AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS}`
           : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}`,
       soldWallets: soldWallets.map((wallet) => wallet.address),
       holdingWallets: holdingWallets.map((wallet) => wallet.address),
@@ -1562,8 +1561,7 @@ export class InsiderBot extends EventEmitter {
       this.isBuyGateEvaluating ||
       this.buyDisabled ||
       existingAtaWalletCount < AXIOM_BUY_MIN_EXISTING_ATA_WALLETS ||
-      existingAtaWalletCount >= AXIOM_BUY_MAX_EXISTING_ATA_WALLETS ||
-      soldAllCount >= AXIOM_BUY_MAX_SOLD_WALLETS ||
+      soldAllCount > AXIOM_BUY_MAX_SOLD_WALLETS ||
       cumulativeSkippedMultiBuy <
         AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS
     ) {
@@ -1615,7 +1613,7 @@ export class InsiderBot extends EventEmitter {
           `Cumulative valid wallets: <b>${watchedCount}</b>`,
           `Missing ATA wallets ignored: <b>${missingAtaWalletCount}</b>`,
           `Cumulative skipped multi-buy wallets: <b>${cumulativeSkippedMultiBuy}</b>`,
-          `Rule: existing ATA wallets &gt;= <b>${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}</b> and &lt; <b>${AXIOM_BUY_MAX_EXISTING_ATA_WALLETS}</b>, sold all &lt; <b>${AXIOM_BUY_MAX_SOLD_WALLETS}</b>.`,
+          `Rule: existing ATA wallets &gt;= <b>${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}</b>, sold all &lt;= <b>${AXIOM_BUY_MAX_SOLD_WALLETS}</b>.`,
           `Multi-buy rule: cumulative skipped multi-buy wallets &gt;= <b>${AXIOM_BUY_MIN_CUMULATIVE_MULTI_BUY_WALLETS}</b>.`,
         ].join("\n"),
       });
