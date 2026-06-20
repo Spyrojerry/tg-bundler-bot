@@ -1397,39 +1397,22 @@ export class InsiderBot extends EventEmitter {
       this.axiomSkippedMultiBuyWallets.add(address);
       addedMultiBuyWallets += 1;
     }
-    const soldWallets = stats.matchingWallets
-      .filter((w) => w.sold)
-      .map((w) => w.address);
-    const holdingWallets = stats.matchingWallets
-      .filter((w) => !w.sold)
-      .map((w) => w.address);
-
     this.log.info(
       `Axiom/empty single-buy GMGN scan [${phase}] — ${stats.soldPositionRatio} sold all position (skip-list excl., buy $${this.bundlerBuyMinUsd}-$${this.bundlerBuyMaxUsd}, tag axiom or []; order buy_volume_cur; limit ${AXIOM_TRADER_SCAN_LIMIT})`,
       {
         mint,
         phase,
-        orderBy: "buy_volume_cur",
-        tag: null,
         buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
         apiTotal: stats.apiTotal,
         excludedCount: stats.excludedCount,
         skippedMultiBuy: stats.skippedMultiBuy,
-        skippedMultiBuyWallets: stats.skippedMultiBuyWallets,
         addedCumulativeMultiBuyWallets: addedMultiBuyWallets,
         cumulativeSkippedMultiBuy:
           this.axiomSkippedMultiBuyWallets.size,
-        cumulativeSkippedMultiBuyWallets: [
-          ...this.axiomSkippedMultiBuyWallets,
-        ],
         validCount: stats.validCount,
         soldAmongValid: stats.soldAmongValid,
         soldPositionRatio: stats.soldPositionRatio,
         matchingWallets: stats.matchingWallets,
-        soldWallets,
-        holdingWallets,
-        initialInsiderWallets: [...this.initialInsiderWallets],
-        devWallet: this.devWallet,
       },
     );
 
@@ -1589,6 +1572,55 @@ export class InsiderBot extends EventEmitter {
       existingAtaWalletCount > 0
         ? soldWallets.length / existingAtaWalletCount
         : 0;
+    const largestSimilarSolGroup = largestSimilarBalanceGroup
+      ? {
+          walletCount: largestGroupExistingAtaWalletCount,
+          holdingCount: largestGroupHoldingCount,
+          soldAnyCount: largestGroupSoldAnyWallets.length,
+          soldAnyRatio: Number(largestGroupSoldAnyRatio.toFixed(4)),
+          balanceUsdRange: `${largestSimilarBalanceGroup.minUsd.toFixed(2)}-${largestSimilarBalanceGroup.maxUsd.toFixed(2)}`,
+          spreadUsd: largestSimilarBalanceGroup.spreadUsd,
+          wallets: largestSimilarBalanceGroup.wallets.map((wallet) => ({
+            address: wallet.address,
+            status: wallet.tokenStatus,
+            sellType: wallet.sellType,
+            solBalanceUsd: wallet.solBalanceUsd,
+          })),
+        }
+      : null;
+    const collapsedToTwo =
+      previousMaxLargestSimilarBalanceGroupCount >
+        AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS &&
+      largestGroupExistingAtaWalletCount ===
+        AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS;
+    const buyGateFailedConditions: string[] = [];
+    if (
+      largestGroupExistingAtaWalletCount <
+      AXIOM_BUY_MIN_EXISTING_ATA_WALLETS
+    ) {
+      buyGateFailedConditions.push(
+        `group_size: ${largestGroupExistingAtaWalletCount} < ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}`,
+      );
+    }
+    if (largestGroupSoldAnyWallets.length > AXIOM_BUY_MAX_SOLD_ANY_WALLETS) {
+      buyGateFailedConditions.push(
+        `sold_any: ${largestGroupSoldAnyWallets.length} > ${AXIOM_BUY_MAX_SOLD_ANY_WALLETS}`,
+      );
+    }
+    const sellGateFailedConditions: string[] = [];
+    if (
+      largestGroupSoldAnyWallets.length <
+      AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD
+    ) {
+      sellGateFailedConditions.push(
+        `sold_any: ${largestGroupSoldAnyWallets.length} < ${AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD}`,
+      );
+    }
+    if (largestGroupSoldAnyRatio < AXIOM_EXIT_MIN_SOLD_ANY_RATIO) {
+      sellGateFailedConditions.push(
+        `sold_any_ratio: ${largestGroupSoldAnyRatio.toFixed(4)} < ${AXIOM_EXIT_MIN_SOLD_ANY_RATIO}`,
+      );
+    }
 
     if (existingAtaWalletCount === 0) {
       this.log.warn(
@@ -1610,36 +1642,34 @@ export class InsiderBot extends EventEmitter {
     this.log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount} sold any in largest similar-SOL group`, {
       mint,
       phase: options.phase,
-      soldPositionRatio: `${soldWallets.length}/${existingAtaWalletCount}`,
-      largestGroupSoldAnyPositionRatio: `${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount}`,
       watchedCount: watched.length,
       existingAtaWalletCount,
-      soldAllCount: soldWallets.length,
-      holdingCount: holdingWallets.length,
-      largestGroupExistingAtaWalletCount,
-      largestGroupSoldAnyCount: largestGroupSoldAnyWallets.length,
-      largestGroupHoldingCount,
-      largestGroupSoldAnyRatio,
-      existingAtaCount,
-      positiveAtaCount,
-      missingAtaWalletCount: missingAtaWallets.length,
       cumulativeSkippedMultiBuy,
-      ataConversionRatio,
-      multiBuyToAtaRatio,
-      soldRatio,
-      solPriceUsd,
-      similarSolBalanceToleranceUsd: 1,
-      mostSimilarSolBalanceGroup: largestSimilarBalanceGroup,
-      rule:
-        options.phase === "pre_buy"
-          ? `buy when largest similar-SOL group existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}, group sold-any <= ${AXIOM_BUY_MAX_SOLD_ANY_WALLETS}`
-          : `sell when largest similar-SOL group sold-any wallets >= ${AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD} and group sold-any ratio >= ${AXIOM_EXIT_MIN_SOLD_ANY_RATIO}, or largest group count collapses to ${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}`,
-      maxObservedLargestSimilarBalanceGroupCount:
-        this.maxObservedLargestSimilarBalanceGroupCount,
-      soldWallets: soldWallets.map((wallet) => wallet.address),
-      largestSimilarSolGroupWallets:
-        largestSimilarBalanceGroup?.wallets ?? [],
-      missingAtaWallets: missingAtaWallets.map((wallet) => wallet.address),
+      solPriceUsd:
+        solPriceUsd === null ? null : Number(solPriceUsd.toFixed(2)),
+      largestSimilarSolGroup,
+      ...(options.phase === "pre_buy"
+        ? {
+            buyGate: {
+              requiredGroupSize: AXIOM_BUY_MIN_EXISTING_ATA_WALLETS,
+              maximumSoldAny: AXIOM_BUY_MAX_SOLD_ANY_WALLETS,
+              passed: buyGateFailedConditions.length === 0,
+              failedConditions: buyGateFailedConditions,
+            },
+          }
+        : {
+            sellGate: {
+              requiredSoldAny: AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD,
+              requiredSoldAnyRatio: AXIOM_EXIT_MIN_SOLD_ANY_RATIO,
+              collapseGroupSize: AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS,
+              collapsedToTwo,
+              passed:
+                collapsedToTwo || sellGateFailedConditions.length === 0,
+              failedConditions: collapsedToTwo
+                ? []
+                : sellGateFailedConditions,
+            },
+          }),
     });
 
     if (options.phase === "pre_buy") {
@@ -1659,11 +1689,6 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    const collapsedToTwo =
-      previousMaxLargestSimilarBalanceGroupCount >
-        AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS &&
-      largestGroupExistingAtaWalletCount ===
-        AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS;
     if (collapsedToTwo) {
       this.log.warn(
         "Axiom largest similar-SOL group count collapsed to 2 — triggering position sell",
