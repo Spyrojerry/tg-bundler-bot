@@ -2975,6 +2975,10 @@ async function main(): Promise<void> {
         });
       }
     } catch (err) {
+      // Clear the failed attempt before rearming the Insider trigger.
+      // Otherwise an immediate authority sell retry can be discarded by
+      // hasPendingSellForMint() as a duplicate of the failed attempt.
+      pendingSells.delete(sellId);
       if (pending.event.insiderBotIndex !== undefined) {
         insiderBots[
           pending.event.insiderBotIndex

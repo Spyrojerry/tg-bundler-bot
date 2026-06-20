@@ -361,14 +361,21 @@ export class InsiderBot extends EventEmitter {
   rearmPositionMonitoringAfterSellFailure(mint: string): void {
     if (!this.activePosition || this.activePosition.mint !== mint) return;
     this.positionSellTriggered = false;
-    this.axiomTraderWatchActive = true;
+    this.axiomTraderWatchActive = false;
     this.phase = "holding";
+    this.stopAxiomAtaPollLoop();
     this.startPollLoop();
-    this.startAxiomAtaPollLoop();
-    this.log.warn("Sell failed; active position and monitoring retained", {
-      mint,
-      cumulativeAxiomWallets: this.axiomWatchedWallets.size,
-    });
+    void this.syncAuthorityTransactions();
+    void this.syncLargeBuyerTransactions();
+    this.log.warn(
+      "Sell failed; active position retained and authority-based monitoring rearmed",
+      {
+        mint,
+        authority: this.authorityMonitor?.authority ?? null,
+        largeBuyerWallet: this.largeBuyerWatch?.wallet ?? null,
+        legacyAxiomPostBuyExitsEnabled: false,
+      },
+    );
   }
 
   clearPreBuyMint(): void {
@@ -2736,6 +2743,18 @@ export class InsiderBot extends EventEmitter {
     this.isLargeBuyerSyncing = true;
     this.lastLargeBuyerSyncAt = Date.now();
     try {
+      if (
+        watch.boughtAmount > 0 &&
+        watch.soldAmount >= watch.boughtAmount * 0.999999
+      ) {
+        await this.triggerLargeBuyerSell(
+          watch,
+          watch.cursorSignature,
+          "Previously detected sell-all condition rearmed after sell failure",
+        );
+        return;
+      }
+
       let cursor = watch.cursorSignature;
       while (true) {
         const batch = await this.heliusClient.getAddressTransactionsAsc(
@@ -2762,18 +2781,10 @@ export class InsiderBot extends EventEmitter {
             watch.boughtAmount > 0 &&
             watch.soldAmount >= watch.boughtAmount * 0.999999
           ) {
-            await this.triggerPositionSell(
-              watch.mint,
-              `Authority >=$200 buyer ${watch.wallet} sold all tracked position`,
-              [
-                "<b>🚨 Lookup-Table Authority Buyer Sold All</b>",
-                `Token: <code>${watch.mint}</code>`,
-                `Wallet: <code>${watch.wallet}</code>`,
-                `Qualifying buy: <b>$${watch.buyUsd.toFixed(2)}</b>`,
-                `Buy tx: <code>${watch.qualifyingSignature}</code>`,
-                `Sell-all tx: <code>${tx.signature}</code>`,
-              ],
+            await this.triggerLargeBuyerSell(
+              watch,
               tx.signature,
+              "New sell-all transaction detected",
             );
             return;
           }
@@ -2794,6 +2805,27 @@ export class InsiderBot extends EventEmitter {
         void this.syncLargeBuyerTransactions();
       }
     }
+  }
+
+  private async triggerLargeBuyerSell(
+    watch: LargeBuyerWatchState,
+    sellAllSignature: string,
+    detection: string,
+  ): Promise<void> {
+    await this.triggerPositionSell(
+      watch.mint,
+      `Authority >=$200 buyer ${watch.wallet} sold all tracked position`,
+      [
+        "<b>🚨 Lookup-Table Authority Buyer Sold All</b>",
+        `Token: <code>${watch.mint}</code>`,
+        `Wallet: <code>${watch.wallet}</code>`,
+        `Qualifying buy: <b>$${watch.buyUsd.toFixed(2)}</b>`,
+        `Buy tx: <code>${watch.qualifyingSignature}</code>`,
+        `Sell-all tx: <code>${sellAllSignature}</code>`,
+        `Detection: <b>${detection}</b>`,
+      ],
+      sellAllSignature,
+    );
   }
 
   private async scanAxiomSingleBuyTradersPreBuy(mint: string): Promise<void> {
