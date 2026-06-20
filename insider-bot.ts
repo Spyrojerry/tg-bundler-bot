@@ -1528,6 +1528,7 @@ export class InsiderBot extends EventEmitter {
     const existingAtaWalletCount = soldWallets.length + holdingWallets.length;
     const {
       solPriceUsd,
+      walletBalances: existingAtaWalletSolBalances,
       groups: similarSolBalanceGroups,
     } = await this.fetchAndGroupExistingAtaWalletSolBalances(
       holdingWallets,
@@ -1588,6 +1589,44 @@ export class InsiderBot extends EventEmitter {
           })),
         }
       : null;
+    const nearZeroWalletBalances =
+      solPriceUsd === null
+        ? []
+        : existingAtaWalletSolBalances
+            .filter(
+              (wallet) =>
+                wallet.solBalanceUsd >= 0 && wallet.solBalanceUsd <= 1,
+            )
+            .sort((a, b) => a.solBalanceUsd - b.solBalanceUsd);
+    const nearZeroSoldAnyCount = nearZeroWalletBalances.filter(
+      (wallet) => wallet.soldAny,
+    ).length;
+    const largestNearZeroSolGroup =
+      nearZeroWalletBalances.length > 0
+        ? {
+            walletCount: nearZeroWalletBalances.length,
+            holdingCount:
+              nearZeroWalletBalances.length - nearZeroSoldAnyCount,
+            soldAnyCount: nearZeroSoldAnyCount,
+            soldAnyRatio: Number(
+              (nearZeroSoldAnyCount / nearZeroWalletBalances.length).toFixed(4),
+            ),
+            balanceUsdRange: `${nearZeroWalletBalances[0].solBalanceUsd.toFixed(2)}-${nearZeroWalletBalances[nearZeroWalletBalances.length - 1].solBalanceUsd.toFixed(2)}`,
+            maximumBalanceUsd: 1,
+            spreadUsd: Number(
+              (
+                nearZeroWalletBalances[nearZeroWalletBalances.length - 1]
+                  .solBalanceUsd - nearZeroWalletBalances[0].solBalanceUsd
+              ).toFixed(2),
+            ),
+            wallets: nearZeroWalletBalances.map((wallet) => ({
+              address: wallet.address,
+              status: wallet.tokenStatus,
+              sellType: wallet.sellType,
+              solBalanceUsd: wallet.solBalanceUsd,
+            })),
+          }
+        : null;
     const collapsedToTwo =
       previousMaxLargestSimilarBalanceGroupCount >
         AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS &&
@@ -1648,6 +1687,7 @@ export class InsiderBot extends EventEmitter {
       solPriceUsd:
         solPriceUsd === null ? null : Number(solPriceUsd.toFixed(2)),
       largestSimilarSolGroup,
+      largestNearZeroSolGroup,
       ...(options.phase === "pre_buy"
         ? {
             buyGate: {
