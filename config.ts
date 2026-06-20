@@ -173,7 +173,7 @@ export function loadConfig(): ServiceConfig {
   const insiderExitPercent     = optionalNumber('INSIDER_EXIT_PERCENT', 40);
   const insiderMinTransferProfit = optionalNumber('INSIDER_MIN_TRANSFER_PROFIT', 70);
   const insiderBundlerBuyMinUsd = optionalNumber('INSIDER_BUNDLER_BUY_MIN_USD', 100);
-  const insiderBundlerBuyMaxUsd = optionalNumber('INSIDER_BUNDLER_BUY_MAX_USD', 150);
+  const insiderBundlerBuyMaxUsd = optionalNumber('INSIDER_BUNDLER_BUY_MAX_USD', 200);
   const insiderRequiredSells = optionalInt('INSIDER_REQUIRED_SELLS', 5);
   const port                   = optionalInt('PORT', 8080);
 

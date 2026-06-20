@@ -1,4 +1,9 @@
-import { Connection, PublicKey } from "@solana/web3.js";
+import {
+  AccountInfo,
+  Connection,
+  LAMPORTS_PER_SOL,
+  PublicKey,
+} from "@solana/web3.js";
 import { EventEmitter } from "events";
 import {
   getAssociatedTokenAddressSync,
@@ -17,12 +22,9 @@ const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const AXIOM_TRADER_SCAN_LIMIT = 50;
 const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 10;
-const AXIOM_BUY_MIN_ATA_CONVERSION_RATIO = 0.8;
-const AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO = 1.2;
-const AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO = 2;
-const AXIOM_BUY_MAX_SOLD_WALLETS = 3;
-const AXIOM_EXIT_SOLD_WALLET_THRESHOLD = 5;
-const AXIOM_EXIT_MIN_SOLD_RATIO = 0.2;
+const AXIOM_BUY_MAX_SOLD_ANY_WALLETS = 3;
+const AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD = 5;
+const AXIOM_EXIT_MIN_SOLD_ANY_RATIO = 0.2;
 const AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS = 2;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 50_000;
 
@@ -129,6 +131,28 @@ interface AxiomWatchedWallet {
   atas: PublicKey[];
 }
 
+interface ExistingAtaWalletSolBalance {
+  address: string;
+  tokenStatus: "holding" | "sold_all";
+  tokenBalanceRaw: string;
+  soldAny: boolean;
+  sellType: "single_sell" | "multi_sell" | null;
+  firstSellBalanceBefore: string | null;
+  firstSellBalanceAfter: string | null;
+  solBalance: number;
+  solBalanceUsd: number;
+  similarBalanceGroup: number | null;
+}
+
+interface SimilarSolBalanceGroup {
+  group: number;
+  walletCount: number;
+  minUsd: number;
+  maxUsd: number;
+  spreadUsd: number;
+  wallets: ExistingAtaWalletSolBalance[];
+}
+
 export class InsiderBot extends EventEmitter {
   private readonly log: Logger;
    private readonly config: ServiceConfig;
@@ -176,7 +200,16 @@ export class InsiderBot extends EventEmitter {
   private axiomTraderWatchActive = false;
   private axiomWatchedWallets = new Map<string, AxiomWatchedWallet>();
   private axiomSkippedMultiBuyWallets = new Set<string>();
-  private maxObservedExistingAtaWalletCount = 0;
+  private axiomPreviousTokenBalances = new Map<string, bigint>();
+  private axiomSoldAnyWallets = new Map<
+    string,
+    {
+      sellType: "single_sell" | "multi_sell";
+      balanceBefore: string;
+      balanceAfter: string;
+    }
+  >();
+  private maxObservedLargestSimilarBalanceGroupCount = 0;
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private insiderSellsReady = false;
@@ -205,6 +238,8 @@ export class InsiderBot extends EventEmitter {
   private isBuyGateEvaluating = false;
   private isProcessing = false;
   private isAxiomAtaPolling = false;
+  private cachedSolPriceUsd: number | null = null;
+  private cachedSolPriceAt = 0;
 
   constructor(
     config: ServiceConfig,
@@ -1160,7 +1195,9 @@ export class InsiderBot extends EventEmitter {
   private clearAxiomWatchedWallets(): void {
     this.axiomWatchedWallets.clear();
     this.axiomSkippedMultiBuyWallets.clear();
-    this.maxObservedExistingAtaWalletCount = 0;
+    this.axiomPreviousTokenBalances.clear();
+    this.axiomSoldAnyWallets.clear();
+    this.maxObservedLargestSimilarBalanceGroupCount = 0;
   }
 
   private bundlerMatchTypeLabel(type: BundlerMatchType): string {
@@ -1438,6 +1475,7 @@ export class InsiderBot extends EventEmitter {
     );
     const hasAnyAta = new Set<string>();
     const hasPositiveBalance = new Set<string>();
+    const currentTokenBalances = new Map<string, bigint>();
     let existingAtaCount = 0;
     let positiveAtaCount = 0;
     const chunkSize = 100;
@@ -1459,11 +1497,35 @@ export class InsiderBot extends EventEmitter {
 
         const amount =
           info.data.length >= 72 ? info.data.readBigUInt64LE(64) : 0n;
+        currentTokenBalances.set(
+          lookup.wallet.address,
+          (currentTokenBalances.get(lookup.wallet.address) ?? 0n) + amount,
+        );
         if (amount > 0n) {
           positiveAtaCount += 1;
           hasPositiveBalance.add(lookup.wallet.address);
         }
       }
+    }
+
+    for (const wallet of watched) {
+      if (!hasAnyAta.has(wallet.address)) continue;
+      const currentBalance = currentTokenBalances.get(wallet.address) ?? 0n;
+      const previousBalance = this.axiomPreviousTokenBalances.get(
+        wallet.address,
+      );
+      if (
+        previousBalance !== undefined &&
+        currentBalance < previousBalance &&
+        !this.axiomSoldAnyWallets.has(wallet.address)
+      ) {
+        this.axiomSoldAnyWallets.set(wallet.address, {
+          sellType: currentBalance === 0n ? "single_sell" : "multi_sell",
+          balanceBefore: previousBalance.toString(),
+          balanceAfter: currentBalance.toString(),
+        });
+      }
+      this.axiomPreviousTokenBalances.set(wallet.address, currentBalance);
     }
 
     const soldWallets: AxiomWatchedWallet[] = [];
@@ -1481,11 +1543,39 @@ export class InsiderBot extends EventEmitter {
     }
 
     const existingAtaWalletCount = soldWallets.length + holdingWallets.length;
-    const previousMaxExistingAtaWalletCount =
-      this.maxObservedExistingAtaWalletCount;
-    this.maxObservedExistingAtaWalletCount = Math.max(
-      this.maxObservedExistingAtaWalletCount,
-      existingAtaWalletCount,
+    const {
+      solPriceUsd,
+      groups: similarSolBalanceGroups,
+    } = await this.fetchAndGroupExistingAtaWalletSolBalances(
+      holdingWallets,
+      soldWallets,
+    );
+    const largestSimilarBalanceGroup = similarSolBalanceGroups[0] ?? null;
+    const largestGroupExistingAtaWalletCount =
+      largestSimilarBalanceGroup?.walletCount ?? 0;
+    const largestGroupSoldAnyWalletBalances =
+      largestSimilarBalanceGroup?.wallets.filter(
+        (wallet) => wallet.soldAny,
+      ) ?? [];
+    const largestGroupSoldAnyWalletAddresses = new Set(
+      largestGroupSoldAnyWalletBalances.map((wallet) => wallet.address),
+    );
+    const largestGroupSoldAnyWallets = watched.filter((wallet) =>
+      largestGroupSoldAnyWalletAddresses.has(wallet.address),
+    );
+    const largestGroupHoldingCount =
+      largestGroupExistingAtaWalletCount -
+      largestGroupSoldAnyWallets.length;
+    const largestGroupSoldAnyRatio =
+      largestGroupExistingAtaWalletCount > 0
+        ? largestGroupSoldAnyWallets.length /
+          largestGroupExistingAtaWalletCount
+        : 0;
+    const previousMaxLargestSimilarBalanceGroupCount =
+      this.maxObservedLargestSimilarBalanceGroupCount;
+    this.maxObservedLargestSimilarBalanceGroupCount = Math.max(
+      this.maxObservedLargestSimilarBalanceGroupCount,
+      largestGroupExistingAtaWalletCount,
     );
     const cumulativeSkippedMultiBuy =
       this.axiomSkippedMultiBuyWallets.size;
@@ -1517,14 +1607,19 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    this.log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${soldWallets.length}/${existingAtaWalletCount} sold existing ATA wallets`, {
+    this.log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount} sold any in largest similar-SOL group`, {
       mint,
       phase: options.phase,
       soldPositionRatio: `${soldWallets.length}/${existingAtaWalletCount}`,
+      largestGroupSoldAnyPositionRatio: `${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount}`,
       watchedCount: watched.length,
       existingAtaWalletCount,
       soldAllCount: soldWallets.length,
       holdingCount: holdingWallets.length,
+      largestGroupExistingAtaWalletCount,
+      largestGroupSoldAnyCount: largestGroupSoldAnyWallets.length,
+      largestGroupHoldingCount,
+      largestGroupSoldAnyRatio,
       existingAtaCount,
       positiveAtaCount,
       missingAtaWalletCount: missingAtaWallets.length,
@@ -1532,25 +1627,27 @@ export class InsiderBot extends EventEmitter {
       ataConversionRatio,
       multiBuyToAtaRatio,
       soldRatio,
-      cumulativeSkippedMultiBuyWallets: [
-        ...this.axiomSkippedMultiBuyWallets,
-      ],
+      solPriceUsd,
+      similarSolBalanceToleranceUsd: 1,
+      mostSimilarSolBalanceGroup: largestSimilarBalanceGroup,
       rule:
         options.phase === "pre_buy"
-          ? `buy when existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}, ATA conversion >= ${AXIOM_BUY_MIN_ATA_CONVERSION_RATIO}, multi-buy/ATA ${AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO}-${AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO}, sold <= ${AXIOM_BUY_MAX_SOLD_WALLETS}`
-          : `sell when sold existing ATA wallets >= ${AXIOM_EXIT_SOLD_WALLET_THRESHOLD} and sold ratio >= ${AXIOM_EXIT_MIN_SOLD_RATIO}, or existing ATA wallets collapse to ${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}`,
-      maxObservedExistingAtaWalletCount:
-        this.maxObservedExistingAtaWalletCount,
+          ? `buy when largest similar-SOL group existing ATA wallets >= ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}, group sold-any <= ${AXIOM_BUY_MAX_SOLD_ANY_WALLETS}`
+          : `sell when largest similar-SOL group sold-any wallets >= ${AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD} and group sold-any ratio >= ${AXIOM_EXIT_MIN_SOLD_ANY_RATIO}, or largest group count collapses to ${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}`,
+      maxObservedLargestSimilarBalanceGroupCount:
+        this.maxObservedLargestSimilarBalanceGroupCount,
       soldWallets: soldWallets.map((wallet) => wallet.address),
-      holdingWallets: holdingWallets.map((wallet) => wallet.address),
+      largestSimilarSolGroupWallets:
+        largestSimilarBalanceGroup?.wallets ?? [],
       missingAtaWallets: missingAtaWallets.map((wallet) => wallet.address),
     });
 
     if (options.phase === "pre_buy") {
       await this.evaluateAxiomAtaBuyGate(
         mint,
+        largestGroupExistingAtaWalletCount,
+        largestGroupSoldAnyWallets.length,
         existingAtaWalletCount,
-        soldWallets.length,
         watched.length,
         missingAtaWallets.length,
         cumulativeSkippedMultiBuy,
@@ -1563,30 +1660,31 @@ export class InsiderBot extends EventEmitter {
     }
 
     const collapsedToTwo =
-      previousMaxExistingAtaWalletCount >
+      previousMaxLargestSimilarBalanceGroupCount >
         AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS &&
-      existingAtaWalletCount === AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS;
+      largestGroupExistingAtaWalletCount ===
+        AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS;
     if (collapsedToTwo) {
       this.log.warn(
-        "Axiom existing ATA wallet count collapsed to 2 — triggering position sell",
+        "Axiom largest similar-SOL group count collapsed to 2 — triggering position sell",
         {
           mint,
-          previousMaxExistingAtaWalletCount,
-          existingAtaWalletCount,
-          soldAllCount: soldWallets.length,
-          soldPositionRatio: `${soldWallets.length}/${existingAtaWalletCount}`,
+          previousMaxLargestSimilarBalanceGroupCount,
+          largestGroupExistingAtaWalletCount,
+          soldAnyCount: largestGroupSoldAnyWallets.length,
+          soldAnyPositionRatio: `${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount}`,
         },
       );
 
       await this.triggerPositionSell(
         mint,
-        `Axiom existing ATA wallets collapsed from ${previousMaxExistingAtaWalletCount} to ${existingAtaWalletCount} (${soldWallets.length}/${existingAtaWalletCount} sold all)`,
+        `Axiom largest similar-SOL group collapsed from ${previousMaxLargestSimilarBalanceGroupCount} to ${largestGroupExistingAtaWalletCount} (${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount} sold any)`,
         [
-          "<b>🚨 Axiom ATA Count Collapse</b>",
+          "<b>🚨 Axiom Similar-SOL Group Collapse</b>",
           `Token: <code>${mint}</code>`,
-          `Existing ATA wallets: <b>${previousMaxExistingAtaWalletCount}</b> → <b>${existingAtaWalletCount}</b>`,
-          `Sold all / existing ATA wallets: <b>${soldWallets.length}</b> / <b>${existingAtaWalletCount}</b>`,
-          `Rule: sell when the post-buy existing ATA count reaches <b>${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}</b>.`,
+          `Largest group wallets: <b>${previousMaxLargestSimilarBalanceGroupCount}</b> → <b>${largestGroupExistingAtaWalletCount}</b>`,
+          `Sold any / largest group: <b>${largestGroupSoldAnyWallets.length}</b> / <b>${largestGroupExistingAtaWalletCount}</b>`,
+          `Rule: sell when the post-buy largest similar-SOL group reaches <b>${AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS}</b>.`,
         ],
         "AXIOM_EXISTING_ATA_COUNT_COLLAPSE_TRIGGER",
       );
@@ -1594,45 +1692,46 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (
-      soldWallets.length < AXIOM_EXIT_SOLD_WALLET_THRESHOLD ||
-      soldRatio < AXIOM_EXIT_MIN_SOLD_RATIO
+      largestGroupSoldAnyWallets.length <
+        AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD ||
+      largestGroupSoldAnyRatio < AXIOM_EXIT_MIN_SOLD_ANY_RATIO
     ) {
       return false;
     }
 
-    const walletLines = soldWallets
-      .slice(0, AXIOM_EXIT_SOLD_WALLET_THRESHOLD)
+    const walletLines = largestGroupSoldAnyWalletBalances
+      .slice(0, AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD)
       .map(
         (wallet, i) =>
-          `${i + 1}. <code>${wallet.address}</code> buy: <b>$${wallet.buyUsd.toFixed(2)}</b> tags: <b>${wallet.tags.length ? wallet.tags.join(", ") : "[]"}</b>`,
+          `${i + 1}. <code>${wallet.address}</code> type: <b>${wallet.sellType}</b> token status: <b>${wallet.tokenStatus}</b>`,
       )
       .join("\n");
 
     this.log.warn(
-      "Axiom watched-wallet ATA sold threshold reached — triggering position sell",
+      "Axiom largest similar-SOL group sold-any threshold reached — triggering position sell",
       {
         mint,
         watchedCount: watched.length,
-        existingAtaWalletCount,
-        soldAllCount: soldWallets.length,
-        soldRatio,
-        soldWallets: soldWallets.map((wallet) => wallet.address),
+        largestGroupExistingAtaWalletCount,
+        soldAnyCount: largestGroupSoldAnyWallets.length,
+        soldAnyRatio: largestGroupSoldAnyRatio,
+        soldAnyWallets: largestGroupSoldAnyWalletBalances,
       },
     );
 
     await this.triggerPositionSell(
       mint,
-      `${soldWallets.length}/${existingAtaWalletCount} cumulative axiom/empty single-buy wallets with existing ATAs have zero balance`,
+      `${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount} wallets in the largest similar-SOL group reduced their token balance`,
       [
-        "<b>🚨 Axiom ATA Exit Threshold</b>",
+        "<b>🚨 Axiom Similar-SOL Group Exit Threshold</b>",
         `Token: <code>${mint}</code>`,
-        `Sold all / existing ATA wallets: <b>${soldWallets.length}</b> / <b>${existingAtaWalletCount}</b>`,
-        `Sold ratio: <b>${(soldRatio * 100).toFixed(1)}%</b>`,
+        `Sold any / largest group: <b>${largestGroupSoldAnyWallets.length}</b> / <b>${largestGroupExistingAtaWalletCount}</b>`,
+        `Group sold-any ratio: <b>${(largestGroupSoldAnyRatio * 100).toFixed(1)}%</b>`,
         `Cumulative valid wallets watched: <b>${watched.length}</b>`,
         `Missing ATA wallets ignored: <b>${missingAtaWallets.length}</b>`,
-        `Rule: sold existing ATA wallets >= <b>${AXIOM_EXIT_SOLD_WALLET_THRESHOLD}</b> and sold ratio >= <b>${(AXIOM_EXIT_MIN_SOLD_RATIO * 100).toFixed(0)}%</b>.`,
+        `Rule: largest-group sold-any wallets >= <b>${AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD}</b> and group sold-any ratio >= <b>${(AXIOM_EXIT_MIN_SOLD_ANY_RATIO * 100).toFixed(0)}%</b>.`,
         "",
-        "<b>First sold wallets:</b>",
+        "<b>First sold-any wallets:</b>",
         walletLines,
       ],
       "AXIOM_SINGLE_BUY_ATA_EXIT_TRIGGER",
@@ -1640,22 +1739,143 @@ export class InsiderBot extends EventEmitter {
     return true;
   }
 
+  private async fetchAndGroupExistingAtaWalletSolBalances(
+    holdingWallets: AxiomWatchedWallet[],
+    soldWallets: AxiomWatchedWallet[],
+  ): Promise<{
+    solPriceUsd: number | null;
+    walletBalances: ExistingAtaWalletSolBalance[];
+    groups: SimilarSolBalanceGroup[];
+  }> {
+    const existingWallets = [
+      ...holdingWallets.map((wallet) => ({
+        wallet,
+        tokenStatus: "holding" as const,
+      })),
+      ...soldWallets.map((wallet) => ({
+        wallet,
+        tokenStatus: "sold_all" as const,
+      })),
+    ];
+    if (existingWallets.length === 0) {
+      return { solPriceUsd: null, walletBalances: [], groups: [] };
+    }
+
+    const accountInfos: Array<AccountInfo<Buffer> | null> = [];
+    for (let start = 0; start < existingWallets.length; start += 100) {
+      const chunk = existingWallets.slice(start, start + 100);
+      accountInfos.push(
+        ...(await this.connection.getMultipleAccountsInfo(
+          chunk.map(({ wallet }) => new PublicKey(wallet.address)),
+          "processed",
+        )),
+      );
+    }
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    const walletBalances: ExistingAtaWalletSolBalance[] = existingWallets.map(
+      ({ wallet, tokenStatus }, index) => {
+        const solBalance =
+          (accountInfos[index]?.lamports ?? 0) / LAMPORTS_PER_SOL;
+        const sellState = this.axiomSoldAnyWallets.get(wallet.address);
+        return {
+          address: wallet.address,
+          tokenStatus,
+          tokenBalanceRaw:
+            this.axiomPreviousTokenBalances.get(wallet.address)?.toString() ??
+            "0",
+          soldAny: this.axiomSoldAnyWallets.has(wallet.address),
+          sellType: sellState?.sellType ?? null,
+          firstSellBalanceBefore: sellState?.balanceBefore ?? null,
+          firstSellBalanceAfter: sellState?.balanceAfter ?? null,
+          solBalance: Number(solBalance.toFixed(9)),
+          solBalanceUsd:
+            solPriceUsd === null
+              ? 0
+              : Number((solBalance * solPriceUsd).toFixed(2)),
+          similarBalanceGroup: null,
+        };
+      },
+    );
+
+    if (solPriceUsd === null) {
+      return { solPriceUsd, walletBalances, groups: [] };
+    }
+
+    const sorted = [...walletBalances].sort(
+      (a, b) => a.solBalanceUsd - b.solBalanceUsd,
+    );
+    let left = 0;
+    let largestGroupWallets: ExistingAtaWalletSolBalance[] = [];
+    for (let right = 0; right < sorted.length; right += 1) {
+      while (
+        sorted[right].solBalanceUsd - sorted[left].solBalanceUsd > 1
+      ) {
+        left += 1;
+      }
+      const candidate = sorted.slice(left, right + 1);
+      if (candidate.length > largestGroupWallets.length) {
+        largestGroupWallets = candidate;
+      }
+    }
+
+    const groups: SimilarSolBalanceGroup[] = [];
+    if (largestGroupWallets.length >= 2) {
+      for (const wallet of largestGroupWallets) {
+        wallet.similarBalanceGroup = 1;
+      }
+      const minUsd = largestGroupWallets[0].solBalanceUsd;
+      const maxUsd =
+        largestGroupWallets[largestGroupWallets.length - 1].solBalanceUsd;
+      groups.push({
+        group: 1,
+        walletCount: largestGroupWallets.length,
+        minUsd: Number(minUsd.toFixed(2)),
+        maxUsd: Number(maxUsd.toFixed(2)),
+        spreadUsd: Number((maxUsd - minUsd).toFixed(2)),
+        wallets: largestGroupWallets,
+      });
+    }
+
+    return { solPriceUsd, walletBalances, groups };
+  }
+
+  private async getCachedSolPriceUsd(): Promise<number | null> {
+    const now = Date.now();
+    if (
+      this.cachedSolPriceUsd !== null &&
+      now - this.cachedSolPriceAt < 30_000
+    ) {
+      return this.cachedSolPriceUsd;
+    }
+
+    const solPriceUsd = await this.gmgnClient.fetchSolPriceUsd();
+    if (solPriceUsd !== null) {
+      this.cachedSolPriceUsd = solPriceUsd;
+      this.cachedSolPriceAt = now;
+      return solPriceUsd;
+    }
+    return this.cachedSolPriceUsd;
+  }
+
   private async evaluateAxiomAtaBuyGate(
     mint: string,
-    existingAtaWalletCount: number,
-    soldAllCount: number,
+    largestGroupExistingAtaWalletCount: number,
+    largestGroupSoldAnyCount: number,
+    overallExistingAtaWalletCount: number,
     watchedCount: number,
     missingAtaWalletCount: number,
     cumulativeSkippedMultiBuy: number,
   ): Promise<void> {
     const ataConversionRatio =
-      watchedCount > 0 ? existingAtaWalletCount / watchedCount : 0;
+      watchedCount > 0 ? overallExistingAtaWalletCount / watchedCount : 0;
     const multiBuyToAtaRatio =
-      existingAtaWalletCount > 0
-        ? cumulativeSkippedMultiBuy / existingAtaWalletCount
+      overallExistingAtaWalletCount > 0
+        ? cumulativeSkippedMultiBuy / overallExistingAtaWalletCount
         : 0;
-    const soldRatio =
-      existingAtaWalletCount > 0 ? soldAllCount / existingAtaWalletCount : 0;
+    const largestGroupSoldAnyRatio =
+      largestGroupExistingAtaWalletCount > 0
+        ? largestGroupSoldAnyCount / largestGroupExistingAtaWalletCount
+        : 0;
 
     if (
       this.phase !== "pre_buy" ||
@@ -1664,11 +1884,9 @@ export class InsiderBot extends EventEmitter {
       this.isBuyExecuting ||
       this.isBuyGateEvaluating ||
       this.buyDisabled ||
-      existingAtaWalletCount < AXIOM_BUY_MIN_EXISTING_ATA_WALLETS ||
-      ataConversionRatio < AXIOM_BUY_MIN_ATA_CONVERSION_RATIO ||
-      multiBuyToAtaRatio < AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO ||
-      multiBuyToAtaRatio > AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO ||
-      soldAllCount > AXIOM_BUY_MAX_SOLD_WALLETS
+      largestGroupExistingAtaWalletCount <
+        AXIOM_BUY_MIN_EXISTING_ATA_WALLETS ||
+      largestGroupSoldAnyCount > AXIOM_BUY_MAX_SOLD_ANY_WALLETS
     ) {
       return;
     }
@@ -1695,14 +1913,15 @@ export class InsiderBot extends EventEmitter {
 
       this.log.warn("Axiom ATA buy gate passed — triggering buy", {
         mint,
-        existingAtaWalletCount,
-        soldAllCount,
+        largestGroupExistingAtaWalletCount,
+        largestGroupSoldAnyCount,
+        overallExistingAtaWalletCount,
         watchedCount,
         missingAtaWalletCount,
         cumulativeSkippedMultiBuy,
         ataConversionRatio,
         multiBuyToAtaRatio,
-        soldRatio,
+        largestGroupSoldAnyRatio,
         currentMc,
         exitMc: newExitMc,
       });
@@ -1716,16 +1935,16 @@ export class InsiderBot extends EventEmitter {
         monitoredWallet: this.monitoredWallet ?? undefined,
         tradersListStr: [
           "<b>Axiom ATA Buy Gate Passed</b>",
-          `Existing ATA wallets: <b>${existingAtaWalletCount}</b>`,
-          `Sold all: <b>${soldAllCount}</b>`,
+          `Largest similar-SOL group: <b>${largestGroupExistingAtaWalletCount}</b> wallets`,
+          `Sold any in largest group: <b>${largestGroupSoldAnyCount}</b>`,
+          `Overall existing ATA wallets: <b>${overallExistingAtaWalletCount}</b>`,
           `Cumulative valid wallets: <b>${watchedCount}</b>`,
           `Missing ATA wallets ignored: <b>${missingAtaWalletCount}</b>`,
           `Cumulative skipped multi-buy wallets: <b>${cumulativeSkippedMultiBuy}</b>`,
           `ATA conversion: <b>${(ataConversionRatio * 100).toFixed(1)}%</b>`,
-          `Multi-buy / ATA ratio: <b>${multiBuyToAtaRatio.toFixed(2)}</b>`,
-          `Rule: existing ATA wallets &gt;= <b>${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}</b>, ATA conversion &gt;= <b>${(AXIOM_BUY_MIN_ATA_CONVERSION_RATIO * 100).toFixed(0)}%</b>.`,
-          `Multi-buy / ATA: <b>${AXIOM_BUY_MIN_MULTI_BUY_TO_ATA_RATIO.toFixed(1)}-${AXIOM_BUY_MAX_MULTI_BUY_TO_ATA_RATIO.toFixed(1)}</b>.`,
-          `Sold all: &lt;= <b>${AXIOM_BUY_MAX_SOLD_WALLETS}</b> wallets.`,
+          `Largest-group sold-any ratio: <b>${(largestGroupSoldAnyRatio * 100).toFixed(1)}%</b>`,
+          `Rule: largest similar-SOL group &gt;= <b>${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}</b>.`,
+          `Sold any in largest group: &lt;= <b>${AXIOM_BUY_MAX_SOLD_ANY_WALLETS}</b> wallets.`,
         ].join("\n"),
       });
     } finally {
