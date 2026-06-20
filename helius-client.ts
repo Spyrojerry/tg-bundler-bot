@@ -25,6 +25,14 @@ export interface HeliusTransaction {
     toUserAccount: string;
     amount: number;
   }>;
+  instructions?: Array<{
+    programId: string;
+    accounts?: string[];
+    innerInstructions?: Array<{
+      programId: string;
+      accounts?: string[];
+    }>;
+  }>;
 }
 
 export interface EarlyBundlerInfo {
@@ -271,6 +279,30 @@ export class HeliusClient {
       log.error(`Failed to fetch transactions for ${address} from Helius`, err);
       throw err;
     }
+  }
+
+  async getAddressTransactionsAsc(
+    address: string,
+    afterSignature?: string,
+    limit: number = 50,
+  ): Promise<HeliusTransaction[]> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'asc',
+      'api-key': this.apiKey,
+      limit: String(limit),
+    });
+    if (afterSignature) {
+      params.set('after-signature', afterSignature);
+    }
+    const url = `${this.baseUrl}/v0/addresses/${address}/transactions?${params.toString()}`;
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+    return await response.json() as HeliusTransaction[];
   }
 
   async getTransactionsBySignatures(signatures: string[]): Promise<HeliusTransaction[]> {
