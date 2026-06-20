@@ -1328,7 +1328,11 @@ private isPumpOnlySellFailure(message: string): boolean {
       await sleep(100);
     }
 
-    throw new Error(`Transaction ${signature} was not confirmed for ${mint} before timeout`);
+    const recentBlockhash = VersionedTransaction.deserialize(rawTx).message
+      .recentBlockhash;
+    throw new Error(
+      `Transaction ${signature} was not confirmed for ${mint} before timeout (blockhash ${recentBlockhash})`,
+    );
   }
 
   // REPLACE lines 725-745 with:
@@ -1465,6 +1469,45 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
 
   async getTokenRawBalance(wallet: string, mint: string): Promise<bigint> {
     return this.getTokenBalance(wallet, mint);
+  }
+
+  async getSubmittedBuyReconciliationState(
+    wallet: string,
+    mint: string,
+    signature: string,
+    recentBlockhash: string | null,
+  ): Promise<{
+    tokenBalance: bigint;
+    signatureStatus: "confirmed" | "failed" | "pending";
+    signatureError: unknown;
+    blockhashValid: boolean | null;
+  }> {
+    const [tokenBalance, statusResponse, blockhashValid] = await Promise.all([
+      this.getTokenRawBalance(wallet, mint).catch(() => 0n),
+      this.connection
+        .getSignatureStatuses([signature], {
+          searchTransactionHistory: true,
+        })
+        .catch(() => null),
+      recentBlockhash
+        ? this.connection
+            .isBlockhashValid(recentBlockhash, {
+              commitment: "processed",
+            })
+            .catch(() => null)
+        : Promise.resolve(null),
+    ]);
+    const status = statusResponse?.value[0] ?? null;
+    return {
+      tokenBalance,
+      signatureStatus: status?.err
+        ? "failed"
+        : status?.confirmationStatus
+          ? "confirmed"
+          : "pending",
+      signatureError: status?.err ?? null,
+      blockhashValid: blockhashValid?.value ?? null,
+    };
   }
 
   private async getTokenBalance(wallet: string, mint: string): Promise<bigint> {

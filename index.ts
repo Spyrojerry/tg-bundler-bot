@@ -1326,25 +1326,40 @@ async function main(): Promise<void> {
               errorMessage.match(
                 /Transaction ([1-9A-HJ-NP-Za-km-z]+)/,
               )?.[1] ?? null;
+            const submittedBlockhash =
+              errorMessage.match(
+                /blockhash ([1-9A-HJ-NP-Za-km-z]+)/,
+              )?.[1] ?? null;
             log.warn(
               `[INSIDER ${botNumber}] Buy confirmation uncertain; locking buy gate while reconciling token balance`,
               {
                 mint: trigger.mint,
                 signature: submittedSignature,
-                reconcileWindowMs: 15_000,
+                blockhash: submittedBlockhash,
+                fastReconcileWindowMs: 5_000,
               },
             );
 
             void (async () => {
-              const deadline = Date.now() + 15_000;
-              while (Date.now() < deadline) {
-                const balance = await client
-                  .getTokenRawBalance(
+              if (!submittedSignature) {
+                log.error(
+                  `[INSIDER ${botNumber}] Timed-out buy had no signature; reopening buy gate`,
+                  { mint: trigger.mint },
+                );
+                bot.resetBuyAttempt();
+                return;
+              }
+
+              const fastDeadline = Date.now() + 5_000;
+              let fastWindowElapsed = false;
+              while (true) {
+                const state = await client.getSubmittedBuyReconciliationState(
                     config.tradingWalletAddress!,
                     trigger.mint,
-                  )
-                  .catch(() => 0n);
-                if (balance > 0n) {
+                    submittedSignature,
+                    submittedBlockhash,
+                  );
+                if (state.tokenBalance > 0n) {
                   bot.markPositionBought(trigger);
                   db.addSeenMint(
                     config.tradingWalletAddress!,
@@ -1355,7 +1370,8 @@ async function main(): Promise<void> {
                     {
                       mint: trigger.mint,
                       signature: submittedSignature,
-                      tokenBalance: balance.toString(),
+                      signatureStatus: state.signatureStatus,
+                      tokenBalance: state.tokenBalance.toString(),
                     },
                   );
                   void telegramBot
@@ -1367,7 +1383,7 @@ async function main(): Promise<void> {
                         submittedSignature
                           ? `Tx: https://solscan.io/tx/${html(submittedSignature)}`
                           : "",
-                        `Token balance: <code>${balance.toString()}</code>`,
+                        `Token balance: <code>${state.tokenBalance.toString()}</code>`,
                       ]
                         .filter(Boolean)
                         .join("\n"),
@@ -1385,17 +1401,50 @@ async function main(): Promise<void> {
                     );
                   return;
                 }
+
+                if (state.signatureStatus === "failed") {
+                  log.error(
+                    `[INSIDER ${botNumber}] Submitted buy failed on-chain; reopening buy gate`,
+                    {
+                      mint: trigger.mint,
+                      signature: submittedSignature,
+                      error: state.signatureError,
+                    },
+                  );
+                  bot.resetBuyAttempt();
+                  return;
+                }
+
+                if (
+                  state.blockhashValid === false &&
+                  state.signatureStatus !== "confirmed"
+                ) {
+                  log.error(
+                    `[INSIDER ${botNumber}] Submitted buy blockhash expired with zero token balance; reopening buy gate`,
+                    {
+                      mint: trigger.mint,
+                      signature: submittedSignature,
+                      blockhash: submittedBlockhash,
+                    },
+                  );
+                  bot.resetBuyAttempt();
+                  return;
+                }
+
+                if (!fastWindowElapsed && Date.now() >= fastDeadline) {
+                  fastWindowElapsed = true;
+                  log.warn(
+                    `[INSIDER ${botNumber}] Five-second reconciliation elapsed; original buy remains locked until confirmation, failure, or blockhash expiry`,
+                    {
+                      mint: trigger.mint,
+                      signature: submittedSignature,
+                      signatureStatus: state.signatureStatus,
+                      blockhashValid: state.blockhashValid,
+                    },
+                  );
+                }
                 await sleep(500);
               }
-
-              log.error(
-                `[INSIDER ${botNumber}] PumpPortal buy remained unconfirmed with zero token balance; reopening buy gate`,
-                {
-                  mint: trigger.mint,
-                  signature: submittedSignature,
-                },
-              );
-              bot.resetBuyAttempt();
             })();
             return;
           }
