@@ -1029,7 +1029,7 @@ private async sellTokenForSolViaPumpSwap(
       const signature = await this.sendRawTransactionAndAssertSuccess(
         Buffer.from(tx.serialize()),
         mint,
-        { maxRetries: 3, timeoutMs: 20_000 },
+        { maxRetries: 3, timeoutMs: 6_000 },
       );
 
       log.info(`Custom direct PumpSwap sell transaction confirmed: ${signature}`, {
@@ -1309,7 +1309,7 @@ private isPumpOnlySellFailure(message: string): boolean {
       maxRetries: options.maxRetries ?? 3,
     });
 
-    const deadline = Date.now() + (options.timeoutMs ?? 12_000);
+    const deadline = Date.now() + (options.timeoutMs ?? 6_000);
     while (Date.now() < deadline) {
       const status = await this.connection.getSignatureStatuses([signature], {
         searchTransactionHistory: true,
@@ -1325,7 +1325,7 @@ private isPumpOnlySellFailure(message: string): boolean {
           return signature;
         }
       }
-      await sleep(250);
+      await sleep(100);
     }
 
     throw new Error(`Transaction ${signature} was not confirmed for ${mint} before timeout`);
@@ -1704,7 +1704,7 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
       const signature = await this.sendRawTransactionAndAssertSuccess(
         Buffer.from(tx.serialize()),
         mint,
-        { maxRetries: 3, timeoutMs: 30_000 },
+        { maxRetries: 3, timeoutMs: 8_000 },
       );
 
       log.info(`Custom Pump.fun buy transaction confirmed: ${signature}`, {
@@ -1832,7 +1832,7 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
       const signature = await this.sendRawTransactionAndAssertSuccess(
         Buffer.from(tx.serialize()),
         mint,
-        { maxRetries: 3, timeoutMs: 30_000 },
+        { maxRetries: 3, timeoutMs: 8_000 },
       );
       const balanceAfter = await this.getTokenBalance(walletAddress, mint)
         .catch(() => balanceBefore);

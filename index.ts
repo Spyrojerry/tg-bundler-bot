@@ -1331,12 +1331,12 @@ async function main(): Promise<void> {
               {
                 mint: trigger.mint,
                 signature: submittedSignature,
-                reconcileWindowMs: 60_000,
+                reconcileWindowMs: 15_000,
               },
             );
 
             void (async () => {
-              const deadline = Date.now() + 60_000;
+              const deadline = Date.now() + 15_000;
               while (Date.now() < deadline) {
                 const balance = await client
                   .getTokenRawBalance(
@@ -1385,7 +1385,7 @@ async function main(): Promise<void> {
                     );
                   return;
                 }
-                await sleep(2_000);
+                await sleep(500);
               }
 
               log.error(
@@ -2829,7 +2829,7 @@ async function main(): Promise<void> {
           lastError = null;
 
           if (lastResult.status === "confirmed") {
-            await sleep(750);
+            await sleep(250);
             const remainingBalance = await getTokenRawBalance(
               owner,
               mintPk,
@@ -2860,7 +2860,7 @@ async function main(): Promise<void> {
         }
 
         if (attempt < 5) {
-          await sleep(250);
+          await sleep(100);
           const remainingBalance = await getTokenRawBalance(
             owner,
             mintPk,

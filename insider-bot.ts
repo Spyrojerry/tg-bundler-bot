@@ -26,6 +26,7 @@ const AXIOM_BUY_MAX_SOLD_ANY_WALLETS = 3;
 const AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD = 5;
 const AXIOM_EXIT_MIN_SOLD_ANY_RATIO = 0.2;
 const AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS = 2;
+const AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD = 2;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 50_000;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
@@ -1601,6 +1602,11 @@ export class InsiderBot extends EventEmitter {
     const nearZeroSoldAnyCount = nearZeroWalletBalances.filter(
       (wallet) => wallet.soldAny,
     ).length;
+    const nearZeroSingleSellWallets = nearZeroWalletBalances.filter(
+      (wallet) =>
+        wallet.tokenStatus === "sold_all" &&
+        wallet.sellType === "single_sell",
+    );
     const largestNearZeroSolGroup =
       nearZeroWalletBalances.length > 0
         ? {
@@ -1702,12 +1708,21 @@ export class InsiderBot extends EventEmitter {
               requiredSoldAny: AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD,
               requiredSoldAnyRatio: AXIOM_EXIT_MIN_SOLD_ANY_RATIO,
               collapseGroupSize: AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS,
+              nearZeroSingleSellThreshold:
+                AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD,
+              nearZeroSingleSellCount: nearZeroSingleSellWallets.length,
               collapsedToTwo,
               passed:
-                collapsedToTwo || sellGateFailedConditions.length === 0,
-              failedConditions: collapsedToTwo
-                ? []
-                : sellGateFailedConditions,
+                nearZeroSingleSellWallets.length >=
+                  AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD ||
+                collapsedToTwo ||
+                sellGateFailedConditions.length === 0,
+              failedConditions:
+                nearZeroSingleSellWallets.length >=
+                  AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD ||
+                collapsedToTwo
+                  ? []
+                  : sellGateFailedConditions,
             },
           }),
     });
@@ -1727,6 +1742,45 @@ export class InsiderBot extends EventEmitter {
 
     if (!options.triggerSell) {
       return false;
+    }
+
+    if (
+      nearZeroSingleSellWallets.length >=
+      AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD
+    ) {
+      const walletLines = nearZeroSingleSellWallets
+        .slice(0, AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD)
+        .map(
+          (wallet, i) =>
+            `${i + 1}. <code>${wallet.address}</code> status: <b>${wallet.tokenStatus}</b> type: <b>${wallet.sellType}</b> SOL: <b>$${wallet.solBalanceUsd.toFixed(2)}</b>`,
+        )
+        .join("\n");
+
+      this.log.warn(
+        "Axiom near-zero SOL group single-sell threshold reached — triggering position sell",
+        {
+          mint,
+          threshold: AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD,
+          nearZeroWalletCount: nearZeroWalletBalances.length,
+          qualifyingSingleSellCount: nearZeroSingleSellWallets.length,
+          qualifyingWallets: nearZeroSingleSellWallets,
+        },
+      );
+
+      await this.triggerPositionSell(
+        mint,
+        `${nearZeroSingleSellWallets.length} wallets in the near-zero SOL group sold all in one transaction`,
+        [
+          "<b>🚨 Axiom Near-Zero SOL Single-Sell Exit</b>",
+          `Token: <code>${mint}</code>`,
+          `Qualifying wallets: <b>${nearZeroSingleSellWallets.length}</b>`,
+          `Rule: sell when at least <b>${AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD}</b> near-zero SOL wallets have status <b>sold_all</b> and type <b>single_sell</b>.`,
+          "",
+          walletLines,
+        ],
+        "AXIOM_NEAR_ZERO_SINGLE_SELL_EXIT_TRIGGER",
+      );
+      return true;
     }
 
     if (collapsedToTwo) {
