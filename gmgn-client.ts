@@ -995,11 +995,11 @@ private async sellTokenForSolViaPumpSwap(
         user,
         sourceTokenAccount.account,
       );
-      const slippage = this.toPumpSlippagePercent(options);
-      const instructions = await PUMP_AMM_SDK.sellBaseInput(
+      const slippage = 100;
+      const instructions = await PUMP_AMM_SDK.sellInstructions(
         swapState,
         new BN(amountRawForAccount.toString()),
-        slippage,
+        new BN(0),
       );
 
       const computeUnitLimit = 350_000;
@@ -1066,6 +1066,8 @@ private async sellTokenForSolViaPumpSwap(
         pool: pool.toBase58(),
         tokenProgram: sourceTokenAccount.tokenProgram.toBase58(),
         sourceTokenAccount: sourceTokenAccount.account.toBase58(),
+        slippage: 100,
+        minQuoteAmountOut: "0",
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -1795,7 +1797,7 @@ private async fetchJupiterJson(url: string, method: 'GET' | 'POST', body?: Recor
     const pool = canonicalPumpPoolPda(mintPk, new PublicKey(SOL_MINT));
     const balanceBefore = await this.getTokenBalance(walletAddress, mint);
     const swapState = await this.pumpAmmSdk.swapSolanaState(pool, user);
-    const slippage = this.toPumpSlippagePercent(options);
+    const slippage = 100;
     const instructions = await PUMP_AMM_SDK.buyQuoteInput(
       swapState,
       new BN(amountLamports),
