@@ -1107,6 +1107,27 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  private async retireLegacyInsiderWalletMonitoring(
+    mint: string,
+    authority: string,
+  ): Promise<void> {
+    const retiredWallet = this.monitoredWallet;
+    await this.stopInsiderMonitoring();
+    this.monitoredWallet = null;
+    this.insiderState = null;
+    this.insiderSellsReady = true;
+    this.log.info(
+      "Stopped legacy insider-wallet monitoring after authority flow started",
+      {
+        mint,
+        authority,
+        retiredWallet,
+        action:
+          "stop wallet history polling and WebSocket logs; keep authority and ATA monitoring active",
+      },
+    );
+  }
+
   private async stopLargeBuyerMonitoring(): Promise<void> {
     if (this.largeBuyerLogsSubId !== null) {
       const subId = this.largeBuyerLogsSubId;
@@ -2422,6 +2443,7 @@ export class InsiderBot extends EventEmitter {
       nonSimilarWallets: new Set(),
       patternStates: new Map(),
     };
+    await this.retireLegacyInsiderWalletMonitoring(mint, authority);
     this.subscribeAuthority(authority);
     this.log.info("Lookup-table authority trigger flow started", {
       mint,
