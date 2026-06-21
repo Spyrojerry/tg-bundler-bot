@@ -30,6 +30,7 @@ const AXIOM_AUTHORITY_INITIAL_TX_COUNT = 15;
 const AXIOM_AUTHORITY_INITIAL_AFTER_LIMIT = 14;
 const AXIOM_AUTHORITY_BATCH_LIMIT = 50;
 const AXIOM_AUTHORITY_MIN_SYNC_INTERVAL_MS = 2_000;
+const AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS = 3;
 const AXIOM_AUTHORITY_SIMILAR_BUY_SPREAD_USD = 1;
 const AXIOM_AUTHORITY_LARGE_BUY_MIN_USD = 200;
 const ADDRESS_LOOKUP_TABLE_PROGRAM =
@@ -2293,14 +2294,59 @@ export class InsiderBot extends EventEmitter {
       throw new Error(`Could not find the first candidate buy transaction for ${mint}`);
     }
 
-    const [enhancedFirstBuy] =
-      await this.heliusClient.getTransactionsBySignatures([firstBuy.signature]);
-    const firstBuyTransaction = enhancedFirstBuy ?? firstBuy;
-    const authority = this.extractLookupTableAuthority(firstBuyTransaction);
-    if (!authority) {
-      throw new Error(
-        `Could not extract lookup-table authority from ${firstBuy.signature}`,
+    let firstBuyTransaction = firstBuy;
+    let authority: string | null = null;
+    for (
+      let attempt = 1;
+      attempt <= AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      const [enhancedFirstBuy] =
+        await this.heliusClient.getTransactionsBySignatures([
+          firstBuy.signature,
+        ]);
+      firstBuyTransaction = enhancedFirstBuy ?? firstBuy;
+      authority = this.extractLookupTableAuthority(firstBuyTransaction);
+      if (authority) break;
+
+      this.log.warn(
+        "Lookup-table authority extraction failed; retrying enhanced transaction",
+        {
+          mint,
+          signature: firstBuy.signature,
+          attempt,
+          maxAttempts: AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS,
+          remainingAttempts:
+            AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS - attempt,
+        },
       );
+      if (attempt < AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+      }
+    }
+
+    if (!authority) {
+      this.log.warn(
+        "Token is incompatible with lookup-table authority strategy after three extraction failures; skipping and resetting",
+        {
+          mint,
+          signature: firstBuy.signature,
+          attempts: AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS,
+          action: "reset token flow and wait for the next followed-wallet token",
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏭️ ${this.label} Token Skipped</b>`,
+          `Token: <code>${mint}</code>`,
+          `First candidate buy: <code>${firstBuy.signature}</code>`,
+          `Reason: lookup-table authority was not found after <b>${AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS}</b> attempts.`,
+          "This token is incompatible with the authority strategy. Flow reset for the next token.",
+        ].join("\n"),
+        "incompatible authority token notification",
+      );
+      await this.resetForNewToken(true);
+      return;
     }
 
     this.authorityMonitor = {
