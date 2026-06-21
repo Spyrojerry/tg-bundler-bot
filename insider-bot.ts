@@ -36,7 +36,9 @@ const AXIOM_AUTHORITY_LARGE_BUY_MIN_USD = 200;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 const ADDRESS_LOOKUP_TABLE_PROGRAM =
   "AddressLookupTab1e1111111111111111111111111";
-const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 5;
+const AXIOM_AUTHORITY_EARLY_PROBE_GROUP_SIZE = 2;
+const AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE = 5;
+const AXIOM_AUTHORITY_NORMAL_BUY_GROUP_MIN_COUNT = 10;
 const AXIOM_BUY_MAX_SOLD_ANY_WALLETS = 3;
 const AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD = 5;
 const AXIOM_EXIT_MIN_SOLD_ANY_RATIO = 0.2;
@@ -201,6 +203,10 @@ interface AuthorityMonitorState {
   initialCursorSignature: string | null;
   cursorSignature: string | null;
   initialReady: boolean;
+  decisionMode:
+    | "pending"
+    | "direct_200_buy"
+    | "normal_non_similar";
   processedSignatures: Set<string>;
   nonSimilarWallets: Set<string>;
   patternStates: Map<string, AuthorityPatternWalletState>;
@@ -286,6 +292,7 @@ export class InsiderBot extends EventEmitter {
   private bundlerLogsSubIds = new Map<string, number>();
 
   private processedSignatures = new Set<string>();
+  private queuedSignatures = new Set<string>();
   private pendingSignaturesBatch: string[] = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -304,6 +311,9 @@ export class InsiderBot extends EventEmitter {
   private lastAuthoritySyncAt = 0;
   private lastLargeBuyerSyncAt = 0;
   private stoppedForHeliusCredits = false;
+  private authorityProbeFailedAtTwo = false;
+  private isSwitchingInsiderWallet = false;
+  private insiderWalletChain = new Set<string>();
 
   private readonly BATCH_WINDOW_MS = 1000;
   private readonly MAX_BATCH_SIZE = 100;
@@ -764,6 +774,7 @@ export class InsiderBot extends EventEmitter {
     this.resetTokenTxCounts();
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
+    this.authorityProbeFailedAtTwo = false;
     this.clearBundlerAccumulation();
     this.clearAxiomWatchedWallets();
 
@@ -777,6 +788,8 @@ export class InsiderBot extends EventEmitter {
     }
 
     this.monitoredWallet = lowest.wallet;
+    this.insiderWalletChain.clear();
+    this.insiderWalletChain.add(lowest.wallet);
     this.initialInsiderWallets.clear();
     for (const wallet of this.extractEarlyInsiderWallets(earlyInsiderBuys)) {
       this.initialInsiderWallets.add(wallet);
@@ -1209,7 +1222,13 @@ export class InsiderBot extends EventEmitter {
     context: "insider" | "bundler",
     bundlerWallet?: string,
   ): void {
-    if (this.processedSignatures.has(signature)) return;
+    if (
+      this.processedSignatures.has(signature) ||
+      this.queuedSignatures.has(signature)
+    ) {
+      return;
+    }
+    this.queuedSignatures.add(signature);
     this.pendingSignaturesBatch.push(signature);
 
     const process = () => {
@@ -1233,6 +1252,9 @@ export class InsiderBot extends EventEmitter {
     }
     const signatures = [...this.pendingSignaturesBatch];
     this.pendingSignaturesBatch = [];
+    for (const signature of signatures) {
+      this.queuedSignatures.delete(signature);
+    }
     const fresh = signatures.filter((s) => !this.processedSignatures.has(s));
     if (fresh.length === 0) return;
 
@@ -1282,7 +1304,9 @@ export class InsiderBot extends EventEmitter {
       this.batchTimer = null;
     }
     this.processedSignatures.clear();
+    this.queuedSignatures.clear();
     this.pendingSignaturesBatch = [];
+    this.isSwitchingInsiderWallet = false;
     this.authorityMonitor = null;
     this.largeBuyerWatch = null;
   }
@@ -1369,7 +1393,12 @@ export class InsiderBot extends EventEmitter {
         (t) => t.mint === mint && t.fromUserAccount === wallet,
       )?.toUserAccount;
       if (!recipient) return;
-      await this.switchToTransferredWallet(recipient, mint, tx.signature);
+      await this.switchToTransferredWallet(
+        wallet,
+        recipient,
+        mint,
+        tx.signature,
+      );
       return;
     }
 
@@ -1415,35 +1444,78 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async switchToTransferredWallet(
+    sourceWallet: string,
     newWallet: string,
     mint: string,
     transferSignature: string,
   ): Promise<void> {
-    await this.stopInsiderMonitoring();
-    this.monitoredWallet = newWallet;
-    this.insiderState = {
-      wallet: newWallet,
-      sellCount: 0,
-      isTransferred: true,
-    };
-    this.insiderSellsReady = false;
-    this.processedSignatures.clear();
-    this.processedSignatures.add(transferSignature);
+    if (this.isSwitchingInsiderWallet) {
+      this.log.debug("Ignoring concurrent insider wallet switch", {
+        mint,
+        sourceWallet,
+        newWallet,
+        transferSignature,
+      });
+      return;
+    }
+    if (this.monitoredWallet !== sourceWallet) {
+      this.log.debug("Ignoring stale transfer from a wallet no longer monitored", {
+        mint,
+        sourceWallet,
+        currentMonitoredWallet: this.monitoredWallet,
+        newWallet,
+        transferSignature,
+      });
+      return;
+    }
+    if (newWallet === sourceWallet || this.insiderWalletChain.has(newWallet)) {
+      this.log.warn("Ignoring self/cyclic insider transfer", {
+        mint,
+        sourceWallet,
+        newWallet,
+        transferSignature,
+        monitoredWalletChain: [...this.insiderWalletChain],
+      });
+      return;
+    }
 
-    await this.syncWalletHistory(newWallet, mint, transferSignature, INSIDER_HISTORY_LIMIT, "insider");
-    this.startInsiderMonitoring();
+    this.isSwitchingInsiderWallet = true;
+    try {
+      await this.stopInsiderMonitoring();
+      this.monitoredWallet = newWallet;
+      this.insiderWalletChain.add(newWallet);
+      this.insiderState = {
+        wallet: newWallet,
+        sellCount: 0,
+        isTransferred: true,
+      };
+      this.insiderSellsReady = false;
+      this.processedSignatures.add(transferSignature);
 
-    void this.sendTelegramSafe(
-      [
-        `<b>🔀 ${this.label} Transfer Detected</b>`,
-        `Token: <code>${mint}</code>`,
-        `Now monitoring: <code>${newWallet}</code>`,
-        `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      "transfer notification",
-    );
+      await this.syncWalletHistory(
+        newWallet,
+        mint,
+        transferSignature,
+        INSIDER_HISTORY_LIMIT,
+        "insider",
+      );
+      this.startInsiderMonitoring();
+
+      void this.sendTelegramSafe(
+        [
+          `<b>🔀 ${this.label} Transfer Detected</b>`,
+          `Token: <code>${mint}</code>`,
+          `From: <code>${sourceWallet}</code>`,
+          `Now monitoring: <code>${newWallet}</code>`,
+          `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        "transfer notification",
+      );
+    } finally {
+      this.isSwitchingInsiderWallet = false;
+    }
   }
 
   private clearBundlerAccumulation(): void {
@@ -1908,15 +1980,24 @@ export class InsiderBot extends EventEmitter {
     const buyGateFailedConditions: string[] = [];
     if (
       largestGroupExistingAtaWalletCount <
-      AXIOM_BUY_MIN_EXISTING_ATA_WALLETS
+      AXIOM_AUTHORITY_EARLY_PROBE_GROUP_SIZE
     ) {
       buyGateFailedConditions.push(
-        `group_size: ${largestGroupExistingAtaWalletCount} < ${AXIOM_BUY_MIN_EXISTING_ATA_WALLETS}`,
+        `group_size: ${largestGroupExistingAtaWalletCount} < ${AXIOM_AUTHORITY_EARLY_PROBE_GROUP_SIZE}`,
       );
     }
     if (largestGroupSoldAnyWallets.length > AXIOM_BUY_MAX_SOLD_ANY_WALLETS) {
       buyGateFailedConditions.push(
         `sold_any: ${largestGroupSoldAnyWallets.length} > ${AXIOM_BUY_MAX_SOLD_ANY_WALLETS}`,
+      );
+    }
+    if (
+      this.authorityProbeFailedAtTwo &&
+      largestGroupExistingAtaWalletCount <
+        AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE
+    ) {
+      buyGateFailedConditions.push(
+        `authority_probe_wait: group_size ${largestGroupExistingAtaWalletCount} < fallback ${AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE}`,
       );
     }
     const sellGateFailedConditions: string[] = [];
@@ -1964,7 +2045,10 @@ export class InsiderBot extends EventEmitter {
       ...(options.phase === "pre_buy"
         ? {
             buyGate: {
-              requiredGroupSize: AXIOM_BUY_MIN_EXISTING_ATA_WALLETS,
+              earlyAuthorityProbeGroupSize:
+                AXIOM_AUTHORITY_EARLY_PROBE_GROUP_SIZE,
+              fallbackAuthorityProbeGroupSize:
+                AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE,
               maximumSoldAny: AXIOM_BUY_MAX_SOLD_ANY_WALLETS,
               passed: buyGateFailedConditions.length === 0,
               failedConditions: buyGateFailedConditions,
@@ -2262,6 +2346,14 @@ export class InsiderBot extends EventEmitter {
       largestGroupExistingAtaWalletCount > 0
         ? largestGroupSoldAnyCount / largestGroupExistingAtaWalletCount
         : 0;
+    const shouldAttemptEarlyAuthority =
+      largestGroupExistingAtaWalletCount >=
+        AXIOM_AUTHORITY_EARLY_PROBE_GROUP_SIZE &&
+      !this.authorityProbeFailedAtTwo;
+    const shouldAttemptFallbackAuthority =
+      this.authorityProbeFailedAtTwo &&
+      largestGroupExistingAtaWalletCount >=
+        AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE;
 
     if (
       this.phase !== "pre_buy" ||
@@ -2272,8 +2364,7 @@ export class InsiderBot extends EventEmitter {
       this.buyDisabled ||
       this.authorityMonitor !== null ||
       !largestSimilarBalanceGroup ||
-      largestGroupExistingAtaWalletCount <
-        AXIOM_BUY_MIN_EXISTING_ATA_WALLETS ||
+      (!shouldAttemptEarlyAuthority && !shouldAttemptFallbackAuthority) ||
       largestGroupSoldAnyCount > AXIOM_BUY_MAX_SOLD_ANY_WALLETS
     ) {
       return;
@@ -2326,7 +2417,23 @@ export class InsiderBot extends EventEmitter {
         },
       );
 
-      await this.startAuthorityTriggerFlow(mint, candidates);
+      const isFallbackAttempt = this.authorityProbeFailedAtTwo;
+      const started = await this.startAuthorityTriggerFlow(
+        mint,
+        candidates,
+        isFallbackAttempt,
+      );
+      if (!started && !isFallbackAttempt) {
+        this.authorityProbeFailedAtTwo = true;
+        this.log.info(
+          "Early authority probe failed; waiting for largest similar-SOL group count 5 before retrying",
+          {
+            mint,
+            attemptedGroupCount: largestGroupExistingAtaWalletCount,
+            fallbackGroupCount: AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE,
+          },
+        );
+      }
       if (this.authorityMonitor) {
         this.stopAxiomAtaPollLoop();
       }
@@ -2338,8 +2445,11 @@ export class InsiderBot extends EventEmitter {
   private async startAuthorityTriggerFlow(
     mint: string,
     candidates: AuthorityCandidateWallet[],
-  ): Promise<void> {
-    if (this.authorityMonitor || this.buySubmitted || this.preBuyStopped) return;
+    resetIfAuthorityMissing: boolean,
+  ): Promise<boolean> {
+    if (this.authorityMonitor || this.buySubmitted || this.preBuyStopped) {
+      return false;
+    }
 
     const candidateAddresses = new Set(candidates.map((wallet) => wallet.address));
     let mintTransactions = await this.heliusClient.getAddressTransactionsAsc(
@@ -2371,7 +2481,26 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (!firstBuy) {
-      throw new Error(`Could not find the first candidate buy transaction for ${mint}`);
+      if (!resetIfAuthorityMissing) {
+        this.log.warn(
+          "Early authority probe could not find a candidate buy transaction; waiting for fallback group count",
+          {
+            mint,
+            candidateWallets: candidates.map((candidate) => candidate.address),
+            fallbackGroupCount: AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE,
+          },
+        );
+        return false;
+      }
+      this.log.warn(
+        "Fallback authority probe could not find a candidate buy transaction; skipping token",
+        {
+          mint,
+          candidateWallets: candidates.map((candidate) => candidate.address),
+        },
+      );
+      await this.resetForNewToken(true);
+      return false;
     }
 
     let firstBuyTransaction = firstBuy;
@@ -2406,6 +2535,18 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (!authority) {
+      if (!resetIfAuthorityMissing) {
+        this.log.warn(
+          "Early lookup-table authority probe failed; token remains active until similar-SOL group reaches fallback count",
+          {
+            mint,
+            signature: firstBuy.signature,
+            attempts: AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS,
+            fallbackGroupCount: AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE,
+          },
+        );
+        return false;
+      }
       this.log.warn(
         "Token is incompatible with lookup-table authority strategy after three extraction failures; skipping and resetting",
         {
@@ -2426,7 +2567,7 @@ export class InsiderBot extends EventEmitter {
         "incompatible authority token notification",
       );
       await this.resetForNewToken(true);
-      return;
+      return false;
     }
 
     this.authorityMonitor = {
@@ -2439,6 +2580,7 @@ export class InsiderBot extends EventEmitter {
       initialCursorSignature: null,
       cursorSignature: null,
       initialReady: false,
+      decisionMode: "pending",
       processedSignatures: new Set([firstBuy.signature]),
       nonSimilarWallets: new Set(),
       patternStates: new Map(),
@@ -2456,6 +2598,7 @@ export class InsiderBot extends EventEmitter {
       initialAfterLimit: AXIOM_AUTHORITY_INITIAL_AFTER_LIMIT,
     });
     await this.syncAuthorityTransactions();
+    return true;
   }
 
   private extractLookupTableAuthority(
@@ -2568,6 +2711,34 @@ export class InsiderBot extends EventEmitter {
       }
 
       if (this.phase === "pre_buy" && !this.buySubmitted) {
+        if (state.decisionMode === "direct_200_buy") {
+          if (this.largeBuyerWatch) {
+            await this.emitDirectAuthorityBuyerBuy(
+              state,
+              this.largeBuyerWatch,
+            );
+            return;
+          }
+          let cursor = state.cursorSignature;
+          while (true) {
+            const batch = await this.heliusClient.getAddressTransactionsAsc(
+              state.authority,
+              cursor,
+              AXIOM_AUTHORITY_BATCH_LIMIT,
+            );
+            if (batch.length === 0) break;
+            for (const tx of batch) {
+              if (state.processedSignatures.has(tx.signature)) continue;
+              state.processedSignatures.add(tx.signature);
+              const found = await this.inspectDirectAuthorityBuyer(state, tx);
+              if (found) return;
+            }
+            cursor = batch[batch.length - 1].signature;
+            state.cursorSignature = cursor;
+            if (batch.length < AXIOM_AUTHORITY_BATCH_LIMIT) break;
+          }
+          return;
+        }
         await this.checkAuthorityPatternAtaBalances(
           state,
           "authority transaction or periodic poll",
@@ -2668,8 +2839,48 @@ export class InsiderBot extends EventEmitter {
         .map((entry) => entry.wallet)
         .filter((wallet) => !similarWallets.has(wallet)),
     );
+    state.decisionMode =
+      largestGroup.length < AXIOM_AUTHORITY_NORMAL_BUY_GROUP_MIN_COUNT
+        ? "direct_200_buy"
+        : "normal_non_similar";
     state.nonSimilarWallets = nonSimilarWallets;
     state.patternStates.clear();
+    if (state.decisionMode === "direct_200_buy") {
+      this.log.info(
+        "Initial authority grouping selected direct $200 buyer path",
+        {
+          mint: state.mint,
+          authority: state.authority,
+          largestSimilarUsdBuyGroupCount: largestGroup.length,
+          normalFlowMinimum:
+            AXIOM_AUTHORITY_NORMAL_BUY_GROUP_MIN_COUNT,
+          afterSignature: state.initialCursorSignature,
+          action:
+            "wait for first later $200+ authority buy, buy immediately, then sell when that same wallet sells all",
+        },
+      );
+      this.log.info("Initial 15-transaction authority window analyzed", {
+        mint: state.mint,
+        authority: state.authority,
+        transactionSignatures: state.initialTransactions.map(
+          (tx) => tx.signature,
+        ),
+        solPriceUsd: Number(solPriceUsd.toFixed(2)),
+        decisionMode: state.decisionMode,
+        groupingRule: `largest group whose USD buy values have a maximum spread of $${AXIOM_AUTHORITY_SIMILAR_BUY_SPREAD_USD.toFixed(2)}`,
+        largestSimilarUsdBuyGroup: largestGroup.map((entry) => ({
+          address: entry.wallet,
+          buyUsd: Number(entry.buyUsd.toFixed(2)),
+        })),
+        allPricedWalletBuys: walletBuys.map((entry) => ({
+          address: entry.wallet,
+          buyUsd: Number(entry.buyUsd.toFixed(2)),
+        })),
+        unpricedBuyWallets: [...unpricedBuyWallets],
+      });
+      return;
+    }
+
     const baselineSnapshot = await this.fetchAuthorityPatternAtaBalances(
       state.mint,
       [...nonSimilarWallets],
@@ -2710,6 +2921,7 @@ export class InsiderBot extends EventEmitter {
         (tx) => tx.signature,
       ),
       solPriceUsd: Number(solPriceUsd.toFixed(2)),
+      decisionMode: state.decisionMode,
       groupingRule: `largest group whose USD buy values have a maximum spread of $${AXIOM_AUTHORITY_SIMILAR_BUY_SPREAD_USD.toFixed(2)}`,
       largestSimilarUsdBuyGroup: largestGroup.map((entry) => ({
         address: entry.wallet,
@@ -3034,6 +3246,122 @@ export class InsiderBot extends EventEmitter {
         ...candidateLines,
       ].join("\n"),
     });
+    } finally {
+      this.isBuyGateEvaluating = false;
+    }
+  }
+
+  private async inspectDirectAuthorityBuyer(
+    state: AuthorityMonitorState,
+    tx: HeliusTransaction,
+  ): Promise<boolean> {
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    if (solPriceUsd === null) return false;
+
+    for (const buy of this.getMintBuyActors(tx, state.mint)) {
+      const buySol = this.estimateWalletSolSpent(tx, buy.wallet);
+      if (buySol === null) continue;
+      const buyUsd = buySol * solPriceUsd;
+      if (buyUsd < AXIOM_AUTHORITY_LARGE_BUY_MIN_USD) continue;
+
+      this.largeBuyerWatch = {
+        mint: state.mint,
+        wallet: buy.wallet,
+        qualifyingSignature: tx.signature,
+        buyUsd,
+        boughtAmount: buy.amount,
+        soldAmount: 0,
+        cursorSignature: tx.signature,
+        processedSignatures: new Set([tx.signature]),
+      };
+      state.cursorSignature = tx.signature;
+      this.subscribeLargeBuyer(buy.wallet);
+      this.log.warn(
+        "Direct authority path found >=$200 buy — triggering our buy and reserving wallet for sell-all exit",
+        {
+          mint: state.mint,
+          authority: state.authority,
+          wallet: buy.wallet,
+          signature: tx.signature,
+          buySol,
+          buyUsd: Number(buyUsd.toFixed(2)),
+          tokenAmount: buy.amount,
+        },
+      );
+      await this.emitDirectAuthorityBuyerBuy(state, this.largeBuyerWatch);
+      return true;
+    }
+    return false;
+  }
+
+  private async emitDirectAuthorityBuyerBuy(
+    state: AuthorityMonitorState,
+    watch: LargeBuyerWatchState,
+  ): Promise<void> {
+    if (
+      this.buySubmitted ||
+      this.buyDisabled ||
+      this.isBuyExecuting ||
+      this.isBuyGateEvaluating
+    ) {
+      return;
+    }
+    this.isBuyGateEvaluating = true;
+    try {
+      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(
+        state.mint,
+      );
+      if (currentMc === null) {
+        this.log.warn(
+          "Direct $200 authority buyer found, but current market cap is unavailable; waiting before buy",
+          {
+            mint: state.mint,
+            wallet: watch.wallet,
+            qualifyingSignature: watch.qualifyingSignature,
+          },
+        );
+        return;
+      }
+      if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
+        this.log.warn(
+          "Direct $200 authority buyer found, but token is below rug threshold; resetting instead of buying",
+          {
+            mint: state.mint,
+            wallet: watch.wallet,
+            buyUsd: watch.buyUsd,
+            currentMc,
+            rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
+          },
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
+
+      await this.stopPreBuyMonitoring();
+      const newExitMc = currentMc * (1 + this.exitPercent / 100);
+      this.setExitMc(newExitMc);
+      this.setEntryMc(currentMc);
+      this.setBuyExecuting(true);
+      this.buySubmitted = true;
+      this.emit("buyTrigger", {
+        followedWallet: this.followedWallet!,
+        mint: state.mint,
+        signature: watch.qualifyingSignature,
+        buySol: this.buySol,
+        entryMc: currentMc,
+        monitoredWallet: watch.wallet,
+        tradersListStr: [
+          "<b>Direct $200 Authority Buy Gate Passed</b>",
+          `Authority: <code>${state.authority}</code>`,
+          `Largest similar USD-buy group: <b>less than ${AXIOM_AUTHORITY_NORMAL_BUY_GROUP_MIN_COUNT}</b>`,
+          `Trigger wallet: <code>${watch.wallet}</code>`,
+          `Trigger buy: <b>$${watch.buyUsd.toFixed(2)}</b>`,
+          `Trigger tx: <code>${watch.qualifyingSignature}</code>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          "",
+          "Sell rule: sell our position when this same wallet sells all of its tracked token position.",
+        ].join("\n"),
+      });
     } finally {
       this.isBuyGateEvaluating = false;
     }
@@ -3427,6 +3755,8 @@ export class InsiderBot extends EventEmitter {
     this.insiderState = null;
     this.clearBundlerAccumulation();
     this.initialInsiderWallets.clear();
+    this.insiderWalletChain.clear();
+    this.isSwitchingInsiderWallet = false;
     this.devWallet = null;
     this.axiomTraderWatchActive = false;
     this.clearAxiomWatchedWallets();
@@ -3469,6 +3799,7 @@ export class InsiderBot extends EventEmitter {
     this.positionSellTriggered = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
+    this.authorityProbeFailedAtTwo = false;
     this.buySubmitted = false;
     this.isBuyGateEvaluating = false;
     this.resetTokenTxCounts();
