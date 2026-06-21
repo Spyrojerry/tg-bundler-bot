@@ -618,74 +618,153 @@ export class GmgnClient {
     shouldFallback: boolean;
     reason: string;
   }> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    let lastReason = 'unknown GMGN request failure';
 
-    try {
-      const resp = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'X-API-KEY': apiKey,
-          Accept: 'application/json',
-          'User-Agent': 'gmgn-monitor/1.0',
-        },
-        signal: controller.signal,
-      });
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-      if (resp.status === 429) {
-        const retryMs = this.getRetryDelayMs(resp) ?? BLOCKED_RETRY_MS;
-        limiter.onRateLimited(retryMs);
+      try {
+        const resp = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'X-API-KEY': apiKey,
+            Accept: 'application/json',
+            'User-Agent': 'gmgn-monitor/1.0',
+          },
+          signal: controller.signal,
+        });
+
+        if (resp.status === 429) {
+          const retryMs = this.getRetryDelayMs(resp) ?? BLOCKED_RETRY_MS;
+          limiter.onRateLimited(retryMs);
+          return {
+            data: null,
+            shouldFallback: keyRole === 'primary',
+            reason: 'HTTP 429 rate limited',
+          };
+        }
+
+        if (resp.status === 401 || resp.status === 403) {
+          return {
+            data: null,
+            shouldFallback: keyRole === 'primary',
+            reason: `HTTP ${resp.status}`,
+          };
+        }
+
+        if (!resp.ok) {
+          lastReason = `HTTP ${resp.status}`;
+          if (resp.status >= 500 && attempt < MAX_RETRIES) {
+            log.warn(`GMGN ${keyRole} transient HTTP failure; retrying`, {
+              status: resp.status,
+              attempt,
+              maxAttempts: MAX_RETRIES,
+            });
+            await sleep(BASE_RETRY_MS * attempt);
+            continue;
+          }
+          return {
+            data: null,
+            shouldFallback: keyRole === 'primary' && resp.status >= 500,
+            reason: lastReason,
+          };
+        }
+
+        const contentType = resp.headers.get('content-type')?.toLowerCase() ?? '';
+        const body = await resp.text();
+        const trimmedBody = body.trimStart();
+        const looksLikeHtml =
+          contentType.includes('text/html') ||
+          /^<!doctype html/i.test(trimmedBody) ||
+          /^<html[\s>]/i.test(trimmedBody);
+
+        if (looksLikeHtml) {
+          lastReason = `HTML response instead of JSON${contentType ? ` (${contentType})` : ''}`;
+          if (attempt < MAX_RETRIES) {
+            log.warn(`GMGN ${keyRole} returned HTML instead of JSON; retrying`, {
+              attempt,
+              maxAttempts: MAX_RETRIES,
+              responsePreview: trimmedBody.slice(0, 120),
+            });
+            await sleep(BASE_RETRY_MS * attempt);
+            continue;
+          }
+          return {
+            data: null,
+            shouldFallback: keyRole === 'primary',
+            reason: lastReason,
+          };
+        }
+
+        let json: GmgnSecurityResponse;
+        try {
+          json = JSON.parse(body) as GmgnSecurityResponse;
+        } catch {
+          lastReason = `Non-JSON response (${contentType || 'unknown content-type'})`;
+          if (attempt < MAX_RETRIES) {
+            log.warn(`GMGN ${keyRole} returned malformed JSON; retrying`, {
+              attempt,
+              maxAttempts: MAX_RETRIES,
+              responsePreview: trimmedBody.slice(0, 120),
+            });
+            await sleep(BASE_RETRY_MS * attempt);
+            continue;
+          }
+          return {
+            data: null,
+            shouldFallback: keyRole === 'primary',
+            reason: lastReason,
+          };
+        }
+
+        if (json.code !== undefined && json.code !== 0) {
+          return {
+            data: null,
+            shouldFallback: false,
+            reason: `GMGN response code ${json.code}`,
+          };
+        }
+
+        limiter.onSuccess(this.baselineMinTime);
+        const unwrapped = this.unwrapResponseData(json);
+        if (unwrapped) {
+          unwrapped.source = keyRole === 'primary' ? 'api' : 'api-fallback';
+        }
+        return {
+          data: unwrapped,
+          shouldFallback: false,
+          reason: unwrapped ? 'success' : 'empty response',
+        };
+      } catch (err) {
+        lastReason = err instanceof Error ? err.message : String(err);
+        const retryable =
+          lastReason.includes('AbortError') ||
+          lastReason.includes('fetch failed');
+        if (retryable && attempt < MAX_RETRIES) {
+          log.warn(`GMGN ${keyRole} network request failed; retrying`, {
+            attempt,
+            maxAttempts: MAX_RETRIES,
+            reason: lastReason,
+          });
+          await sleep(BASE_RETRY_MS * attempt);
+          continue;
+        }
         return {
           data: null,
           shouldFallback: keyRole === 'primary',
-          reason: 'HTTP 429 rate limited',
+          reason: lastReason,
         };
+      } finally {
+        clearTimeout(timer);
       }
-
-      if (resp.status === 401 || resp.status === 403 || resp.status >= 500) {
-        return {
-          data: null,
-          shouldFallback: keyRole === 'primary',
-          reason: `HTTP ${resp.status}`,
-        };
-      }
-
-      if (!resp.ok) {
-        return {
-          data: null,
-          shouldFallback: false,
-          reason: `HTTP ${resp.status}`,
-        };
-      }
-
-      const json = (await resp.json()) as GmgnSecurityResponse;
-      if (json.code !== undefined && json.code !== 0) {
-        return {
-          data: null,
-          shouldFallback: false,
-          reason: `GMGN response code ${json.code}`,
-        };
-      }
-
-      limiter.onSuccess(this.baselineMinTime);
-      const unwrapped = this.unwrapResponseData(json);
-      if (unwrapped) {
-        unwrapped.source = keyRole === 'primary' ? 'api' : 'api-fallback';
-      }
-      return {
-        data: unwrapped,
-        shouldFallback: false,
-        reason: unwrapped ? 'success' : 'empty response',
-      };
-    } catch (err) {
-      return {
-        data: null,
-        shouldFallback: keyRole === 'primary',
-        reason: err instanceof Error ? err.message : String(err),
-      };
-    } finally {
-      clearTimeout(timer);
     }
+
+    return {
+      data: null,
+      shouldFallback: keyRole === 'primary',
+      reason: lastReason,
+    };
   }
 
   // ── Internal: extract MC from raw data ────────────────────────────────────
