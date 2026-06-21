@@ -113,6 +113,10 @@ export function loadConfig(): ServiceConfig {
   const insiderHeliusApiKey2 = optional('INSIDER_HELIUS_API_KEY_2', '');
   const insiderHeliusApiKey3 = optional('INSIDER_HELIUS_API_KEY_3', '');
   const insiderHeliusApiKey4 = optional('INSIDER_HELIUS_API_KEY_4', '');
+  const insiderHeliusProjectId = optional('INSIDER_HELIUS_PROJECT_ID', '');
+  const insiderHeliusProjectId2 = optional('INSIDER_HELIUS_PROJECT_ID_2', '');
+  const insiderHeliusProjectId3 = optional('INSIDER_HELIUS_PROJECT_ID_3', '');
+  const insiderHeliusProjectId4 = optional('INSIDER_HELIUS_PROJECT_ID_4', '');
   const insiderSolanaRpcUrl = optional(
     'INSIDER_SOLANA_RPC_URL',
     insiderHeliusApiKey ? heliusRpcUrl(insiderHeliusApiKey) : solanaRpcUrl
@@ -236,6 +240,10 @@ export function loadConfig(): ServiceConfig {
     insiderHeliusApiKey2,
     insiderHeliusApiKey3,
     insiderHeliusApiKey4,
+    insiderHeliusProjectId,
+    insiderHeliusProjectId2,
+    insiderHeliusProjectId3,
+    insiderHeliusProjectId4,
     insiderSolanaRpcUrl,
     insiderSolanaWsUrl,
     insiderSolanaRpcUrl2,

@@ -59,6 +59,7 @@ async function main(): Promise<void> {
         hasEnvValue("INSIDER_SOLANA_WS_URL"),
       gmgnApiKey: config.gmgnApiKey,
       heliusApiKey: config.insiderHeliusApiKey || config.heliusApiKey,
+      heliusProjectId: config.insiderHeliusProjectId,
       rpcUrl: config.insiderSolanaRpcUrl,
       wsUrl: config.insiderSolanaWsUrl,
       followWallet: config.insiderFollowWallet,
@@ -72,6 +73,7 @@ async function main(): Promise<void> {
         hasEnvValue("INSIDER_SOLANA_WS_URL_2"),
       gmgnApiKey: config.gmgnApiKey2,
       heliusApiKey: config.insiderHeliusApiKey2 || config.heliusApiKey,
+      heliusProjectId: config.insiderHeliusProjectId2,
       rpcUrl: config.insiderSolanaRpcUrl2,
       wsUrl: config.insiderSolanaWsUrl2,
       followWallet: config.insiderFollowWallet2,
@@ -85,6 +87,7 @@ async function main(): Promise<void> {
         hasEnvValue("INSIDER_SOLANA_WS_URL_3"),
       gmgnApiKey: config.gmgnApiKey3,
       heliusApiKey: config.insiderHeliusApiKey3 || config.heliusApiKey,
+      heliusProjectId: config.insiderHeliusProjectId3,
       rpcUrl: config.insiderSolanaRpcUrl3,
       wsUrl: config.insiderSolanaWsUrl3,
       followWallet: config.insiderFollowWallet3,
@@ -98,6 +101,7 @@ async function main(): Promise<void> {
         hasEnvValue("INSIDER_SOLANA_WS_URL_4"),
       gmgnApiKey: config.gmgnApiKey4,
       heliusApiKey: config.insiderHeliusApiKey4 || config.heliusApiKey,
+      heliusProjectId: config.insiderHeliusProjectId4,
       rpcUrl: config.insiderSolanaRpcUrl4,
       wsUrl: config.insiderSolanaWsUrl4,
       followWallet: config.insiderFollowWallet4,
@@ -883,21 +887,44 @@ async function main(): Promise<void> {
       claimInsiderMint(botIndex, mint);
 
   insiderBotDefinitions.forEach((definition, index) => {
-    insiderBots.push(
-      new InsiderBot(
-        config,
-        definition.rpcUrl,
-        definition.wsUrl,
-        gmgnClients[index],
-        gmgnClients[index],
-        gmgnClients[index],
-        definition.heliusApiKey,
-        telegramBot,
-        makeClaimFn(index),
-        () => undefined,
-        `Insider ${definition.botNumber}`,
-      ),
+    const bot = new InsiderBot(
+      config,
+      definition.rpcUrl,
+      definition.wsUrl,
+      gmgnClients[index],
+      gmgnClients[index],
+      gmgnClients[index],
+      definition.heliusApiKey,
+      definition.heliusProjectId,
+      telegramBot,
+      makeClaimFn(index),
+      () => undefined,
+      `Insider ${definition.botNumber}`,
     );
+    bot.on("heliusCreditsExhausted", (info) => {
+      void (async () => {
+        await bot.stopForHeliusCredits();
+        await telegramBot?.sendDefault(
+          [
+            `<b>🛑 Insider ${definition.botNumber} Stopped — Helius Credits Exhausted</b>`,
+            `Project: <code>${html(info.projectId)}</code>`,
+            `Plan: <b>${html(info.usage.subscriptionDetails?.plan ?? "Unknown")}</b>`,
+            `Credits remaining: <b>${html(String(info.usage.creditsRemaining))}</b>`,
+            `Prepaid credits remaining: <b>${html(String(info.usage.prepaidCreditsRemaining))}</b>`,
+            "",
+            "A Helius request returned 429 and the Admin API confirmed that this project has no remaining credits.",
+            "This bot has been stopped. Other Insider bots continue running.",
+          ].join("\n"),
+          { pin: true },
+        );
+      })().catch((err) =>
+        log.error(
+          `[INSIDER ${definition.botNumber}] Failed to stop or notify after Helius credit exhaustion`,
+          err,
+        ),
+      );
+    });
+    insiderBots.push(bot);
   });
 
  
@@ -907,6 +934,7 @@ async function main(): Promise<void> {
       const wallet = bot.getFollowedWallet();
       if (
         wallet &&
+        !bot.isStoppedForHeliusCredits() &&
         !bot.isRunning() &&
         !bot.getActivePosition() &&
         !bot.getPreBuyMint()
@@ -1295,6 +1323,7 @@ async function main(): Promise<void> {
                 .filter(Boolean)
                 .join("\n"),
               {
+                pin: true,
                 replyMarkup: {
                   inline_keyboard: [
                     [
@@ -1387,6 +1416,7 @@ async function main(): Promise<void> {
                       ]
                         .filter(Boolean)
                         .join("\n"),
+                      { pin: true },
                     )
                     .catch((notifyErr) =>
                       log.warn(
@@ -1895,6 +1925,7 @@ async function main(): Promise<void> {
     const bot = insiderBots[index];
     const client = gmgnClients[index];
     const botNumber = getInsiderBotNumber(index);
+    if (bot.isStoppedForHeliusCredits()) return;
     const preBuyMint = bot.getPreBuyMint();
     const activePos = bot.getActivePosition();
 

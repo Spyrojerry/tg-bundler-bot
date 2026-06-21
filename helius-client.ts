@@ -45,13 +45,150 @@ export interface EarlyBundlerInfo {
   creatorVaultAddress?: string;
 }
 
+export interface HeliusProjectUsage {
+  creditsUsed: number;
+  creditsRemaining: number;
+  prepaidCreditsUsed: number;
+  prepaidCreditsRemaining: number;
+  subscriptionDetails?: {
+    plan?: string;
+    creditsLimit?: number;
+    billingCycle?: {
+      start?: string;
+      end?: string;
+    };
+  };
+  usage?: Record<string, number>;
+}
+
+export interface HeliusCreditExhaustionInfo {
+  projectId: string;
+  label: string;
+  usage: HeliusProjectUsage;
+}
+
+interface HeliusClientOptions {
+  projectId?: string;
+  label?: string;
+  onCreditsExhausted?: (
+    info: HeliusCreditExhaustionInfo,
+  ) => void | Promise<void>;
+}
+
 export class HeliusClient {
   private readonly apiKey: string;
   private readonly baseUrl: string;
+  private readonly projectId: string | null;
+  private readonly label: string;
+  private readonly onCreditsExhausted:
+    | HeliusClientOptions['onCreditsExhausted']
+    | null;
+  private creditCheckPromise: Promise<void> | null = null;
+  private lastCreditCheckAt = 0;
+  private creditsExhaustedNotified = false;
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, options: HeliusClientOptions = {}) {
     this.apiKey = apiKey;
     this.baseUrl = 'https://api-mainnet.helius-rpc.com';
+    this.projectId = options.projectId?.trim() || null;
+    this.label = options.label?.trim() || 'Helius';
+    this.onCreditsExhausted = options.onCreditsExhausted ?? null;
+  }
+
+  private async fetchWithCreditCheck(
+    input: string,
+    init?: RequestInit,
+  ): Promise<Response> {
+    const response = await fetch(input, init);
+    if (response.status === 429) {
+      await this.checkProjectCreditsAfter429();
+    }
+    return response;
+  }
+
+  private async checkProjectCreditsAfter429(): Promise<void> {
+    if (this.creditsExhaustedNotified) return;
+    if (!this.projectId) {
+      log.warn(`${this.label} received Helius 429 but has no project ID configured`, {
+        requiredSetting: 'INSIDER_HELIUS_PROJECT_ID[_2|_3|_4]',
+      });
+      return;
+    }
+    if (this.creditCheckPromise) {
+      await this.creditCheckPromise;
+      return;
+    }
+    if (Date.now() - this.lastCreditCheckAt < 30_000) return;
+
+    this.lastCreditCheckAt = Date.now();
+    this.creditCheckPromise = this.fetchProjectUsage()
+      .then(async (usage) => {
+        const creditsRemaining = Number(usage.creditsRemaining);
+        const prepaidCreditsRemaining = Number(
+          usage.prepaidCreditsRemaining,
+        );
+        const hasConfirmedBalances =
+          Number.isFinite(creditsRemaining) &&
+          Number.isFinite(prepaidCreditsRemaining);
+        const exhausted =
+          hasConfirmedBalances &&
+          creditsRemaining <= 0 &&
+          prepaidCreditsRemaining <= 0;
+
+        log.warn(`${this.label} Helius project usage checked after 429`, {
+          projectId: this.projectId,
+          creditsUsed: usage.creditsUsed,
+          creditsRemaining,
+          prepaidCreditsUsed: usage.prepaidCreditsUsed,
+          prepaidCreditsRemaining,
+          exhausted,
+        });
+        if (!exhausted || this.creditsExhaustedNotified) return;
+
+        this.creditsExhaustedNotified = true;
+        await this.onCreditsExhausted?.({
+          projectId: this.projectId!,
+          label: this.label,
+          usage,
+        });
+      })
+      .catch((err) => {
+        log.warn(`${this.label} Helius Admin credit check failed after 429`, {
+          projectId: this.projectId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        this.creditCheckPromise = null;
+      });
+    await this.creditCheckPromise;
+  }
+
+  async handlePossibleRateLimitError(error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/\b429\b|too many requests/i.test(message)) {
+      await this.checkProjectCreditsAfter429();
+    }
+  }
+
+  private async fetchProjectUsage(): Promise<HeliusProjectUsage> {
+    const projectId = encodeURIComponent(this.projectId!);
+    const params = new URLSearchParams({ 'api-key': this.apiKey });
+    const url =
+      `https://admin-api.helius.xyz/v0/projects/${projectId}/usage?${params.toString()}`;
+    const response = await globalThis.fetch(url, {
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'X-API-Key': this.apiKey,
+      },
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `Helius Admin API error: ${response.status} ${response.statusText} - ${text}`,
+      );
+    }
+    return await response.json() as HeliusProjectUsage;
   }
 
   /**
@@ -68,7 +205,7 @@ export class HeliusClient {
     // Retry up to 3 times with a delay, as tokens might be very new
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const response = await fetch(url);
+        const response = await this.fetchWithCreditCheck(url);
         if (!response.ok) {
           const text = await response.text();
           throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -117,7 +254,10 @@ export class HeliusClient {
       : null;
 
     try {
-      const response = await fetch(url, controller ? { signal: controller.signal } : undefined);
+      const response = await this.fetchWithCreditCheck(
+        url,
+        controller ? { signal: controller.signal } : undefined,
+      );
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -142,7 +282,7 @@ export class HeliusClient {
     const url = `${this.baseUrl}/v0/addresses/${mintAddress}/transactions?${params.toString()}`;
 
     try {
-      const response = await fetch(url);
+      const response = await this.fetchWithCreditCheck(url);
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -169,7 +309,7 @@ export class HeliusClient {
     });
     const url = `${this.baseUrl}/v0/addresses/${mintAddress}/transactions?${params.toString()}`;
 
-    const response = await fetch(url);
+    const response = await this.fetchWithCreditCheck(url);
     if (!response.ok) {
       const text = await response.text();
       throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -196,7 +336,7 @@ export class HeliusClient {
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const response = await fetch(url);
+        const response = await this.fetchWithCreditCheck(url);
         if (!response.ok) {
           const text = await response.text();
           throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -240,7 +380,7 @@ export class HeliusClient {
     let lastError: Error | null = null;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        const response = await fetch(url);
+        const response = await this.fetchWithCreditCheck(url);
         if (!response.ok) {
           const text = await response.text();
           throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -268,7 +408,7 @@ export class HeliusClient {
     const url = `${this.baseUrl}/v0/addresses/${address}/transactions?api-key=${this.apiKey}&limit=${limit}`;
     
     try {
-      const response = await fetch(url);
+      const response = await this.fetchWithCreditCheck(url);
       if (!response.ok) {
         const text = await response.text();
         throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -297,7 +437,7 @@ export class HeliusClient {
     }
     const url = `${this.baseUrl}/v0/addresses/${address}/transactions?${params.toString()}`;
 
-    const response = await fetch(url);
+    const response = await this.fetchWithCreditCheck(url);
     if (!response.ok) {
       const text = await response.text();
       throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
@@ -310,7 +450,7 @@ export class HeliusClient {
     const url = `${this.baseUrl}/v0/transactions?api-key=${this.apiKey}`;
 
     try {
-      const response = await fetch(url, {
+      const response = await this.fetchWithCreditCheck(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transactions: signatures }),

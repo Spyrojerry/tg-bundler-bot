@@ -11,7 +11,11 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { createLogger, Logger } from "./logger";
-import { HeliusClient, HeliusTransaction } from "./helius-client";
+import {
+  HeliusClient,
+  HeliusCreditExhaustionInfo,
+  HeliusTransaction,
+} from "./helius-client";
 import { GmgnClient } from "./gmgn-client";
 import type { ServiceConfig } from "./types";
 import { TelegramBot } from "./telegram-bot";
@@ -75,6 +79,10 @@ export interface InsiderBot {
     listener: (trigger: InsiderSellTrigger) => void,
   ): this;
   on(event: "mintSeen", listener: (mint: string) => void): this;
+  on(
+    event: "heliusCreditsExhausted",
+    listener: (info: HeliusCreditExhaustionInfo) => void,
+  ): this;
   on(event: "error", listener: (error: Error) => void): this;
   getActivePosition(): { followedWallet: string; mint: string } | null;
   getPreBuyMint(): string | null;
@@ -99,6 +107,8 @@ export interface InsiderBot {
   setBuyDisabled(value: boolean): void;
   configureFollowWallet(address: string): void;
   pause(): void;
+  stopForHeliusCredits(): Promise<void>;
+  isStoppedForHeliusCredits(): boolean;
   isRunning(): boolean;
   isBuyInProgress(): boolean;
   setBuyExecuting(executing: boolean): void;
@@ -284,6 +294,7 @@ export class InsiderBot extends EventEmitter {
   private largeBuyerSyncPending = false;
   private lastAuthoritySyncAt = 0;
   private lastLargeBuyerSyncAt = 0;
+  private stoppedForHeliusCredits = false;
 
   private readonly BATCH_WINDOW_MS = 1000;
   private readonly MAX_BATCH_SIZE = 100;
@@ -307,6 +318,7 @@ export class InsiderBot extends EventEmitter {
     bundlerGmgnClient: GmgnClient,
     preBuyAxiomGmgnClient: GmgnClient,
     heliusApiKey: string,
+    heliusProjectId: string,
     telegramBot: TelegramBot | null = null,
     claimMint: InsiderMintClaimFn | null = null,
     releaseMint: InsiderMintReleaseFn | null = null,
@@ -320,7 +332,13 @@ export class InsiderBot extends EventEmitter {
     this.gmgnClient = gmgnClient;
     this.bundlerGmgnClient = bundlerGmgnClient;
     this.preBuyAxiomGmgnClient = preBuyAxiomGmgnClient;
-    this.heliusClient = new HeliusClient(heliusApiKey);
+    this.heliusClient = new HeliusClient(heliusApiKey, {
+      projectId: heliusProjectId,
+      label,
+      onCreditsExhausted: (info) => {
+        this.emit("heliusCreditsExhausted", info);
+      },
+    });
     this.claimMint = claimMint;
     this.releaseMint = releaseMint;
     this.label = label;
@@ -496,6 +514,12 @@ export class InsiderBot extends EventEmitter {
   }
 
   async followWallet(address: string): Promise<void> {
+    if (this.stoppedForHeliusCredits) {
+      this.log.warn("Follow-wallet start blocked because Helius credits are exhausted", {
+        followedWallet: address,
+      });
+      return;
+    }
     const normalized = new PublicKey(address).toBase58();
     if (this.followedWallet !== normalized) {
       this.boughtMints.clear();
@@ -568,6 +592,31 @@ export class InsiderBot extends EventEmitter {
       this.followMonitor.stop();
       this.followMonitor = null;
     }
+  }
+
+  async stopForHeliusCredits(): Promise<void> {
+    if (this.stoppedForHeliusCredits) return;
+    this.stoppedForHeliusCredits = true;
+    await this.stopFlowMonitoring();
+    if (this.followMonitor) {
+      this.followMonitor.stop();
+      this.followMonitor = null;
+    }
+    if (this.claimedMint) {
+      this.releaseMint?.(this.claimedMint);
+      this.claimedMint = null;
+    }
+    this.watchingMint = null;
+    this.monitoredWallet = null;
+    this.insiderState = null;
+    this.phase = this.activePosition ? "holding" : null;
+    this.log.error("Insider bot stopped because its Helius project has no credits", {
+      activePositionMint: this.activePosition?.mint ?? null,
+    });
+  }
+
+  isStoppedForHeliusCredits(): boolean {
+    return this.stoppedForHeliusCredits;
   }
 
   markPositionBought(trigger: InsiderBuyTrigger): void {
@@ -686,6 +735,7 @@ export class InsiderBot extends EventEmitter {
 
       await this.startInsiderFlow(mint);
     } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
       this.releaseMint?.(mint);
       if (err instanceof InsiderMinBuySolFilterError) {
         this.log.info("Insider flow skipped by min-buy SOL filter; resetting", {
@@ -858,7 +908,12 @@ export class InsiderBot extends EventEmitter {
   private startPollLoop(): void {
     this.stopPollLoop();
     this.pollTimer = setInterval(() => {
-      void this.runPollTick();
+      void this.runPollTick().catch((err) => {
+        void this.heliusClient.handlePossibleRateLimitError(err);
+        this.log.warn("Insider poll tick failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }, this.config.monitorInterval);
   }
 
@@ -907,6 +962,7 @@ export class InsiderBot extends EventEmitter {
         triggerSell: phase === "post_buy",
       });
     } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
       this.log.warn(`Independent Axiom ATA poll [${phase}] failed`, {
         mint,
         error: err instanceof Error ? err.message : String(err),
@@ -1114,6 +1170,7 @@ export class InsiderBot extends EventEmitter {
         }
       }
     } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
       this.log.error("Failed to process signature batch", err);
     }
   }
@@ -2439,6 +2496,7 @@ export class InsiderBot extends EventEmitter {
         }
       }
     } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
       this.log.warn("Lookup-table authority transaction sync failed", {
         mint: state.mint,
         authority: state.authority,
@@ -2793,6 +2851,7 @@ export class InsiderBot extends EventEmitter {
         if (batch.length < AXIOM_AUTHORITY_BATCH_LIMIT) break;
       }
     } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
       this.log.warn("Large authority buyer transaction sync failed", {
         mint: watch.mint,
         wallet: watch.wallet,

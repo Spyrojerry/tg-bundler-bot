@@ -158,6 +158,10 @@ export interface ServiceConfig {
   insiderHeliusApiKey2: string;
   insiderHeliusApiKey3: string;
   insiderHeliusApiKey4: string;
+  insiderHeliusProjectId: string;
+  insiderHeliusProjectId2: string;
+  insiderHeliusProjectId3: string;
+  insiderHeliusProjectId4: string;
   insiderSolanaRpcUrl: string;
   insiderSolanaWsUrl: string;
   insiderSolanaRpcUrl2: string;
