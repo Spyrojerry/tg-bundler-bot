@@ -33,6 +33,7 @@ const AXIOM_AUTHORITY_MIN_SYNC_INTERVAL_MS = 2_000;
 const AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS = 3;
 const AXIOM_AUTHORITY_SIMILAR_BUY_SPREAD_USD = 1;
 const AXIOM_AUTHORITY_LARGE_BUY_MIN_USD = 200;
+const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 const ADDRESS_LOOKUP_TABLE_PROGRAM =
   "AddressLookupTab1e1111111111111111111111111";
 const AXIOM_BUY_MIN_EXISTING_ATA_WALLETS = 5;
@@ -181,9 +182,13 @@ interface AuthorityCandidateWallet {
 }
 
 interface AuthorityPatternWalletState {
-  buyCount: number;
-  boughtAmount: number;
-  soldAmount: number;
+  atas: PublicKey[];
+  ataBalances: Map<string, bigint>;
+  baselineBalance: bigint;
+  currentBalance: bigint;
+  seenPositiveBalance: boolean;
+  completed: boolean;
+  completedBalance: bigint | null;
 }
 
 interface AuthorityMonitorState {
@@ -286,11 +291,14 @@ export class InsiderBot extends EventEmitter {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private axiomAtaPollTimer: ReturnType<typeof setInterval> | null = null;
   private authorityLogsSubId: number | null = null;
+  private authorityPatternAtaSubIds = new Map<string, number>();
   private largeBuyerLogsSubId: number | null = null;
   private authorityMonitor: AuthorityMonitorState | null = null;
   private largeBuyerWatch: LargeBuyerWatchState | null = null;
   private isAuthoritySyncing = false;
   private authoritySyncPending = false;
+  private isAuthorityAtaChecking = false;
+  private authorityAtaCheckPending = false;
   private isLargeBuyerSyncing = false;
   private largeBuyerSyncPending = false;
   private lastAuthoritySyncAt = 0;
@@ -622,6 +630,7 @@ export class InsiderBot extends EventEmitter {
 
   markPositionBought(trigger: InsiderBuyTrigger): void {
     void this.stopPreBuyMonitoring();
+    void this.stopAuthorityPatternAtaMonitoring();
     this.activePosition = {
       followedWallet: trigger.followedWallet,
       mint: trigger.mint,
@@ -1084,6 +1093,18 @@ export class InsiderBot extends EventEmitter {
     }
     this.isAuthoritySyncing = false;
     this.authoritySyncPending = false;
+    await this.stopAuthorityPatternAtaMonitoring();
+    this.isAuthorityAtaChecking = false;
+    this.authorityAtaCheckPending = false;
+  }
+
+  private async stopAuthorityPatternAtaMonitoring(): Promise<void> {
+    for (const [ata, subId] of this.authorityPatternAtaSubIds) {
+      await this.connection
+        .removeAccountChangeListener(subId)
+        .catch(() => undefined);
+      this.authorityPatternAtaSubIds.delete(ata);
+    }
   }
 
   private async stopLargeBuyerMonitoring(): Promise<void> {
@@ -1109,6 +1130,44 @@ export class InsiderBot extends EventEmitter {
     this.log.info("Subscribed to lookup-table authority transactions", {
       address,
       batchLimit: AXIOM_AUTHORITY_BATCH_LIMIT,
+    });
+  }
+
+  private subscribeAuthorityPatternAtas(state: AuthorityMonitorState): void {
+    for (const [wallet, walletState] of state.patternStates) {
+      for (const ata of walletState.atas) {
+        const ataAddress = ata.toBase58();
+        if (this.authorityPatternAtaSubIds.has(ataAddress)) continue;
+        const subId = this.connection.onAccountChange(
+          ata,
+          (accountInfo) => {
+            const amount =
+              accountInfo.data.length >= 72
+                ? accountInfo.data.readBigUInt64LE(64)
+                : 0n;
+            void this.applyAuthorityPatternAtaBalance(
+              state,
+              wallet,
+              ataAddress,
+              amount,
+              `ATA subscription update for ${wallet}`,
+            ).catch((err) => {
+              this.log.warn("Non-similar wallet ATA subscription check failed", {
+                mint: state.mint,
+                wallet,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+          },
+          "processed",
+        );
+        this.authorityPatternAtaSubIds.set(ataAddress, subId);
+      }
+    }
+    this.log.info("Subscribed to non-similar wallet ATAs", {
+      mint: state.mint,
+      wallets: [...state.nonSimilarWallets],
+      ataSubscriptionCount: this.authorityPatternAtaSubIds.size,
     });
   }
 
@@ -2487,27 +2546,10 @@ export class InsiderBot extends EventEmitter {
       }
 
       if (this.phase === "pre_buy" && !this.buySubmitted) {
-        let cursor = state.cursorSignature;
-        while (true) {
-          const batch = await this.heliusClient.getAddressTransactionsAsc(
-            state.authority,
-            cursor,
-            AXIOM_AUTHORITY_BATCH_LIMIT,
-          );
-          if (batch.length === 0) break;
-          for (const tx of batch) {
-            if (state.processedSignatures.has(tx.signature)) continue;
-            state.processedSignatures.add(tx.signature);
-            const trigger = this.applyAuthorityPatternTransaction(state, tx);
-            if (trigger) {
-              await this.emitAuthorityPatternBuy(state, trigger);
-              return;
-            }
-          }
-          cursor = batch[batch.length - 1].signature;
-          state.cursorSignature = cursor;
-          if (batch.length < AXIOM_AUTHORITY_BATCH_LIMIT) break;
-        }
+        await this.checkAuthorityPatternAtaBalances(
+          state,
+          "authority transaction or periodic poll",
+        );
         return;
       }
 
@@ -2606,42 +2648,38 @@ export class InsiderBot extends EventEmitter {
     );
     state.nonSimilarWallets = nonSimilarWallets;
     state.patternStates.clear();
-    let trigger:
-      | { wallet: string; signature: string; state: AuthorityPatternWalletState }
-      | null = null;
-
-    for (const tx of state.initialTransactions) {
-      for (const buy of this.getMintBuyActors(tx, state.mint)) {
-        if (!nonSimilarWallets.has(buy.wallet)) continue;
-        const walletState = state.patternStates.get(buy.wallet) ?? {
-          buyCount: 0,
-          boughtAmount: 0,
-          soldAmount: 0,
-        };
-        walletState.buyCount += 1;
-        walletState.boughtAmount += buy.amount;
-        state.patternStates.set(buy.wallet, walletState);
-      }
-      for (const sell of this.getMintSellActors(tx, state.mint)) {
-        if (!nonSimilarWallets.has(sell.wallet)) continue;
-        const walletState = state.patternStates.get(sell.wallet);
-        if (!walletState) continue;
-        walletState.soldAmount += sell.amount;
-        if (
-          walletState.buyCount >= 2 &&
-          walletState.boughtAmount > 0 &&
-          walletState.soldAmount >= walletState.boughtAmount * 0.999999
-        ) {
-          trigger = {
-            wallet: sell.wallet,
-            signature: tx.signature,
-            state: { ...walletState },
-          };
-          break;
-        }
-      }
-      if (trigger) break;
+    const baselineSnapshot = await this.fetchAuthorityPatternAtaBalances(
+      state.mint,
+      [...nonSimilarWallets],
+    );
+    for (const wallet of nonSimilarWallets) {
+      const atas = [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].map(
+        (tokenProgram) =>
+          getAssociatedTokenAddressSync(
+            new PublicKey(state.mint),
+            new PublicKey(wallet),
+            true,
+            tokenProgram,
+          ),
+      );
+      const ataBalances = new Map(
+        atas.map((ata) => [
+          ata.toBase58(),
+          baselineSnapshot.byAta.get(ata.toBase58()) ?? 0n,
+        ]),
+      );
+      const baselineBalance = baselineSnapshot.byWallet.get(wallet) ?? 0n;
+      state.patternStates.set(wallet, {
+        atas,
+        ataBalances,
+        baselineBalance,
+        currentBalance: baselineBalance,
+        seenPositiveBalance: baselineBalance > 0n,
+        completed: false,
+        completedBalance: null,
+      });
     }
+    this.subscribeAuthorityPatternAtas(state);
 
     this.log.info("Initial 15-transaction authority window analyzed", {
       mint: state.mint,
@@ -2663,81 +2701,270 @@ export class InsiderBot extends EventEmitter {
       nonSimilarWallets: [...nonSimilarWallets],
       patternStates: [...state.patternStates].map(([wallet, pattern]) => ({
         wallet,
-        ...pattern,
+        baselineBalance: pattern.baselineBalance.toString(),
+        ataBalances: Object.fromEntries(
+          [...pattern.ataBalances].map(([ata, balance]) => [
+            ata,
+            balance.toString(),
+          ]),
+        ),
+        currentBalance: pattern.currentBalance.toString(),
+        seenPositiveBalance: pattern.seenPositiveBalance,
+        completed: pattern.completed,
+        completedBalance: pattern.completedBalance?.toString() ?? null,
       })),
-      trigger,
+      trigger: null,
     });
-    if (trigger) {
-      await this.emitAuthorityPatternBuy(state, trigger);
-      return;
-    }
     this.log.info(
-      "Initial authority grouping complete; watching non-similar wallets for a second buy followed by sell-all",
+      "Initial authority grouping complete; waiting for every non-similar wallet ATA to sell all",
       {
         mint: state.mint,
         authority: state.authority,
         afterSignature: state.initialCursorSignature,
-        nonSimilarWallets: [...state.nonSimilarWallets],
+        nonSimilarWallets: [...state.patternStates].map(
+          ([wallet, pattern]) => ({
+            address: wallet,
+            baselineBalance: pattern.baselineBalance.toString(),
+            atas: pattern.atas.map((ata) => ata.toBase58()),
+          }),
+        ),
       },
     );
   }
 
-  private applyAuthorityPatternTransaction(
+  private async fetchAuthorityPatternAtaBalances(
+    mint: string,
+    wallets: string[],
+  ): Promise<{
+    byWallet: Map<string, bigint>;
+    byAta: Map<string, bigint>;
+  }> {
+    const lookups = wallets.flatMap((wallet) =>
+      [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].map((tokenProgram) => ({
+        wallet,
+        ata: getAssociatedTokenAddressSync(
+          new PublicKey(mint),
+          new PublicKey(wallet),
+          true,
+          tokenProgram,
+        ),
+      })),
+    );
+    const byWallet = new Map(wallets.map((wallet) => [wallet, 0n]));
+    const byAta = new Map<string, bigint>();
+    for (let start = 0; start < lookups.length; start += 100) {
+      const chunk = lookups.slice(start, start + 100);
+      const infos = await this.connection.getMultipleAccountsInfo(
+        chunk.map((lookup) => lookup.ata),
+        "processed",
+      );
+      for (let index = 0; index < chunk.length; index += 1) {
+        const info = infos[index];
+        if (!info) continue;
+        const amount =
+          info.data.length >= 72 ? info.data.readBigUInt64LE(64) : 0n;
+        const wallet = chunk[index].wallet;
+        byAta.set(chunk[index].ata.toBase58(), amount);
+        byWallet.set(wallet, (byWallet.get(wallet) ?? 0n) + amount);
+      }
+    }
+    return { byWallet, byAta };
+  }
+
+  private async checkAuthorityPatternAtaBalances(
     state: AuthorityMonitorState,
-    tx: HeliusTransaction,
-  ):
-    | {
-        wallet: string;
-        signature: string;
-        state: AuthorityPatternWalletState;
-      }
-    | null {
-    for (const buy of this.getMintBuyActors(tx, state.mint)) {
-      if (!state.nonSimilarWallets.has(buy.wallet)) continue;
-      const walletState = state.patternStates.get(buy.wallet) ?? {
-        buyCount: 0,
-        boughtAmount: 0,
-        soldAmount: 0,
-      };
-      walletState.buyCount += 1;
-      walletState.boughtAmount += buy.amount;
-      state.patternStates.set(buy.wallet, walletState);
+    source: string,
+  ): Promise<void> {
+    if (
+      this.phase !== "pre_buy" ||
+      this.buySubmitted ||
+      state.patternStates.size === 0
+    ) {
+      return;
     }
-    for (const sell of this.getMintSellActors(tx, state.mint)) {
-      if (!state.nonSimilarWallets.has(sell.wallet)) continue;
-      const walletState = state.patternStates.get(sell.wallet);
-      if (!walletState) continue;
-      walletState.soldAmount += sell.amount;
-      if (
-        walletState.buyCount >= 2 &&
-        walletState.boughtAmount > 0 &&
-        walletState.soldAmount >= walletState.boughtAmount * 0.999999
-      ) {
-        return {
-          wallet: sell.wallet,
-          signature: tx.signature,
-          state: { ...walletState },
-        };
+    if (this.isAuthorityAtaChecking) {
+      this.authorityAtaCheckPending = true;
+      return;
+    }
+
+    this.isAuthorityAtaChecking = true;
+    try {
+      const snapshot = await this.fetchAuthorityPatternAtaBalances(
+        state.mint,
+        [...state.patternStates.keys()],
+      );
+      for (const [wallet, walletState] of state.patternStates) {
+        for (const ata of walletState.atas) {
+          const ataAddress = ata.toBase58();
+          walletState.ataBalances.set(
+            ataAddress,
+            snapshot.byAta.get(ataAddress) ?? 0n,
+          );
+        }
+        await this.applyAuthorityPatternWalletBalance(
+          state,
+          wallet,
+          snapshot.byWallet.get(wallet) ?? 0n,
+          source,
+        );
+      }
+
+      await this.tryTriggerAllAuthorityWalletsCompleted(state);
+    } finally {
+      this.isAuthorityAtaChecking = false;
+      if (this.authorityAtaCheckPending) {
+        this.authorityAtaCheckPending = false;
+        void this.checkAuthorityPatternAtaBalances(
+          state,
+          "queued ATA update",
+        ).catch((err) => {
+          this.log.warn("Queued non-similar wallet ATA check failed", {
+            mint: state.mint,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
       }
     }
-    return null;
+  }
+
+  private async applyAuthorityPatternAtaBalance(
+    state: AuthorityMonitorState,
+    wallet: string,
+    ataAddress: string,
+    amount: bigint,
+    source: string,
+  ): Promise<void> {
+    const walletState = state.patternStates.get(wallet);
+    if (!walletState || walletState.completed) return;
+    walletState.ataBalances.set(ataAddress, amount);
+    const combinedBalance = [...walletState.ataBalances.values()].reduce(
+      (total, balance) => total + balance,
+      0n,
+    );
+    await this.applyAuthorityPatternWalletBalance(
+      state,
+      wallet,
+      combinedBalance,
+      source,
+    );
+    await this.tryTriggerAllAuthorityWalletsCompleted(state);
+  }
+
+  private async applyAuthorityPatternWalletBalance(
+    state: AuthorityMonitorState,
+    wallet: string,
+    currentBalance: bigint,
+    source: string,
+  ): Promise<void> {
+    const walletState = state.patternStates.get(wallet);
+    if (!walletState || walletState.completed) return;
+
+    const previousBalance = walletState.currentBalance;
+    walletState.currentBalance = currentBalance;
+    if (currentBalance > 0n) {
+      walletState.seenPositiveBalance = true;
+      return;
+    }
+    if (
+      !walletState.seenPositiveBalance ||
+      previousBalance <= 0n ||
+      currentBalance !== 0n
+    ) {
+      return;
+    }
+
+    walletState.completed = true;
+    walletState.completedBalance = currentBalance;
+    const completedWallets = [...state.patternStates].filter(
+      ([, pattern]) => pattern.completed,
+    );
+    this.log.info(
+      "Non-similar wallet sold all — wallet frozen as completed",
+      {
+        mint: state.mint,
+        authority: state.authority,
+        wallet,
+        source,
+        baselineBalance: walletState.baselineBalance.toString(),
+        previousBalance: previousBalance.toString(),
+        currentBalance: currentBalance.toString(),
+        completedCount: completedWallets.length,
+        requiredCount: state.patternStates.size,
+        completedWallets: completedWallets.map(([address]) => address),
+      },
+    );
+  }
+
+  private async tryTriggerAllAuthorityWalletsCompleted(
+    state: AuthorityMonitorState,
+  ): Promise<void> {
+    const allCompleted =
+      state.patternStates.size > 0 &&
+      [...state.patternStates.values()].every(
+        (walletState) => walletState.completed,
+      );
+    if (!allCompleted) return;
+
+    await this.emitAuthorityPatternBuy(state, {
+      signature: state.cursorSignature ?? "AUTHORITY_ALL_ATAS_SOLD_ALL",
+      completedWallets: [...state.patternStates.keys()],
+    });
   }
 
   private async emitAuthorityPatternBuy(
     state: AuthorityMonitorState,
     trigger: {
-      wallet: string;
       signature: string;
-      state: AuthorityPatternWalletState;
+      completedWallets: string[];
     },
   ): Promise<void> {
-    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
-    await this.stopPreBuyMonitoring();
+    if (
+      this.buySubmitted ||
+      this.buyDisabled ||
+      this.isBuyExecuting ||
+      this.isBuyGateEvaluating
+    ) {
+      return;
+    }
+    this.isBuyGateEvaluating = true;
+    try {
     const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
     if (currentMc === null) {
-      throw new Error("Could not fetch MC for lookup-table authority buy trigger");
+      this.log.warn(
+        "All non-similar wallets sold all, but current market cap is unavailable; waiting before buy",
+        {
+          mint: state.mint,
+          completedWallets: trigger.completedWallets,
+        },
+      );
+      return;
+    }
+    if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
+      this.log.warn(
+        "All non-similar wallets sold all, but token is below rug threshold; resetting instead of buying",
+        {
+          mint: state.mint,
+          currentMc,
+          rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
+          completedWallets: trigger.completedWallets,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>🧹 ${this.label} Rug Reset — Buy Skipped</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `All non-similar wallets sold all: <b>${trigger.completedWallets.length}</b>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          `Required MC: <b>$${INSIDER_RUG_MARKET_CAP_USD.toLocaleString()}</b> or higher`,
+          "Flow reset for the next token.",
+        ].join("\n"),
+        "all non-similar wallets completed but token rugged",
+      );
+      await this.resetForNewToken(true);
+      return;
     }
 
+    await this.stopPreBuyMonitoring();
     const newExitMc = currentMc * (1 + this.exitPercent / 100);
     this.setExitMc(newExitMc);
     this.setEntryMc(currentMc);
@@ -2755,9 +2982,9 @@ export class InsiderBot extends EventEmitter {
         authority: state.authority,
         firstBuySignature: state.firstBuySignature,
         cursorSignature: state.cursorSignature,
-        triggerWallet: trigger.wallet,
         triggerSignature: trigger.signature,
-        triggerState: trigger.state,
+        completedWallets: trigger.completedWallets,
+        completedCount: trigger.completedWallets.length,
         candidateWallets: state.candidates,
         currentMc,
         exitMc: newExitMc,
@@ -2769,18 +2996,25 @@ export class InsiderBot extends EventEmitter {
       signature: trigger.signature,
       buySol: this.buySol,
       entryMc: currentMc,
-      monitoredWallet: trigger.wallet,
       tradersListStr: [
         "<b>Lookup-Table Authority Buy Gate Passed</b>",
         `Authority: <code>${state.authority}</code>`,
         `First candidate buy: <code>${state.firstBuySignature}</code>`,
-        `Pattern wallet: <code>${trigger.wallet}</code>`,
-        `Pattern: <b>${trigger.state.buyCount} buys → sell all</b>`,
+        `Pattern: <b>All ${trigger.completedWallets.length} non-similar wallets sold all</b>`,
+        `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
         "",
-        `<b>Five GMGN candidate wallets:</b>`,
+        "<b>Frozen completed non-similar wallets:</b>",
+        ...trigger.completedWallets.map(
+          (wallet, index) => `${index + 1}. <code>${wallet}</code>`,
+        ),
+        "",
+        "<b>Five ATA-group candidate wallets:</b>",
         ...candidateLines,
       ].join("\n"),
     });
+    } finally {
+      this.isBuyGateEvaluating = false;
+    }
   }
 
   private async inspectAuthorityTransactionForLargeBuyer(
