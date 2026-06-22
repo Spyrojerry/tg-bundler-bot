@@ -218,9 +218,10 @@ interface LargeBuyerWatchState {
   qualifyingSignature: string;
   buyUsd: number;
   boughtAmount: number;
-  soldAmount: number;
-  cursorSignature: string;
-  processedSignatures: Set<string>;
+  atas: PublicKey[];
+  ataBalances: Map<string, bigint>;
+  currentBalance: bigint;
+  seenPositiveBalance: boolean;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -299,7 +300,7 @@ export class InsiderBot extends EventEmitter {
   private axiomAtaPollTimer: ReturnType<typeof setInterval> | null = null;
   private authorityLogsSubId: number | null = null;
   private authorityPatternAtaSubIds = new Map<string, number>();
-  private largeBuyerLogsSubId: number | null = null;
+  private largeBuyerAtaSubIds = new Map<string, number>();
   private authorityMonitor: AuthorityMonitorState | null = null;
   private largeBuyerWatch: LargeBuyerWatchState | null = null;
   private isAuthoritySyncing = false;
@@ -403,7 +404,7 @@ export class InsiderBot extends EventEmitter {
     this.stopAxiomAtaPollLoop();
     this.startPollLoop();
     void this.syncAuthorityTransactions();
-    void this.syncLargeBuyerTransactions();
+    void this.syncLargeBuyerAtaBalances();
     this.log.warn(
       "Sell failed; active position retained and authority-based monitoring rearmed",
       {
@@ -657,6 +658,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     void this.syncAuthorityTransactions();
+    void this.syncLargeBuyerAtaBalances();
   }
 
   private resetTokenTxCounts(): void {
@@ -1015,7 +1017,7 @@ export class InsiderBot extends EventEmitter {
 
       if (this.phase === "holding") {
         await this.syncAuthorityTransactions();
-        await this.syncLargeBuyerTransactions();
+        await this.syncLargeBuyerAtaBalances();
       }
     } finally {
       this.isProcessing = false;
@@ -1142,10 +1144,11 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async stopLargeBuyerMonitoring(): Promise<void> {
-    if (this.largeBuyerLogsSubId !== null) {
-      const subId = this.largeBuyerLogsSubId;
-      this.largeBuyerLogsSubId = null;
-      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    for (const [ata, subId] of this.largeBuyerAtaSubIds) {
+      await this.connection
+        .removeAccountChangeListener(subId)
+        .catch(() => undefined);
+      this.largeBuyerAtaSubIds.delete(ata);
     }
     this.largeBuyerWatch = null;
     this.isLargeBuyerSyncing = false;
@@ -1205,16 +1208,34 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
-  private subscribeLargeBuyer(address: string): void {
-    if (this.largeBuyerLogsSubId !== null) return;
-    this.largeBuyerLogsSubId = this.connection.onLogs(
-      new PublicKey(address),
-      (logInfo) => {
-        if (!logInfo.err) void this.syncLargeBuyerTransactions();
-      },
-      "processed",
-    );
-    this.log.info("Subscribed to >=$200 authority buyer", { address });
+  private subscribeLargeBuyerAtas(watch: LargeBuyerWatchState): void {
+    for (const ata of watch.atas) {
+      const ataAddress = ata.toBase58();
+      if (this.largeBuyerAtaSubIds.has(ataAddress)) continue;
+      const subId = this.connection.onAccountChange(
+        ata,
+        (accountInfo) => {
+          const amount =
+            accountInfo.data.length >= 72
+              ? accountInfo.data.readBigUInt64LE(64)
+              : 0n;
+          void this.applyLargeBuyerAtaBalance(
+            watch,
+            ataAddress,
+            amount,
+            `ATA subscription update for ${ataAddress}`,
+          );
+        },
+        "processed",
+      );
+      this.largeBuyerAtaSubIds.set(ataAddress, subId);
+    }
+    this.log.info("Subscribed to >=$200 authority buyer ATAs", {
+      mint: watch.mint,
+      wallet: watch.wallet,
+      atas: watch.atas.map((ata) => ata.toBase58()),
+      currentBalance: watch.currentBalance.toString(),
+    });
   }
 
   private queueSignature(
@@ -3264,18 +3285,15 @@ export class InsiderBot extends EventEmitter {
       const buyUsd = buySol * solPriceUsd;
       if (buyUsd < AXIOM_AUTHORITY_LARGE_BUY_MIN_USD) continue;
 
-      this.largeBuyerWatch = {
-        mint: state.mint,
-        wallet: buy.wallet,
-        qualifyingSignature: tx.signature,
+      this.largeBuyerWatch = await this.createLargeBuyerAtaWatch(
+        state.mint,
+        buy.wallet,
+        tx.signature,
         buyUsd,
-        boughtAmount: buy.amount,
-        soldAmount: 0,
-        cursorSignature: tx.signature,
-        processedSignatures: new Set([tx.signature]),
-      };
+        buy.amount,
+      );
       state.cursorSignature = tx.signature;
-      this.subscribeLargeBuyer(buy.wallet);
+      this.subscribeLargeBuyerAtas(this.largeBuyerWatch);
       this.log.warn(
         "Direct authority path found >=$200 buy — triggering our buy and reserving wallet for sell-all exit",
         {
@@ -3286,6 +3304,7 @@ export class InsiderBot extends EventEmitter {
           buySol,
           buyUsd: Number(buyUsd.toFixed(2)),
           tokenAmount: buy.amount,
+          ataBalance: this.largeBuyerWatch.currentBalance.toString(),
         },
       );
       await this.emitDirectAuthorityBuyerBuy(state, this.largeBuyerWatch);
@@ -3379,19 +3398,16 @@ export class InsiderBot extends EventEmitter {
       const buyUsd = buySol * solPriceUsd;
       if (buyUsd < AXIOM_AUTHORITY_LARGE_BUY_MIN_USD) continue;
 
-      this.largeBuyerWatch = {
-        mint: state.mint,
-        wallet: buy.wallet,
-        qualifyingSignature: tx.signature,
+      this.largeBuyerWatch = await this.createLargeBuyerAtaWatch(
+        state.mint,
+        buy.wallet,
+        tx.signature,
         buyUsd,
-        boughtAmount: buy.amount,
-        soldAmount: 0,
-        cursorSignature: tx.signature,
-        processedSignatures: new Set([tx.signature]),
-      };
-      this.subscribeLargeBuyer(buy.wallet);
+        buy.amount,
+      );
+      this.subscribeLargeBuyerAtas(this.largeBuyerWatch);
       this.log.warn(
-        "Authority monitor found >=$200 buy; watching buyer until sell-all",
+        "Authority monitor found >=$200 buy; watching buyer ATA balance until sell-all",
         {
           mint: state.mint,
           authority: state.authority,
@@ -3400,14 +3416,95 @@ export class InsiderBot extends EventEmitter {
           buySol,
           buyUsd: Number(buyUsd.toFixed(2)),
           tokenAmount: buy.amount,
+          ataBalance: this.largeBuyerWatch.currentBalance.toString(),
+          atas: this.largeBuyerWatch.atas.map((ata) => ata.toBase58()),
         },
       );
-      await this.syncLargeBuyerTransactions();
+      await this.syncLargeBuyerAtaBalances();
       return;
     }
   }
 
-  private async syncLargeBuyerTransactions(): Promise<void> {
+  private async createLargeBuyerAtaWatch(
+    mint: string,
+    wallet: string,
+    qualifyingSignature: string,
+    buyUsd: number,
+    boughtAmount: number,
+  ): Promise<LargeBuyerWatchState> {
+    const atas = [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID].map((tokenProgram) =>
+      getAssociatedTokenAddressSync(
+        new PublicKey(mint),
+        new PublicKey(wallet),
+        true,
+        tokenProgram,
+      ),
+    );
+    const infos = await this.connection.getMultipleAccountsInfo(
+      atas,
+      "processed",
+    );
+    const ataBalances = new Map<string, bigint>();
+    let currentBalance = 0n;
+    for (let index = 0; index < atas.length; index += 1) {
+      const info = infos[index];
+      const amount =
+        info && info.data.length >= 72
+          ? info.data.readBigUInt64LE(64)
+          : 0n;
+      ataBalances.set(atas[index].toBase58(), amount);
+      currentBalance += amount;
+    }
+    return {
+      mint,
+      wallet,
+      qualifyingSignature,
+      buyUsd,
+      boughtAmount,
+      atas,
+      ataBalances,
+      currentBalance,
+      // The qualifying transaction proves this wallet held a positive amount,
+      // even if the RPC snapshot is briefly behind the indexed transaction.
+      seenPositiveBalance: boughtAmount > 0 || currentBalance > 0n,
+    };
+  }
+
+  private async applyLargeBuyerAtaBalance(
+    watch: LargeBuyerWatchState,
+    ataAddress: string,
+    amount: bigint,
+    detection: string,
+  ): Promise<void> {
+    if (this.largeBuyerWatch !== watch || this.positionSellTriggered) return;
+    const previousBalance = watch.currentBalance;
+    watch.ataBalances.set(ataAddress, amount);
+    watch.currentBalance = [...watch.ataBalances.values()].reduce(
+      (total, balance) => total + balance,
+      0n,
+    );
+    if (watch.currentBalance > 0n) watch.seenPositiveBalance = true;
+    if (watch.currentBalance !== previousBalance) {
+      this.log.info("Tracked >=$200 buyer ATA balance changed", {
+        mint: watch.mint,
+        wallet: watch.wallet,
+        ata: ataAddress,
+        previousBalance: previousBalance.toString(),
+        currentBalance: watch.currentBalance.toString(),
+        detection,
+      });
+    }
+    if (
+      watch.seenPositiveBalance &&
+      watch.currentBalance === 0n &&
+      this.phase === "holding" &&
+      this.activePosition?.mint === watch.mint
+    ) {
+      await this.triggerLargeBuyerSell(watch, detection);
+    }
+  }
+
+  private async syncLargeBuyerAtaBalances(): Promise<void> {
     const watch = this.largeBuyerWatch;
     if (
       !watch ||
@@ -3431,58 +3528,41 @@ export class InsiderBot extends EventEmitter {
     this.isLargeBuyerSyncing = true;
     this.lastLargeBuyerSyncAt = Date.now();
     try {
-      if (
-        watch.boughtAmount > 0 &&
-        watch.soldAmount >= watch.boughtAmount * 0.999999
-      ) {
+      const infos = await this.connection.getMultipleAccountsInfo(
+        watch.atas,
+        "processed",
+      );
+      for (let index = 0; index < watch.atas.length; index += 1) {
+        const info = infos[index];
+        const amount =
+          info && info.data.length >= 72
+            ? info.data.readBigUInt64LE(64)
+            : 0n;
+        watch.ataBalances.set(watch.atas[index].toBase58(), amount);
+      }
+      const previousBalance = watch.currentBalance;
+      watch.currentBalance = [...watch.ataBalances.values()].reduce(
+        (total, balance) => total + balance,
+        0n,
+      );
+      if (watch.currentBalance > 0n) watch.seenPositiveBalance = true;
+      if (watch.currentBalance !== previousBalance) {
+        this.log.info("Tracked >=$200 buyer ATA balance changed", {
+          mint: watch.mint,
+          wallet: watch.wallet,
+          previousBalance: previousBalance.toString(),
+          currentBalance: watch.currentBalance.toString(),
+          detection: "periodic ATA balance poll",
+        });
+      }
+      if (watch.seenPositiveBalance && watch.currentBalance === 0n) {
         await this.triggerLargeBuyerSell(
           watch,
-          watch.cursorSignature,
-          "Previously detected sell-all condition rearmed after sell failure",
+          "Combined standard SPL and Token-2022 ATA balance reached zero",
         );
-        return;
-      }
-
-      let cursor = watch.cursorSignature;
-      while (true) {
-        const batch = await this.heliusClient.getAddressTransactionsAsc(
-          watch.wallet,
-          cursor,
-          AXIOM_AUTHORITY_BATCH_LIMIT,
-        );
-        const fresh = batch.filter(
-          (tx) => !watch.processedSignatures.has(tx.signature),
-        );
-        if (fresh.length === 0) break;
-
-        for (const tx of fresh) {
-          watch.processedSignatures.add(tx.signature);
-          for (const buy of this.getMintBuyActors(tx, watch.mint)) {
-            if (buy.wallet === watch.wallet) watch.boughtAmount += buy.amount;
-          }
-          for (const sell of this.getMintSellActors(tx, watch.mint)) {
-            if (sell.wallet === watch.wallet) watch.soldAmount += sell.amount;
-          }
-          watch.cursorSignature = tx.signature;
-
-          if (
-            watch.boughtAmount > 0 &&
-            watch.soldAmount >= watch.boughtAmount * 0.999999
-          ) {
-            await this.triggerLargeBuyerSell(
-              watch,
-              tx.signature,
-              "New sell-all transaction detected",
-            );
-            return;
-          }
-        }
-        cursor = fresh[fresh.length - 1].signature;
-        if (batch.length < AXIOM_AUTHORITY_BATCH_LIMIT) break;
       }
     } catch (err) {
-      void this.heliusClient.handlePossibleRateLimitError(err);
-      this.log.warn("Large authority buyer transaction sync failed", {
+      this.log.warn("Large authority buyer ATA balance sync failed", {
         mint: watch.mint,
         wallet: watch.wallet,
         error: err instanceof Error ? err.message : String(err),
@@ -3491,29 +3571,28 @@ export class InsiderBot extends EventEmitter {
       this.isLargeBuyerSyncing = false;
       if (this.largeBuyerSyncPending) {
         this.largeBuyerSyncPending = false;
-        void this.syncLargeBuyerTransactions();
+        void this.syncLargeBuyerAtaBalances();
       }
     }
   }
 
   private async triggerLargeBuyerSell(
     watch: LargeBuyerWatchState,
-    sellAllSignature: string,
     detection: string,
   ): Promise<void> {
     await this.triggerPositionSell(
       watch.mint,
-      `Authority >=$200 buyer ${watch.wallet} sold all tracked position`,
+      `Authority >=$200 buyer ${watch.wallet} ATA balance reached zero`,
       [
         "<b>🚨 Lookup-Table Authority Buyer Sold All</b>",
         `Token: <code>${watch.mint}</code>`,
         `Wallet: <code>${watch.wallet}</code>`,
         `Qualifying buy: <b>$${watch.buyUsd.toFixed(2)}</b>`,
         `Buy tx: <code>${watch.qualifyingSignature}</code>`,
-        `Sell-all tx: <code>${sellAllSignature}</code>`,
+        "Combined ATA balance: <code>0</code>",
         `Detection: <b>${detection}</b>`,
       ],
-      sellAllSignature,
+      watch.qualifyingSignature,
     );
   }
 

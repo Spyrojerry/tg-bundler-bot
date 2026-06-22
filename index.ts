@@ -151,10 +151,7 @@ async function main(): Promise<void> {
   // ── 3. Per-bot rate limiters + GMGN clients ────────────────────────────────
   const gmgnLimiters = insiderBotDefinitions.map(
     () =>
-      new RateLimiter(
-        config.rateLimitMinTime,
-        config.rateLimitMaxConcurrent,
-      ),
+      new RateLimiter(config.rateLimitMinTime, config.rateLimitMaxConcurrent),
   );
   const gmgnFallbackLimiter = new RateLimiter(
     config.rateLimitMinTime,
@@ -347,8 +344,7 @@ async function main(): Promise<void> {
             }
           } catch (err) {
             log.error(`Failed to refresh position data for ${mint}`, err);
-            quoteError =
-              err instanceof Error ? err.message : String(err);
+            quoteError = err instanceof Error ? err.message : String(err);
           }
 
           let buySol = 0;
@@ -386,9 +382,7 @@ async function main(): Promise<void> {
           }
 
           const marketCapPnlPct =
-            entryMc !== null &&
-            entryMc > 0 &&
-            currentMarketCapUsd !== null
+            entryMc !== null && entryMc > 0 && currentMarketCapUsd !== null
               ? ((currentMarketCapUsd - entryMc) / entryMc) * 100
               : null;
           const profitDisplay =
@@ -927,7 +921,6 @@ async function main(): Promise<void> {
     insiderBots.push(bot);
   });
 
- 
   async function resumeAllInsiderBots(): Promise<void> {
     for (let i = 0; i < insiderBots.length; i++) {
       const bot = insiderBots[i];
@@ -940,9 +933,12 @@ async function main(): Promise<void> {
         !bot.getPreBuyMint()
       ) {
         await bot.followWallet(wallet);
-        log.info(`[INSIDER ${getInsiderBotNumber(i)}] Resumed follow-wallet monitoring`, {
-          wallet,
-        });
+        log.info(
+          `[INSIDER ${getInsiderBotNumber(i)}] Resumed follow-wallet monitoring`,
+          {
+            wallet,
+          },
+        );
       }
     }
   }
@@ -1347,18 +1343,15 @@ async function main(): Promise<void> {
               ),
             );
         } catch (err) {
-          const errorMessage =
-            err instanceof Error ? err.message : String(err);
+          const errorMessage = err instanceof Error ? err.message : String(err);
           if (errorMessage.includes("was not confirmed")) {
             bot.setBuyExecuting(false);
             const submittedSignature =
-              errorMessage.match(
-                /Transaction ([1-9A-HJ-NP-Za-km-z]+)/,
-              )?.[1] ?? null;
+              errorMessage.match(/Transaction ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ??
+              null;
             const submittedBlockhash =
-              errorMessage.match(
-                /blockhash ([1-9A-HJ-NP-Za-km-z]+)/,
-              )?.[1] ?? null;
+              errorMessage.match(/blockhash ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ??
+              null;
             log.warn(
               `[INSIDER ${botNumber}] Buy confirmation uncertain; locking buy gate while reconciling token balance`,
               {
@@ -1381,19 +1374,19 @@ async function main(): Promise<void> {
 
               const fastDeadline = Date.now() + 5_000;
               let fastWindowElapsed = false;
+              let reconcileCallCount = 0;
               while (true) {
                 const state = await client.getSubmittedBuyReconciliationState(
-                    config.tradingWalletAddress!,
-                    trigger.mint,
-                    submittedSignature,
-                    submittedBlockhash,
-                  );
+                  config.tradingWalletAddress!,
+                  trigger.mint,
+                  submittedSignature,
+                  submittedBlockhash,
+                    reconcileCallCount,    
+                );
+                reconcileCallCount++;
                 if (state.tokenBalance > 0n) {
                   bot.markPositionBought(trigger);
-                  db.addSeenMint(
-                    config.tradingWalletAddress!,
-                    trigger.mint,
-                  );
+                  db.addSeenMint(config.tradingWalletAddress!, trigger.mint);
                   log.warn(
                     `[INSIDER ${botNumber}] Uncertain PumpPortal buy recovered from token balance`,
                     {
@@ -1464,7 +1457,7 @@ async function main(): Promise<void> {
                 if (!fastWindowElapsed && Date.now() >= fastDeadline) {
                   fastWindowElapsed = true;
                   log.warn(
-                    `[INSIDER ${botNumber}] Five-second reconciliation elapsed; original buy remains locked until confirmation, failure, or blockhash expiry`,
+                    `[INSIDER ${botNumber}] Five-second reconciliation elapsed; switching to slow poll`,
                     {
                       mint: trigger.mint,
                       signature: submittedSignature,
@@ -1473,7 +1466,7 @@ async function main(): Promise<void> {
                     },
                   );
                 }
-                await sleep(500);
+                await sleep(fastWindowElapsed ? 3_000 : 500);
               }
             })();
             return;
@@ -2033,97 +2026,100 @@ async function main(): Promise<void> {
     // 1. Insider MC flow. Keep these loops alive across mode changes; an
     // inactive bot simply has no pre-buy mint or active position to inspect.
     insiderBots.forEach((bot, i) => {
-        let isChecking = false;
-        setInterval(async () => {
-          if (isChecking) return;
-          isChecking = true;
+      let isChecking = false;
+      setInterval(async () => {
+        if (isChecking) return;
+        isChecking = true;
 
-          try {
-            const preBuyMint = bot.getPreBuyMint();
-            const activePos = bot.getActivePosition();
+        try {
+          const preBuyMint = bot.getPreBuyMint();
+          const activePos = bot.getActivePosition();
 
-            // Monitor both pre-buy and active position concurrently if they exist
-            const tasks: Promise<void>[] = [];
+          // Monitor both pre-buy and active position concurrently if they exist
+          const tasks: Promise<void>[] = [];
 
-            if (preBuyMint) {
-              tasks.push(
-                (async () => {
-                  const client = gmgnClients[i];
-                  const currentMc =
-                    await client.fetchTokenMarketCapUsd(preBuyMint);
-                  if (currentMc !== null) {
-                    await checkInsiderMcapFlow(i, currentMc);
-                  }
-                })(),
-              );
-            }
-
-            if (activePos) {
-              // Background refresh balance and quote if missing or old (> 30s)
-              const cached = activePositionCache.get(activePos.mint);
-              if (
-                config.tradingWalletAddress &&
-                (!cached || Date.now() - cached.timestamp > 30_000)
-              ) {
+          if (preBuyMint) {
+            tasks.push(
+              (async () => {
                 const client = gmgnClients[i];
-                const owner = new PublicKey(config.tradingWalletAddress);
-                const mintPk = new PublicKey(activePos.mint);
+                const currentMc =
+                  await client.fetchTokenMarketCapUsd(preBuyMint);
+                if (currentMc !== null) {
+                  await checkInsiderMcapFlow(i, currentMc);
+                }
+              })(),
+            );
+          }
 
-                log.debug(
-                  `[INSIDER ${getInsiderBotNumber(i)} BACKGROUND] Refreshing balance/quote for ${activePos.mint}`,
-                );
-                Promise.all([
-                  getTokenRawBalance(owner, mintPk),
-                  client
-                    .quoteTokenSellForSol(
-                      config.tradingWalletAddress,
-                      activePos.mint,
-                      100,
-                    )
-                    .catch(() => null),
-                ])
-                  .then(([balance, quote]) => {
-                    activePositionCache.set(activePos.mint, {
-                      balance,
-                      quote,
-                      timestamp: Date.now(),
-                    });
-                  })
-                  .catch((e) =>
-                    log.error(
-                      `Background balance/quote refresh failed for ${activePos.mint}`,
-                      e,
-                    ),
-                  );
-              }
+          if (activePos) {
+            // Background refresh balance and quote if missing or old (> 30s)
+            const cached = activePositionCache.get(activePos.mint);
+            if (
+              config.tradingWalletAddress &&
+              (!cached || Date.now() - cached.timestamp > 30_000)
+            ) {
+              const client = gmgnClients[i];
+              const owner = new PublicKey(config.tradingWalletAddress);
+              const mintPk = new PublicKey(activePos.mint);
 
-              tasks.push(
-                (async () => {
-                  const client = gmgnClients[i];
-                  const currentMc = await client.fetchTokenMarketCapUsd(
-                    activePos.mint,
-                  );
-                  if (currentMc !== null) {
-                    // checkInsiderMcapFlow handles Exit MC and Flow v2 for active positions
-                    await checkInsiderMcapFlow(i, currentMc);
-                    await checkAndSellIfLowMcap(
-                      activePos.mint,
-                      "insider",
-                      i,
-                      currentMc,
-                    );
-                  }
-                })(),
+              log.debug(
+                `[INSIDER ${getInsiderBotNumber(i)} BACKGROUND] Refreshing balance/quote for ${activePos.mint}`,
               );
+              Promise.all([
+                getTokenRawBalance(owner, mintPk),
+                client
+                  .quoteTokenSellForSol(
+                    config.tradingWalletAddress,
+                    activePos.mint,
+                    100,
+                  )
+                  .catch(() => null),
+              ])
+                .then(([balance, quote]) => {
+                  activePositionCache.set(activePos.mint, {
+                    balance,
+                    quote,
+                    timestamp: Date.now(),
+                  });
+                })
+                .catch((e) =>
+                  log.error(
+                    `Background balance/quote refresh failed for ${activePos.mint}`,
+                    e,
+                  ),
+                );
             }
 
-            await Promise.all(tasks);
-          } catch (err) {
-            log.error(`Error in Insider Bot ${getInsiderBotNumber(i)} MC loop`, err);
-          } finally {
-            isChecking = false;
+            tasks.push(
+              (async () => {
+                const client = gmgnClients[i];
+                const currentMc = await client.fetchTokenMarketCapUsd(
+                  activePos.mint,
+                );
+                if (currentMc !== null) {
+                  // checkInsiderMcapFlow handles Exit MC and Flow v2 for active positions
+                  await checkInsiderMcapFlow(i, currentMc);
+                  await checkAndSellIfLowMcap(
+                    activePos.mint,
+                    "insider",
+                    i,
+                    currentMc,
+                  );
+                }
+              })(),
+            );
           }
-        }, MCAP_CHECK_INTERVAL_MS);
+
+          await Promise.all(tasks);
+        } catch (err) {
+          log.error(
+            `Error in Insider Bot ${getInsiderBotNumber(i)} MC loop`,
+            err,
+          );
+        } finally {
+          isChecking = false;
+        }
+      }, MCAP_CHECK_INTERVAL_MS);
     });
 
     // 2. Bundler / Reverse Mode loop
@@ -2316,7 +2312,7 @@ async function main(): Promise<void> {
         config.tradingWalletAddress,
         {
           enforceMinBuySol: false,
-          logLabel: 'WALLET TRADING 1',
+          logLabel: "WALLET TRADING 1",
         },
       );
       wireTradingWalletMonitor(tradingWalletMonitor);
