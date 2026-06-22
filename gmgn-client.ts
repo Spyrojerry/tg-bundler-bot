@@ -1569,41 +1569,79 @@ export class GmgnClient {
     });
   }
 
-  private async sendRawTransactionAndAssertSuccess(
-    rawTx: Buffer,
-    mint: string,
-    options: { maxRetries?: number; timeoutMs?: number } = {},
-  ): Promise<string> {
-    const signature = await this.connection.sendRawTransaction(rawTx, {
+// ── Helius Sender endpoint (closest to Ashburn VA = Newark) ──────────────────
+private readonly SENDER_URL = "http://ewr-sender.helius-rpc.com/fast";
+
+private async sendRawTransactionAndAssertSuccess(
+  rawTx: Buffer,
+  mint: string,
+  options: { maxRetries?: number; timeoutMs?: number } = {},
+): Promise<string> {
+  const rawTxBase64 = rawTx.toString("base64");
+  let signature: string;
+
+  // ── Send via Helius Sender (with fallback to normal RPC) ─────────────────
+  try {
+    const res = await fetch(this.SENDER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: Date.now().toString(),
+        method: "sendTransaction",
+        params: [
+          rawTxBase64,
+          {
+            encoding: "base64",
+            skipPreflight: true,
+            maxRetries: 0,
+          },
+        ],
+      }),
+    });
+
+    const json = await res.json() as { result?: string; error?: { message: string } };
+
+    if (json.error) throw new Error(json.error.message);
+    if (!json.result) throw new Error("Helius Sender returned no signature");
+
+    signature = json.result;
+    log.debug(`Sent via Helius Sender: ${signature}`, { mint });
+  } catch (senderErr) {
+    // Fallback: 429 / 503 / network timeout → use normal RPC
+    log.warn(`Helius Sender failed, falling back to RPC: ${senderErr instanceof Error ? senderErr.message : String(senderErr)}`, { mint });
+    signature = await this.connection.sendRawTransaction(rawTx, {
       skipPreflight: true,
       maxRetries: options.maxRetries ?? 3,
     });
-
-    const deadline = Date.now() + (options.timeoutMs ?? 6_000);
-    while (Date.now() < deadline) {
-      const status = await this.connection.getSignatureStatuses([signature], {
-        searchTransactionHistory: true,
-      });
-      const value = status.value[0];
-      if (value) {
-        if (value.err) {
-          throw new Error(
-            `Transaction ${signature} failed on-chain for ${mint}: ${JSON.stringify(value.err)}`,
-          );
-        }
-        if (value.confirmationStatus) {
-          return signature;
-        }
-      }
-      await sleep(100);
-    }
-
-    const recentBlockhash =
-      VersionedTransaction.deserialize(rawTx).message.recentBlockhash;
-    throw new Error(
-      `Transaction ${signature} was not confirmed for ${mint} before timeout (blockhash ${recentBlockhash})`,
-    );
   }
+
+  // ── Confirm via normal RPC ────────────────────────────────────────────────
+  const deadline = Date.now() + (options.timeoutMs ?? 8_000);
+  while (Date.now() < deadline) {
+    const status = await this.connection.getSignatureStatuses([signature], {
+      searchTransactionHistory: true,
+    });
+    const value = status.value[0];
+    if (value) {
+      if (value.err) {
+        throw new Error(
+          `Transaction ${signature} failed on-chain for ${mint}: ${JSON.stringify(value.err)}`,
+        );
+      }
+      if (value.confirmationStatus) {
+        return signature;
+      }
+    }
+    await sleep(100);
+  }
+
+  const recentBlockhash =
+    VersionedTransaction.deserialize(rawTx).message.recentBlockhash;
+  throw new Error(
+    `Transaction ${signature} was not confirmed for ${mint} before timeout (blockhash ${recentBlockhash})`,
+  );
+}
 
   // REPLACE lines 725-745 with:
   private async fetchJupiterJson(
