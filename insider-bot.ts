@@ -28,6 +28,7 @@ const AXIOM_TRADER_SCAN_LIMIT = 50;
 const AXIOM_AUTHORITY_CANDIDATE_COUNT = 5;
 const AXIOM_AUTHORITY_INITIAL_TX_COUNT = 15;
 const AXIOM_AUTHORITY_INITIAL_AFTER_LIMIT = 14;
+const AXIOM_AUTHORITY_EARLY_PROBE_TX_COUNT = 3;
 const AXIOM_AUTHORITY_BATCH_LIMIT = 50;
 const AXIOM_AUTHORITY_MIN_SYNC_INTERVAL_MS = 2_000;
 const AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS = 3;
@@ -203,10 +204,8 @@ interface AuthorityMonitorState {
   initialCursorSignature: string | null;
   cursorSignature: string | null;
   initialReady: boolean;
-  decisionMode:
-    | "pending"
-    | "direct_200_buy"
-    | "normal_non_similar";
+  earlyProbeCompleted: boolean;
+  decisionMode: "pending" | "direct_200_buy" | "normal_non_similar";
   processedSignatures: Set<string>;
   nonSimilarWallets: Set<string>;
   patternStates: Map<string, AuthorityPatternWalletState>;
@@ -226,7 +225,7 @@ interface LargeBuyerWatchState {
 
 export class InsiderBot extends EventEmitter {
   private readonly log: Logger;
-   private readonly config: ServiceConfig;
+  private readonly config: ServiceConfig;
   private readonly connection: Connection;
   private readonly telegramBot: TelegramBot | null;
   private readonly heliusClient: HeliusClient;
@@ -239,7 +238,6 @@ export class InsiderBot extends EventEmitter {
   private readonly rpcUrl: string;
   private readonly wsUrl: string;
   private readonly label: string;
-  
 
   private followedWallet: string | null = null;
   private buySol: number;
@@ -319,7 +317,8 @@ export class InsiderBot extends EventEmitter {
   private readonly BATCH_WINDOW_MS = 1000;
   private readonly MAX_BATCH_SIZE = 100;
 
-  private activePosition: { followedWallet: string; mint: string } | null = null;
+  private activePosition: { followedWallet: string; mint: string } | null =
+    null;
   private boughtMints = new Set<string>();
   private claimedMint: string | null = null;
   private buySubmitted = false;
@@ -377,8 +376,8 @@ export class InsiderBot extends EventEmitter {
   }
 
   seedSeenMints(mints: Set<string>): void {
-  for (const m of mints) this.boughtMints.add(m);
-}
+    for (const m of mints) this.boughtMints.add(m);
+  }
 
   getActivePosition() {
     return this.activePosition;
@@ -535,9 +534,12 @@ export class InsiderBot extends EventEmitter {
 
   async followWallet(address: string): Promise<void> {
     if (this.stoppedForHeliusCredits) {
-      this.log.warn("Follow-wallet start blocked because Helius credits are exhausted", {
-        followedWallet: address,
-      });
+      this.log.warn(
+        "Follow-wallet start blocked because Helius credits are exhausted",
+        {
+          followedWallet: address,
+        },
+      );
       return;
     }
     const normalized = new PublicKey(address).toBase58();
@@ -551,7 +553,7 @@ export class InsiderBot extends EventEmitter {
     }
     this.followedWallet = normalized;
 
-   this.followMonitor = new WalletMonitor(this.config, normalized, {
+    this.followMonitor = new WalletMonitor(this.config, normalized, {
       enforceMinBuySol: false,
       rpcUrl: this.rpcUrl,
       wsUrl: this.wsUrl,
@@ -630,9 +632,12 @@ export class InsiderBot extends EventEmitter {
     this.monitoredWallet = null;
     this.insiderState = null;
     this.phase = this.activePosition ? "holding" : null;
-    this.log.error("Insider bot stopped because its Helius project has no credits", {
-      activePositionMint: this.activePosition?.mint ?? null,
-    });
+    this.log.error(
+      "Insider bot stopped because its Helius project has no credits",
+      {
+        activePositionMint: this.activePosition?.mint ?? null,
+      },
+    );
   }
 
   isStoppedForHeliusCredits(): boolean {
@@ -688,14 +693,20 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
-  private async handleFollowWalletBuy(mint: string, signature: string): Promise<void> {
+  private async handleFollowWalletBuy(
+    mint: string,
+    signature: string,
+  ): Promise<void> {
     if (this.boughtMints.has(mint)) return;
     if (this.activePosition || this.watchingMint) return;
     if (this.claimMint && !this.claimMint(mint)) {
-      this.log.info("Mint active on other insider bot; ignoring follow-wallet buy", {
-        mint,
-        signature,
-      });
+      this.log.info(
+        "Mint active on other insider bot; ignoring follow-wallet buy",
+        {
+          mint,
+          signature,
+        },
+      );
       return;
     }
 
@@ -746,13 +757,16 @@ export class InsiderBot extends EventEmitter {
           { mint, signature },
         );
       } else {
-        this.log.info("Follow-wallet buy MC accepted; starting token monitoring", {
-          mint,
-          signature,
-          followWalletBuyMc,
-          maxFollowWalletStartMarketCapUsd:
-            MAX_FOLLOW_WALLET_START_MARKET_CAP_USD,
-        });
+        this.log.info(
+          "Follow-wallet buy MC accepted; starting token monitoring",
+          {
+            mint,
+            signature,
+            followWalletBuyMc,
+            maxFollowWalletStartMarketCapUsd:
+              MAX_FOLLOW_WALLET_START_MARKET_CAP_USD,
+          },
+        );
       }
 
       await this.startInsiderFlow(mint);
@@ -841,7 +855,10 @@ export class InsiderBot extends EventEmitter {
     await this.scanAxiomSingleBuyTradersPreBuy(mint);
   }
 
-  private extractEarlyInsiderBuys(swaps: HeliusTransaction[], mint: string): EarlyInsiderBuy[] {
+  private extractEarlyInsiderBuys(
+    swaps: HeliusTransaction[],
+    mint: string,
+  ): EarlyInsiderBuy[] {
     const buys: EarlyInsiderBuy[] = [];
     for (const tx of swaps) {
       if (tx.type !== "SWAP") continue;
@@ -864,11 +881,16 @@ export class InsiderBot extends EventEmitter {
     return [...new Set(buys.map((buy) => buy.wallet))];
   }
 
-  private assertEarlyInsidersMeetMinBuySol(mint: string, buys: EarlyInsiderBuy[]): void {
+  private assertEarlyInsidersMeetMinBuySol(
+    mint: string,
+    buys: EarlyInsiderBuy[],
+  ): void {
     const minBuySol = this.config.minBuySol;
     if (minBuySol <= 0) return;
 
-    const failing = buys.filter((buy) => buy.buySol === null || buy.buySol < minBuySol);
+    const failing = buys.filter(
+      (buy) => buy.buySol === null || buy.buySol < minBuySol,
+    );
     if (!failing.length) {
       this.log.info("Early insider min-buy SOL check passed", {
         mint,
@@ -883,33 +905,41 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    this.log.warn("Early insider min-buy SOL check failed; resetting token flow", {
-      mint,
-      minBuySol,
-      failingInsiders: failing.map((buy) => ({
-        wallet: buy.wallet,
-        buySol: buy.buySol,
-        tokenAmount: buy.tokenAmount,
-        signature: buy.signature,
-      })),
-      insiderBuys: buys.map((buy) => ({
-        wallet: buy.wallet,
-        buySol: buy.buySol,
-        tokenAmount: buy.tokenAmount,
-        signature: buy.signature,
-      })),
-    });
+    this.log.warn(
+      "Early insider min-buy SOL check failed; resetting token flow",
+      {
+        mint,
+        minBuySol,
+        failingInsiders: failing.map((buy) => ({
+          wallet: buy.wallet,
+          buySol: buy.buySol,
+          tokenAmount: buy.tokenAmount,
+          signature: buy.signature,
+        })),
+        insiderBuys: buys.map((buy) => ({
+          wallet: buy.wallet,
+          buySol: buy.buySol,
+          tokenAmount: buy.tokenAmount,
+          signature: buy.signature,
+        })),
+      },
+    );
 
     throw new InsiderMinBuySolFilterError(
       `Early insider buy SOL below MIN_BUY_SOL ${minBuySol} for ${mint}`,
     );
   }
 
-  private estimateWalletSolSpent(tx: HeliusTransaction, wallet: string): number | null {
+  private estimateWalletSolSpent(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): number | null {
     let spentLamports = 0;
     for (const transfer of tx.nativeTransfers ?? []) {
-      if (transfer.fromUserAccount === wallet) spentLamports += transfer.amount ?? 0;
-      if (transfer.toUserAccount === wallet) spentLamports -= transfer.amount ?? 0;
+      if (transfer.fromUserAccount === wallet)
+        spentLamports += transfer.amount ?? 0;
+      if (transfer.toUserAccount === wallet)
+        spentLamports -= transfer.amount ?? 0;
     }
 
     if (spentLamports <= 0) return null;
@@ -917,7 +947,11 @@ export class InsiderBot extends EventEmitter {
   }
 
   private findLowestInsiderWallet(buys: EarlyInsiderBuy[]) {
-    let lowest: { wallet: string; tokenAmount: number; signature: string } | null = null;
+    let lowest: {
+      wallet: string;
+      tokenAmount: number;
+      signature: string;
+    } | null = null;
     for (const buy of buys) {
       if (!lowest || buy.tokenAmount < lowest.tokenAmount) {
         lowest = {
@@ -977,7 +1011,8 @@ export class InsiderBot extends EventEmitter {
           ? "post_buy"
           : null;
     if (!phase) return;
-    if (phase === "pre_buy" && (this.preBuyStopped || this.buySubmitted)) return;
+    if (phase === "pre_buy" && (this.preBuyStopped || this.buySubmitted))
+      return;
     if (phase === "post_buy" && this.positionSellTriggered) return;
 
     this.isAxiomAtaPolling = true;
@@ -1029,7 +1064,10 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     context: "insider" | "bundler",
   ): Promise<void> {
-    const txs = await this.heliusClient.getWalletTransactionsDesc(wallet, INSIDER_HISTORY_LIMIT);
+    const txs = await this.heliusClient.getWalletTransactionsDesc(
+      wallet,
+      INSIDER_HISTORY_LIMIT,
+    );
     const relevant = txs
       .filter((tx) => this.isRelevantMintTx(tx, mint))
       .reverse();
@@ -1066,7 +1104,10 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async startBundlerMonitoring(wallets: string[], mint: string): Promise<void> {
+  private async startBundlerMonitoring(
+    wallets: string[],
+    mint: string,
+  ): Promise<void> {
     await this.stopBundlerMonitoring();
     this.bundlerWatch = {
       wallets,
@@ -1078,7 +1119,8 @@ export class InsiderBot extends EventEmitter {
       const subId = this.connection.onLogs(
         pubkey,
         (logInfo) => {
-          if (!logInfo.err) this.queueSignature(logInfo.signature, "bundler", wallet);
+          if (!logInfo.err)
+            this.queueSignature(logInfo.signature, "bundler", wallet);
         },
         "processed",
       );
@@ -1086,7 +1128,13 @@ export class InsiderBot extends EventEmitter {
     }
 
     for (const wallet of wallets) {
-      await this.syncWalletHistory(wallet, mint, undefined, INSIDER_HISTORY_LIMIT, "bundler");
+      await this.syncWalletHistory(
+        wallet,
+        mint,
+        undefined,
+        INSIDER_HISTORY_LIMIT,
+        "bundler",
+      );
     }
 
     this.log.info("Started post-buy bundler monitoring", { mint, wallets });
@@ -1189,11 +1237,14 @@ export class InsiderBot extends EventEmitter {
               amount,
               `ATA subscription update for ${wallet}`,
             ).catch((err) => {
-              this.log.warn("Non-similar wallet ATA subscription check failed", {
-                mint: state.mint,
-                wallet,
-                error: err instanceof Error ? err.message : String(err),
-              });
+              this.log.warn(
+                "Non-similar wallet ATA subscription check failed",
+                {
+                  mint: state.mint,
+                  wallet,
+                  error: err instanceof Error ? err.message : String(err),
+                },
+              );
             });
           },
           "processed",
@@ -1352,11 +1403,14 @@ export class InsiderBot extends EventEmitter {
 
     if (tx.type === "SWAP") {
       for (const transfer of tx.tokenTransfers ?? []) {
-        if (transfer.mint === mint && transfer.toUserAccount === wallet) return "buy";
+        if (transfer.mint === mint && transfer.toUserAccount === wallet)
+          return "buy";
       }
       for (const transfer of tx.tokenTransfers ?? []) {
-        if (transfer.mint === SOL_MINT && transfer.toUserAccount === wallet) return "sell";
-        if (transfer.mint === mint && transfer.fromUserAccount === wallet) return "sell";
+        if (transfer.mint === SOL_MINT && transfer.toUserAccount === wallet)
+          return "sell";
+        if (transfer.mint === mint && transfer.fromUserAccount === wallet)
+          return "sell";
       }
     }
     return null;
@@ -1369,7 +1423,10 @@ export class InsiderBot extends EventEmitter {
     limit: number,
     context: "insider" | "bundler",
   ): Promise<void> {
-    const txs = await this.heliusClient.getWalletTransactionsDesc(wallet, limit);
+    const txs = await this.heliusClient.getWalletTransactionsDesc(
+      wallet,
+      limit,
+    );
     const sorted = [...txs].reverse();
     let foundStart = !startSignature;
 
@@ -1391,7 +1448,10 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async handleInsiderTransaction(tx: HeliusTransaction, mint: string): Promise<void> {
+  private async handleInsiderTransaction(
+    tx: HeliusTransaction,
+    mint: string,
+  ): Promise<void> {
     if (!this.insiderState || !this.monitoredWallet) return;
     await this.applyInsiderTx(tx, mint, this.monitoredWallet);
   }
@@ -1480,13 +1540,16 @@ export class InsiderBot extends EventEmitter {
       return;
     }
     if (this.monitoredWallet !== sourceWallet) {
-      this.log.debug("Ignoring stale transfer from a wallet no longer monitored", {
-        mint,
-        sourceWallet,
-        currentMonitoredWallet: this.monitoredWallet,
-        newWallet,
-        transferSignature,
-      });
+      this.log.debug(
+        "Ignoring stale transfer from a wallet no longer monitored",
+        {
+          mint,
+          sourceWallet,
+          currentMonitoredWallet: this.monitoredWallet,
+          newWallet,
+          transferSignature,
+        },
+      );
       return;
     }
     if (newWallet === sourceWallet || this.insiderWalletChain.has(newWallet)) {
@@ -1605,12 +1668,15 @@ export class InsiderBot extends EventEmitter {
     ]);
   }
 
-  private parseBundlerCandidate(entry: Record<string, unknown>): BundlerMatch | null {
+  private parseBundlerCandidate(
+    entry: Record<string, unknown>,
+  ): BundlerMatch | null {
     const buyUsd = this.parseBuyVolumeUsd(entry);
     const buyTxCount = this.parseBuyTxCount(entry);
     const address = entry.address as string | undefined;
     if (!address || buyUsd === null || buyTxCount === null) return null;
-    if (buyUsd < this.bundlerBuyMinUsd || buyUsd > this.bundlerBuyMaxUsd) return null;
+    if (buyUsd < this.bundlerBuyMinUsd || buyUsd > this.bundlerBuyMaxUsd)
+      return null;
     return { address, buyUsd, buyTxCount };
   }
 
@@ -1664,9 +1730,7 @@ export class InsiderBot extends EventEmitter {
     return false;
   }
 
-  private collectAxiomSingleBuyMatches(
-    list: Array<Record<string, unknown>>,
-  ): {
+  private collectAxiomSingleBuyMatches(list: Array<Record<string, unknown>>): {
     matchingWallets: Array<{
       address: string;
       buyUsd: number;
@@ -1714,9 +1778,7 @@ export class InsiderBot extends EventEmitter {
       const address = entry.address as string;
       const buyUsd = this.parseBuyVolumeUsd(entry)!;
       const sold = this.hasSoldAllPosition(entry);
-      const tags = Array.isArray(entry.tags)
-        ? (entry.tags as string[])
-        : [];
+      const tags = Array.isArray(entry.tags) ? (entry.tags as string[]) : [];
 
       if (sold) soldAmongValid += 1;
       matchingWallets.push({ address, buyUsd, sold, tags });
@@ -1761,8 +1823,7 @@ export class InsiderBot extends EventEmitter {
         excludedCount: stats.excludedCount,
         skippedMultiBuy: stats.skippedMultiBuy,
         addedCumulativeMultiBuyWallets: addedMultiBuyWallets,
-        cumulativeSkippedMultiBuy:
-          this.axiomSkippedMultiBuyWallets.size,
+        cumulativeSkippedMultiBuy: this.axiomSkippedMultiBuyWallets.size,
         validCount: stats.validCount,
         soldAmongValid: stats.soldAmongValid,
         soldPositionRatio: stats.soldPositionRatio,
@@ -1892,9 +1953,8 @@ export class InsiderBot extends EventEmitter {
     const largestGroupExistingAtaWalletCount =
       largestSimilarBalanceGroup?.walletCount ?? 0;
     const largestGroupSoldAnyWalletBalances =
-      largestSimilarBalanceGroup?.wallets.filter(
-        (wallet) => wallet.soldAny,
-      ) ?? [];
+      largestSimilarBalanceGroup?.wallets.filter((wallet) => wallet.soldAny) ??
+      [];
     const largestGroupSoldAnyWalletAddresses = new Set(
       largestGroupSoldAnyWalletBalances.map((wallet) => wallet.address),
     );
@@ -1902,12 +1962,10 @@ export class InsiderBot extends EventEmitter {
       largestGroupSoldAnyWalletAddresses.has(wallet.address),
     );
     const largestGroupHoldingCount =
-      largestGroupExistingAtaWalletCount -
-      largestGroupSoldAnyWallets.length;
+      largestGroupExistingAtaWalletCount - largestGroupSoldAnyWallets.length;
     const largestGroupSoldAnyRatio =
       largestGroupExistingAtaWalletCount > 0
-        ? largestGroupSoldAnyWallets.length /
-          largestGroupExistingAtaWalletCount
+        ? largestGroupSoldAnyWallets.length / largestGroupExistingAtaWalletCount
         : 0;
     const previousMaxLargestSimilarBalanceGroupCount =
       this.maxObservedLargestSimilarBalanceGroupCount;
@@ -1915,8 +1973,7 @@ export class InsiderBot extends EventEmitter {
       this.maxObservedLargestSimilarBalanceGroupCount,
       largestGroupExistingAtaWalletCount,
     );
-    const cumulativeSkippedMultiBuy =
-      this.axiomSkippedMultiBuyWallets.size;
+    const cumulativeSkippedMultiBuy = this.axiomSkippedMultiBuyWallets.size;
     const ataConversionRatio =
       watched.length > 0 ? existingAtaWalletCount / watched.length : 0;
     const multiBuyToAtaRatio =
@@ -1957,8 +2014,7 @@ export class InsiderBot extends EventEmitter {
     ).length;
     const nearZeroSingleSellWallets = nearZeroWalletBalances.filter(
       (wallet) =>
-        wallet.tokenStatus === "sold_all" &&
-        wallet.sellType === "single_sell",
+        wallet.tokenStatus === "sold_all" && wallet.sellType === "single_sell",
     );
     const nearZeroMultiSellWallets = nearZeroWalletBalances.filter(
       (wallet) => wallet.sellType === "multi_sell",
@@ -1971,8 +2027,7 @@ export class InsiderBot extends EventEmitter {
       nearZeroWalletBalances.length > 0
         ? {
             walletCount: nearZeroWalletBalances.length,
-            holdingCount:
-              nearZeroWalletBalances.length - nearZeroSoldAnyCount,
+            holdingCount: nearZeroWalletBalances.length - nearZeroSoldAnyCount,
             soldAnyCount: nearZeroSoldAnyCount,
             soldAnyRatio: Number(
               (nearZeroSoldAnyCount / nearZeroWalletBalances.length).toFixed(4),
@@ -2014,8 +2069,7 @@ export class InsiderBot extends EventEmitter {
     }
     if (
       this.authorityProbeFailedAtTwo &&
-      largestGroupExistingAtaWalletCount <
-        AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE
+      largestGroupExistingAtaWalletCount < AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE
     ) {
       buyGateFailedConditions.push(
         `authority_probe_wait: group_size ${largestGroupExistingAtaWalletCount} < fallback ${AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE}`,
@@ -2023,8 +2077,7 @@ export class InsiderBot extends EventEmitter {
     }
     const sellGateFailedConditions: string[] = [];
     if (
-      largestGroupSoldAnyWallets.length <
-      AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD
+      largestGroupSoldAnyWallets.length < AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD
     ) {
       sellGateFailedConditions.push(
         `sold_any: ${largestGroupSoldAnyWallets.length} < ${AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD}`,
@@ -2053,51 +2106,54 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    this.log.info(`Axiom watched-wallet ATA poll [${options.phase}] — ${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount} sold any in largest similar-SOL group`, {
-      mint,
-      phase: options.phase,
-      watchedCount: watched.length,
-      existingAtaWalletCount,
-      cumulativeSkippedMultiBuy,
-      solPriceUsd:
-        solPriceUsd === null ? null : Number(solPriceUsd.toFixed(2)),
-      largestSimilarSolGroup,
-      largestNearZeroSolGroup,
-      ...(options.phase === "pre_buy"
-        ? {
-            buyGate: {
-              earlyAuthorityProbeGroupSize:
-                AXIOM_AUTHORITY_EARLY_PROBE_GROUP_SIZE,
-              fallbackAuthorityProbeGroupSize:
-                AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE,
-              maximumSoldAny: AXIOM_BUY_MAX_SOLD_ANY_WALLETS,
-              passed: buyGateFailedConditions.length === 0,
-              failedConditions: buyGateFailedConditions,
-            },
-          }
-        : {
-            sellGate: {
-              requiredSoldAny: AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD,
-              requiredSoldAnyRatio: AXIOM_EXIT_MIN_SOLD_ANY_RATIO,
-              collapseGroupSize: AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS,
-              nearZeroSingleSellThreshold:
-                AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD,
-              nearZeroSingleSellCount: nearZeroSingleSellWallets.length,
-              nearZeroMultiSellCount: nearZeroMultiSellWallets.length,
-              nearZeroSingleSellFilterSkipped:
-                nearZeroMultiSellWallets.length > 0,
-              collapsedToTwo,
-              passed:
-                nearZeroSingleSellTriggerPassed ||
-                collapsedToTwo ||
-                sellGateFailedConditions.length === 0,
-              failedConditions:
-                nearZeroSingleSellTriggerPassed || collapsedToTwo
-                  ? []
-                  : sellGateFailedConditions,
-            },
-          }),
-    });
+    this.log.info(
+      `Axiom watched-wallet ATA poll [${options.phase}] — ${largestGroupSoldAnyWallets.length}/${largestGroupExistingAtaWalletCount} sold any in largest similar-SOL group`,
+      {
+        mint,
+        phase: options.phase,
+        watchedCount: watched.length,
+        existingAtaWalletCount,
+        cumulativeSkippedMultiBuy,
+        solPriceUsd:
+          solPriceUsd === null ? null : Number(solPriceUsd.toFixed(2)),
+        largestSimilarSolGroup,
+        largestNearZeroSolGroup,
+        ...(options.phase === "pre_buy"
+          ? {
+              buyGate: {
+                earlyAuthorityProbeGroupSize:
+                  AXIOM_AUTHORITY_EARLY_PROBE_GROUP_SIZE,
+                fallbackAuthorityProbeGroupSize:
+                  AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE,
+                maximumSoldAny: AXIOM_BUY_MAX_SOLD_ANY_WALLETS,
+                passed: buyGateFailedConditions.length === 0,
+                failedConditions: buyGateFailedConditions,
+              },
+            }
+          : {
+              sellGate: {
+                requiredSoldAny: AXIOM_EXIT_SOLD_ANY_WALLET_THRESHOLD,
+                requiredSoldAnyRatio: AXIOM_EXIT_MIN_SOLD_ANY_RATIO,
+                collapseGroupSize: AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS,
+                nearZeroSingleSellThreshold:
+                  AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD,
+                nearZeroSingleSellCount: nearZeroSingleSellWallets.length,
+                nearZeroMultiSellCount: nearZeroMultiSellWallets.length,
+                nearZeroSingleSellFilterSkipped:
+                  nearZeroMultiSellWallets.length > 0,
+                collapsedToTwo,
+                passed:
+                  nearZeroSingleSellTriggerPassed ||
+                  collapsedToTwo ||
+                  sellGateFailedConditions.length === 0,
+                failedConditions:
+                  nearZeroSingleSellTriggerPassed || collapsedToTwo
+                    ? []
+                    : sellGateFailedConditions,
+              },
+            }),
+      },
+    );
 
     if (options.phase === "pre_buy") {
       await this.evaluateAxiomAtaBuyGate(
@@ -2296,9 +2352,7 @@ export class InsiderBot extends EventEmitter {
     let left = 0;
     let largestGroupWallets: ExistingAtaWalletSolBalance[] = [];
     for (let right = 0; right < sorted.length; right += 1) {
-      while (
-        sorted[right].solBalanceUsd - sorted[left].solBalanceUsd > 1
-      ) {
+      while (sorted[right].solBalanceUsd - sorted[left].solBalanceUsd > 1) {
         left += 1;
       }
       const candidate = sorted.slice(left, right + 1);
@@ -2373,8 +2427,7 @@ export class InsiderBot extends EventEmitter {
       !this.authorityProbeFailedAtTwo;
     const shouldAttemptFallbackAuthority =
       this.authorityProbeFailedAtTwo &&
-      largestGroupExistingAtaWalletCount >=
-        AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE;
+      largestGroupExistingAtaWalletCount >= AXIOM_AUTHORITY_FALLBACK_GROUP_SIZE;
 
     if (
       this.phase !== "pre_buy" ||
@@ -2472,7 +2525,9 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    const candidateAddresses = new Set(candidates.map((wallet) => wallet.address));
+    const candidateAddresses = new Set(
+      candidates.map((wallet) => wallet.address),
+    );
     let mintTransactions = await this.heliusClient.getAddressTransactionsAsc(
       mint,
       undefined,
@@ -2546,8 +2601,7 @@ export class InsiderBot extends EventEmitter {
           signature: firstBuy.signature,
           attempt,
           maxAttempts: AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS,
-          remainingAttempts:
-            AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS - attempt,
+          remainingAttempts: AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS - attempt,
         },
       );
       if (attempt < AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS) {
@@ -2574,7 +2628,8 @@ export class InsiderBot extends EventEmitter {
           mint,
           signature: firstBuy.signature,
           attempts: AXIOM_AUTHORITY_EXTRACTION_MAX_ATTEMPTS,
-          action: "reset token flow and wait for the next followed-wallet token",
+          action:
+            "reset token flow and wait for the next followed-wallet token",
         },
       );
       void this.sendTelegramSafe(
@@ -2601,6 +2656,7 @@ export class InsiderBot extends EventEmitter {
       initialCursorSignature: null,
       cursorSignature: null,
       initialReady: false,
+      earlyProbeCompleted: false,
       decisionMode: "pending",
       processedSignatures: new Set([firstBuy.signature]),
       nonSimilarWallets: new Set(),
@@ -2622,9 +2678,7 @@ export class InsiderBot extends EventEmitter {
     return true;
   }
 
-  private extractLookupTableAuthority(
-    tx: HeliusTransaction,
-  ): string | null {
+  private extractLookupTableAuthority(tx: HeliusTransaction): string | null {
     const lookupInstruction = (tx.instructions ?? []).find(
       (instruction) =>
         instruction.programId === ADDRESS_LOOKUP_TABLE_PROGRAM &&
@@ -2690,6 +2744,99 @@ export class InsiderBot extends EventEmitter {
     this.lastAuthoritySyncAt = Date.now();
     try {
       if (!state.initialReady) {
+        // ── Early-probe: check the first 4 txs (tx #1 + 3 more) for a $200+ buy ──
+        if (!state.earlyProbeCompleted) {
+          const earlyAfter = await this.heliusClient.getAddressTransactionsAsc(
+            state.authority,
+            state.firstBuySignature,
+            AXIOM_AUTHORITY_EARLY_PROBE_TX_COUNT,
+          );
+          const uniqueEarly = earlyAfter.filter(
+            (tx) => !state.processedSignatures.has(tx.signature),
+          );
+          if (uniqueEarly.length >= AXIOM_AUTHORITY_EARLY_PROBE_TX_COUNT) {
+            // We have at least 4 txs — scan them for a $200+ buy
+            const earlyWindow = [
+              state.firstBuyTransaction,
+              ...uniqueEarly.slice(0, AXIOM_AUTHORITY_EARLY_PROBE_TX_COUNT),
+            ].sort((a, b) => a.slot - b.slot);
+
+            const solPriceUsd = await this.getCachedSolPriceUsd();
+            if (solPriceUsd !== null) {
+              for (const tx of earlyWindow) {
+                if (
+                  state.processedSignatures.has(tx.signature) &&
+                  tx.signature !== state.firstBuySignature
+                ) {
+                  continue;
+                }
+                for (const buy of this.getMintBuyActors(tx, state.mint)) {
+                  const buySol = this.estimateWalletSolSpent(tx, buy.wallet);
+                  if (buySol === null) continue;
+                  const buyUsd = buySol * solPriceUsd;
+                  if (buyUsd < AXIOM_AUTHORITY_LARGE_BUY_MIN_USD) continue;
+
+                  // Found a $200+ buy in the first 4 txs — go direct immediately
+                  this.log.warn(
+                    "Early 4-tx probe found >=$200 buy — skipping 15-tx window, entering direct_200_buy mode immediately",
+                    {
+                      mint: state.mint,
+                      authority: state.authority,
+                      wallet: buy.wallet,
+                      signature: tx.signature,
+                      buySol,
+                      buyUsd: Number(buyUsd.toFixed(2)),
+                    },
+                  );
+
+                  // Mark all early txs as processed and set cursor
+                  for (const etx of earlyWindow) {
+                    state.processedSignatures.add(etx.signature);
+                  }
+                  state.cursorSignature =
+                    earlyWindow[earlyWindow.length - 1].signature;
+                  state.initialCursorSignature = state.cursorSignature;
+                  state.initialTransactions = earlyWindow;
+                  state.initialReady = true;
+                  state.earlyProbeCompleted = true;
+                  state.decisionMode = "direct_200_buy";
+                  state.nonSimilarWallets = new Set();
+
+                  this.largeBuyerWatch = await this.createLargeBuyerAtaWatch(
+                    state.mint,
+                    buy.wallet,
+                    tx.signature,
+                    buyUsd,
+                    buy.amount,
+                  );
+                  this.subscribeLargeBuyerAtas(this.largeBuyerWatch);
+                  await this.emitDirectAuthorityBuyerBuy(
+                    state,
+                    this.largeBuyerWatch,
+                  );
+                  return;
+                }
+              }
+            }
+            // No $200+ buy found in early window — mark probe done, fall through to full 15-tx wait
+            state.earlyProbeCompleted = true;
+            this.log.info(
+              "Early 4-tx probe complete — no $200+ buy found, waiting for full 15-tx window",
+              { mint: state.mint, authority: state.authority },
+            );
+          } else {
+            // Don't have 4 txs yet — wait
+            this.log.info("Waiting for early 4-tx authority probe window", {
+              mint: state.mint,
+              authority: state.authority,
+              collected: 1 + uniqueEarly.length,
+              needed: 1 + AXIOM_AUTHORITY_EARLY_PROBE_TX_COUNT,
+            });
+            return;
+          }
+        }
+
+        // ── Full 15-tx window (only reached if early probe found nothing) ──
         const after = await this.heliusClient.getAddressTransactionsAsc(
           state.authority,
           state.firstBuySignature,
@@ -2699,12 +2846,15 @@ export class InsiderBot extends EventEmitter {
           (tx) => !state.processedSignatures.has(tx.signature),
         );
         if (uniqueAfter.length < AXIOM_AUTHORITY_INITIAL_AFTER_LIMIT) {
-          this.log.info("Waiting for complete 15-transaction authority window", {
-            mint: state.mint,
-            authority: state.authority,
-            collected: 1 + uniqueAfter.length,
-            required: AXIOM_AUTHORITY_INITIAL_TX_COUNT,
-          });
+          this.log.info(
+            "Waiting for complete 15-transaction authority window",
+            {
+              mint: state.mint,
+              authority: state.authority,
+              collected: 1 + uniqueAfter.length,
+              required: AXIOM_AUTHORITY_INITIAL_TX_COUNT,
+            },
+          );
           return;
         }
 
@@ -2716,28 +2866,23 @@ export class InsiderBot extends EventEmitter {
           state.processedSignatures.add(tx.signature);
         }
         state.cursorSignature =
-          state.initialTransactions[state.initialTransactions.length - 1]
-            .signature;
+          state.initialTransactions[
+            state.initialTransactions.length - 1
+          ].signature;
         state.initialCursorSignature = state.cursorSignature;
         state.initialReady = true;
 
         await this.evaluateInitialAuthorityWindow(state);
         return;
       }
-
-      if (
-        !state.cursorSignature
-      ) {
+      if (!state.cursorSignature) {
         return;
       }
 
       if (this.phase === "pre_buy" && !this.buySubmitted) {
         if (state.decisionMode === "direct_200_buy") {
           if (this.largeBuyerWatch) {
-            await this.emitDirectAuthorityBuyerBuy(
-              state,
-              this.largeBuyerWatch,
-            );
+            await this.emitDirectAuthorityBuyerBuy(state, this.largeBuyerWatch);
             return;
           }
           let cursor = state.cursorSignature;
@@ -2793,7 +2938,10 @@ export class InsiderBot extends EventEmitter {
         if (batch.length === 0) break;
         cursor = batch[batch.length - 1].signature;
         state.cursorSignature = cursor;
-        if (this.largeBuyerWatch || batch.length < AXIOM_AUTHORITY_BATCH_LIMIT) {
+        if (
+          this.largeBuyerWatch ||
+          batch.length < AXIOM_AUTHORITY_BATCH_LIMIT
+        ) {
           break;
         }
       }
@@ -2873,8 +3021,7 @@ export class InsiderBot extends EventEmitter {
           mint: state.mint,
           authority: state.authority,
           largestSimilarUsdBuyGroupCount: largestGroup.length,
-          normalFlowMinimum:
-            AXIOM_AUTHORITY_NORMAL_BUY_GROUP_MIN_COUNT,
+          normalFlowMinimum: AXIOM_AUTHORITY_NORMAL_BUY_GROUP_MIN_COUNT,
           afterSignature: state.initialCursorSignature,
           action:
             "wait for first later $200+ authority buy, buy immediately, then sell when that same wallet sells all",
@@ -3044,10 +3191,9 @@ export class InsiderBot extends EventEmitter {
 
     this.isAuthorityAtaChecking = true;
     try {
-      const snapshot = await this.fetchAuthorityPatternAtaBalances(
-        state.mint,
-        [...state.patternStates.keys()],
-      );
+      const snapshot = await this.fetchAuthorityPatternAtaBalances(state.mint, [
+        ...state.patternStates.keys(),
+      ]);
       for (const [wallet, walletState] of state.patternStates) {
         for (const ata of walletState.atas) {
           const ataAddress = ata.toBase58();
@@ -3133,21 +3279,18 @@ export class InsiderBot extends EventEmitter {
     const completedWallets = [...state.patternStates].filter(
       ([, pattern]) => pattern.completed,
     );
-    this.log.info(
-      "Non-similar wallet sold all — wallet frozen as completed",
-      {
-        mint: state.mint,
-        authority: state.authority,
-        wallet,
-        source,
-        baselineBalance: walletState.baselineBalance.toString(),
-        previousBalance: previousBalance.toString(),
-        currentBalance: currentBalance.toString(),
-        completedCount: completedWallets.length,
-        requiredCount: state.patternStates.size,
-        completedWallets: completedWallets.map(([address]) => address),
-      },
-    );
+    this.log.info("Non-similar wallet sold all — wallet frozen as completed", {
+      mint: state.mint,
+      authority: state.authority,
+      wallet,
+      source,
+      baselineBalance: walletState.baselineBalance.toString(),
+      previousBalance: previousBalance.toString(),
+      currentBalance: currentBalance.toString(),
+      completedCount: completedWallets.length,
+      requiredCount: state.patternStates.size,
+      completedWallets: completedWallets.map(([address]) => address),
+    });
   }
 
   private async tryTriggerAllAuthorityWalletsCompleted(
@@ -3183,90 +3326,92 @@ export class InsiderBot extends EventEmitter {
     }
     this.isBuyGateEvaluating = true;
     try {
-    const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
-    if (currentMc === null) {
-      this.log.warn(
-        "All non-similar wallets sold all, but current market cap is unavailable; waiting before buy",
-        {
-          mint: state.mint,
-          completedWallets: trigger.completedWallets,
-        },
+      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(
+        state.mint,
       );
-      return;
-    }
-    if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
+      if (currentMc === null) {
+        this.log.warn(
+          "All non-similar wallets sold all, but current market cap is unavailable; waiting before buy",
+          {
+            mint: state.mint,
+            completedWallets: trigger.completedWallets,
+          },
+        );
+        return;
+      }
+      if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
+        this.log.warn(
+          "All non-similar wallets sold all, but token is below rug threshold; resetting instead of buying",
+          {
+            mint: state.mint,
+            currentMc,
+            rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
+            completedWallets: trigger.completedWallets,
+          },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>🧹 ${this.label} Rug Reset — Buy Skipped</b>`,
+            `Token: <code>${state.mint}</code>`,
+            `All non-similar wallets sold all: <b>${trigger.completedWallets.length}</b>`,
+            `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+            `Required MC: <b>$${INSIDER_RUG_MARKET_CAP_USD.toLocaleString()}</b> or higher`,
+            "Flow reset for the next token.",
+          ].join("\n"),
+          "all non-similar wallets completed but token rugged",
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
+
+      await this.stopPreBuyMonitoring();
+      const newExitMc = currentMc * (1 + this.exitPercent / 100);
+      this.setExitMc(newExitMc);
+      this.setEntryMc(currentMc);
+      this.setBuyExecuting(true);
+      this.buySubmitted = true;
+      const candidateLines = state.candidates.map(
+        (candidate, index) =>
+          `${index + 1}. <code>${candidate.address}</code> — <b>$${candidate.buyUsd.toFixed(2)}</b>`,
+      );
+
       this.log.warn(
-        "All non-similar wallets sold all, but token is below rug threshold; resetting instead of buying",
+        "Lookup-table authority non-similar wallet pattern passed — triggering buy",
         {
           mint: state.mint,
+          authority: state.authority,
+          firstBuySignature: state.firstBuySignature,
+          cursorSignature: state.cursorSignature,
+          triggerSignature: trigger.signature,
+          completedWallets: trigger.completedWallets,
+          completedCount: trigger.completedWallets.length,
+          candidateWallets: state.candidates,
           currentMc,
-          rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
-          completedWallets: trigger.completedWallets,
+          exitMc: newExitMc,
         },
       );
-      void this.sendTelegramSafe(
-        [
-          `<b>🧹 ${this.label} Rug Reset — Buy Skipped</b>`,
-          `Token: <code>${state.mint}</code>`,
-          `All non-similar wallets sold all: <b>${trigger.completedWallets.length}</b>`,
-          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-          `Required MC: <b>$${INSIDER_RUG_MARKET_CAP_USD.toLocaleString()}</b> or higher`,
-          "Flow reset for the next token.",
-        ].join("\n"),
-        "all non-similar wallets completed but token rugged",
-      );
-      await this.resetForNewToken(true);
-      return;
-    }
-
-    await this.stopPreBuyMonitoring();
-    const newExitMc = currentMc * (1 + this.exitPercent / 100);
-    this.setExitMc(newExitMc);
-    this.setEntryMc(currentMc);
-    this.setBuyExecuting(true);
-    this.buySubmitted = true;
-    const candidateLines = state.candidates.map(
-      (candidate, index) =>
-        `${index + 1}. <code>${candidate.address}</code> — <b>$${candidate.buyUsd.toFixed(2)}</b>`,
-    );
-
-    this.log.warn(
-      "Lookup-table authority non-similar wallet pattern passed — triggering buy",
-      {
+      this.emit("buyTrigger", {
+        followedWallet: this.followedWallet!,
         mint: state.mint,
-        authority: state.authority,
-        firstBuySignature: state.firstBuySignature,
-        cursorSignature: state.cursorSignature,
-        triggerSignature: trigger.signature,
-        completedWallets: trigger.completedWallets,
-        completedCount: trigger.completedWallets.length,
-        candidateWallets: state.candidates,
-        currentMc,
-        exitMc: newExitMc,
-      },
-    );
-    this.emit("buyTrigger", {
-      followedWallet: this.followedWallet!,
-      mint: state.mint,
-      signature: trigger.signature,
-      buySol: this.buySol,
-      entryMc: currentMc,
-      tradersListStr: [
-        "<b>Lookup-Table Authority Buy Gate Passed</b>",
-        `Authority: <code>${state.authority}</code>`,
-        `First candidate buy: <code>${state.firstBuySignature}</code>`,
-        `Pattern: <b>All ${trigger.completedWallets.length} non-similar wallets sold all</b>`,
-        `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-        "",
-        "<b>Frozen completed non-similar wallets:</b>",
-        ...trigger.completedWallets.map(
-          (wallet, index) => `${index + 1}. <code>${wallet}</code>`,
-        ),
-        "",
-        "<b>Five ATA-group candidate wallets:</b>",
-        ...candidateLines,
-      ].join("\n"),
-    });
+        signature: trigger.signature,
+        buySol: this.buySol,
+        entryMc: currentMc,
+        tradersListStr: [
+          "<b>Lookup-Table Authority Buy Gate Passed</b>",
+          `Authority: <code>${state.authority}</code>`,
+          `First candidate buy: <code>${state.firstBuySignature}</code>`,
+          `Pattern: <b>All ${trigger.completedWallets.length} non-similar wallets sold all</b>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          "",
+          "<b>Frozen completed non-similar wallets:</b>",
+          ...trigger.completedWallets.map(
+            (wallet, index) => `${index + 1}. <code>${wallet}</code>`,
+          ),
+          "",
+          "<b>Five ATA-group candidate wallets:</b>",
+          ...candidateLines,
+        ].join("\n"),
+      });
     } finally {
       this.isBuyGateEvaluating = false;
     }
@@ -3449,9 +3594,7 @@ export class InsiderBot extends EventEmitter {
     for (let index = 0; index < atas.length; index += 1) {
       const info = infos[index];
       const amount =
-        info && info.data.length >= 72
-          ? info.data.readBigUInt64LE(64)
-          : 0n;
+        info && info.data.length >= 72 ? info.data.readBigUInt64LE(64) : 0n;
       ataBalances.set(atas[index].toBase58(), amount);
       currentBalance += amount;
     }
@@ -3535,9 +3678,7 @@ export class InsiderBot extends EventEmitter {
       for (let index = 0; index < watch.atas.length; index += 1) {
         const info = infos[index];
         const amount =
-          info && info.data.length >= 72
-            ? info.data.readBigUInt64LE(64)
-            : 0n;
+          info && info.data.length >= 72 ? info.data.readBigUInt64LE(64) : 0n;
         watch.ataBalances.set(watch.atas[index].toBase58(), amount);
       }
       const previousBalance = watch.currentBalance;
@@ -3612,15 +3753,18 @@ export class InsiderBot extends EventEmitter {
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
-      this.log.info("Axiom/empty single-buy GMGN scan [pre_buy] — no traders returned", {
-        mint,
-        phase: "pre_buy",
-        orderBy: "buy_volume_cur",
-        tag: null,
-        buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
-        limit: AXIOM_TRADER_SCAN_LIMIT,
-        responseShape: this.describeTraderResponseShape(traders),
-      });
+      this.log.info(
+        "Axiom/empty single-buy GMGN scan [pre_buy] — no traders returned",
+        {
+          mint,
+          phase: "pre_buy",
+          orderBy: "buy_volume_cur",
+          tag: null,
+          buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
+          limit: AXIOM_TRADER_SCAN_LIMIT,
+          responseShape: this.describeTraderResponseShape(traders),
+        },
+      );
       return;
     }
 
@@ -3646,15 +3790,18 @@ export class InsiderBot extends EventEmitter {
     );
     const list = this.extractTraderList(traders);
     if (!list.length) {
-      this.log.info("Axiom/empty single-buy GMGN scan [post_buy] — no traders returned", {
-        mint,
-        phase: "post_buy",
-        orderBy: "buy_volume_cur",
-        tag: null,
-        buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
-        limit: AXIOM_TRADER_SCAN_LIMIT,
-        responseShape: this.describeTraderResponseShape(traders),
-      });
+      this.log.info(
+        "Axiom/empty single-buy GMGN scan [post_buy] — no traders returned",
+        {
+          mint,
+          phase: "post_buy",
+          orderBy: "buy_volume_cur",
+          tag: null,
+          buyUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
+          limit: AXIOM_TRADER_SCAN_LIMIT,
+          responseShape: this.describeTraderResponseShape(traders),
+        },
+      );
       return;
     }
 
@@ -3666,9 +3813,12 @@ export class InsiderBot extends EventEmitter {
     this.rememberAxiomWatchedWallets(mint, stats.matchingWallets);
   }
 
-  private extractTraderList(traders: Record<string, unknown> | null): Array<Record<string, unknown>> {
+  private extractTraderList(
+    traders: Record<string, unknown> | null,
+  ): Array<Record<string, unknown>> {
     if (!traders) return [];
-    if (Array.isArray(traders)) return traders as Array<Record<string, unknown>>;
+    if (Array.isArray(traders))
+      return traders as Array<Record<string, unknown>>;
     let list = traders.list;
     if (!Array.isArray(list)) {
       list =
@@ -3684,9 +3834,12 @@ export class InsiderBot extends EventEmitter {
     return Array.isArray(list) ? list : [];
   }
 
-  private describeTraderResponseShape(traders: Record<string, unknown> | null): Record<string, unknown> {
+  private describeTraderResponseShape(
+    traders: Record<string, unknown> | null,
+  ): Record<string, unknown> {
     if (!traders) return { type: "null" };
-    if (Array.isArray(traders)) return { type: "array", length: traders.length };
+    if (Array.isArray(traders))
+      return { type: "array", length: traders.length };
 
     const data = traders.data;
     const dataRecord =
@@ -3699,7 +3852,9 @@ export class InsiderBot extends EventEmitter {
       keys: Object.keys(traders).slice(0, 12),
       source: traders.source ?? null,
       listLength: Array.isArray(traders.list) ? traders.list.length : null,
-      tradersLength: Array.isArray(traders.traders) ? traders.traders.length : null,
+      tradersLength: Array.isArray(traders.traders)
+        ? traders.traders.length
+        : null,
       itemsLength: Array.isArray(traders.items) ? traders.items.length : null,
       dataIsArray: Array.isArray(data),
       dataLength: Array.isArray(data) ? data.length : null,
@@ -3744,28 +3899,31 @@ export class InsiderBot extends EventEmitter {
       const recipient = (tx.tokenTransfers ?? []).find(
         (t) => t.mint === mint && t.fromUserAccount === wallet,
       )?.toUserAccount;
-      this.log.warn("Bundler wallet transfer-out detected (post-buy) — selling ASAP", {
+      this.log.warn(
+        "Bundler wallet transfer-out detected (post-buy) — selling ASAP",
+        {
+          mint,
+          wallet,
+          recipient,
+          signature: tx.signature,
+          totalBuyTxs: this.tokenBuyCount,
+          totalSellTxs: this.tokenSellCount,
+        },
+      );
+      await this.triggerPositionSell(
         mint,
-        wallet,
-        recipient,
-        signature: tx.signature,
-        totalBuyTxs: this.tokenBuyCount,
-        totalSellTxs: this.tokenSellCount,
-      });
-    await this.triggerPositionSell(
-      mint,
-      recipient
+        recipient
           ? `Bundler wallet ${wallet} transferred token out to ${recipient}`
           : `Bundler wallet ${wallet} transferred token out`,
-      [
-        "<b>🚨 Bundler Transfer-Out — Selling ASAP</b>",
-        `Token: <code>${mint}</code>`,
-        `Bundler: <code>${wallet}</code>`,
-        recipient ? `Recipient: <code>${recipient}</code>` : "",
-        "Tracked bundler moved tokens out — immediate sell triggered.",
-      ].filter(Boolean),
-      "BUNDLER_TRANSFER_OUT_TRIGGER",
-    );
+        [
+          "<b>🚨 Bundler Transfer-Out — Selling ASAP</b>",
+          `Token: <code>${mint}</code>`,
+          `Bundler: <code>${wallet}</code>`,
+          recipient ? `Recipient: <code>${recipient}</code>` : "",
+          "Tracked bundler moved tokens out — immediate sell triggered.",
+        ].filter(Boolean),
+        "BUNDLER_TRANSFER_OUT_TRIGGER",
+      );
       return;
     }
 
@@ -3807,10 +3965,7 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
-  private async sendTelegramSafe(
-    text: string,
-    context: string,
-  ): Promise<void> {
+  private async sendTelegramSafe(text: string, context: string): Promise<void> {
     if (!this.telegramBot) return;
     try {
       await this.telegramBot.sendDefault(text);
@@ -3862,7 +4017,7 @@ export class InsiderBot extends EventEmitter {
 
     await this.stopFlowMonitoring();
     if (clearPosition) {
-    this.activePosition = null;
+      this.activePosition = null;
     }
     this.watchingMint = null;
     this.phase = null;
