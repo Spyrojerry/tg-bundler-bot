@@ -2881,77 +2881,26 @@ async function main(): Promise<void> {
       if (!currentPending) return;
 
       let lastResult: SellResult | null = null;
-      let lastError: unknown = null;
-      let sold = false;
 
       log.info(
         `[SELL EXECUTE] Starting sell for ${currentPending.event.mint} (Initial Balance: ${startingBalance ?? "unknown"})`,
       );
 
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        try {
-          lastResult = await gmgnClients[0].sellTokenForSol(
-            currentPending.event.walletAddress,
-            currentPending.event.mint,
-            {
-              percent: config.sellPercent,
-              slippage: config.sellSlippage,
-              autoSlippage: config.sellAutoSlippage,
-              priorityFeeSol: config.sellPriorityFeeSol,
-              antiMev: config.sellAntiMev,
-              preFetchedBalance: startingBalance ?? undefined,
-            },
-          );
-          lastError = null;
-
-          if (lastResult.status === "confirmed") {
-            await sleep(250);
-            const remainingBalance = await getTokenRawBalance(
-              owner,
-              mintPk,
-            ).catch(() => null);
-            if (remainingBalance !== null && remainingBalance <= 0n) {
-              sold = true;
-              break;
-            }
-            lastError = new Error(
-              `Sell transaction confirmed but token balance remains ${remainingBalance ?? "unknown"}`,
-            );
-            log.warn(
-              `Sell transaction confirmed but balance not cleared for ${currentPending.event.mint}`,
-              {
-                hash: lastResult.hash,
-                remainingBalance: remainingBalance?.toString() ?? "unknown",
-              },
-            );
-          }
-        } catch (err) {
-          lastError = err;
-          log.warn(
-            `Sell attempt ${attempt}/5 failed for ${currentPending.event.mint}`,
-            {
-              error: err instanceof Error ? err.message : String(err),
-            },
-          );
-        }
-
-        if (attempt < 5) {
-          await sleep(100);
-          const remainingBalance = await getTokenRawBalance(
-            owner,
-            mintPk,
-          ).catch(() => null);
-          if (remainingBalance !== null && remainingBalance <= 0n) {
-            sold = true;
-            break;
-          }
-        }
-      }
-
-      if (!sold) {
-        throw (
-          lastError ??
-          new Error(`Sell did not clear token balance after 5 attempts`)
+      lastResult = await gmgnClients[0].sellTokenForSol(
+        currentPending.event.walletAddress,
+        currentPending.event.mint,
+        {
+          percent: config.sellPercent,
+          slippage: config.sellSlippage,
+          autoSlippage: config.sellAutoSlippage,
+          priorityFeeSol: config.sellPriorityFeeSol,
+          antiMev: config.sellAntiMev,
+          preFetchedBalance: startingBalance ?? undefined,
+        },
+      );
+      if (lastResult.status !== "confirmed") {
+        throw new Error(
+          `PumpPortal sell returned unexpected status: ${lastResult.status}`,
         );
       }
 
@@ -2961,23 +2910,7 @@ async function main(): Promise<void> {
         insiderBots[pending.event.insiderBotIndex]?.clearActivePosition();
       }
 
-      const receiptResult = lastResult
-        ? {
-            ...lastResult,
-            status:
-              lastResult.status === "failed" ? "confirmed" : lastResult.status,
-          }
-        : {
-            orderId: null,
-            hash: null,
-            status: "confirmed",
-            inputToken: currentPending.event.mint,
-            outputToken: "So11111111111111111111111111111111111111112",
-            soldPercent: config.sellPercent,
-            filledInputAmount: null,
-            filledOutputAmount: null,
-            raw: {},
-          };
+      const receiptResult = lastResult;
       if (
         currentPending.event.entryMc !== null &&
         currentPending.event.entryMc !== undefined

@@ -63,6 +63,8 @@ const BLOCKED_RETRY_MS = 60_000;
 const JUPITER_ORDER_RETRIES = 5;
 const JUPITER_SELL_RETRIES = 5;
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade";
+const PUMPPORTAL_STATUS_CHECKPOINTS_MS = [300, 800, 1_500, 3_000, 5_000];
 const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const TOKEN_PROGRAM_IDS = [
@@ -71,6 +73,11 @@ const TOKEN_PROGRAM_IDS = [
 ];
 
 type PumpTradeVenue = "bonding_curve" | "pump_swap" | "unknown";
+type PumpPortalTradeAction = "buy" | "sell";
+type PumpPortalSignatureState =
+  | { status: "confirmed"; error: null }
+  | { status: "failed"; error: unknown }
+  | { status: "unknown"; error: null };
 
 // ── Helper: sleep ─────────────────────────────────────────────────────────────
 
@@ -85,6 +92,8 @@ export class GmgnClient {
   private readonly jupiterSwapBaseUrl: string;
   private readonly jupiterApiKey: string;
   private readonly jupiterPriceApiKey: string;
+  private readonly pumpPortalApiKey: string | null;
+  private readonly pumpPortalWalletAddress: string | null;
   private readonly connection: Connection;
   private readonly chain = "sol";
   private readonly limiter: RateLimiter;
@@ -108,6 +117,8 @@ export class GmgnClient {
     this.jupiterSwapBaseUrl = config.jupiterSwapBaseUrl.replace(/\/$/, "");
     this.jupiterApiKey = config.jupiterApiKey;
     this.jupiterPriceApiKey = config.jupiterPriceApiKey;
+    this.pumpPortalApiKey = config.pumpPortalApiKey;
+    this.pumpPortalWalletAddress = config.pumpPortalWalletAddress;
     this.connection = new Connection(
       rpcUrlOverride || config.solanaRpcUrl,
       "confirmed",
@@ -931,253 +942,414 @@ export class GmgnClient {
     mint: string,
     options: BuyOptions,
   ): Promise<SellResult> {
-    if (!this.tradingKeypair)
-      throw new Error("No JUPITER_PRIVATE_KEY configured");
-
     const venue = await this.detectPumpTradeVenue(mint);
-
-    if (venue !== "pump_swap") {
-      try {
-        return await this.buyTokenWithSolViaPump(walletAddress, mint, options);
-      } catch (err) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        if (errorMessage.includes("was not confirmed")) {
-          log.warn(
-            `Custom Pump.fun buy was submitted but confirmation is uncertain for ${mint}; skipping Jupiter fallback to avoid a duplicate buy`,
-            { error: errorMessage },
-          );
-          throw err;
-        }
-        log.warn(
-          `Custom Pump.fun bonding-curve buy path failed for ${mint}; trying PumpSwap AMM`,
-          {
-            error: errorMessage,
-          },
-        );
-      }
-    } else {
-      log.info(
-        `Token migration detected before buy; routing directly to PumpSwap AMM`,
-        {
-          mint,
-          venue,
-        },
-      );
-    }
-
-    try {
-      return await this.buyTokenWithSolViaPumpSwap(
-        walletAddress,
-        mint,
-        options,
-      );
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : String(err);
-      if (errorMessage.includes("was not confirmed")) {
-        log.warn(
-          `Custom PumpSwap buy was submitted but confirmation is uncertain for ${mint}; skipping Jupiter fallback to avoid a duplicate buy`,
-          { error: errorMessage },
-        );
-        throw err;
-      }
-      log.warn(
-        `Custom PumpSwap AMM buy path failed for ${mint}; falling back to Jupiter`,
-        {
-          error: errorMessage,
-        },
-      );
-    }
-
-    const amountLamports = Math.floor(options.solAmount * 1e9);
-
-    // 1. GET ORDER (V2 Meta-Aggregator)
-    const orderUrl = `${this.jupiterSwapBaseUrl}/order?inputMint=${SOL_MINT}&outputMint=${mint}&amount=${amountLamports}&taker=${walletAddress}`;
-    const order = await this.fetchJupiterJson(orderUrl, "GET");
-
-    if (!order.transaction || !order.requestId) {
-      throw new Error(
-        `Invalid Jupiter order response: ${JSON.stringify(order)}`,
-      );
-    }
-
-    // 2. SIGN TRANSACTION
-    const signedTx = this.signVersionedTransaction(order.transaction as string);
-
-    // 3. EXECUTE
-    const execute = await this.fetchJupiterJson(
-      `${this.jupiterSwapBaseUrl}/execute`,
-      "POST",
-      {
-        signedTransaction: signedTx,
-        requestId: order.requestId,
-      },
+    return this.executePumpPortalLightningTrade(
+      "buy",
+      walletAddress,
+      mint,
+      options,
+      venue,
     );
-
-    return {
-      orderId: String(order.requestId),
-      hash: String(execute.signature),
-      status: "confirmed",
-      inputToken: SOL_MINT,
-      outputToken: mint,
-      soldPercent: 100,
-      filledInputAmount: String(order.inAmount || 0),
-      filledOutputAmount: String(order.outAmount || 0),
-      raw: { order, execute },
-    };
   }
 
-  // REPLACE lines 658-701 with:
   async sellTokenForSol(
     walletAddress: string,
     mint: string,
     options: SellOptions & { preFetchedBalance?: bigint },
   ): Promise<SellResult> {
-    if (!this.tradingKeypair)
-      throw new Error("No JUPITER_PRIVATE_KEY configured");
-
-    const balance =
-      options.preFetchedBalance !== undefined
-        ? options.preFetchedBalance
-        : await this.getTokenBalance(walletAddress, mint);
-
-    if (balance === 0n) throw new Error(`No token balance found for ${mint}`);
-
-    let amountRaw = (balance * BigInt(Math.round(options.percent))) / 100n;
-    if (amountRaw <= 0n) throw new Error(`Sell amount is zero for ${mint}`);
-
     const venue = await this.detectPumpTradeVenue(mint);
+    return this.executePumpPortalLightningTrade(
+      "sell",
+      walletAddress,
+      mint,
+      options,
+      venue,
+      options.preFetchedBalance,
+    );
+  }
 
-    if (venue !== "pump_swap") {
-      try {
-        return await this.sellTokenForSolViaPump(
-          walletAddress,
-          mint,
-          amountRaw,
-          options,
-        );
-      } catch (err) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        if (this.isPumpOnlySellFailure(errorMessage)) {
-          log.warn(
-            `Pump.fun sell path failed for ${mint}; skipping Jupiter fallback`,
-            {
-              error: errorMessage,
-            },
-          );
-          throw err;
-        }
-        log.warn(
-          `Pump.fun bonding-curve sell path failed for ${mint}; trying PumpSwap AMM`,
-          {
-            error: errorMessage,
-          },
-        );
-      }
-    } else {
-      log.info(
-        `Token migration detected before sell; routing directly to PumpSwap AMM`,
-        {
-          mint,
-          venue,
-        },
-      );
-    }
-
-    const pumpSwapBalance = await this.getTokenBalance(walletAddress, mint);
-    const pumpSwapAmount =
-      (pumpSwapBalance * BigInt(Math.round(options.percent))) / 100n;
-    if (pumpSwapAmount > 0n) {
-      try {
-        return await this.sellTokenForSolViaPumpSwap(
-          walletAddress,
-          mint,
-          pumpSwapAmount,
-          options,
-        );
-      } catch (err) {
-        log.warn(
-          `Direct PumpSwap AMM sell path failed for ${mint}; falling back to Jupiter`,
-          {
-            error: err instanceof Error ? err.message : String(err),
-          },
-        );
-      }
-    }
-
-    const refreshedBalance = await this.getTokenBalance(walletAddress, mint);
-    amountRaw = (refreshedBalance * BigInt(Math.round(options.percent))) / 100n;
-    if (amountRaw <= 0n) {
+  private async executePumpPortalLightningTrade(
+    action: PumpPortalTradeAction,
+    walletAddress: string,
+    mint: string,
+    options: BuyOptions | SellOptions,
+    venue: PumpTradeVenue,
+    preFetchedBalance?: bigint,
+  ): Promise<SellResult> {
+    if (!this.pumpPortalApiKey) {
       throw new Error(
-        `No token balance remains for Jupiter fallback on ${mint}`,
+        "PUMPPORTAL_API_KEY is required for Lightning buy/sell execution",
+      );
+    }
+    if (!this.pumpPortalWalletAddress) {
+      throw new Error(
+        "PUMPPORTAL_WALLET_ADDRESS is required for Lightning balance verification",
+      );
+    }
+    if (walletAddress !== this.pumpPortalWalletAddress) {
+      throw new Error(
+        `TRADING_WALLET_ADDRESS must match PUMPPORTAL_WALLET_ADDRESS before Lightning trading (received ${walletAddress})`,
       );
     }
 
-    // 1. QUOTE (v1 standard aggregator)
-    const slippageBps = this.toJupiterSlippageBps(options);
-    const slippageParam =
-      slippageBps !== null
-        ? `slippageBps=${slippageBps}`
-        : `autoSlippage=true&maxAutoSlippageBps=3000`;
+    this.validateSolAddress(walletAddress, "PumpPortal Lightning wallet");
+    this.validateSolAddress(mint, "mint");
 
-    const JUPITER_V1_BASE = "https://api.jup.ag/swap/v1";
-    const quoteUrl = `${JUPITER_V1_BASE}/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amountRaw.toString()}&${slippageParam}`;
-    const quote = await this.fetchJupiterJson(quoteUrl, "GET");
-
-    if (!quote.outAmount) {
-      throw new Error(`Jupiter quote failed: ${JSON.stringify(quote)}`);
+    const balanceBefore = await this.getTokenBalance(walletAddress, mint);
+    if (
+      preFetchedBalance !== undefined &&
+      preFetchedBalance !== balanceBefore
+    ) {
+      log.info(`Ignoring stale cached token balance before PumpPortal sell`, {
+        mint,
+        cachedBalance: preFetchedBalance.toString(),
+        liveBalance: balanceBefore.toString(),
+      });
+    }
+    if (action === "buy" && balanceBefore > 0n) {
+      log.info(`PumpPortal buy skipped because wallet already holds ${mint}`, {
+        walletAddress,
+        balance: balanceBefore.toString(),
+      });
+      return this.pumpPortalResult(
+        action,
+        mint,
+        null,
+        options,
+        balanceBefore,
+        balanceBefore,
+        venue,
+        0,
+        "already-held",
+      );
+    }
+    if (action === "sell" && balanceBefore === 0n) {
+      log.info(`PumpPortal sell skipped because token balance is already zero`, {
+        walletAddress,
+        mint,
+      });
+      return this.pumpPortalResult(
+        action,
+        mint,
+        null,
+        options,
+        balanceBefore,
+        0n,
+        venue,
+        0,
+        "already-sold",
+      );
     }
 
-    // 2. GET SWAP TRANSACTION (v1 standard)
-    const swapBody: Record<string, unknown> = {
-      quoteResponse: quote,
-      userPublicKey: walletAddress,
-      wrapAndUnwrapSol: true,
-      prioritizationFeeLamports:
-        options.priorityFeeSol > 0
-          ? Math.floor(options.priorityFeeSol * 1e9)
-          : "auto",
+    let lastSignature: string | null = null;
+    let lastState: PumpPortalSignatureState = {
+      status: "unknown",
+      error: null,
     };
 
-    const swapResp = await this.fetchJupiterJson(
-      `${JUPITER_V1_BASE}/swap`,
-      "POST",
-      swapBody,
-    );
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        lastSignature = await this.submitPumpPortalLightningTrade(
+          action,
+          mint,
+          options,
+          venue,
+        );
+      } catch (submitError) {
+        const balanceAfter = await this.getTokenBalance(walletAddress, mint);
+        const balanceProvesCompletion =
+          action === "buy"
+            ? balanceAfter > 0n
+            : (options as SellOptions).percent >= 100
+              ? balanceAfter === 0n
+              : balanceAfter < balanceBefore;
+        if (balanceProvesCompletion) {
+          log.warn(
+            `PumpPortal Lightning ${action} request errored but wallet balance proves completion`,
+            {
+              mint,
+              attempt,
+              error:
+                submitError instanceof Error
+                  ? submitError.message
+                  : String(submitError),
+              balanceBefore: balanceBefore.toString(),
+              balanceAfter: balanceAfter.toString(),
+            },
+          );
+          return this.pumpPortalResult(
+            action,
+            mint,
+            null,
+            options,
+            balanceBefore,
+            balanceAfter,
+            venue,
+            attempt,
+            "request-error-balance-recovered",
+          );
+        }
+        if (attempt === 1) {
+          log.warn(`Retrying PumpPortal Lightning ${action} once after request error`, {
+            mint,
+            error:
+              submitError instanceof Error
+                ? submitError.message
+                : String(submitError),
+            balance: balanceAfter.toString(),
+          });
+          continue;
+        }
+        throw submitError;
+      }
+      lastState = await this.waitForPumpPortalSignature(lastSignature);
 
-    if (!swapResp.swapTransaction) {
-      throw new Error(
-        `Jupiter swap response missing transaction: ${JSON.stringify(swapResp)}`,
-      );
+      if (lastState.status === "confirmed") {
+        const balanceAfter = await this.getTokenBalance(
+          walletAddress,
+          mint,
+        ).catch(() => balanceBefore);
+        log.info(`PumpPortal Lightning ${action} confirmed`, {
+          mint,
+          signature: lastSignature,
+          attempt,
+          pool: this.pumpPortalPoolForVenue(venue),
+          balanceBefore: balanceBefore.toString(),
+          balanceAfter: balanceAfter.toString(),
+        });
+        return this.pumpPortalResult(
+          action,
+          mint,
+          lastSignature,
+          options,
+          balanceBefore,
+          balanceAfter,
+          venue,
+          attempt,
+          "signature-confirmed",
+        );
+      }
+
+      const balanceAfter = await this.getTokenBalance(walletAddress, mint);
+      const balanceProvesCompletion =
+        action === "buy"
+          ? balanceAfter > 0n
+          : (options as SellOptions).percent >= 100
+            ? balanceAfter === 0n
+            : balanceAfter < balanceBefore;
+
+      if (balanceProvesCompletion) {
+        log.warn(
+          `PumpPortal Lightning ${action} recovered from wallet balance`,
+          {
+            mint,
+            signature: lastSignature,
+            signatureStatus: lastState.status,
+            attempt,
+            balanceBefore: balanceBefore.toString(),
+            balanceAfter: balanceAfter.toString(),
+          },
+        );
+        return this.pumpPortalResult(
+          action,
+          mint,
+          lastSignature,
+          options,
+          balanceBefore,
+          balanceAfter,
+          venue,
+          attempt,
+          "balance-recovered",
+        );
+      }
+
+      if (attempt === 1) {
+        log.warn(`Retrying PumpPortal Lightning ${action} once`, {
+          mint,
+          signature: lastSignature,
+          signatureStatus: lastState.status,
+          signatureError: lastState.error,
+          balance: balanceAfter.toString(),
+        });
+      }
     }
 
-    // 3. SIGN
-    const tx = VersionedTransaction.deserialize(
-      Buffer.from(swapResp.swapTransaction as string, "base64"),
+    throw new Error(
+      `PumpPortal Lightning ${action} failed after one retry for ${mint}` +
+        (lastSignature ? ` (last signature ${lastSignature})` : "") +
+        (lastState.status === "failed"
+          ? `: ${JSON.stringify(lastState.error)}`
+          : ": signature remained unknown and wallet balance did not change"),
     );
-    tx.sign([this.tradingKeypair]);
-    const rawTx = Buffer.from(tx.serialize());
+  }
 
-    // 4. SEND via RPC directly (no Ultra /execute needed)
-    const signature = await this.sendRawTransactionAndAssertSuccess(
-      rawTx,
-      mint,
-    );
+  private async submitPumpPortalLightningTrade(
+    action: PumpPortalTradeAction,
+    mint: string,
+    options: BuyOptions | SellOptions,
+    venue: PumpTradeVenue,
+  ): Promise<string> {
+    const amount =
+      action === "buy"
+        ? (options as BuyOptions).solAmount
+        : `${Math.min(Math.max((options as SellOptions).percent, 0), 100)}%`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
-    log.info(`Sell transaction sent: ${signature}`, {
-      mint,
-      amount: amountRaw.toString(),
-    });
+    try {
+      const response = await fetch(
+        `${PUMPPORTAL_TRADE_URL}?api-key=${encodeURIComponent(this.pumpPortalApiKey!)}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            action,
+            mint,
+            amount,
+            denominatedInSol: action === "buy" ? "true" : "false",
+            slippage: options.autoSlippage ? 30 : options.slippage,
+            priorityFee: options.priorityFeeSol,
+            pool: this.pumpPortalPoolForVenue(venue),
+            skipPreflight: "false",
+          }),
+          signal: controller.signal,
+        },
+      );
+      const text = await response.text();
+      let data: unknown = text;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        // PumpPortal may return the signature as plain text.
+      }
 
+      if (!response.ok) {
+        throw new Error(
+          `PumpPortal API ${response.status}: ${this.pumpPortalErrorMessage(data)}`,
+        );
+      }
+
+      const signature = this.extractPumpPortalSignature(data);
+      if (!signature) {
+        throw new Error(
+          `PumpPortal returned no transaction signature: ${this.pumpPortalErrorMessage(data)}`,
+        );
+      }
+      log.info(`PumpPortal Lightning ${action} submitted`, {
+        mint,
+        signature,
+        amount,
+        pool: this.pumpPortalPoolForVenue(venue),
+      });
+      return signature;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async waitForPumpPortalSignature(
+    signature: string,
+  ): Promise<PumpPortalSignatureState> {
+    const startedAt = Date.now();
+    for (const checkpointMs of PUMPPORTAL_STATUS_CHECKPOINTS_MS) {
+      const remainingMs = checkpointMs - (Date.now() - startedAt);
+      if (remainingMs > 0) await sleep(remainingMs);
+
+      const response = await this.connection
+        .getSignatureStatuses([signature], { searchTransactionHistory: true })
+        .catch(() => null);
+      const status = response?.value[0] ?? null;
+      if (status?.err) return { status: "failed", error: status.err };
+      if (
+        status?.confirmationStatus === "confirmed" ||
+        status?.confirmationStatus === "finalized"
+      ) {
+        return { status: "confirmed", error: null };
+      }
+    }
+    return { status: "unknown", error: null };
+  }
+
+  private pumpPortalPoolForVenue(venue: PumpTradeVenue): "pump" | "auto" {
+    return venue === "bonding_curve" ? "pump" : "auto";
+  }
+
+  private extractPumpPortalSignature(data: unknown): string | null {
+    if (typeof data === "string") {
+      const trimmed = data.trim().replace(/^"|"$/g, "");
+      return /^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(trimmed) ? trimmed : null;
+    }
+    if (!data || typeof data !== "object") return null;
+    const record = data as Record<string, unknown>;
+    for (const value of [
+      record.signature,
+      record.txSignature,
+      record.transactionSignature,
+      record.txid,
+    ]) {
+      if (
+        typeof value === "string" &&
+        /^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(value)
+      ) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  private pumpPortalErrorMessage(data: unknown): string {
+    if (typeof data === "string") return data.slice(0, 500);
+    if (!data || typeof data !== "object") return String(data);
+    const record = data as Record<string, unknown>;
+    const message = record.error ?? record.errors ?? record.message ?? data;
+    return typeof message === "string"
+      ? message.slice(0, 500)
+      : JSON.stringify(message).slice(0, 500);
+  }
+
+  private pumpPortalResult(
+    action: PumpPortalTradeAction,
+    mint: string,
+    signature: string | null,
+    options: BuyOptions | SellOptions,
+    balanceBefore: bigint,
+    balanceAfter: bigint,
+    venue: PumpTradeVenue,
+    attempt: number,
+    verification: string,
+  ): SellResult {
+    const isBuy = action === "buy";
+    const filledTokenAmount = isBuy
+      ? balanceAfter > balanceBefore
+        ? balanceAfter - balanceBefore
+        : 0n
+      : balanceBefore > balanceAfter
+        ? balanceBefore - balanceAfter
+        : 0n;
     return {
       orderId: null,
       hash: signature,
       status: "confirmed",
-      inputToken: mint,
-      outputToken: SOL_MINT,
-      soldPercent: options.percent,
-      filledInputAmount: String(amountRaw),
-      filledOutputAmount: String(quote.outAmount),
-      raw: { quote, swapResp },
+      inputToken: isBuy ? SOL_MINT : mint,
+      outputToken: isBuy ? mint : SOL_MINT,
+      soldPercent: isBuy ? 100 : (options as SellOptions).percent,
+      filledInputAmount: isBuy
+        ? String(Math.floor((options as BuyOptions).solAmount * 1e9))
+        : filledTokenAmount.toString(),
+      filledOutputAmount: isBuy ? filledTokenAmount.toString() : null,
+      raw: {
+        route: "pumpportal-lightning",
+        action,
+        pool: this.pumpPortalPoolForVenue(venue),
+        venue,
+        attempt,
+        verification,
+        balanceBefore: balanceBefore.toString(),
+        balanceAfter: balanceAfter.toString(),
+      },
     };
   }
 

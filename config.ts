@@ -90,6 +90,8 @@ export function loadConfig(): ServiceConfig {
   const jupiterSwapBaseUrl = optional('JUPITER_SWAP_BASE_URL', 'https://api.jup.ag/swap/v2');
   const jupiterApiKey    = required('JUPITER_API_KEY');
   const jupiterPriceApiKey = optional('JUPITER_PRICE_API_KEY', jupiterApiKey);
+  const pumpPortalApiKey = optionalNullable('PUMPPORTAL_API_KEY');
+  const pumpPortalWalletAddress = optionalNullable('PUMPPORTAL_WALLET_ADDRESS');
   const heliusApiKey     = optional('HELIUS_API_KEY', '');
   const receiverHeliusApiKey = optional('RECEIVER_HELIUS_API_KEY', '');
   const receiverSolanaRpcUrl = optional(
@@ -224,6 +226,8 @@ export function loadConfig(): ServiceConfig {
     jupiterSwapBaseUrl,
     jupiterApiKey,
     jupiterPriceApiKey,
+    pumpPortalApiKey,
+    pumpPortalWalletAddress,
     monitorInterval,
     monitoringWindowMs,
     rateLimitMinTime,

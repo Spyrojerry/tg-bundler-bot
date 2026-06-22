@@ -142,6 +142,8 @@ export interface ServiceConfig {
   jupiterSwapBaseUrl: string;
   jupiterApiKey: string;
   jupiterPriceApiKey: string;
+  pumpPortalApiKey: string | null;
+  pumpPortalWalletAddress: string | null;
   monitorInterval: number;
   monitoringWindowMs: number;  // legacy env setting; linked tokens use apply-sample decisions
   rateLimitMinTime: number;
