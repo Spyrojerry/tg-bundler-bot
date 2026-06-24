@@ -575,7 +575,7 @@ async function main(): Promise<void> {
             index: activeInsiderIndex,
           });
           return {
-            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the Exit profit percentage increase.\nExample: <code>40</code> for a 40% ATH MC increase from your entry point.`,
+            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the Exit profit percentage increase.\nExample: <code>40</code> for a 40% current MC increase from your entry point.`,
             trackPrompt: true,
             editCurrent: true,
           };
@@ -1313,8 +1313,8 @@ async function main(): Promise<void> {
                   ? `Tx: https://solscan.io/tx/${html(result.hash)}`
                   : "",
                 "",
-                "<b>Strategy: ATH MC Exit</b>",
-                `Exit when ATH MC reaches: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
+                "<b>Strategy: Current MC Exit</b>",
+                `Exit when current MC reaches: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
               ]
                 .filter(Boolean)
                 .join("\n"),
@@ -1997,16 +1997,15 @@ async function main(): Promise<void> {
 
       if (activePos) {
         const exitMc = bot.getExitMc();
-        const athMc = await client.fetchTokenAthMarketCapUsd(mint);
-        if (athMc !== null && athMc >= exitMc) {
+        if (currentMc >= exitMc) {
           log.warn(
-            `[INSIDER ${botNumber} EXIT] ATH MC $${athMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`,
+            `[INSIDER ${botNumber} EXIT] Current MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`,
           );
           bot.emit("sellTrigger", {
             followedWallet: bot.getFollowedWallet()!,
             positionMint: activePos.mint,
             signature: "MC_TRIGGER",
-            reason: `ATH MC $${athMc.toLocaleString()} reached target $${exitMc.toLocaleString()}`,
+            reason: `Current MC $${currentMc.toLocaleString()} reached target $${exitMc.toLocaleString()}`,
           });
         }
       }
@@ -2540,7 +2539,7 @@ async function main(): Promise<void> {
             ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
             : "",
           `Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
-          `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% ATH MC from Entry</b>`,
+          `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% Current MC from Entry</b>`,
           `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
           "",
           "<b>Flow</b>",
@@ -2549,7 +2548,7 @@ async function main(): Promise<void> {
           "3. GMGN discovers cumulative axiom/empty single-buy wallets; their ATAs are polled independently.",
           "4. Buy when the largest similar-SOL balance group has at least 10 existing ATA wallets and no more than 3 group wallets have reduced their token balance.",
           "5. After buy: continue Axiom discovery and independent ATA polling.",
-          "6. Sell when at least 5 wallets and at least 20% of the largest similar-SOL group have reduced their token balance, the largest group collapses to 2, on ATH MC target, rug threshold, or manual sell.",
+          "6. Sell when at least 5 wallets and at least 20% of the largest similar-SOL group have reduced their token balance, the largest group collapses to 2, on current MC target, rug threshold, or manual sell.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
         ].join("\n"),
         replyMarkup: {
