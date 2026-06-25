@@ -170,7 +170,7 @@ async function main(): Promise<void> {
 
   let telegramBot: TelegramBot | null = null;
   const insiderBots: InsiderBot[] = [];
-  let activeInsiderIndex = 0; // Which insider bot we are currently viewing/configuring in Telegram
+  let activeInsiderIndex = 0; // Insider UI is pinned to bot 1; keys 2-4 provide API capacity.
 
   // ── 4. Early Bundler Orchestrator ─────────────────────────────────────────
   let earlyBundlerOrchestrator: EarlyBundlerOrchestrator;
@@ -481,7 +481,7 @@ async function main(): Promise<void> {
           await stopBundlerModeServices("Switched to Insider mode");
           await stopReverseCopySellModeServices("Switched to Insider mode");
           botMode = "insider";
-          await resumeAllInsiderBots();
+          await resumePrimaryInsiderBot();
           return homeReply(true);
         }
         if (data === "mode:bundler") {
@@ -536,91 +536,73 @@ async function main(): Promise<void> {
           return homeReply(true);
         }
         if (data.startsWith("insider:select:")) {
-          const selectedIndex = parseInt(data.split(":")[2], 10);
-          if (
-            !Number.isInteger(selectedIndex) ||
-            selectedIndex < 0 ||
-            selectedIndex >= insiderBots.length
-          ) {
-            return "Invalid Insider bot selection.";
-          }
-          activeInsiderIndex = selectedIndex;
+          activeInsiderIndex = 0;
           return homeReply(true);
         }
         if (data === "insider:follow") {
+          activeInsiderIndex = 0;
           pendingTelegramActions.set(chatId, {
             type: "insiderFollowWallet",
-            index: activeInsiderIndex,
+            index: 0,
           });
           return {
-            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the wallet address for Insider Bot to follow.`,
+            text: "Send the one wallet address for Insider Bot to follow.",
             trackPrompt: true,
             editCurrent: true,
           };
         }
         if (data === "insider:buysol") {
+          activeInsiderIndex = 0;
           pendingTelegramActions.set(chatId, {
             type: "insiderBuySol",
-            index: activeInsiderIndex,
+            index: 0,
           });
           return {
-            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the SOL amount Insider Bot should buy with.`,
+            text: "Send the SOL amount Insider Bot should buy with.",
             trackPrompt: true,
             editCurrent: true,
           };
         }
         if (data === "insider:exitpercent") {
+          activeInsiderIndex = 0;
           pendingTelegramActions.set(chatId, {
             type: "insiderExitPercent",
-            index: activeInsiderIndex,
+            index: 0,
           });
           return {
-            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the Exit profit percentage increase.\nExample: <code>40</code> for a 40% current MC increase from your entry point.`,
+            text: "Send the Exit profit percentage increase.\nExample: <code>40</code> for a 40% current MC increase from your entry point.",
             trackPrompt: true,
             editCurrent: true,
           };
         }
         if (data === "insider:bundlermin") {
-          pendingTelegramActions.set(chatId, {
-            type: "insiderBundlerMinUsd",
-            index: activeInsiderIndex,
-          });
-          return {
-            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the minimum bundler buy USD.\nExample: <code>100</code>`,
-            trackPrompt: true,
-            editCurrent: true,
-          };
+          return homeReply(true);
         }
         if (data === "insider:bundlermax") {
-          pendingTelegramActions.set(chatId, {
-            type: "insiderBundlerMaxUsd",
-            index: activeInsiderIndex,
-          });
-          return {
-            text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the maximum bundler buy USD.\nExample: <code>150</code>`,
-            trackPrompt: true,
-            editCurrent: true,
-          };
+          return homeReply(true);
         }
         if (data === "insider:togglebuy") {
-          const bot = insiderBots[activeInsiderIndex];
+          activeInsiderIndex = 0;
+          const bot = insiderBots[0];
           bot.setBuyDisabled(!bot.isBuyDisabled());
           return homeReply(true);
         }
         if (data === "insider:stop") {
-          await insiderBots[activeInsiderIndex].stop();
+          activeInsiderIndex = 0;
+          await insiderBots[0].stop();
           return homeReply(true);
         }
         if (data === "insider:resume") {
-          const bot = insiderBots[activeInsiderIndex];
+          activeInsiderIndex = 0;
+          const bot = insiderBots[0];
           const followedWallet = bot.getFollowedWallet();
           if (!followedWallet) {
             pendingTelegramActions.set(chatId, {
               type: "insiderFollowWallet",
-              index: activeInsiderIndex,
+              index: 0,
             });
             return {
-              text: `[Bot ${getInsiderBotNumber(activeInsiderIndex)}] Send the wallet address for Insider Bot to follow.`,
+              text: "Send the one wallet address for Insider Bot to follow.",
               trackPrompt: true,
               editCurrent: true,
             };
@@ -921,25 +903,22 @@ async function main(): Promise<void> {
     insiderBots.push(bot);
   });
 
-  async function resumeAllInsiderBots(): Promise<void> {
-    for (let i = 0; i < insiderBots.length; i++) {
-      const bot = insiderBots[i];
-      const wallet = bot.getFollowedWallet();
-      if (
-        wallet &&
-        !bot.isStoppedForHeliusCredits() &&
-        !bot.isRunning() &&
-        !bot.getActivePosition() &&
-        !bot.getPreBuyMint()
-      ) {
-        await bot.followWallet(wallet);
-        log.info(
-          `[INSIDER ${getInsiderBotNumber(i)}] Resumed follow-wallet monitoring`,
-          {
-            wallet,
-          },
-        );
-      }
+  async function resumePrimaryInsiderBot(): Promise<void> {
+    const bot = insiderBots[0];
+    if (!bot) return;
+    const wallet = bot.getFollowedWallet();
+    if (
+      wallet &&
+      !bot.isStoppedForHeliusCredits() &&
+      !bot.isRunning() &&
+      !bot.getActivePosition() &&
+      !bot.getPreBuyMint()
+    ) {
+      await bot.followWallet(wallet);
+      log.info("[INSIDER] Resumed primary follow-wallet monitoring", {
+        wallet,
+        apiPoolBots: insiderBots.length,
+      });
     }
   }
 
@@ -2482,7 +2461,8 @@ async function main(): Promise<void> {
 
   function homeReply(editCurrent = false): TelegramReply {
     if (botMode === "insider") {
-      const bot = insiderBots[activeInsiderIndex];
+      activeInsiderIndex = 0;
+      const bot = insiderBots[0];
       const followedWallet = bot.getFollowedWallet();
       const insiderRunning = bot.isRunning();
       const preBuyMint = bot.getPreBuyMint();
@@ -2512,25 +2492,9 @@ async function main(): Promise<void> {
 
       const monitoredWallet = bot.getMonitoredWallet();
 
-      const botSelectionRows = insiderBots.reduce<
-        Array<Array<{ text: string; callback_data: string }>>
-      >((rows, _insiderBot, index) => {
-        const rowIndex = Math.floor(index / 2);
-        const botNumber = getInsiderBotNumber(index);
-        rows[rowIndex] ??= [];
-        rows[rowIndex].push({
-          text:
-            activeInsiderIndex === index
-              ? `🟢 Bot ${botNumber}`
-              : `Bot ${botNumber}`,
-          callback_data: `insider:select:${index}`,
-        });
-        return rows;
-      }, []);
-
       return {
         text: [
-          `<b>Insider Bot ${getInsiderBotNumber(activeInsiderIndex)}</b>`,
+          "<b>Insider Bot</b>",
           "",
           `Mode: <b>Insider</b>`,
           `Status: <b>${status}</b>`,
@@ -2560,18 +2524,16 @@ async function main(): Promise<void> {
               { text: "Insider", callback_data: "mode:insider" },
               { text: "Bundler", callback_data: "mode:bundler" },
             ],
-            ...botSelectionRows,
             [
               { text: "Follow wallet", callback_data: "insider:follow" },
               { text: "Buy SOL", callback_data: "insider:buysol" },
             ],
             [
               { text: "Set Exit %", callback_data: "insider:exitpercent" },
-              { text: "Bundler Min $", callback_data: "insider:bundlermin" },
-            ],
-            [{ text: "Bundler Max $", callback_data: "insider:bundlermax" }],
-            [
               disableBuyButton,
+            ],
+            [
+              { text: "Status", callback_data: "menu:status" },
               { text: "Refresh", callback_data: "menu:refresh" },
             ],
             [stopResumeButton],
@@ -2716,24 +2678,21 @@ async function main(): Promise<void> {
   function statusReply(editCurrent = false): TelegramReply {
     let text = "";
     if (botMode === "insider") {
-      const botsInfo = insiderBots
-        .map((bot, i) => {
-          const followed = bot.getFollowedWallet();
-          const status = bot.isRunning()
-            ? "Running"
-            : followed
-              ? "Paused"
-              : "Idle";
-          return [
-            `<b>Insider Bot ${getInsiderBotNumber(i)}</b>`,
-            `Status: ${status}`,
-            `Follow: ${followed ?? "not set"}`,
-            `Buy: ${bot.getBuySol()} SOL`,
-          ].join("\n");
-        })
-        .join("\n\n");
+      const bot = insiderBots[0];
+      const followed = bot?.getFollowedWallet();
+      const status = bot?.isRunning()
+        ? "Running"
+        : followed
+          ? "Paused"
+          : "Idle";
+      const primaryInfo = [
+        "<b>Primary Insider Bot</b>",
+        `Status: ${status}`,
+        `Follow: ${followed ?? "not set"}`,
+        `Buy: ${bot?.getBuySol() ?? config.insiderBuySol} SOL`,
+        `Helius key pool: ${insiderBots.length} key${insiderBots.length === 1 ? "" : "s"}`,
+      ].join("\n");
 
-      text = ["<b>Bot Status</b>", "Mode: Insider", "", botsInfo].join("\n");
       text = [
         "<b>Bot Status</b>",
         "Mode: Insider",
@@ -2741,7 +2700,7 @@ async function main(): Promise<void> {
         "Candidate rule: transfer-out confirms only when the immediate next funder tx is not a SOL transfer-in.",
         "API guard: queued Helius pool, transient-only fallback, per-key backoff, capped recipient batch sync.",
         "",
-        botsInfo,
+        primaryInfo,
       ].join("\n");
     } else if (botMode === "reverse_copysell") {
       const targetWallet = config.reverseCopySellTargetWallet;
@@ -2971,7 +2930,7 @@ async function main(): Promise<void> {
     await startBundlerModeServices();
   } else {
     await stopBundlerModeServices("Service started in Insider mode");
-    await resumeAllInsiderBots();
+    await resumePrimaryInsiderBot();
   }
   startMarketCapChecker();
 
