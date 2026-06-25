@@ -76,7 +76,7 @@ async function main(): Promise<void> {
       heliusProjectId: config.insiderHeliusProjectId2,
       rpcUrl: config.insiderSolanaRpcUrl2,
       wsUrl: config.insiderSolanaWsUrl2,
-      followWallet: config.insiderFollowWallet2,
+      followWallet: null,
     },
     {
       botNumber: 3,
@@ -90,7 +90,7 @@ async function main(): Promise<void> {
       heliusProjectId: config.insiderHeliusProjectId3,
       rpcUrl: config.insiderSolanaRpcUrl3,
       wsUrl: config.insiderSolanaWsUrl3,
-      followWallet: config.insiderFollowWallet3,
+      followWallet: null,
     },
     {
       botNumber: 4,
@@ -104,7 +104,7 @@ async function main(): Promise<void> {
       heliusProjectId: config.insiderHeliusProjectId4,
       rpcUrl: config.insiderSolanaRpcUrl4,
       wsUrl: config.insiderSolanaWsUrl4,
-      followWallet: config.insiderFollowWallet4,
+      followWallet: null,
     },
   ].filter((definition) => definition.enabled);
 
@@ -2543,13 +2543,16 @@ async function main(): Promise<void> {
           `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
           "",
           "<b>Flow</b>",
-          "1. Bots 1–4 run in parallel on their own follow wallets (same mint blocked).",
-          "2. Skip immediately when the follow-wallet buy MC is above $50,000.",
-          "3. GMGN discovers cumulative axiom/empty single-buy wallets; their ATAs are polled independently.",
-          "4. Buy when the largest similar-SOL balance group has at least 10 existing ATA wallets and no more than 3 group wallets have reduced their token balance.",
-          "5. After buy: continue Axiom discovery and independent ATA polling.",
-          "6. Sell when at least 5 wallets and at least 20% of the largest similar-SOL group have reduced their token balance, the largest group collapses to 2, on current MC target, rug threshold, or manual sell.",
-          `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets flow.`,
+          "1. Bot 1 follows one wallet; Insider API keys 1–4 are used as the Helius fallback/key pool.",
+          "2. Skip if the follow-wallet buy MC is above $50,000.",
+          "3. First four token SWAP buyers are checked; the follow wallet must be one of those four bundlers.",
+          "4. Each bundler must have a valid first SOL funding transfer after its wallet was last 0 SOL, and all four must share the same sender.",
+          "5. Watch the shared sender from the earliest bundler funding tx for transfer-outs >= largest bundler funding + 2 SOL.",
+          "6. A transfer-out is only confirmed if the immediate next funder tx is not a SOL transfer-in.",
+          "7. Buy on the first confirmed transfer-out; keep watching other confirmed transfer-out recipients.",
+          "8. After buy: sell on MC target, rug, or when a confirmed recipient buys then sells at least 50% of its first tracked position.",
+          "• API guard: Helius calls use a queued four-key pool, transient-only fallback, per-key backoff, and capped recipient batch sync.",
+          `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets before buy or sells after buy.`,
         ].join("\n"),
         replyMarkup: {
           inline_keyboard: [
@@ -2731,6 +2734,15 @@ async function main(): Promise<void> {
         .join("\n\n");
 
       text = ["<b>Bot Status</b>", "Mode: Insider", "", botsInfo].join("\n");
+      text = [
+        "<b>Bot Status</b>",
+        "Mode: Insider",
+        "Flow: one follow wallet, four-key Helius pool, shared bundler-funder confirmation.",
+        "Candidate rule: transfer-out confirms only when the immediate next funder tx is not a SOL transfer-in.",
+        "API guard: queued Helius pool, transient-only fallback, per-key backoff, capped recipient batch sync.",
+        "",
+        botsInfo,
+      ].join("\n");
     } else if (botMode === "reverse_copysell") {
       const targetWallet = config.reverseCopySellTargetWallet;
       const activePosition = reverseCopySellOrchestrator.getActivePosition();

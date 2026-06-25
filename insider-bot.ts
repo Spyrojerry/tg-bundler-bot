@@ -46,6 +46,20 @@ const AXIOM_EXIT_MIN_SOLD_ANY_RATIO = 0.2;
 const AXIOM_EXIT_COLLAPSED_EXISTING_ATA_WALLETS = 2;
 const AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD = 2;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 50_000;
+const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
+const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
+const BUNDLER_FUNDER_EXTRA_SOL = 2;
+const BUNDLER_FUNDER_SYNC_LIMIT = 50;
+const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
+const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 12;
+const BUNDLER_FUNDER_RECIPIENT_SYNC_INTERVAL_MS = 1_500;
+const BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE = 5;
+const HELIUS_POOL_MAX_CONCURRENT = 2;
+const HELIUS_POOL_MIN_TIME_MS = 150;
+const HELIUS_POOL_REQUEST_TIMEOUT_MS = 10_000;
+const HELIUS_POOL_BASE_BACKOFF_MS = 2_000;
+const HELIUS_POOL_MAX_BACKOFF_MS = 60_000;
+const HELIUS_POOL_METRICS_INTERVAL_MS = 30_000;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 type FlowPhase = "pre_buy" | "holding";
@@ -55,6 +69,79 @@ class InsiderMinBuySolFilterError extends Error {
     super(message);
     this.name = "InsiderMinBuySolFilterError";
   }
+}
+
+class HeliusTransientError extends Error {
+  constructor(
+    message: string,
+    readonly cause: unknown,
+  ) {
+    super(message);
+    this.name = "HeliusTransientError";
+  }
+}
+
+class AsyncRequestQueue {
+  private active = 0;
+  private lastStartedAt = 0;
+  private readonly pending: Array<() => void> = [];
+
+  constructor(
+    private readonly maxConcurrent: number,
+    private readonly minTimeMs: number,
+  ) {}
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await task();
+    } finally {
+      this.active -= 1;
+      this.pump();
+    }
+  }
+
+  private acquire(): Promise<void> {
+    return new Promise((resolve) => {
+      this.pending.push(resolve);
+      this.pump();
+    });
+  }
+
+  private pump(): void {
+    if (this.active >= this.maxConcurrent) return;
+    const next = this.pending.shift();
+    if (!next) return;
+
+    const waitMs = Math.max(
+      0,
+      this.minTimeMs - (Date.now() - this.lastStartedAt),
+    );
+    this.active += 1;
+    setTimeout(() => {
+      this.lastStartedAt = Date.now();
+      next();
+      this.pump();
+    }, waitMs);
+  }
+}
+
+interface HeliusPoolStats {
+  requests: number;
+  successes: number;
+  fallbacks: number;
+  rateLimits: number;
+  transientFailures: number;
+  permanentFailures: number;
+}
+
+interface HeliusPoolEntry {
+  client: HeliusClient;
+  index: number;
+  label: string;
+  unavailableUntil: number;
+  backoffMs: number;
+  stats: HeliusPoolStats;
 }
 
 export type InsiderMintClaimFn = (mint: string) => boolean;
@@ -223,12 +310,62 @@ interface LargeBuyerWatchState {
   seenPositiveBalance: boolean;
 }
 
+interface BundlerFundingRecord {
+  bundlerWallet: string;
+  bundlerBuySignature: string;
+  fundingSignature: string;
+  senderWallet: string;
+  amountSol: number;
+  timestamp: number;
+}
+
+interface FunderRecipientWatch {
+  wallet: string;
+  fundingSignature: string;
+  outAmountSol: number;
+  tokenActions: Array<{
+    kind: "buy" | "sell";
+    signature: string;
+    amount: number;
+  }>;
+  boughtAmount: number;
+  soldAmount: number;
+  followSellExit: boolean;
+  firstBuySignature: string | null;
+}
+
+interface BundlerFunderWatchState {
+  mint: string;
+  funderWallet: string;
+  earliestFundingTimestamp: number;
+  earliestFundingSignature: string;
+  largestFundingSol: number;
+  minTransferOutSol: number;
+  cursorSignature: string | null;
+  processedSignatures: Set<string>;
+  validOutSignatures: Set<string>;
+  invalidOutSignatures: Set<string>;
+  recipientWatches: Map<string, FunderRecipientWatch>;
+  pendingTransferOut: {
+    signature: string;
+    recipient: string;
+    amountSol: number;
+    timestamp: number;
+  } | null;
+}
+
 export class InsiderBot extends EventEmitter {
   private readonly log: Logger;
   private readonly config: ServiceConfig;
   private readonly connection: Connection;
   private readonly telegramBot: TelegramBot | null;
   private readonly heliusClient: HeliusClient;
+  private readonly heliusClients: HeliusClient[] = [];
+  private readonly heliusPool: HeliusPoolEntry[] = [];
+  private readonly heliusRequestQueue = new AsyncRequestQueue(
+    HELIUS_POOL_MAX_CONCURRENT,
+    HELIUS_POOL_MIN_TIME_MS,
+  );
   private readonly gmgnClient: GmgnClient;
   private readonly bundlerGmgnClient: GmgnClient;
   /** This bot's GMGN client for pre-buy axiom/empty single-buy discovery. */
@@ -301,6 +438,17 @@ export class InsiderBot extends EventEmitter {
   private largeBuyerAtaSubIds = new Map<string, number>();
   private authorityMonitor: AuthorityMonitorState | null = null;
   private largeBuyerWatch: LargeBuyerWatchState | null = null;
+  private bundlerFunderWatch: BundlerFunderWatchState | null = null;
+  private bundlerFunderLogsSubId: number | null = null;
+  private recipientLogsSubIds = new Map<string, number>();
+  private isBundlerFunderSyncing = false;
+  private bundlerFunderSyncPending = false;
+  private lastBundlerFunderSyncAt = 0;
+  private dirtyFunderRecipients = new Set<string>();
+  private isFunderRecipientBatchSyncing = false;
+  private funderRecipientBatchSyncPending = false;
+  private lastFunderRecipientBatchSyncAt = 0;
+  private lastHeliusPoolMetricsAt = 0;
   private isAuthoritySyncing = false;
   private authoritySyncPending = false;
   private isAuthorityAtaChecking = false;
@@ -358,6 +506,54 @@ export class InsiderBot extends EventEmitter {
         this.emit("heliusCreditsExhausted", info);
       },
     });
+    const apiKeys = [
+      heliusApiKey,
+      config.insiderHeliusApiKey || config.heliusApiKey,
+      config.insiderHeliusApiKey2,
+      config.insiderHeliusApiKey3,
+      config.insiderHeliusApiKey4,
+    ]
+      .map((key) => key?.trim())
+      .filter((key): key is string => Boolean(key));
+    const projectIds = [
+      heliusProjectId,
+      config.insiderHeliusProjectId,
+      config.insiderHeliusProjectId2,
+      config.insiderHeliusProjectId3,
+      config.insiderHeliusProjectId4,
+    ];
+    const seenHeliusKeys = new Set<string>();
+    for (let index = 0; index < apiKeys.length; index += 1) {
+      const key = apiKeys[index];
+      if (seenHeliusKeys.has(key)) continue;
+      seenHeliusKeys.add(key);
+      const client =
+        index === 0
+          ? this.heliusClient
+          : new HeliusClient(key, {
+              projectId: projectIds[index] ?? "",
+              label: `${label} fallback Helius ${index + 1}`,
+              onCreditsExhausted: (info) => {
+                this.emit("heliusCreditsExhausted", info);
+              },
+            });
+      this.heliusClients.push(client);
+      this.heliusPool.push({
+        client,
+        index,
+        label: index === 0 ? `${label} primary Helius` : `${label} Helius ${index + 1}`,
+        unavailableUntil: 0,
+        backoffMs: HELIUS_POOL_BASE_BACKOFF_MS,
+        stats: {
+          requests: 0,
+          successes: 0,
+          fallbacks: 0,
+          rateLimits: 0,
+          transientFailures: 0,
+          permanentFailures: 0,
+        },
+      });
+    }
     this.claimMint = claimMint;
     this.releaseMint = releaseMint;
     this.label = label;
@@ -527,6 +723,8 @@ export class InsiderBot extends EventEmitter {
       this.followMonitor !== null ||
       this.insiderLogsSubId !== null ||
       this.bundlerLogsSubIds.size > 0 ||
+      this.bundlerFunderLogsSubId !== null ||
+      this.recipientLogsSubIds.size > 0 ||
       this.pollTimer !== null ||
       this.axiomAtaPollTimer !== null
     );
@@ -604,6 +802,7 @@ export class InsiderBot extends EventEmitter {
     this.monitoredWallet = null;
     this.insiderState = null;
     this.bundlerWatch = null;
+    this.bundlerFunderWatch = null;
     this.clearBundlerAccumulation();
     this.clearAxiomWatchedWallets();
   }
@@ -664,6 +863,7 @@ export class InsiderBot extends EventEmitter {
 
     void this.syncAuthorityTransactions();
     void this.syncLargeBuyerAtaBalances();
+    void this.syncBundlerFunderTransactions();
   }
 
   private resetTokenTxCounts(): void {
@@ -794,23 +994,30 @@ export class InsiderBot extends EventEmitter {
     this.clearBundlerAccumulation();
     this.clearAxiomWatchedWallets();
 
-    const swaps = await this.heliusClient.getEarlyInsiderSwaps(mint, 4);
+    const swaps = await this.withHeliusFallback((client) =>
+      client.getEarlyInsiderSwaps(mint, 4),
+    );
     const earlyInsiderBuys = this.extractEarlyInsiderBuys(swaps, mint);
-    this.assertEarlyInsidersMeetMinBuySol(mint, earlyInsiderBuys);
-
-    const lowest = this.findLowestInsiderWallet(earlyInsiderBuys);
-    if (!lowest) {
-      throw new Error(`Could not identify lowest insider wallet for ${mint}`);
-    }
-
-    this.monitoredWallet = lowest.wallet;
-    this.insiderWalletChain.clear();
-    this.insiderWalletChain.add(lowest.wallet);
+    const earlyBundlerWallets = this.extractEarlyInsiderWallets(earlyInsiderBuys);
     this.initialInsiderWallets.clear();
-    for (const wallet of this.extractEarlyInsiderWallets(earlyInsiderBuys)) {
-      this.initialInsiderWallets.add(wallet);
+    for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
+
+    if (!this.followedWallet || !earlyBundlerWallets.includes(this.followedWallet)) {
+      this.log.warn(
+        "Follow wallet is not one of the first four bundlers; resetting token flow",
+        {
+          mint,
+          followedWallet: this.followedWallet,
+          earlyBundlers: earlyBundlerWallets,
+        },
+      );
+      await this.resetForNewToken(true);
+      return;
     }
-    const createTx = await this.heliusClient.getMintCreateTransaction(mint);
+
+    const createTx = await this.withHeliusFallback((client) =>
+      client.getMintCreateTransaction(mint),
+    );
     this.devWallet = createTx?.feePayer ?? null;
     if (this.devWallet) {
       this.log.info("Dev wallet identified for trader-scan exclusions", {
@@ -821,38 +1028,24 @@ export class InsiderBot extends EventEmitter {
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.axiomTraderWatchActive = false;
-    this.insiderState = {
-      wallet: lowest.wallet,
-      sellCount: 0,
-      isTransferred: false,
-    };
+    this.monitoredWallet = null;
+    this.insiderState = null;
     this.phase = "pre_buy";
-    this.processedSignatures.add(lowest.signature);
-
-    await this.syncWalletHistory(
-      lowest.wallet,
-      mint,
-      lowest.signature,
-      INSIDER_HISTORY_LIMIT,
-      "insider",
-    );
 
     void this.sendTelegramSafe(
       [
-        `<b>🔍 ${this.label} Flow Started</b>`,
+        `<b>🔍 ${this.label} Bundler-Funder Flow Started</b>`,
         `Token: <code>${mint}</code>`,
-        `Lowest insider: <code>${lowest.wallet}</code>`,
-        `Insider sells: <b>${this.insiderState.sellCount}</b> / ${this.requiredInsiderSells}`,
+        `Follow wallet: <code>${this.followedWallet}</code>`,
+        `First four bundlers: <b>${earlyBundlerWallets.length}</b>`,
         "",
-        "Monitoring insider while discovering cumulative Axiom/empty single-buy wallets...",
+        "Validating the shared SOL funder, then watching transfer-outs with an immediate next-tx transfer-in invalidation check.",
       ].join("\n"),
       "flow-start notification",
     );
 
-    this.startInsiderMonitoring();
     this.startPollLoop();
-    this.startAxiomAtaPollLoop();
-    await this.scanAxiomSingleBuyTradersPreBuy(mint);
+    await this.startBundlerFunderFlow(mint, earlyInsiderBuys);
   }
 
   private extractEarlyInsiderBuys(
@@ -964,6 +1157,370 @@ export class InsiderBot extends EventEmitter {
     return lowest;
   }
 
+  private async withHeliusFallback<T>(
+    fn: (client: HeliusClient, index: number) => Promise<T>,
+    preferredIndex = 0,
+  ): Promise<T> {
+    const pool = this.heliusPool.length
+      ? this.heliusPool
+      : [
+          {
+            client: this.heliusClient,
+            index: 0,
+            label: `${this.label} primary Helius`,
+            unavailableUntil: 0,
+            backoffMs: HELIUS_POOL_BASE_BACKOFF_MS,
+            stats: {
+              requests: 0,
+              successes: 0,
+              fallbacks: 0,
+              rateLimits: 0,
+              transientFailures: 0,
+              permanentFailures: 0,
+            },
+          },
+        ];
+    let lastError: unknown = null;
+    for (let offset = 0; offset < pool.length; offset += 1) {
+      const entry = this.pickHeliusPoolEntry(pool, preferredIndex, offset);
+      if (!entry) break;
+      const index = entry.index;
+      try {
+        const result = await this.runHeliusPoolRequest(entry, () =>
+          fn(entry.client, index),
+        );
+        if (offset > 0) entry.stats.fallbacks += 1;
+        this.logHeliusPoolMetricsIfDue();
+        return result;
+      } catch (err) {
+        lastError = err;
+        await entry.client.handlePossibleRateLimitError(err);
+        const transient = this.isTransientHeliusError(err);
+        if (!transient) {
+          entry.stats.permanentFailures += 1;
+          this.log.warn("Helius request failed with non-retryable error", {
+            preferredIndex,
+            attemptedIndex: index,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          this.logHeliusPoolMetricsIfDue(true);
+          throw err instanceof Error ? err : new Error(String(err));
+        }
+
+        entry.stats.transientFailures += 1;
+        if (this.isRateLimitError(err)) entry.stats.rateLimits += 1;
+        this.applyHeliusPoolBackoff(entry);
+        this.log.warn("Helius transient request failed; trying fallback key if available", {
+          preferredIndex,
+          attemptedIndex: index,
+          hasFallback: offset + 1 < pool.length,
+          backoffMs: entry.backoffMs,
+          unavailableUntil: new Date(entry.unavailableUntil).toISOString(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    this.logHeliusPoolMetricsIfDue(true);
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private pickHeliusPoolEntry(
+    pool: HeliusPoolEntry[],
+    preferredIndex: number,
+    offset: number,
+  ): HeliusPoolEntry | null {
+    const now = Date.now();
+    const ordered = pool.map((_, i) => pool[(preferredIndex + i) % pool.length]);
+    const available = ordered.filter((entry) => entry.unavailableUntil <= now);
+    const coolingDown = ordered.filter((entry) => entry.unavailableUntil > now);
+    const candidates = [...available, ...coolingDown];
+    return candidates[offset] ?? null;
+  }
+
+  private async runHeliusPoolRequest<T>(
+    entry: HeliusPoolEntry,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    entry.stats.requests += 1;
+    return await this.heliusRequestQueue.run(async () => {
+      const result = await this.withRequestTimeout(fn(), HELIUS_POOL_REQUEST_TIMEOUT_MS);
+      entry.stats.successes += 1;
+      entry.backoffMs = HELIUS_POOL_BASE_BACKOFF_MS;
+      entry.unavailableUntil = 0;
+      return result;
+    });
+  }
+
+  private async withRequestTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+  ): Promise<T> {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timeout = setTimeout(
+            () =>
+              reject(
+                new HeliusTransientError(
+                  `Helius request timed out after ${timeoutMs}ms`,
+                  null,
+                ),
+              ),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  private isTransientHeliusError(error: unknown): boolean {
+    if (error instanceof HeliusTransientError) return true;
+    const message = error instanceof Error ? error.message : String(error);
+    if (/\b429\b|too many requests/i.test(message)) return true;
+    if (/\b5\d\d\b/.test(message)) return true;
+    if (/timeout|timed out|network|fetch failed|econnreset|etimedout|enotfound|socket|tls/i.test(message)) {
+      return true;
+    }
+    return false;
+  }
+
+  private isRateLimitError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /\b429\b|too many requests/i.test(message);
+  }
+
+  private applyHeliusPoolBackoff(entry: HeliusPoolEntry): void {
+    entry.unavailableUntil = Date.now() + entry.backoffMs;
+    entry.backoffMs = Math.min(
+      entry.backoffMs * 2,
+      HELIUS_POOL_MAX_BACKOFF_MS,
+    );
+  }
+
+  private logHeliusPoolMetricsIfDue(force = false): void {
+    const now = Date.now();
+    if (!force && now - this.lastHeliusPoolMetricsAt < HELIUS_POOL_METRICS_INTERVAL_MS) {
+      return;
+    }
+    this.lastHeliusPoolMetricsAt = now;
+    this.log.info("Helius pool metrics", {
+      queue: {
+        maxConcurrent: HELIUS_POOL_MAX_CONCURRENT,
+        minTimeMs: HELIUS_POOL_MIN_TIME_MS,
+        requestTimeoutMs: HELIUS_POOL_REQUEST_TIMEOUT_MS,
+      },
+      keys: this.heliusPool.map((entry) => ({
+        index: entry.index,
+        label: entry.label,
+        unavailableMs: Math.max(0, entry.unavailableUntil - now),
+        nextBackoffMs: entry.backoffMs,
+        ...entry.stats,
+      })),
+    });
+  }
+
+  private async startBundlerFunderFlow(
+    mint: string,
+    earlyBuys: EarlyInsiderBuy[],
+  ): Promise<void> {
+    const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
+    if (firstFour.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
+      this.log.warn("Token has fewer than four early bundler buys; resetting", {
+        mint,
+        earlyBuyCount: firstFour.length,
+      });
+      await this.resetForNewToken(true);
+      return;
+    }
+
+    const fundingRecords = await Promise.all(
+      firstFour.map((buy, index) =>
+        this.findValidBundlerFundingRecord(mint, buy, index),
+      ),
+    );
+    if (fundingRecords.some((record) => !record)) {
+      this.log.warn("Could not validate all four bundler funding records; resetting", {
+        mint,
+        fundingRecords,
+      });
+      await this.resetForNewToken(true);
+      return;
+    }
+
+    const records = fundingRecords as BundlerFundingRecord[];
+    const senders = new Set(records.map((record) => record.senderWallet));
+    if (senders.size !== 1) {
+      this.log.warn("First four bundlers were not funded by the same wallet; resetting", {
+        mint,
+        fundingRecords: records,
+      });
+      await this.resetForNewToken(true);
+      return;
+    }
+
+    const earliest = records.reduce((best, record) =>
+      record.timestamp < best.timestamp ? record : best,
+    );
+    const largestFundingSol = Math.max(...records.map((record) => record.amountSol));
+    const funderWallet = records[0].senderWallet;
+    this.bundlerFunderWatch = {
+      mint,
+      funderWallet,
+      earliestFundingTimestamp: earliest.timestamp,
+      earliestFundingSignature: earliest.fundingSignature,
+      largestFundingSol,
+      minTransferOutSol: largestFundingSol + BUNDLER_FUNDER_EXTRA_SOL,
+      cursorSignature: earliest.fundingSignature,
+      processedSignatures: new Set(records.map((record) => record.fundingSignature)),
+      validOutSignatures: new Set<string>(),
+      invalidOutSignatures: new Set<string>(),
+      recipientWatches: new Map<string, FunderRecipientWatch>(),
+      pendingTransferOut: null,
+    };
+
+    this.subscribeBundlerFunder(funderWallet);
+    await this.syncBundlerFunderTransactions(true);
+
+    this.log.warn("Bundler shared-funder watch started", {
+      mint,
+      funderWallet,
+      earliestFundingTimestamp: earliest.timestamp,
+      largestFundingSol,
+      minTransferOutSol: this.bundlerFunderWatch.minTransferOutSol,
+      fundingRecords: records,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>✅ ${this.label} Shared Funder Locked</b>`,
+        `Token: <code>${mint}</code>`,
+        `Funder: <code>${funderWallet}</code>`,
+        `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b>`,
+        `Watching transfer-outs: <b>${this.bundlerFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
+        "",
+        "A transfer-out only confirms after the next funder tx is not a SOL transfer-in.",
+      ].join("\n"),
+      "shared funder notification",
+    );
+  }
+
+  private async findValidBundlerFundingRecord(
+    mint: string,
+    buy: EarlyInsiderBuy,
+    preferredClientIndex: number,
+  ): Promise<BundlerFundingRecord | null> {
+    const txs = await this.withHeliusFallback(
+      (client) =>
+        client.getAddressTransferTransactionsDescBefore(
+          buy.wallet,
+          buy.signature,
+          BUNDLER_FUNDER_TRANSFER_LIMIT,
+        ),
+      preferredClientIndex,
+    );
+
+    for (let index = 0; index < txs.length; index += 1) {
+      const tx = txs[index];
+      if (tx.type && tx.type !== "TRANSFER") continue;
+      const incoming = this.extractSolIncomingToWallet(tx, buy.wallet);
+      if (!incoming) continue;
+
+      const currentBalance = await this.fetchSolBalanceAt(
+        buy.wallet,
+        tx.timestamp,
+        preferredClientIndex,
+      );
+      if (currentBalance <= 0) continue;
+
+      const olderTx = txs[index + 1];
+      if (!olderTx) {
+        this.log.info("Bundler funding candidate has no older transfer in current page", {
+          mint,
+          bundlerWallet: buy.wallet,
+          fundingSignature: tx.signature,
+          currentBalance,
+        });
+        continue;
+      }
+      const olderBalance = await this.fetchSolBalanceAt(
+        buy.wallet,
+        olderTx.timestamp,
+        preferredClientIndex,
+      );
+      if (olderBalance !== 0) continue;
+
+      return {
+        bundlerWallet: buy.wallet,
+        bundlerBuySignature: buy.signature,
+        fundingSignature: tx.signature,
+        senderWallet: incoming.from,
+        amountSol: incoming.amountSol,
+        timestamp: tx.timestamp,
+      };
+    }
+
+    this.log.warn("No valid first funding transfer found for bundler", {
+      mint,
+      bundlerWallet: buy.wallet,
+      bundlerBuySignature: buy.signature,
+      transferCount: txs.length,
+    });
+    return null;
+  }
+
+  private async fetchSolBalanceAt(
+    wallet: string,
+    timestamp: number,
+    preferredClientIndex: number,
+  ): Promise<number> {
+    const balance = await this.withHeliusFallback(
+      (client) => client.getWalletBalanceAt(wallet, SOL_MINT, timestamp),
+      preferredClientIndex,
+    );
+    const parsed = Number(balance.balance);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private extractSolIncomingToWallet(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): { from: string; amountSol: number } | null {
+    const tokenTransfer = (tx.tokenTransfers ?? []).find(
+      (transfer) =>
+        transfer.mint === SOL_MINT &&
+        transfer.toUserAccount === wallet &&
+        transfer.fromUserAccount !== wallet,
+    );
+    if (tokenTransfer?.fromUserAccount) {
+      return {
+        from: tokenTransfer.fromUserAccount,
+        amountSol: tokenTransfer.tokenAmount ?? 0,
+      };
+    }
+
+    const accountChange = (tx.accountData ?? []).find(
+      (account) => account.account === wallet,
+    )?.nativeBalanceChange;
+    if (accountChange !== undefined && accountChange <= 0) return null;
+
+    const nativeIncoming = (tx.nativeTransfers ?? [])
+      .filter(
+        (transfer) =>
+          transfer.toUserAccount === wallet &&
+          transfer.fromUserAccount !== wallet &&
+          (transfer.amount ?? 0) > 0,
+      )
+      .sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0))[0];
+    if (!nativeIncoming) return null;
+    return {
+      from: nativeIncoming.fromUserAccount,
+      amountSol: (nativeIncoming.amount ?? 0) / LAMPORTS_PER_SOL,
+    };
+  }
+
   private startPollLoop(): void {
     this.stopPollLoop();
     this.pollTimer = setInterval(() => {
@@ -1040,17 +1597,21 @@ export class InsiderBot extends EventEmitter {
       if (!mint) return;
 
       if (this.phase === "pre_buy" && !this.preBuyStopped) {
-        if (this.monitoredWallet && !this.insiderSellsReady) {
+        if (this.bundlerFunderWatch) {
+          await this.syncBundlerFunderTransactions();
+          await this.syncFunderRecipientBatch();
+        } else if (this.monitoredWallet && !this.insiderSellsReady) {
           await this.pollWallet(this.monitoredWallet, mint, "insider");
-        }
-        if (this.authorityMonitor) {
+        } else if (this.authorityMonitor) {
           await this.syncAuthorityTransactions();
-        } else {
+        } else if (this.monitoredWallet) {
           await this.scanAxiomSingleBuyTradersPreBuy(mint);
         }
       }
 
       if (this.phase === "holding") {
+        await this.syncBundlerFunderTransactions();
+        await this.syncFunderRecipientBatch();
         await this.syncAuthorityTransactions();
         await this.syncLargeBuyerAtaBalances();
       }
@@ -1064,9 +1625,8 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     context: "insider" | "bundler",
   ): Promise<void> {
-    const txs = await this.heliusClient.getWalletTransactionsDesc(
-      wallet,
-      INSIDER_HISTORY_LIMIT,
+    const txs = await this.withHeliusFallback((client) =>
+      client.getWalletTransactionsDesc(wallet, INSIDER_HISTORY_LIMIT),
     );
     const relevant = txs
       .filter((tx) => this.isRelevantMintTx(tx, mint))
@@ -1289,6 +1849,558 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private subscribeBundlerFunder(address: string): void {
+    if (this.bundlerFunderLogsSubId !== null) return;
+    this.bundlerFunderLogsSubId = this.connection.onLogs(
+      new PublicKey(address),
+      (logInfo) => {
+        if (!logInfo.err) void this.syncBundlerFunderTransactions();
+      },
+      "processed",
+    );
+    this.log.info("Subscribed to shared bundler funder transactions", {
+      address,
+      syncLimit: BUNDLER_FUNDER_SYNC_LIMIT,
+    });
+  }
+
+  private subscribeFunderRecipient(wallet: string): void {
+    if (this.recipientLogsSubIds.has(wallet)) return;
+    const subId = this.connection.onLogs(
+      new PublicKey(wallet),
+      (logInfo) => {
+        if (!logInfo.err) {
+          this.markFunderRecipientDirty(wallet, logInfo.signature);
+          void this.syncFunderRecipientBatch();
+        }
+      },
+      "processed",
+    );
+    this.recipientLogsSubIds.set(wallet, subId);
+    this.log.info("Subscribed to valid funder transfer-out recipient", {
+      wallet,
+    });
+  }
+
+  private async stopBundlerFunderMonitoring(): Promise<void> {
+    if (this.bundlerFunderLogsSubId !== null) {
+      const subId = this.bundlerFunderLogsSubId;
+      this.bundlerFunderLogsSubId = null;
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+    for (const [wallet, subId] of this.recipientLogsSubIds) {
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+      this.recipientLogsSubIds.delete(wallet);
+    }
+    this.bundlerFunderWatch = null;
+    this.isBundlerFunderSyncing = false;
+    this.bundlerFunderSyncPending = false;
+    this.dirtyFunderRecipients.clear();
+    this.isFunderRecipientBatchSyncing = false;
+    this.funderRecipientBatchSyncPending = false;
+  }
+
+  private async syncBundlerFunderTransactions(force = false): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    if (!state || this.positionSellTriggered) return;
+    if (this.isBundlerFunderSyncing) {
+      this.bundlerFunderSyncPending = true;
+      return;
+    }
+    if (
+      !force &&
+      Date.now() - this.lastBundlerFunderSyncAt <
+        BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    this.isBundlerFunderSyncing = true;
+    this.lastBundlerFunderSyncAt = Date.now();
+    try {
+      const txs = await this.withHeliusFallback((client) =>
+        client.getAddressTransactionsAsc(
+          state.funderWallet,
+          state.cursorSignature ?? undefined,
+          BUNDLER_FUNDER_SYNC_LIMIT,
+        ),
+      );
+      for (const tx of txs) {
+        if (state.processedSignatures.has(tx.signature)) continue;
+        state.processedSignatures.add(tx.signature);
+        state.cursorSignature = tx.signature;
+        await this.resolvePendingBundlerFunderCandidate(state, tx);
+        await this.inspectBundlerFunderTransaction(state, tx);
+      }
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Shared bundler funder sync failed", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.isBundlerFunderSyncing = false;
+      if (this.bundlerFunderSyncPending) {
+        this.bundlerFunderSyncPending = false;
+        void this.syncBundlerFunderTransactions();
+      }
+    }
+  }
+
+  private async inspectBundlerFunderTransaction(
+    state: BundlerFunderWatchState,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    const transferOut = this.extractSolTransferOutFromWallet(
+      tx,
+      state.funderWallet,
+      state.minTransferOutSol,
+    );
+    if (!transferOut) return;
+    if (this.hasSolIncomingToWallet(tx, state.funderWallet)) {
+      this.log.info("Skipping funder transfer-out because same tx also has transfer-in", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        signature: tx.signature,
+        amountSol: transferOut.amountSol,
+        recipient: transferOut.to,
+      });
+      return;
+    }
+    if (
+      state.validOutSignatures.has(tx.signature) ||
+      state.invalidOutSignatures.has(tx.signature) ||
+      state.pendingTransferOut?.signature === tx.signature
+    ) {
+      return;
+    }
+
+    state.pendingTransferOut = {
+      signature: tx.signature,
+      recipient: transferOut.to,
+      amountSol: transferOut.amountSol,
+      timestamp: tx.timestamp,
+    };
+
+    this.log.warn("Shared-funder transfer-out candidate pending next-tx check", {
+      mint: state.mint,
+      funderWallet: state.funderWallet,
+      recipient: transferOut.to,
+      amountSol: transferOut.amountSol,
+      minTransferOutSol: state.minTransferOutSol,
+      signature: tx.signature,
+      rule:
+        "candidate is invalid if the next funder transaction is a SOL transfer-in",
+    });
+
+    void this.sendTelegramSafe(
+      [
+        `<b>🟡 ${this.label} Funder Transfer-Out Candidate</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `Funder: <code>${state.funderWallet}</code>`,
+        `Recipient: <code>${transferOut.to}</code>`,
+        `Amount: <b>${transferOut.amountSol.toFixed(4)} SOL</b>`,
+        `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
+        `Tx: <code>${tx.signature}</code>`,
+        "",
+        "Waiting for the next funder tx. If it is a SOL transfer-in, this candidate is invalid.",
+      ].join("\n"),
+      "pending funder transfer-out notification",
+    );
+  }
+
+  private async resolvePendingBundlerFunderCandidate(
+    state: BundlerFunderWatchState,
+    nextTx: HeliusTransaction,
+  ): Promise<void> {
+    const pending = state.pendingTransferOut;
+    if (!pending || nextTx.signature === pending.signature) return;
+
+    state.pendingTransferOut = null;
+    if (this.hasSolIncomingToWallet(nextTx, state.funderWallet)) {
+      state.invalidOutSignatures.add(pending.signature);
+      this.log.warn(
+        "Shared-funder transfer-out candidate invalidated by immediate next SOL transfer-in",
+        {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          candidateSignature: pending.signature,
+          nextSignature: nextTx.signature,
+          recipient: pending.recipient,
+          amountSol: pending.amountSol,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>🔴 ${this.label} Funder Candidate Invalid</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `Funder: <code>${state.funderWallet}</code>`,
+          `Candidate tx: <code>${pending.signature}</code>`,
+          `Next tx: <code>${nextTx.signature}</code>`,
+          "Reason: the immediate next funder transaction was a SOL transfer-in.",
+          "",
+          "Continuing to watch for the next valid transfer-out.",
+        ].join("\n"),
+        "invalid funder transfer-out notification",
+      );
+      return;
+    }
+
+    state.validOutSignatures.add(pending.signature);
+    let watch = state.recipientWatches.get(pending.recipient);
+    if (!watch) {
+      if (state.recipientWatches.size >= BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES) {
+        this.log.warn("Shared-funder recipient watch cap reached; confirmed transfer-out recipient not watched", {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          recipient: pending.recipient,
+          candidateSignature: pending.signature,
+          cap: BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES,
+        });
+        return;
+      }
+      watch = {
+        wallet: pending.recipient,
+        fundingSignature: pending.signature,
+        outAmountSol: pending.amountSol,
+        tokenActions: [],
+        boughtAmount: 0,
+        soldAmount: 0,
+        followSellExit: true,
+        firstBuySignature: null,
+      };
+      state.recipientWatches.set(pending.recipient, watch);
+      this.subscribeFunderRecipient(pending.recipient);
+    }
+
+    this.log.warn("Shared-funder transfer-out confirmed by next-tx check", {
+      mint: state.mint,
+      funderWallet: state.funderWallet,
+      recipient: pending.recipient,
+      amountSol: pending.amountSol,
+      minTransferOutSol: state.minTransferOutSol,
+      candidateSignature: pending.signature,
+      nextSignature: nextTx.signature,
+      buySubmitted: this.buySubmitted,
+    });
+
+    await this.emitBundlerFunderBuy(state, watch, pending.signature);
+    this.markFunderRecipientDirty(pending.recipient);
+    await this.syncFunderRecipientBatch(true);
+  }
+
+  private extractSolTransferOutFromWallet(
+    tx: HeliusTransaction,
+    wallet: string,
+    minAmountSol: number,
+  ): { to: string; amountSol: number } | null {
+    const tokenTransfer = (tx.tokenTransfers ?? [])
+      .filter(
+        (transfer) =>
+          transfer.mint === SOL_MINT &&
+          transfer.fromUserAccount === wallet &&
+          transfer.toUserAccount !== wallet &&
+          (transfer.tokenAmount ?? 0) >= minAmountSol,
+      )
+      .sort((a, b) => (b.tokenAmount ?? 0) - (a.tokenAmount ?? 0))[0];
+    if (tokenTransfer?.toUserAccount) {
+      return {
+        to: tokenTransfer.toUserAccount,
+        amountSol: tokenTransfer.tokenAmount ?? 0,
+      };
+    }
+
+    const nativeTransfer = (tx.nativeTransfers ?? [])
+      .filter(
+        (transfer) =>
+          transfer.fromUserAccount === wallet &&
+          transfer.toUserAccount !== wallet &&
+          (transfer.amount ?? 0) / LAMPORTS_PER_SOL >= minAmountSol,
+      )
+      .sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0))[0];
+    if (!nativeTransfer) return null;
+    return {
+      to: nativeTransfer.toUserAccount,
+      amountSol: (nativeTransfer.amount ?? 0) / LAMPORTS_PER_SOL,
+    };
+  }
+
+  private hasSolIncomingToWallet(tx: HeliusTransaction, wallet: string): boolean {
+    return (
+      (tx.tokenTransfers ?? []).some(
+        (transfer) =>
+          transfer.mint === SOL_MINT &&
+          transfer.toUserAccount === wallet &&
+          transfer.fromUserAccount !== wallet,
+      ) ||
+      (tx.nativeTransfers ?? []).some(
+        (transfer) =>
+          transfer.toUserAccount === wallet &&
+          transfer.fromUserAccount !== wallet &&
+          (transfer.amount ?? 0) > 0,
+      )
+    );
+  }
+
+  private async emitBundlerFunderBuy(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+    signature: string,
+  ): Promise<void> {
+    if (
+      this.buySubmitted ||
+      this.buyDisabled ||
+      this.isBuyExecuting ||
+      this.isBuyGateEvaluating
+    ) {
+      return;
+    }
+    this.isBuyGateEvaluating = true;
+    try {
+      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
+      if (currentMc === null) {
+        this.log.warn(
+          "Confirmed shared-funder transfer-out found, but current market cap is unavailable; waiting before buy",
+          { mint: state.mint, recipient: watch.wallet, signature },
+        );
+        return;
+      }
+      if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
+        this.log.warn(
+          "Confirmed shared-funder transfer-out found, but token is below rug threshold; resetting instead of buying",
+          {
+            mint: state.mint,
+            recipient: watch.wallet,
+            currentMc,
+            rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
+          },
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
+
+      const newExitMc = currentMc * (1 + this.exitPercent / 100);
+      this.setExitMc(newExitMc);
+      this.setEntryMc(currentMc);
+      this.setBuyExecuting(true);
+      this.buySubmitted = true;
+      this.preBuyStopped = true;
+      this.emit("buyTrigger", {
+        followedWallet: this.followedWallet!,
+        mint: state.mint,
+        signature,
+        buySol: this.buySol,
+        entryMc: currentMc,
+        monitoredWallet: watch.wallet,
+        tradersListStr: [
+          "<b>Shared Bundler Funder Buy Gate Passed</b>",
+          `Funder: <code>${state.funderWallet}</code>`,
+          `Recipient: <code>${watch.wallet}</code>`,
+          `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
+          `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
+          `Trigger tx: <code>${signature}</code>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          "",
+          "Next-tx check: confirmed; the immediate next funder tx was not a SOL transfer-in.",
+          "Sell rule: if this recipient's first token action is a buy, sell when it sells at least 50% of that position. If its second token action is another buy, use only MC/rug exits.",
+        ].join("\n"),
+      });
+    } finally {
+      this.isBuyGateEvaluating = false;
+    }
+  }
+
+  private async syncFunderRecipientTransactions(
+    wallet: string,
+    signature?: string,
+  ): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    const watch = state?.recipientWatches.get(wallet);
+    if (!state || !watch || this.positionSellTriggered) return;
+    try {
+      const txs = signature
+        ? await this.withHeliusFallback((client) =>
+            client.getTransactionsBySignatures([signature]),
+          )
+        : await this.withHeliusFallback((client) =>
+            client.getWalletTransactionsDesc(wallet, INSIDER_HISTORY_LIMIT),
+          );
+      const sorted = [...txs].reverse();
+      for (const tx of sorted) {
+        if (tx.timestamp < state.earliestFundingTimestamp) continue;
+        await this.applyFunderRecipientTransaction(state, watch, tx);
+      }
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Valid transfer-out recipient sync failed", {
+        mint: state.mint,
+        wallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private markFunderRecipientDirty(wallet: string, signature?: string): void {
+    const state = this.bundlerFunderWatch;
+    if (!state?.recipientWatches.has(wallet)) return;
+    this.dirtyFunderRecipients.add(wallet);
+    this.log.debug("Marked shared-funder recipient for batch sync", {
+      mint: state.mint,
+      wallet,
+      signature,
+      dirtyCount: this.dirtyFunderRecipients.size,
+    });
+  }
+
+  private async syncFunderRecipientBatch(force = false): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    if (!state || this.positionSellTriggered) return;
+    if (state.recipientWatches.size === 0) return;
+    if (this.isFunderRecipientBatchSyncing) {
+      this.funderRecipientBatchSyncPending = true;
+      return;
+    }
+    if (
+      !force &&
+      Date.now() - this.lastFunderRecipientBatchSyncAt <
+        BUNDLER_FUNDER_RECIPIENT_SYNC_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    this.isFunderRecipientBatchSyncing = true;
+    this.lastFunderRecipientBatchSyncAt = Date.now();
+    try {
+      const dirty = [...this.dirtyFunderRecipients].filter((wallet) =>
+        state.recipientWatches.has(wallet),
+      );
+      const wallets = (dirty.length > 0 ? dirty : [...state.recipientWatches.keys()])
+        .slice(0, BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE);
+      for (const wallet of wallets) {
+        this.dirtyFunderRecipients.delete(wallet);
+        await this.syncFunderRecipientTransactions(wallet);
+      }
+      this.log.info("Shared-funder recipient batch sync completed", {
+        mint: state.mint,
+        syncedWallets: wallets,
+        remainingDirty: this.dirtyFunderRecipients.size,
+        watchedRecipients: state.recipientWatches.size,
+        batchSize: BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE,
+      });
+    } finally {
+      this.isFunderRecipientBatchSyncing = false;
+      if (this.funderRecipientBatchSyncPending || this.dirtyFunderRecipients.size > 0) {
+        this.funderRecipientBatchSyncPending = false;
+        void this.syncFunderRecipientBatch();
+      }
+    }
+  }
+
+  private async applyFunderRecipientTransaction(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    if (!this.isRelevantMintTx(tx, state.mint)) return;
+    const action = this.classifyTx(tx, watch.wallet, state.mint);
+    if (action !== "buy" && action !== "sell") return;
+    if (watch.tokenActions.some((existing) => existing.signature === tx.signature)) return;
+
+    const amount = this.extractTokenAmountForWallet(tx, watch.wallet, state.mint, action);
+    watch.tokenActions.push({ kind: action, signature: tx.signature, amount });
+    if (action === "buy") {
+      if (!watch.firstBuySignature) {
+        watch.firstBuySignature = tx.signature;
+        watch.boughtAmount += amount;
+        this.log.warn("Valid transfer-out recipient bought token; 50% sell watch armed", {
+          mint: state.mint,
+          wallet: watch.wallet,
+          signature: tx.signature,
+          boughtAmount: watch.boughtAmount,
+        });
+        void this.sendTelegramSafe(
+          [
+            `<b>🟢 ${this.label} Recipient Bought Token</b>`,
+            `Token: <code>${state.mint}</code>`,
+            `Recipient: <code>${watch.wallet}</code>`,
+            `Buy tx: <code>${tx.signature}</code>`,
+            `Tracked amount: <b>${watch.boughtAmount.toLocaleString()}</b>`,
+            "",
+            "50% recipient-sell exit is now armed unless this wallet's next token action is another buy.",
+          ].join("\n"),
+          "recipient first-buy notification",
+        );
+      } else {
+        watch.followSellExit = false;
+        this.log.warn(
+          "Valid transfer-out recipient made a second buy; disabling 50% recipient-sell exit for this wallet",
+          {
+            mint: state.mint,
+            wallet: watch.wallet,
+            signature: tx.signature,
+            firstBuySignature: watch.firstBuySignature,
+          },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>🟠 ${this.label} Recipient Second Buy</b>`,
+            `Token: <code>${state.mint}</code>`,
+            `Recipient: <code>${watch.wallet}</code>`,
+            `Second buy tx: <code>${tx.signature}</code>`,
+            "",
+            "50% recipient-sell exit disabled for this wallet. MC target and rug exits remain active.",
+          ].join("\n"),
+          "recipient second-buy notification",
+        );
+      }
+      return;
+    }
+
+    if (!watch.firstBuySignature || !watch.followSellExit) return;
+    watch.soldAmount += amount;
+    const soldRatio = watch.boughtAmount > 0 ? watch.soldAmount / watch.boughtAmount : 0;
+    this.log.info("Valid transfer-out recipient sell observed", {
+      mint: state.mint,
+      wallet: watch.wallet,
+      signature: tx.signature,
+      soldAmount: watch.soldAmount,
+      boughtAmount: watch.boughtAmount,
+      soldRatio,
+    });
+    if (soldRatio >= 0.5 && this.phase === "holding") {
+      await this.triggerPositionSell(
+        state.mint,
+        `Shared-funder recipient ${watch.wallet} sold at least 50% of first buy`,
+        [
+          "<b>🚨 Shared-Funder Recipient Sold 50%</b>",
+          `Token: <code>${state.mint}</code>`,
+          `Recipient: <code>${watch.wallet}</code>`,
+          `First buy: <code>${watch.firstBuySignature}</code>`,
+          `Sell tx: <code>${tx.signature}</code>`,
+          `Sold: <b>${(soldRatio * 100).toFixed(2)}%</b> of first tracked position`,
+        ],
+        tx.signature,
+      );
+    }
+  }
+
+  private extractTokenAmountForWallet(
+    tx: HeliusTransaction,
+    wallet: string,
+    mint: string,
+    action: "buy" | "sell",
+  ): number {
+    return (tx.tokenTransfers ?? [])
+      .filter((transfer) => {
+        if (transfer.mint !== mint) return false;
+        return action === "buy"
+          ? transfer.toUserAccount === wallet
+          : transfer.fromUserAccount === wallet;
+      })
+      .reduce((sum, transfer) => sum + (transfer.tokenAmount ?? 0), 0);
+  }
+
   private queueSignature(
     signature: string,
     context: "insider" | "bundler",
@@ -1331,7 +2443,9 @@ export class InsiderBot extends EventEmitter {
     if (fresh.length === 0) return;
 
     try {
-      const txs = await this.heliusClient.getTransactionsBySignatures(fresh);
+      const txs = await this.withHeliusFallback((client) =>
+        client.getTransactionsBySignatures(fresh),
+      );
       for (const tx of txs) {
         if (this.processedSignatures.has(tx.signature)) continue;
         const mint = this.watchingMint ?? this.activePosition?.mint;
@@ -1369,6 +2483,7 @@ export class InsiderBot extends EventEmitter {
     await this.stopBundlerMonitoring();
     await this.stopAuthorityMonitoring();
     await this.stopLargeBuyerMonitoring();
+    await this.stopBundlerFunderMonitoring();
     this.axiomTraderWatchActive = false;
     this.clearAxiomWatchedWallets();
     if (this.batchTimer) {
@@ -1381,6 +2496,7 @@ export class InsiderBot extends EventEmitter {
     this.isSwitchingInsiderWallet = false;
     this.authorityMonitor = null;
     this.largeBuyerWatch = null;
+    this.bundlerFunderWatch = null;
   }
 
   private isRelevantMintTx(tx: HeliusTransaction, mint: string): boolean {
@@ -1423,9 +2539,8 @@ export class InsiderBot extends EventEmitter {
     limit: number,
     context: "insider" | "bundler",
   ): Promise<void> {
-    const txs = await this.heliusClient.getWalletTransactionsDesc(
-      wallet,
-      limit,
+    const txs = await this.withHeliusFallback((client) =>
+      client.getWalletTransactionsDesc(wallet, limit),
     );
     const sorted = [...txs].reverse();
     let foundStart = !startSignature;
@@ -2528,10 +3643,8 @@ export class InsiderBot extends EventEmitter {
     const candidateAddresses = new Set(
       candidates.map((wallet) => wallet.address),
     );
-    let mintTransactions = await this.heliusClient.getAddressTransactionsAsc(
-      mint,
-      undefined,
-      100,
+    let mintTransactions = await this.withHeliusFallback((client) =>
+      client.getAddressTransactionsAsc(mint, undefined, 100),
     );
     let firstBuy = mintTransactions.find((tx) =>
       this.getMintBuyActors(tx, mint).some((buy) =>
@@ -2542,7 +3655,9 @@ export class InsiderBot extends EventEmitter {
     if (!firstBuy) {
       const walletTransactions = await Promise.all(
         candidates.map((candidate) =>
-          this.heliusClient.getWalletTransactionsDesc(candidate.address, 50),
+          this.withHeliusFallback((client) =>
+            client.getWalletTransactionsDesc(candidate.address, 50),
+          ),
         ),
       );
       mintTransactions = walletTransactions
@@ -2587,9 +3702,9 @@ export class InsiderBot extends EventEmitter {
       attempt += 1
     ) {
       const [enhancedFirstBuy] =
-        await this.heliusClient.getTransactionsBySignatures([
-          firstBuy.signature,
-        ]);
+        await this.withHeliusFallback((client) =>
+          client.getTransactionsBySignatures([firstBuy.signature]),
+        );
       firstBuyTransaction = enhancedFirstBuy ?? firstBuy;
       authority = this.extractLookupTableAuthority(firstBuyTransaction);
       if (authority) break;
@@ -2746,10 +3861,12 @@ export class InsiderBot extends EventEmitter {
       if (!state.initialReady) {
         // ── Early-probe: check the first 4 txs (tx #1 + 3 more) for a $200+ buy ──
         if (!state.earlyProbeCompleted) {
-          const earlyAfter = await this.heliusClient.getAddressTransactionsAsc(
-            state.authority,
-            state.firstBuySignature,
-            AXIOM_AUTHORITY_EARLY_PROBE_TX_COUNT,
+          const earlyAfter = await this.withHeliusFallback((client) =>
+            client.getAddressTransactionsAsc(
+              state.authority,
+              state.firstBuySignature,
+              AXIOM_AUTHORITY_EARLY_PROBE_TX_COUNT,
+            ),
           );
           const uniqueEarly = earlyAfter.filter(
             (tx) => !state.processedSignatures.has(tx.signature),
@@ -2837,10 +3954,12 @@ export class InsiderBot extends EventEmitter {
         }
 
         // ── Full 15-tx window (only reached if early probe found nothing) ──
-        const after = await this.heliusClient.getAddressTransactionsAsc(
-          state.authority,
-          state.firstBuySignature,
-          AXIOM_AUTHORITY_INITIAL_AFTER_LIMIT,
+        const after = await this.withHeliusFallback((client) =>
+          client.getAddressTransactionsAsc(
+            state.authority,
+            state.firstBuySignature,
+            AXIOM_AUTHORITY_INITIAL_AFTER_LIMIT,
+          ),
         );
         const uniqueAfter = after.filter(
           (tx) => !state.processedSignatures.has(tx.signature),
@@ -2887,10 +4006,12 @@ export class InsiderBot extends EventEmitter {
           }
           let cursor = state.cursorSignature;
           while (true) {
-            const batch = await this.heliusClient.getAddressTransactionsAsc(
-              state.authority,
-              cursor,
-              AXIOM_AUTHORITY_BATCH_LIMIT,
+            const batch = await this.withHeliusFallback((client) =>
+              client.getAddressTransactionsAsc(
+                state.authority,
+                cursor,
+                AXIOM_AUTHORITY_BATCH_LIMIT,
+              ),
             );
             if (batch.length === 0) break;
             for (const tx of batch) {
@@ -2922,10 +4043,12 @@ export class InsiderBot extends EventEmitter {
 
       let cursor = state.cursorSignature;
       while (true) {
-        const batch = await this.heliusClient.getAddressTransactionsAsc(
-          state.authority,
-          cursor,
-          AXIOM_AUTHORITY_BATCH_LIMIT,
+        const batch = await this.withHeliusFallback((client) =>
+          client.getAddressTransactionsAsc(
+            state.authority,
+            cursor,
+            AXIOM_AUTHORITY_BATCH_LIMIT,
+          ),
         );
         const fresh = batch.filter(
           (tx) => !state.processedSignatures.has(tx.signature),
@@ -3983,6 +5106,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     await this.stopBundlerMonitoring();
+    await this.stopBundlerFunderMonitoring();
     this.stopAxiomAtaPollLoop();
     this.watchingMint = null;
     this.monitoredWallet = null;
@@ -4024,6 +5148,7 @@ export class InsiderBot extends EventEmitter {
     this.monitoredWallet = null;
     this.insiderState = null;
     this.bundlerWatch = null;
+    this.bundlerFunderWatch = null;
     this.clearBundlerAccumulation();
     this.initialInsiderWallets.clear();
     this.devWallet = null;

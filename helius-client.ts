@@ -25,6 +25,19 @@ export interface HeliusTransaction {
     toUserAccount: string;
     amount: number;
   }>;
+  accountData?: Array<{
+    account: string;
+    nativeBalanceChange?: number;
+    tokenBalanceChanges?: Array<{
+      userAccount?: string;
+      tokenAccount?: string;
+      rawTokenAmount?: {
+        tokenAmount?: string;
+        decimals?: number;
+      };
+      mint?: string;
+    }>;
+  }>;
   instructions?: Array<{
     programId: string;
     accounts?: string[];
@@ -33,6 +46,25 @@ export interface HeliusTransaction {
       accounts?: string[];
     }>;
   }>;
+}
+
+export interface HeliusBalanceAtResponse {
+  wallet: string;
+  mint: string;
+  isNative: boolean;
+  balance: string;
+  balanceRaw: string;
+  decimals: number;
+  requested?: {
+    time?: number | null;
+    slot?: number | null;
+    datetime?: string | null;
+  };
+  asOf?: {
+    slot?: number;
+    blockTime?: number;
+    signature?: string;
+  };
 }
 
 export interface EarlyBundlerInfo {
@@ -171,6 +203,19 @@ export class HeliusClient {
     }
   }
 
+  private shouldRetryRequest(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/No transactions found for mint yet|No SWAP transactions found for mint yet/i.test(message)) {
+      return true;
+    }
+    if (/\b429\b|too many requests/i.test(message)) return true;
+    if (/\b5\d\d\b/.test(message)) return true;
+    if (/timeout|timed out|network|fetch failed|econnreset|etimedout|enotfound|socket|tls/i.test(message)) {
+      return true;
+    }
+    return false;
+  }
+
   private async fetchProjectUsage(): Promise<HeliusProjectUsage> {
     const projectId = encodeURIComponent(this.projectId!);
     const params = new URLSearchParams({ 'api-key': this.apiKey });
@@ -223,8 +268,10 @@ export class HeliusClient {
         lastError = err instanceof Error ? err : new Error(String(err));
         log.warn(`Attempt ${attempt} failed to fetch early bundlers`, { error: lastError.message });
         
-        if (attempt < 3) {
+        if (attempt < 3 && this.shouldRetryRequest(lastError)) {
           await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+        } else {
+          break;
         }
       }
     }
@@ -353,8 +400,10 @@ export class HeliusClient {
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         log.warn(`Attempt ${attempt} failed to fetch early insider swaps`, { error: lastError.message });
-        if (attempt < 3) {
+        if (attempt < 3 && this.shouldRetryRequest(lastError)) {
           await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+        } else {
+          break;
         }
       }
     }
@@ -392,8 +441,10 @@ export class HeliusClient {
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         log.warn(`Attempt ${attempt} failed to fetch desc transactions for ${address}`, { error: lastError.message });
-        if (attempt < 3) {
+        if (attempt < 3 && this.shouldRetryRequest(lastError)) {
           await new Promise((resolve) => setTimeout(resolve, attempt * 1000));
+        } else {
+          break;
         }
       }
     }
@@ -419,6 +470,49 @@ export class HeliusClient {
       log.error(`Failed to fetch transactions for ${address} from Helius`, err);
       throw err;
     }
+  }
+
+  async getAddressTransferTransactionsDescBefore(
+    address: string,
+    beforeSignature: string,
+    limit: number = 5,
+  ): Promise<HeliusTransaction[]> {
+    const params = new URLSearchParams({
+      'sort-order': 'desc',
+      'api-key': this.apiKey,
+      'before-signature': beforeSignature,
+      limit: String(limit),
+      'token-accounts': 'balanceChanged',
+      type: 'TRANSFER',
+    });
+    const url = `${this.baseUrl}/v0/addresses/${address}/transactions?${params.toString()}`;
+
+    const response = await this.fetchWithCreditCheck(url);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+    return await response.json() as HeliusTransaction[];
+  }
+
+  async getWalletBalanceAt(
+    wallet: string,
+    mint: string,
+    time: number,
+  ): Promise<HeliusBalanceAtResponse> {
+    const params = new URLSearchParams({
+      'api-key': this.apiKey,
+      mint,
+      time: String(time),
+    });
+    const url = `https://api.helius.xyz/v1/wallet/${wallet}/balance-at?${params.toString()}`;
+
+    const response = await this.fetchWithCreditCheck(url);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Helius balance-at API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+    return await response.json() as HeliusBalanceAtResponse;
   }
 
   async getAddressTransactionsAsc(
