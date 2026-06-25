@@ -2508,7 +2508,7 @@ async function main(): Promise<void> {
           "",
           "<b>Flow</b>",
           "1. Bot 1 follows one wallet; Insider API keys 1–4 are used as the Helius fallback/key pool.",
-          "2. Skip if the follow-wallet buy MC is above $50,000.",
+          "2. Skip if the follow-wallet buy MC is above $60,000.",
           "3. First four token SWAP buyers are checked; the follow wallet must be one of those four bundlers.",
           "4. Each bundler must have a valid first SOL funding transfer after its wallet was last 0 SOL, and all four must share the same sender.",
           "5. Watch the shared sender from the earliest bundler funding tx for transfer-outs >= largest bundler funding + 2 SOL.",
