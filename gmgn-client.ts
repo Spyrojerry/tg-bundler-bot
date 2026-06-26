@@ -995,7 +995,22 @@ export class GmgnClient {
     this.validateSolAddress(walletAddress, "PumpPortal Lightning wallet");
     this.validateSolAddress(mint, "mint");
 
-    const balanceBefore = await this.getTokenBalance(walletAddress, mint);
+    const balanceBefore = await this.getTokenBalance(walletAddress, mint).catch(
+      (err) => {
+        if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) {
+          log.warn(
+            "PumpPortal buy precheck could not read token balance because mint lookup is not ready; continuing as zero balance",
+            {
+              mint,
+              walletAddress,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
+          return 0n;
+        }
+        throw err;
+      },
+    );
     if (
       preFetchedBalance !== undefined &&
       preFetchedBalance !== balanceBefore
@@ -1056,7 +1071,14 @@ export class GmgnClient {
           venue,
         );
       } catch (submitError) {
-        const balanceAfter = await this.getTokenBalance(walletAddress, mint);
+        const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
+          (err) => {
+            if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) {
+              return 0n;
+            }
+            throw err;
+          },
+        );
         const balanceProvesCompletion =
           action === "buy"
             ? balanceAfter > 0n
@@ -1130,7 +1152,14 @@ export class GmgnClient {
         );
       }
 
-      const balanceAfter = await this.getTokenBalance(walletAddress, mint);
+      const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
+        (err) => {
+          if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) {
+            return 0n;
+          }
+          throw err;
+        },
+      );
       const balanceProvesCompletion =
         action === "buy"
           ? balanceAfter > 0n
@@ -2043,6 +2072,13 @@ private async sendRawTransactionAndAssertSuccess(
     }
 
     return total;
+  }
+
+  private isMissingMintTokenAccountLookup(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /could not find mint|invalid param|token program id and mint/i.test(
+      message,
+    );
   }
 
   private async getTokenProgramsWithBalance(

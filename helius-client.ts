@@ -117,6 +117,7 @@ export class HeliusClient {
     | null;
   private creditCheckPromise: Promise<void> | null = null;
   private lastCreditCheckAt = 0;
+  private creditCheckDisabledUntil = 0;
   private creditsExhaustedNotified = false;
 
   constructor(apiKey: string, options: HeliusClientOptions = {}) {
@@ -140,6 +141,7 @@ export class HeliusClient {
 
   private async checkProjectCreditsAfter429(): Promise<void> {
     if (this.creditsExhaustedNotified) return;
+    if (Date.now() < this.creditCheckDisabledUntil) return;
     if (!this.projectId) {
       log.warn(`${this.label} received Helius 429 but has no project ID configured`, {
         requiredSetting: 'INSIDER_HELIUS_PROJECT_ID[_2|_3|_4]',
@@ -185,9 +187,17 @@ export class HeliusClient {
         });
       })
       .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/401|403|unauthorized|forbidden/i.test(message)) {
+          this.creditCheckDisabledUntil = Date.now() + 5 * 60_000;
+        }
         log.warn(`${this.label} Helius Admin credit check failed after 429`, {
           projectId: this.projectId,
-          error: err instanceof Error ? err.message : String(err),
+          error: message,
+          disabledUntil:
+            this.creditCheckDisabledUntil > Date.now()
+              ? new Date(this.creditCheckDisabledUntil).toISOString()
+              : null,
         });
       })
       .finally(() => {

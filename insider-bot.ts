@@ -53,10 +53,10 @@ const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
 const BUNDLER_FUNDER_EXTRA_SOL = 2;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
-const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 5;
-const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 12;
+const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 50;
+const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 2;
 const BUNDLER_FUNDER_RECIPIENT_SYNC_INTERVAL_MS = 1_500;
-const BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE = 5;
+const BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE = 2;
 const HELIUS_POOL_MAX_CONCURRENT = 2;
 const HELIUS_POOL_MIN_TIME_MS = 150;
 const HELIUS_POOL_REQUEST_TIMEOUT_MS = 10_000;
@@ -330,6 +330,7 @@ interface FunderRecipientWatch {
   wallet: string;
   fundingSignature: string;
   outAmountSol: number;
+  heliusPreferredIndex: number;
   tokenActions: Array<{
     kind: "buy" | "sell";
     signature: string;
@@ -455,6 +456,7 @@ export class InsiderBot extends EventEmitter {
   private bundlerFunderWsSyncTimer: ReturnType<typeof setTimeout> | null = null;
   private lastBundlerFunderSyncAt = 0;
   private dirtyFunderRecipients = new Set<string>();
+  private dirtyFunderRecipientSignatures = new Map<string, Set<string>>();
   private isFunderRecipientBatchSyncing = false;
   private funderRecipientBatchSyncPending = false;
   private lastFunderRecipientBatchSyncAt = 0;
@@ -2087,6 +2089,7 @@ export class InsiderBot extends EventEmitter {
     this.bundlerFunderSyncPending = false;
     this.bundlerFunderSyncPendingForce = false;
     this.dirtyFunderRecipients.clear();
+    this.dirtyFunderRecipientSignatures.clear();
     this.isFunderRecipientBatchSyncing = false;
     this.funderRecipientBatchSyncPending = false;
   }
@@ -2258,6 +2261,8 @@ export class InsiderBot extends EventEmitter {
         wallet: pending.recipient,
         fundingSignature: pending.signature,
         outAmountSol: pending.amountSol,
+        heliusPreferredIndex:
+          state.recipientWatches.size % Math.max(1, this.heliusPool.length || 1),
         tokenActions: [],
         boughtAmount: 0,
         soldAmount: 0,
@@ -2491,11 +2496,14 @@ export class InsiderBot extends EventEmitter {
     if (!state || !watch || this.positionSellTriggered) return;
     try {
       const txs = signature
-        ? await this.withHeliusFallback((client) =>
-            client.getTransactionsBySignatures([signature]),
+        ? await this.withHeliusFallback(
+            (client) => client.getTransactionsBySignatures([signature]),
+            watch.heliusPreferredIndex,
           )
-        : await this.withHeliusFallback((client) =>
-            client.getWalletTransactionsDesc(wallet, INSIDER_HISTORY_LIMIT),
+        : await this.withHeliusFallback(
+            (client) =>
+              client.getWalletTransactionsDesc(wallet, INSIDER_HISTORY_LIMIT),
+            watch.heliusPreferredIndex,
           );
       const sorted = [...txs].reverse();
       for (const tx of sorted) {
@@ -2516,6 +2524,14 @@ export class InsiderBot extends EventEmitter {
     const state = this.bundlerFunderWatch;
     if (!state?.recipientWatches.has(wallet)) return;
     this.dirtyFunderRecipients.add(wallet);
+    if (signature) {
+      let signatures = this.dirtyFunderRecipientSignatures.get(wallet);
+      if (!signatures) {
+        signatures = new Set<string>();
+        this.dirtyFunderRecipientSignatures.set(wallet, signatures);
+      }
+      signatures.add(signature);
+    }
     this.log.debug("Marked shared feePayer recipient for batch sync", {
       mint: state.mint,
       wallet,
@@ -2546,11 +2562,20 @@ export class InsiderBot extends EventEmitter {
       const dirty = [...this.dirtyFunderRecipients].filter((wallet) =>
         state.recipientWatches.has(wallet),
       );
+      if (!force && dirty.length === 0) return;
       const wallets = (dirty.length > 0 ? dirty : [...state.recipientWatches.keys()])
         .slice(0, BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE);
       for (const wallet of wallets) {
         this.dirtyFunderRecipients.delete(wallet);
-        await this.syncFunderRecipientTransactions(wallet);
+        const signatures = this.dirtyFunderRecipientSignatures.get(wallet);
+        this.dirtyFunderRecipientSignatures.delete(wallet);
+        if (signatures?.size) {
+          for (const signature of signatures) {
+            await this.syncFunderRecipientTransactions(wallet, signature);
+          }
+        } else {
+          await this.syncFunderRecipientTransactions(wallet);
+        }
       }
       this.log.info("Shared feePayer recipient batch sync completed", {
         mint: state.mint,
@@ -2561,9 +2586,11 @@ export class InsiderBot extends EventEmitter {
       });
     } finally {
       this.isFunderRecipientBatchSyncing = false;
-      if (this.funderRecipientBatchSyncPending || this.dirtyFunderRecipients.size > 0) {
+      if (this.dirtyFunderRecipients.size > 0) {
         this.funderRecipientBatchSyncPending = false;
         void this.syncFunderRecipientBatch();
+      } else if (this.funderRecipientBatchSyncPending) {
+        this.funderRecipientBatchSyncPending = false;
       }
     }
   }
