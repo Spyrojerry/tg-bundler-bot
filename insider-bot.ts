@@ -461,6 +461,8 @@ export class InsiderBot extends EventEmitter {
   private funderRecipientBatchSyncPending = false;
   private lastFunderRecipientBatchSyncAt = 0;
   private lastHeliusPoolMetricsAt = 0;
+  private heliusPoolMetricsMint: string | null = null;
+  private heliusPoolMetricsStartedAt = 0;
   private isAuthoritySyncing = false;
   private authoritySyncPending = false;
   private isAuthorityAtaChecking = false;
@@ -1004,6 +1006,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async startInsiderFlow(mint: string): Promise<void> {
+    this.resetHeliusPoolMetricsForMint(mint);
     this.resetTokenTxCounts();
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
@@ -1385,6 +1388,11 @@ export class InsiderBot extends EventEmitter {
     }
     this.lastHeliusPoolMetricsAt = now;
     this.log.info("Helius pool metrics", {
+      mint: this.heliusPoolMetricsMint,
+      elapsedMs:
+        this.heliusPoolMetricsStartedAt > 0
+          ? now - this.heliusPoolMetricsStartedAt
+          : null,
       queue: {
         maxConcurrent: HELIUS_POOL_MAX_CONCURRENT,
         minTimeMs: HELIUS_POOL_MIN_TIME_MS,
@@ -1398,6 +1406,21 @@ export class InsiderBot extends EventEmitter {
         ...entry.stats,
       })),
     });
+  }
+
+  private resetHeliusPoolMetricsForMint(mint: string): void {
+    this.heliusPoolMetricsMint = mint;
+    this.heliusPoolMetricsStartedAt = Date.now();
+    this.lastHeliusPoolMetricsAt = 0;
+    for (const entry of this.heliusPool) {
+      entry.stats.requests = 0;
+      entry.stats.successes = 0;
+      entry.stats.fallbacks = 0;
+      entry.stats.rateLimits = 0;
+      entry.stats.transientFailures = 0;
+      entry.stats.permanentFailures = 0;
+    }
+    this.log.info("Helius pool metrics reset for token", { mint });
   }
 
   private async startBundlerFunderFlow(
@@ -5486,6 +5509,9 @@ export class InsiderBot extends EventEmitter {
     this.buySubmitted = false;
     this.isBuyGateEvaluating = false;
     this.profitExitDisabled = false;
+    this.heliusPoolMetricsMint = null;
+    this.heliusPoolMetricsStartedAt = 0;
+    this.lastHeliusPoolMetricsAt = 0;
     this.resetTokenTxCounts();
 
     this.log.info("InsiderBot reset; resuming followed wallet monitoring");
