@@ -22,6 +22,8 @@ import { TelegramBot } from "./telegram-bot";
 import { WalletMonitor } from "./wallet-monitor";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const NATIVE_SOL_BALANCE_MINT =
+  "So11111111111111111111111111111111111111111";
 const INSIDER_HISTORY_LIMIT = 21;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const AXIOM_TRADER_SCAN_LIMIT = 50;
@@ -1477,24 +1479,61 @@ export class InsiderBot extends EventEmitter {
 
     for (let index = 0; index < txs.length; index += 1) {
       const tx = txs[index];
-      if (tx.type && tx.type !== "TRANSFER") continue;
+      if (tx.type && tx.type !== "TRANSFER") {
+        this.log.info("Bundler funding candidate rejected: tx is not TRANSFER", {
+          mint,
+          bundlerWallet: buy.wallet,
+          candidateSignature: tx.signature,
+          type: tx.type,
+          index,
+        });
+        continue;
+      }
       const incoming = this.extractSolIncomingToWallet(tx, buy.wallet);
-      if (!incoming) continue;
+      if (!incoming) {
+        this.log.info("Bundler funding candidate rejected: no incoming SOL to bundler", {
+          mint,
+          bundlerWallet: buy.wallet,
+          candidateSignature: tx.signature,
+          index,
+          timestamp: tx.timestamp,
+          nativeTransferCount: tx.nativeTransfers?.length ?? 0,
+          tokenTransferCount: tx.tokenTransfers?.length ?? 0,
+          nativeBalanceChange: (tx.accountData ?? []).find(
+            (account) => account.account === buy.wallet,
+          )?.nativeBalanceChange ?? null,
+        });
+        continue;
+      }
 
       const currentBalance = await this.fetchSolBalanceAt(
         buy.wallet,
         tx.timestamp,
         preferredClientIndex,
       );
-      if (currentBalance <= 0) continue;
+      if (currentBalance <= 0) {
+        this.log.info("Bundler funding candidate rejected: balance-at candidate timestamp is not positive", {
+          mint,
+          bundlerWallet: buy.wallet,
+          candidateSignature: tx.signature,
+          senderWallet: incoming.from,
+          amountSol: incoming.amountSol,
+          timestamp: tx.timestamp,
+          currentBalance,
+        });
+        continue;
+      }
 
       const olderTx = txs[index + 1];
       if (!olderTx) {
-        this.log.info("Bundler funding candidate has no older transfer in current page", {
+        this.log.info("Bundler funding candidate rejected: no older transfer in current page", {
           mint,
           bundlerWallet: buy.wallet,
           fundingSignature: tx.signature,
+          senderWallet: incoming.from,
+          amountSol: incoming.amountSol,
           currentBalance,
+          transferLimit: BUNDLER_FUNDER_TRANSFER_LIMIT,
         });
         continue;
       }
@@ -1503,8 +1542,34 @@ export class InsiderBot extends EventEmitter {
         olderTx.timestamp,
         preferredClientIndex,
       );
-      if (olderBalance !== 0) continue;
+      if (olderBalance !== 0) {
+        this.log.info("Bundler funding candidate rejected: previous transfer balance was not zero", {
+          mint,
+          bundlerWallet: buy.wallet,
+          candidateSignature: tx.signature,
+          previousSignature: olderTx.signature,
+          senderWallet: incoming.from,
+          amountSol: incoming.amountSol,
+          candidateTimestamp: tx.timestamp,
+          previousTimestamp: olderTx.timestamp,
+          currentBalance,
+          olderBalance,
+        });
+        continue;
+      }
 
+      this.log.warn("Bundler funding transfer validated", {
+        mint,
+        bundlerWallet: buy.wallet,
+        bundlerBuySignature: buy.signature,
+        fundingSignature: tx.signature,
+        senderWallet: incoming.from,
+        amountSol: incoming.amountSol,
+        timestamp: tx.timestamp,
+        previousSignature: olderTx.signature,
+        currentBalance,
+        olderBalance,
+      });
       return {
         bundlerWallet: buy.wallet,
         bundlerBuySignature: buy.signature,
@@ -1530,7 +1595,8 @@ export class InsiderBot extends EventEmitter {
     preferredClientIndex: number,
   ): Promise<number> {
     const balance = await this.withHeliusFallback(
-      (client) => client.getWalletBalanceAt(wallet, SOL_MINT, timestamp),
+      (client) =>
+        client.getWalletBalanceAt(wallet, NATIVE_SOL_BALANCE_MINT, timestamp),
       preferredClientIndex,
     );
     const parsed = Number(balance.balance);
@@ -1541,6 +1607,16 @@ export class InsiderBot extends EventEmitter {
     tx: HeliusTransaction,
     wallet: string,
   ): { from: string; amountSol: number } | null {
+    const nativeIncoming = (tx.nativeTransfers ?? [])
+      .filter(
+        (transfer) =>
+          transfer.toUserAccount === wallet &&
+          transfer.fromUserAccount !== wallet &&
+          (transfer.amount ?? 0) > 0,
+      )
+      .sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0))[0];
+    if (!nativeIncoming) return null;
+
     const tokenTransfer = (tx.tokenTransfers ?? []).find(
       (transfer) =>
         transfer.mint === SOL_MINT &&
@@ -1558,16 +1634,6 @@ export class InsiderBot extends EventEmitter {
       (account) => account.account === wallet,
     )?.nativeBalanceChange;
     if (accountChange !== undefined && accountChange <= 0) return null;
-
-    const nativeIncoming = (tx.nativeTransfers ?? [])
-      .filter(
-        (transfer) =>
-          transfer.toUserAccount === wallet &&
-          transfer.fromUserAccount !== wallet &&
-          (transfer.amount ?? 0) > 0,
-      )
-      .sort((a, b) => (b.amount ?? 0) - (a.amount ?? 0))[0];
-    if (!nativeIncoming) return null;
     return {
       from: nativeIncoming.fromUserAccount,
       amountSol: (nativeIncoming.amount ?? 0) / LAMPORTS_PER_SOL,
