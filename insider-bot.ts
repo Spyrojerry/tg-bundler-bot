@@ -1607,6 +1607,19 @@ export class InsiderBot extends EventEmitter {
     tx: HeliusTransaction,
     wallet: string,
   ): { from: string; amountSol: number } | null {
+    const described = this.parseSolTransferDescription(tx.description);
+    if (
+      described &&
+      described.to === wallet &&
+      described.from !== wallet &&
+      described.amountSol > 0
+    ) {
+      return {
+        from: described.from,
+        amountSol: described.amountSol,
+      };
+    }
+
     const nativeIncoming = (tx.nativeTransfers ?? [])
       .filter(
         (transfer) =>
@@ -2214,6 +2227,19 @@ export class InsiderBot extends EventEmitter {
     wallet: string,
     minAmountSol: number,
   ): { to: string; amountSol: number } | null {
+    const described = this.parseSolTransferDescription(tx.description);
+    if (
+      described &&
+      described.from === wallet &&
+      described.to !== wallet &&
+      described.amountSol >= minAmountSol
+    ) {
+      return {
+        to: described.to,
+        amountSol: described.amountSol,
+      };
+    }
+
     const tokenTransfer = (tx.tokenTransfers ?? [])
       .filter(
         (transfer) =>
@@ -2246,6 +2272,16 @@ export class InsiderBot extends EventEmitter {
   }
 
   private hasSolIncomingToWallet(tx: HeliusTransaction, wallet: string): boolean {
+    const described = this.parseSolTransferDescription(tx.description);
+    if (
+      described &&
+      described.to === wallet &&
+      described.from !== wallet &&
+      described.amountSol > 0
+    ) {
+      return true;
+    }
+
     return (
       (tx.tokenTransfers ?? []).some(
         (transfer) =>
@@ -2260,6 +2296,23 @@ export class InsiderBot extends EventEmitter {
           (transfer.amount ?? 0) > 0,
       )
     );
+  }
+
+  private parseSolTransferDescription(
+    description?: string,
+  ): { from: string; to: string; amountSol: number } | null {
+    if (!description) return null;
+    const match = description.match(
+      /^([1-9A-HJ-NP-Za-km-z]{32,44}) transferred ([0-9]+(?:\.[0-9]+)?) SOL to ([1-9A-HJ-NP-Za-km-z]{32,44})\.$/,
+    );
+    if (!match) return null;
+    const amountSol = Number(match[2]);
+    if (!Number.isFinite(amountSol)) return null;
+    return {
+      from: match[1],
+      amountSol,
+      to: match[3],
+    };
   }
 
   private async emitBundlerFunderBuy(
