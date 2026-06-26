@@ -350,6 +350,7 @@ async function main(): Promise<void> {
           let buySol = 0;
           let entryMc: number | null = null;
           let exitMc: number | null = null;
+          let insiderProfitExitDisabled = false;
 
           if (context === "insider") {
             const bot =
@@ -357,6 +358,7 @@ async function main(): Promise<void> {
             buySol = bot.getBuySol();
             entryMc = bot.getEntryMc();
             exitMc = bot.getExitMc();
+            insiderProfitExitDisabled = bot.isProfitExitDisabled();
           } else if (context === "bundler") {
             const position = earlyBundlerOrchestrator.getActivePosition();
             buySol = position?.buySol ?? earlyBundlerOrchestrator.getBuySol();
@@ -421,6 +423,9 @@ async function main(): Promise<void> {
               : context === "bundler" && exitMc !== null
                 ? `Exit MC: <b>$${exitMc.toLocaleString()}</b>`
                 : null,
+            context === "insider" && insiderProfitExitDisabled
+              ? "Exit MC status: <b>Disabled — waiting for recipient 50% sell</b>"
+              : null,
             profitDisplay,
             tokenBalanceLine,
             "",
@@ -1976,6 +1981,12 @@ async function main(): Promise<void> {
 
       if (activePos) {
         const exitMc = bot.getExitMc();
+        if (bot.isProfitExitDisabled()) {
+          log.info(
+            `[INSIDER ${botNumber} MC EXIT SKIP] Profit MC exit disabled for ${activePos.mint}; waiting for recipient 50% sell exit. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+          );
+          return;
+        }
         if (currentMc >= exitMc) {
           log.warn(
             `[INSIDER ${botNumber} EXIT] Current MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`,
@@ -2509,12 +2520,13 @@ async function main(): Promise<void> {
           "<b>Flow</b>",
           "1. Bot 1 follows one wallet; Insider API keys 1–4 are used as the Helius fallback/key pool.",
           "2. Skip if the follow-wallet buy MC is above $60,000.",
-          "3. First four token SWAP buyers are checked; the follow wallet must be one of those four bundlers.",
+          "3. First four unique bundler-wallet buy txs are checked; the follow wallet must be one of those first-buy wallets.",
           "4. Each bundler must have a valid first SOL funding transfer after its wallet was last 0 SOL, and all four must share the same sender.",
           "5. Watch the shared sender from the earliest bundler funding tx for transfer-outs >= largest bundler funding + 2 SOL.",
           "6. A transfer-out is only confirmed if the immediate next funder tx is not a SOL transfer-in.",
           "7. Buy on the first confirmed transfer-out; keep watching other confirmed transfer-out recipients.",
           "8. After buy: sell on MC target, rug, or when a confirmed recipient buys then sells at least 50% of its first tracked position.",
+          "9. If that recipient's second token action is a sell, disable the % MC profit exit and stick to the 50% recipient-sell exit; if the second action is another buy, use MC/rug exits.",
           "• API guard: Helius calls use a queued four-key pool, transient-only fallback, per-key backoff, and capped recipient batch sync.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets before buy or sells after buy.`,
         ].join("\n"),

@@ -184,6 +184,7 @@ export interface InsiderBot {
   clearPreBuyMint(): void;
   getEntryMc(): number;
   getExitMc(): number;
+  isProfitExitDisabled(): boolean;
   setExitMc(value: number): void;
   getExitPercent(): number;
   setExitPercent(value: number): void;
@@ -418,6 +419,7 @@ export class InsiderBot extends EventEmitter {
   private maxObservedLargestSimilarBalanceGroupCount = 0;
   private preBuyStopped = false;
   private positionSellTriggered = false;
+  private profitExitDisabled = false;
   private insiderSellsReady = false;
   private bundlerMatchesReady = false;
 
@@ -648,6 +650,10 @@ export class InsiderBot extends EventEmitter {
     return this.exitMc;
   }
 
+  isProfitExitDisabled() {
+    return this.profitExitDisabled;
+  }
+
   setExitPercent(value: number): void {
     if (!Number.isFinite(value) || value < 0) {
       throw new Error("Exit percent must be a non-negative number");
@@ -856,6 +862,7 @@ export class InsiderBot extends EventEmitter {
     this.boughtMints.add(trigger.mint);
     this.phase = "holding";
     this.axiomTraderWatchActive = false;
+    this.profitExitDisabled = false;
     if (this.authorityMonitor?.initialCursorSignature) {
       this.authorityMonitor.cursorSignature =
         this.authorityMonitor.initialCursorSignature;
@@ -997,14 +1004,17 @@ export class InsiderBot extends EventEmitter {
     const swaps = await this.withHeliusFallback((client) =>
       client.getEarlyInsiderSwaps(mint, 4),
     );
-    const earlyInsiderBuys = this.extractEarlyInsiderBuys(swaps, mint);
+    const earlyInsiderBuys = this.extractFirstUniqueEarlyBundlerBuys(
+      swaps,
+      mint,
+    );
     const earlyBundlerWallets = this.extractEarlyInsiderWallets(earlyInsiderBuys);
     this.initialInsiderWallets.clear();
     for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
 
     if (!this.followedWallet || !earlyBundlerWallets.includes(this.followedWallet)) {
       this.log.warn(
-        "Follow wallet is not one of the first four bundlers; resetting token flow",
+        "Follow wallet is not one of the first four unique bundler first-buy wallets; resetting token flow",
         {
           mint,
           followedWallet: this.followedWallet,
@@ -1037,7 +1047,7 @@ export class InsiderBot extends EventEmitter {
         `<b>🔍 ${this.label} Bundler-Funder Flow Started</b>`,
         `Token: <code>${mint}</code>`,
         `Follow wallet: <code>${this.followedWallet}</code>`,
-        `First four bundlers: <b>${earlyBundlerWallets.length}</b>`,
+        `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
         "Validating the shared SOL funder, then watching transfer-outs with an immediate next-tx transfer-in invalidation check.",
       ].join("\n"),
@@ -1068,6 +1078,49 @@ export class InsiderBot extends EventEmitter {
       }
     }
     return buys;
+  }
+
+  private extractFirstUniqueEarlyBundlerBuys(
+    swaps: HeliusTransaction[],
+    mint: string,
+  ): EarlyInsiderBuy[] {
+    const firstBuys: EarlyInsiderBuy[] = [];
+    const seenWallets = new Set<string>();
+    const sortedSwaps = [...swaps].sort(
+      (a, b) => a.slot - b.slot || a.timestamp - b.timestamp,
+    );
+
+    for (const tx of sortedSwaps) {
+      if (tx.type !== "SWAP") continue;
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint !== mint) continue;
+        const wallet = transfer.toUserAccount;
+        if (!wallet) continue;
+        if (seenWallets.has(wallet)) {
+          this.log.info(
+            "Ignoring follow-up bundler buy; first wallet tx already locked",
+            {
+              mint,
+              wallet,
+              ignoredSignature: tx.signature,
+            },
+          );
+          continue;
+        }
+        seenWallets.add(wallet);
+        firstBuys.push({
+          wallet,
+          tokenAmount: transfer.tokenAmount ?? 0,
+          signature: tx.signature,
+          buySol: this.estimateWalletSolSpent(tx, wallet),
+        });
+        if (firstBuys.length >= BUNDLER_FUNDER_REQUIRED_COUNT) {
+          return firstBuys;
+        }
+      }
+    }
+
+    return firstBuys;
   }
 
   private extractEarlyInsiderWallets(buys: EarlyInsiderBuy[]): string[] {
@@ -2203,7 +2256,7 @@ export class InsiderBot extends EventEmitter {
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
           "Next-tx check: confirmed; the immediate next funder tx was not a SOL transfer-in.",
-          "Sell rule: if this recipient's first token action is a buy, sell when it sells at least 50% of that position. If its second token action is another buy, use only MC/rug exits.",
+          "Sell rule: if this recipient's first token action is a buy, sell when it sells at least 50% of that position. If its second token action is a sell, disable the % MC profit exit and stick to the 50% recipient-sell exit. If its second token action is another buy, use only MC/rug exits.",
         ].join("\n"),
       });
     } finally {
@@ -2358,6 +2411,31 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (!watch.firstBuySignature || !watch.followSellExit) return;
+    if (watch.tokenActions.length === 2 && !this.profitExitDisabled) {
+      this.profitExitDisabled = true;
+      this.log.warn(
+        "Recipient second token action is a sell; disabling MC profit exit and keeping 50% recipient-sell exit",
+        {
+          mint: state.mint,
+          wallet: watch.wallet,
+          firstBuySignature: watch.firstBuySignature,
+          secondActionSignature: tx.signature,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>🔵 ${this.label} Exit Mode Changed</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `Recipient: <code>${watch.wallet}</code>`,
+          `First buy: <code>${watch.firstBuySignature}</code>`,
+          `Second token action: <b>SELL</b>`,
+          `Sell tx: <code>${tx.signature}</code>`,
+          "",
+          "% MC profit exit disabled for this position. Bot will wait for this recipient to sell at least 50% of its first tracked buy. Rug protection remains active.",
+        ].join("\n"),
+        "recipient second-action sell notification",
+      );
+    }
     watch.soldAmount += amount;
     const soldRatio = watch.boughtAmount > 0 ? watch.soldAmount / watch.boughtAmount : 0;
     this.log.info("Valid transfer-out recipient sell observed", {
@@ -5156,11 +5234,13 @@ export class InsiderBot extends EventEmitter {
     this.clearAxiomWatchedWallets();
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
+    this.profitExitDisabled = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
     this.authorityProbeFailedAtTwo = false;
     this.buySubmitted = false;
     this.isBuyGateEvaluating = false;
+    this.profitExitDisabled = false;
     this.resetTokenTxCounts();
 
     this.log.info("InsiderBot reset; resuming followed wallet monitoring");
