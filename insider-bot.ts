@@ -237,6 +237,8 @@ interface EarlyInsiderBuy {
   tokenAmount: number;
   signature: string;
   buySol: number | null;
+  feePayer: string | null;
+  timestamp: number;
 }
 
 interface AxiomWatchedWallet {
@@ -317,6 +319,7 @@ interface BundlerFundingRecord {
   bundlerWallet: string;
   bundlerBuySignature: string;
   fundingSignature: string;
+  fundingFeePayer: string;
   senderWallet: string;
   amountSol: number;
   timestamp: number;
@@ -1051,7 +1054,7 @@ export class InsiderBot extends EventEmitter {
         `Follow wallet: <code>${this.followedWallet}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
-        "Validating the shared SOL funder, then watching transfer-outs with an immediate next-tx transfer-in invalidation check.",
+        "Finding each bundler's first valid funding transfer, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs with an immediate next-tx transfer-in invalidation check.",
       ].join("\n"),
       "flow-start notification",
     );
@@ -1075,7 +1078,9 @@ export class InsiderBot extends EventEmitter {
           wallet,
           tokenAmount: transfer.tokenAmount ?? 0,
           signature: tx.signature,
-          buySol: this.estimateWalletSolSpent(tx, wallet),
+          buySol: this.estimateEarlyBuySol(tx, wallet),
+          feePayer: tx.feePayer ?? null,
+          timestamp: tx.timestamp,
         });
       }
     }
@@ -1114,7 +1119,9 @@ export class InsiderBot extends EventEmitter {
           wallet,
           tokenAmount: transfer.tokenAmount ?? 0,
           signature: tx.signature,
-          buySol: this.estimateWalletSolSpent(tx, wallet),
+          buySol: this.estimateEarlyBuySol(tx, wallet),
+          feePayer: tx.feePayer ?? null,
+          timestamp: tx.timestamp,
         });
         if (firstBuys.length >= BUNDLER_FUNDER_REQUIRED_COUNT) {
           return firstBuys;
@@ -1192,6 +1199,16 @@ export class InsiderBot extends EventEmitter {
 
     if (spentLamports <= 0) return null;
     return parseFloat((spentLamports / 1_000_000_000).toFixed(6));
+  }
+
+  private estimateEarlyBuySol(
+    tx: HeliusTransaction,
+    buyWallet: string,
+  ): number | null {
+    return (
+      this.estimateWalletSolSpent(tx, buyWallet) ??
+      (tx.feePayer ? this.estimateWalletSolSpent(tx, tx.feePayer) : null)
+    );
   }
 
   private findLowestInsiderWallet(buys: EarlyInsiderBuy[]) {
@@ -1407,9 +1424,9 @@ export class InsiderBot extends EventEmitter {
     }
 
     const records = fundingRecords as BundlerFundingRecord[];
-    const senders = new Set(records.map((record) => record.senderWallet));
-    if (senders.size !== 1) {
-      this.log.warn("First four bundlers were not funded by the same wallet; resetting", {
+    const feePayers = new Set(records.map((record) => record.fundingFeePayer));
+    if (feePayers.size !== 1) {
+      this.log.warn("First four bundler funding tx feePayers did not match; resetting", {
         mint,
         fundingRecords: records,
       });
@@ -1421,7 +1438,7 @@ export class InsiderBot extends EventEmitter {
       record.timestamp < best.timestamp ? record : best,
     );
     const largestFundingSol = Math.max(...records.map((record) => record.amountSol));
-    const funderWallet = records[0].senderWallet;
+    const funderWallet = records[0].fundingFeePayer;
     this.bundlerFunderWatch = {
       mint,
       funderWallet,
@@ -1440,25 +1457,26 @@ export class InsiderBot extends EventEmitter {
     this.subscribeBundlerFunder(funderWallet);
     await this.syncBundlerFunderTransactions(true);
 
-    this.log.warn("Bundler shared-funder watch started", {
+    this.log.warn("First-four bundler funding feePayer gate passed; shared feePayer watch started", {
       mint,
-      funderWallet,
+      sharedFeePayer: funderWallet,
       earliestFundingTimestamp: earliest.timestamp,
+      earliestFundingSignature: earliest.fundingSignature,
       largestFundingSol,
       minTransferOutSol: this.bundlerFunderWatch.minTransferOutSol,
       fundingRecords: records,
     });
     void this.sendTelegramSafe(
       [
-        `<b>✅ ${this.label} Shared Funder Locked</b>`,
+        `<b>✅ ${this.label} Shared FeePayer Locked</b>`,
         `Token: <code>${mint}</code>`,
-        `Funder: <code>${funderWallet}</code>`,
+        `FeePayer: <code>${funderWallet}</code>`,
         `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b>`,
-        `Watching transfer-outs: <b>${this.bundlerFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
+        `Watching feePayer transfer-outs: <b>${this.bundlerFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
         "",
-        "A transfer-out only confirms after the next funder tx is not a SOL transfer-in.",
+        "A transfer-out only confirms after the next feePayer tx is not a SOL transfer-in.",
       ].join("\n"),
-      "shared funder notification",
+      "shared feePayer notification",
     );
   }
 
@@ -1485,6 +1503,15 @@ export class InsiderBot extends EventEmitter {
           bundlerWallet: buy.wallet,
           candidateSignature: tx.signature,
           type: tx.type,
+          index,
+        });
+        continue;
+      }
+      if (!tx.feePayer) {
+        this.log.info("Bundler funding candidate rejected: missing feePayer", {
+          mint,
+          bundlerWallet: buy.wallet,
+          candidateSignature: tx.signature,
           index,
         });
         continue;
@@ -1516,6 +1543,7 @@ export class InsiderBot extends EventEmitter {
           mint,
           bundlerWallet: buy.wallet,
           candidateSignature: tx.signature,
+          fundingFeePayer: tx.feePayer,
           senderWallet: incoming.from,
           amountSol: incoming.amountSol,
           timestamp: tx.timestamp,
@@ -1530,6 +1558,7 @@ export class InsiderBot extends EventEmitter {
           mint,
           bundlerWallet: buy.wallet,
           fundingSignature: tx.signature,
+          fundingFeePayer: tx.feePayer,
           senderWallet: incoming.from,
           amountSol: incoming.amountSol,
           currentBalance,
@@ -1548,6 +1577,7 @@ export class InsiderBot extends EventEmitter {
           bundlerWallet: buy.wallet,
           candidateSignature: tx.signature,
           previousSignature: olderTx.signature,
+          fundingFeePayer: tx.feePayer,
           senderWallet: incoming.from,
           amountSol: incoming.amountSol,
           candidateTimestamp: tx.timestamp,
@@ -1563,6 +1593,7 @@ export class InsiderBot extends EventEmitter {
         bundlerWallet: buy.wallet,
         bundlerBuySignature: buy.signature,
         fundingSignature: tx.signature,
+        fundingFeePayer: tx.feePayer,
         senderWallet: incoming.from,
         amountSol: incoming.amountSol,
         timestamp: tx.timestamp,
@@ -1574,6 +1605,7 @@ export class InsiderBot extends EventEmitter {
         bundlerWallet: buy.wallet,
         bundlerBuySignature: buy.signature,
         fundingSignature: tx.signature,
+        fundingFeePayer: tx.feePayer,
         senderWallet: incoming.from,
         amountSol: incoming.amountSol,
         timestamp: tx.timestamp,
@@ -2206,7 +2238,7 @@ export class InsiderBot extends EventEmitter {
       this.subscribeFunderRecipient(pending.recipient);
     }
 
-    this.log.warn("Shared-funder transfer-out confirmed by next-tx check", {
+    this.log.warn("Shared feePayer transfer-out confirmed by next-tx check", {
       mint: state.mint,
       funderWallet: state.funderWallet,
       recipient: pending.recipient,
@@ -2333,14 +2365,14 @@ export class InsiderBot extends EventEmitter {
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) {
         this.log.warn(
-          "Confirmed shared-funder transfer-out found, but current market cap is unavailable; waiting before buy",
+          "Confirmed shared feePayer transfer-out found, but current market cap is unavailable; waiting before buy",
           { mint: state.mint, recipient: watch.wallet, signature },
         );
         return;
       }
       if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
         this.log.warn(
-          "Confirmed shared-funder transfer-out found, but token is below rug threshold; resetting instead of buying",
+          "Confirmed shared feePayer transfer-out found, but token is below rug threshold; resetting instead of buying",
           {
             mint: state.mint,
             recipient: watch.wallet,
@@ -2366,15 +2398,15 @@ export class InsiderBot extends EventEmitter {
         entryMc: currentMc,
         monitoredWallet: watch.wallet,
         tradersListStr: [
-          "<b>Shared Bundler Funder Buy Gate Passed</b>",
-          `Funder: <code>${state.funderWallet}</code>`,
+          "<b>Shared Bundler FeePayer Buy Gate Passed</b>",
+          `FeePayer: <code>${state.funderWallet}</code>`,
           `Recipient: <code>${watch.wallet}</code>`,
           `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
           `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
           `Trigger tx: <code>${signature}</code>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
-          "Next-tx check: confirmed; the immediate next funder tx was not a SOL transfer-in.",
+          "Next-tx check: confirmed; the immediate next feePayer tx was not a SOL transfer-in.",
           "Sell rule: if this recipient's first token action is a buy, sell when it sells at least 50% of that position. If its second token action is a sell, disable the % MC profit exit and stick to the 50% recipient-sell exit. If its second token action is another buy, use only MC/rug exits.",
         ].join("\n"),
       });
@@ -2417,7 +2449,7 @@ export class InsiderBot extends EventEmitter {
     const state = this.bundlerFunderWatch;
     if (!state?.recipientWatches.has(wallet)) return;
     this.dirtyFunderRecipients.add(wallet);
-    this.log.debug("Marked shared-funder recipient for batch sync", {
+    this.log.debug("Marked shared feePayer recipient for batch sync", {
       mint: state.mint,
       wallet,
       signature,
