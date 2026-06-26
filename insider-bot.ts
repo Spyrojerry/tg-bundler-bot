@@ -53,6 +53,7 @@ const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
 const BUNDLER_FUNDER_EXTRA_SOL = 2;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
+const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 5;
 const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 12;
 const BUNDLER_FUNDER_RECIPIENT_SYNC_INTERVAL_MS = 1_500;
 const BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE = 5;
@@ -450,6 +451,8 @@ export class InsiderBot extends EventEmitter {
   private recipientLogsSubIds = new Map<string, number>();
   private isBundlerFunderSyncing = false;
   private bundlerFunderSyncPending = false;
+  private bundlerFunderSyncPendingForce = false;
+  private bundlerFunderWsSyncTimer: ReturnType<typeof setTimeout> | null = null;
   private lastBundlerFunderSyncAt = 0;
   private dirtyFunderRecipients = new Set<string>();
   private isFunderRecipientBatchSyncing = false;
@@ -2018,13 +2021,32 @@ export class InsiderBot extends EventEmitter {
     this.bundlerFunderLogsSubId = this.connection.onLogs(
       new PublicKey(address),
       (logInfo) => {
-        if (!logInfo.err) void this.syncBundlerFunderTransactions();
+        if (!logInfo.err) {
+          this.scheduleBundlerFunderWsSync(logInfo.signature);
+        }
       },
       "processed",
     );
     this.log.info("Subscribed to shared bundler funder transactions", {
       address,
       syncLimit: BUNDLER_FUNDER_SYNC_LIMIT,
+      wsSyncDelayMs: BUNDLER_FUNDER_WS_SYNC_DELAY_MS,
+    });
+  }
+
+  private scheduleBundlerFunderWsSync(signature: string): void {
+    if (this.bundlerFunderWsSyncTimer) {
+      this.bundlerFunderSyncPending = true;
+      this.bundlerFunderSyncPendingForce = true;
+      return;
+    }
+    this.bundlerFunderWsSyncTimer = setTimeout(() => {
+      this.bundlerFunderWsSyncTimer = null;
+      void this.syncBundlerFunderTransactions(true);
+    }, BUNDLER_FUNDER_WS_SYNC_DELAY_MS);
+    this.log.debug("Scheduled shared feePayer websocket sync", {
+      signature,
+      delayMs: BUNDLER_FUNDER_WS_SYNC_DELAY_MS,
     });
   }
 
@@ -2052,6 +2074,10 @@ export class InsiderBot extends EventEmitter {
       this.bundlerFunderLogsSubId = null;
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
     }
+    if (this.bundlerFunderWsSyncTimer) {
+      clearTimeout(this.bundlerFunderWsSyncTimer);
+      this.bundlerFunderWsSyncTimer = null;
+    }
     for (const [wallet, subId] of this.recipientLogsSubIds) {
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
       this.recipientLogsSubIds.delete(wallet);
@@ -2059,6 +2085,7 @@ export class InsiderBot extends EventEmitter {
     this.bundlerFunderWatch = null;
     this.isBundlerFunderSyncing = false;
     this.bundlerFunderSyncPending = false;
+    this.bundlerFunderSyncPendingForce = false;
     this.dirtyFunderRecipients.clear();
     this.isFunderRecipientBatchSyncing = false;
     this.funderRecipientBatchSyncPending = false;
@@ -2069,6 +2096,7 @@ export class InsiderBot extends EventEmitter {
     if (!state || this.positionSellTriggered) return;
     if (this.isBundlerFunderSyncing) {
       this.bundlerFunderSyncPending = true;
+      if (force) this.bundlerFunderSyncPendingForce = true;
       return;
     }
     if (
@@ -2107,7 +2135,9 @@ export class InsiderBot extends EventEmitter {
       this.isBundlerFunderSyncing = false;
       if (this.bundlerFunderSyncPending) {
         this.bundlerFunderSyncPending = false;
-        void this.syncBundlerFunderTransactions();
+        const pendingForce = this.bundlerFunderSyncPendingForce;
+        this.bundlerFunderSyncPendingForce = false;
+        void this.syncBundlerFunderTransactions(pendingForce);
       }
     }
   }
@@ -2147,7 +2177,7 @@ export class InsiderBot extends EventEmitter {
       timestamp: tx.timestamp,
     };
 
-    this.log.warn("Shared-funder transfer-out candidate pending next-tx check", {
+    this.log.warn("Shared feePayer transfer-out candidate pending next-tx check", {
       mint: state.mint,
       funderWallet: state.funderWallet,
       recipient: transferOut.to,
@@ -2160,9 +2190,9 @@ export class InsiderBot extends EventEmitter {
 
     void this.sendTelegramSafe(
       [
-        `<b>🟡 ${this.label} Funder Transfer-Out Candidate</b>`,
+        `<b>🟡 ${this.label} FeePayer Transfer-Out Candidate</b>`,
         `Token: <code>${state.mint}</code>`,
-        `Funder: <code>${state.funderWallet}</code>`,
+        `FeePayer: <code>${state.funderWallet}</code>`,
         `Recipient: <code>${transferOut.to}</code>`,
         `Amount: <b>${transferOut.amountSol.toFixed(4)} SOL</b>`,
         `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
@@ -2170,7 +2200,7 @@ export class InsiderBot extends EventEmitter {
         "",
         "Waiting for the next funder tx. If it is a SOL transfer-in, this candidate is invalid.",
       ].join("\n"),
-      "pending funder transfer-out notification",
+      "pending feePayer transfer-out notification",
     );
   }
 
@@ -2185,7 +2215,7 @@ export class InsiderBot extends EventEmitter {
     if (this.hasSolIncomingToWallet(nextTx, state.funderWallet)) {
       state.invalidOutSignatures.add(pending.signature);
       this.log.warn(
-        "Shared-funder transfer-out candidate invalidated by immediate next SOL transfer-in",
+        "Shared feePayer transfer-out candidate invalidated by immediate next SOL transfer-in",
         {
           mint: state.mint,
           funderWallet: state.funderWallet,
@@ -2197,16 +2227,16 @@ export class InsiderBot extends EventEmitter {
       );
       void this.sendTelegramSafe(
         [
-          `<b>🔴 ${this.label} Funder Candidate Invalid</b>`,
+          `<b>🔴 ${this.label} FeePayer Candidate Invalid</b>`,
           `Token: <code>${state.mint}</code>`,
-          `Funder: <code>${state.funderWallet}</code>`,
+          `FeePayer: <code>${state.funderWallet}</code>`,
           `Candidate tx: <code>${pending.signature}</code>`,
           `Next tx: <code>${nextTx.signature}</code>`,
           "Reason: the immediate next funder transaction was a SOL transfer-in.",
           "",
           "Continuing to watch for the next valid transfer-out.",
         ].join("\n"),
-        "invalid funder transfer-out notification",
+        "invalid feePayer transfer-out notification",
       );
       return;
     }
@@ -2215,7 +2245,7 @@ export class InsiderBot extends EventEmitter {
     let watch = state.recipientWatches.get(pending.recipient);
     if (!watch) {
       if (state.recipientWatches.size >= BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES) {
-        this.log.warn("Shared-funder recipient watch cap reached; confirmed transfer-out recipient not watched", {
+        this.log.warn("Shared feePayer recipient watch cap reached; confirmed transfer-out recipient not watched", {
           mint: state.mint,
           funderWallet: state.funderWallet,
           recipient: pending.recipient,
@@ -2259,6 +2289,13 @@ export class InsiderBot extends EventEmitter {
     wallet: string,
     minAmountSol: number,
   ): { to: string; amountSol: number } | null {
+    const nativeChain = this.extractNativeTransferOutChain(
+      tx,
+      wallet,
+      minAmountSol,
+    );
+    if (nativeChain) return nativeChain;
+
     const described = this.parseSolTransferDescription(tx.description);
     if (
       described &&
@@ -2300,6 +2337,36 @@ export class InsiderBot extends EventEmitter {
     return {
       to: nativeTransfer.toUserAccount,
       amountSol: (nativeTransfer.amount ?? 0) / LAMPORTS_PER_SOL,
+    };
+  }
+
+  private extractNativeTransferOutChain(
+    tx: HeliusTransaction,
+    wallet: string,
+    minAmountSol: number,
+  ): { to: string; amountSol: number } | null {
+    const transfers = (tx.nativeTransfers ?? []).filter(
+      (transfer) =>
+        transfer.fromUserAccount &&
+        transfer.toUserAccount &&
+        (transfer.amount ?? 0) > 0,
+    );
+    if (!transfers.length) return null;
+
+    const first = transfers[0];
+    const last = transfers[transfers.length - 1];
+    if (first.fromUserAccount !== wallet) return null;
+    if (last.toUserAccount === wallet) return null;
+
+    const amountLamports = Math.max(
+      ...transfers.map((transfer) => transfer.amount ?? 0),
+    );
+    const amountSol = amountLamports / LAMPORTS_PER_SOL;
+    if (amountSol < minAmountSol) return null;
+
+    return {
+      to: last.toUserAccount,
+      amountSol,
     };
   }
 
@@ -2485,7 +2552,7 @@ export class InsiderBot extends EventEmitter {
         this.dirtyFunderRecipients.delete(wallet);
         await this.syncFunderRecipientTransactions(wallet);
       }
-      this.log.info("Shared-funder recipient batch sync completed", {
+      this.log.info("Shared feePayer recipient batch sync completed", {
         mint: state.mint,
         syncedWallets: wallets,
         remainingDirty: this.dirtyFunderRecipients.size,
@@ -2600,7 +2667,7 @@ export class InsiderBot extends EventEmitter {
     if (soldRatio >= 0.5 && this.phase === "holding") {
       await this.triggerPositionSell(
         state.mint,
-        `Shared-funder recipient ${watch.wallet} sold at least 50% of first buy`,
+        `Shared feePayer recipient ${watch.wallet} sold at least 50% of first buy`,
         [
           "<b>🚨 Shared-Funder Recipient Sold 50%</b>",
           `Token: <code>${state.mint}</code>`,
