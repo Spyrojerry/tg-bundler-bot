@@ -51,6 +51,9 @@ const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 60_000;
 const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
 const BUNDLER_FUNDER_EXTRA_SOL = 2;
+const BUNDLER_FUNDER_LOW_FUNDING_SOL = 15;
+const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
+const BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT = 50;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
 const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 50;
@@ -324,6 +327,8 @@ interface BundlerFundingRecord {
   senderWallet: string;
   amountSol: number;
   timestamp: number;
+  latestWindowFundingSignature: string;
+  latestWindowFundingTimestamp: number;
 }
 
 interface FunderRecipientWatch {
@@ -1465,7 +1470,18 @@ export class InsiderBot extends EventEmitter {
     const earliest = records.reduce((best, record) =>
       record.timestamp < best.timestamp ? record : best,
     );
+    const latest = records.reduce((best, record) =>
+      record.timestamp > best.timestamp ? record : best,
+    );
+    const lowFundingSyncStart = records.reduce((best, record) =>
+      record.latestWindowFundingTimestamp > best.latestWindowFundingTimestamp
+        ? record
+        : best,
+    );
     const largestFundingSol = Math.max(...records.map((record) => record.amountSol));
+    const latestBundlerBuyTimestamp = Math.max(
+      ...firstFour.map((buy) => buy.timestamp),
+    );
     const funderWallet = records[0].fundingFeePayer;
     this.bundlerFunderWatch = {
       mint,
@@ -1483,13 +1499,30 @@ export class InsiderBot extends EventEmitter {
     };
 
     this.subscribeBundlerFunder(funderWallet);
-    await this.syncBundlerFunderTransactions(true);
+    if (largestFundingSol < BUNDLER_FUNDER_LOW_FUNDING_SOL) {
+      await this.evaluateLowFundingSharedFeePayerBuy({
+        state: this.bundlerFunderWatch!,
+        syncStart: {
+          signature: lowFundingSyncStart.latestWindowFundingSignature,
+          timestamp: lowFundingSyncStart.latestWindowFundingTimestamp,
+          bundlerWallet: lowFundingSyncStart.bundlerWallet,
+        },
+        latestBundlerBuyTimestamp,
+      });
+    }
+    if (!this.buySubmitted) {
+      await this.syncBundlerFunderTransactions(true);
+    }
 
     this.log.warn("First-four bundler funding feePayer gate passed; shared feePayer watch started", {
       mint,
       sharedFeePayer: funderWallet,
       earliestFundingTimestamp: earliest.timestamp,
       earliestFundingSignature: earliest.fundingSignature,
+      latestFundingTimestamp: latest.timestamp,
+      latestFundingSignature: latest.fundingSignature,
+      lowFundingSyncStartSignature: lowFundingSyncStart.latestWindowFundingSignature,
+      lowFundingSyncStartTimestamp: lowFundingSyncStart.latestWindowFundingTimestamp,
       largestFundingSol,
       minTransferOutSol: this.bundlerFunderWatch.minTransferOutSol,
       fundingRecords: records,
@@ -1505,6 +1538,89 @@ export class InsiderBot extends EventEmitter {
         "A transfer-out only confirms after the next feePayer tx is not a SOL transfer-in.",
       ].join("\n"),
       "shared feePayer notification",
+    );
+  }
+
+  private async evaluateLowFundingSharedFeePayerBuy(args: {
+    state: BundlerFunderWatchState;
+    syncStart: {
+      signature: string;
+      timestamp: number;
+      bundlerWallet: string;
+    };
+    latestBundlerBuyTimestamp: number;
+  }): Promise<void> {
+    const { state, syncStart, latestBundlerBuyTimestamp } = args;
+    const txs = await this.withHeliusFallback((client) =>
+      client.getAddressTransactionsAsc(
+        state.funderWallet,
+        syncStart.signature,
+        BUNDLER_FUNDER_SYNC_LIMIT,
+      ),
+    );
+    const windowTxs = txs.filter(
+      (tx) =>
+        tx.timestamp >= syncStart.timestamp &&
+        tx.timestamp <= latestBundlerBuyTimestamp,
+    );
+    const transferOuts = windowTxs
+      .map((tx) => ({
+        tx,
+        transferOut: this.extractSolTransferOutFromWallet(
+          tx,
+          state.funderWallet,
+          Number.EPSILON,
+        ),
+      }))
+      .filter(
+        (entry): entry is {
+          tx: HeliusTransaction;
+          transferOut: { to: string; amountSol: number };
+        } => Boolean(entry.transferOut),
+      );
+    const largestIncomingSol = Math.max(
+      0,
+      ...windowTxs.map((tx) =>
+        this.extractSolIncomingAmountToWallet(tx, state.funderWallet),
+      ),
+    );
+    const pass =
+      transferOuts.length <= BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS &&
+      largestIncomingSol <= state.largestFundingSol;
+
+    this.log.warn("Low-funding shared feePayer window evaluated", {
+      mint: state.mint,
+      sharedFeePayer: state.funderWallet,
+      largestFundingSol: state.largestFundingSol,
+      lowFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
+      syncStartSignature: syncStart.signature,
+      syncStartTimestamp: syncStart.timestamp,
+      syncStartBundlerWallet: syncStart.bundlerWallet,
+      latestBundlerBuyTimestamp,
+      txCount: windowTxs.length,
+      transferOutTxCount: transferOuts.length,
+      maxTransferOutTxs: BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS,
+      largestIncomingSol,
+      pass,
+      transferOuts: transferOuts.map((entry) => ({
+        signature: entry.tx.signature,
+        timestamp: entry.tx.timestamp,
+        recipient: entry.transferOut.to,
+        amountSol: entry.transferOut.amountSol,
+      })),
+    });
+
+    if (!pass) return;
+    await this.emitLowFundingSharedFeePayerBuy(
+      state,
+      syncStart.signature,
+      {
+        windowTxCount: windowTxs.length,
+        transferOutTxCount: transferOuts.length,
+        largestIncomingSol,
+        syncStart,
+        latestBundlerBuyTimestamp,
+      },
     );
   }
 
@@ -1636,6 +1752,7 @@ export class InsiderBot extends EventEmitter {
     const selected = candidates.reduce((best, candidate) =>
       candidate.incoming.amountSol > best.incoming.amountSol ? candidate : best,
     );
+    const latestWindowFunding = candidates[0];
     this.log.warn("Bundler funding transfer selected from post-zero window", {
       mint,
       bundlerWallet: buy.wallet,
@@ -1645,6 +1762,8 @@ export class InsiderBot extends EventEmitter {
       senderWallet: selected.incoming.from,
       amountSol: selected.incoming.amountSol,
       timestamp: selected.tx.timestamp,
+      latestWindowFundingSignature: latestWindowFunding.tx.signature,
+      latestWindowFundingTimestamp: latestWindowFunding.tx.timestamp,
       currentBalance: selected.currentBalance,
       zeroBoundary,
       candidateCount: candidates.length,
@@ -1666,6 +1785,8 @@ export class InsiderBot extends EventEmitter {
       senderWallet: selected.incoming.from,
       amountSol: selected.incoming.amountSol,
       timestamp: selected.tx.timestamp,
+      latestWindowFundingSignature: latestWindowFunding.tx.signature,
+      latestWindowFundingTimestamp: latestWindowFunding.tx.timestamp,
     };
   }
 
@@ -2419,6 +2540,13 @@ export class InsiderBot extends EventEmitter {
   }
 
   private hasSolIncomingToWallet(tx: HeliusTransaction, wallet: string): boolean {
+    return this.extractSolIncomingAmountToWallet(tx, wallet) > 0;
+  }
+
+  private extractSolIncomingAmountToWallet(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): number {
     const described = this.parseSolTransferDescription(tx.description);
     if (
       described &&
@@ -2426,23 +2554,27 @@ export class InsiderBot extends EventEmitter {
       described.from !== wallet &&
       described.amountSol > 0
     ) {
-      return true;
+      return described.amountSol;
     }
 
-    return (
-      (tx.tokenTransfers ?? []).some(
+    const tokenIncoming = (tx.tokenTransfers ?? [])
+      .filter(
         (transfer) =>
           transfer.mint === SOL_MINT &&
           transfer.toUserAccount === wallet &&
-          transfer.fromUserAccount !== wallet,
-      ) ||
-      (tx.nativeTransfers ?? []).some(
+          transfer.fromUserAccount !== wallet &&
+          (transfer.tokenAmount ?? 0) > 0,
+      )
+      .map((transfer) => transfer.tokenAmount ?? 0);
+    const nativeIncoming = (tx.nativeTransfers ?? [])
+      .filter(
         (transfer) =>
           transfer.toUserAccount === wallet &&
           transfer.fromUserAccount !== wallet &&
           (transfer.amount ?? 0) > 0,
       )
-    );
+      .map((transfer) => (transfer.amount ?? 0) / LAMPORTS_PER_SOL);
+    return Math.max(0, ...tokenIncoming, ...nativeIncoming);
   }
 
   private parseSolTransferDescription(
@@ -2460,6 +2592,86 @@ export class InsiderBot extends EventEmitter {
       amountSol,
       to: match[3],
     };
+  }
+
+  private async emitLowFundingSharedFeePayerBuy(
+    state: BundlerFunderWatchState,
+    signature: string,
+    details: {
+      windowTxCount: number;
+      transferOutTxCount: number;
+      largestIncomingSol: number;
+      syncStart: {
+        signature: string;
+        timestamp: number;
+        bundlerWallet: string;
+      };
+      latestBundlerBuyTimestamp: number;
+    },
+  ): Promise<void> {
+    if (
+      this.buySubmitted ||
+      this.buyDisabled ||
+      this.isBuyExecuting ||
+      this.isBuyGateEvaluating
+    ) {
+      return;
+    }
+    this.isBuyGateEvaluating = true;
+    try {
+      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
+      if (currentMc === null) {
+        this.log.warn(
+          "Low-funding shared feePayer condition passed, but current market cap is unavailable; waiting before buy",
+          { mint: state.mint, sharedFeePayer: state.funderWallet, signature },
+        );
+        return;
+      }
+      if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
+        this.log.warn(
+          "Low-funding shared feePayer condition passed, but token is below rug threshold; resetting instead of buying",
+          {
+            mint: state.mint,
+            sharedFeePayer: state.funderWallet,
+            currentMc,
+            rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
+          },
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
+
+      const newExitMc =
+        currentMc * (1 + BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT / 100);
+      this.setExitMc(newExitMc);
+      this.setEntryMc(currentMc);
+      this.setBuyExecuting(true);
+      this.buySubmitted = true;
+      this.preBuyStopped = true;
+      this.emit("buyTrigger", {
+        followedWallet: this.followedWallet!,
+        mint: state.mint,
+        signature,
+        buySol: this.buySol,
+        entryMc: currentMc,
+        monitoredWallet: state.funderWallet,
+        tradersListStr: [
+          "<b>Low-Funding Shared FeePayer Buy Gate Passed</b>",
+          `FeePayer: <code>${state.funderWallet}</code>`,
+          `Largest bundler funding: <b>${state.largestFundingSol.toFixed(4)} SOL</b>`,
+          `Low-funding threshold: <b>${BUNDLER_FUNDER_LOW_FUNDING_SOL.toFixed(2)} SOL</b>`,
+          `Window txs: <b>${details.windowTxCount}</b>`,
+          `Transfer-out txs in window: <b>${details.transferOutTxCount}/${BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS}</b>`,
+          `Largest transfer-in to feePayer in window: <b>${details.largestIncomingSol.toFixed(4)} SOL</b>`,
+          `Low-funding sync start tx: <code>${details.syncStart.signature}</code>`,
+          `Sync-start bundler: <code>${details.syncStart.bundlerWallet}</code>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          `Special exit: <b>+${BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT}% Current MC from Entry</b>`,
+        ].join("\n"),
+      });
+    } finally {
+      this.isBuyGateEvaluating = false;
+    }
   }
 
   private async emitBundlerFunderBuy(
