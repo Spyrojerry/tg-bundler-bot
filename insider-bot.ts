@@ -1062,7 +1062,7 @@ export class InsiderBot extends EventEmitter {
         `Follow wallet: <code>${this.followedWallet}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
-        "Finding each bundler's first valid funding transfer, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs with an immediate next-tx transfer-in invalidation check.",
+        "Finding each bundler's zero-balance funding window, selecting the highest valid funding transfer in that window, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs with an immediate next-tx transfer-in invalidation check.",
       ].join("\n"),
       "flow-start notification",
     );
@@ -1523,8 +1523,51 @@ export class InsiderBot extends EventEmitter {
       preferredClientIndex,
     );
 
+    const candidates: Array<{
+      tx: HeliusTransaction;
+      incoming: { from: string; amountSol: number };
+      currentBalance: number;
+      index: number;
+    }> = [];
+    let zeroBoundary: {
+      signature: string;
+      timestamp: number;
+      balance: number;
+    } | null = null;
+
     for (let index = 0; index < txs.length; index += 1) {
       const tx = txs[index];
+      const currentBalance = await this.fetchSolBalanceAt(
+        buy.wallet,
+        tx.timestamp,
+        preferredClientIndex,
+      );
+      if (currentBalance === 0) {
+        zeroBoundary = {
+          signature: tx.signature,
+          timestamp: tx.timestamp,
+          balance: currentBalance,
+        };
+        this.log.info("Bundler funding zero-balance boundary found", {
+          mint,
+          bundlerWallet: buy.wallet,
+          boundarySignature: tx.signature,
+          boundaryTimestamp: tx.timestamp,
+          candidateCount: candidates.length,
+        });
+        break;
+      }
+      if (currentBalance < 0) {
+        this.log.info("Bundler funding candidate rejected: balance-at timestamp is negative", {
+          mint,
+          bundlerWallet: buy.wallet,
+          candidateSignature: tx.signature,
+          index,
+          timestamp: tx.timestamp,
+          currentBalance,
+        });
+        continue;
+      }
       if (tx.type && tx.type !== "TRANSFER") {
         this.log.info("Bundler funding candidate rejected: tx is not TRANSFER", {
           mint,
@@ -1560,93 +1603,70 @@ export class InsiderBot extends EventEmitter {
         });
         continue;
       }
+      candidates.push({
+        tx,
+        incoming,
+        currentBalance,
+        index,
+      });
+    }
 
-      const currentBalance = await this.fetchSolBalanceAt(
-        buy.wallet,
-        tx.timestamp,
-        preferredClientIndex,
-      );
-      if (currentBalance <= 0) {
-        this.log.info("Bundler funding candidate rejected: balance-at candidate timestamp is not positive", {
-          mint,
-          bundlerWallet: buy.wallet,
-          candidateSignature: tx.signature,
-          fundingFeePayer: tx.feePayer,
-          senderWallet: incoming.from,
-          amountSol: incoming.amountSol,
-          timestamp: tx.timestamp,
-          currentBalance,
-        });
-        continue;
-      }
-
-      const olderTx = txs[index + 1];
-      if (!olderTx) {
-        this.log.info("Bundler funding candidate rejected: no older transfer in current page", {
-          mint,
-          bundlerWallet: buy.wallet,
-          fundingSignature: tx.signature,
-          fundingFeePayer: tx.feePayer,
-          senderWallet: incoming.from,
-          amountSol: incoming.amountSol,
-          currentBalance,
-          transferLimit: BUNDLER_FUNDER_TRANSFER_LIMIT,
-        });
-        continue;
-      }
-      const olderBalance = await this.fetchSolBalanceAt(
-        buy.wallet,
-        olderTx.timestamp,
-        preferredClientIndex,
-      );
-      if (olderBalance !== 0) {
-        this.log.info("Bundler funding candidate rejected: previous transfer balance was not zero", {
-          mint,
-          bundlerWallet: buy.wallet,
-          candidateSignature: tx.signature,
-          previousSignature: olderTx.signature,
-          fundingFeePayer: tx.feePayer,
-          senderWallet: incoming.from,
-          amountSol: incoming.amountSol,
-          candidateTimestamp: tx.timestamp,
-          previousTimestamp: olderTx.timestamp,
-          currentBalance,
-          olderBalance,
-        });
-        continue;
-      }
-
-      this.log.warn("Bundler funding transfer validated", {
+    if (!zeroBoundary) {
+      this.log.warn("No zero-balance boundary found for bundler funding window", {
         mint,
         bundlerWallet: buy.wallet,
         bundlerBuySignature: buy.signature,
-        fundingSignature: tx.signature,
-        fundingFeePayer: tx.feePayer,
-        senderWallet: incoming.from,
-        amountSol: incoming.amountSol,
-        timestamp: tx.timestamp,
-        previousSignature: olderTx.signature,
-        currentBalance,
-        olderBalance,
+        transferCount: txs.length,
+        candidateCount: candidates.length,
       });
-      return {
-        bundlerWallet: buy.wallet,
-        bundlerBuySignature: buy.signature,
-        fundingSignature: tx.signature,
-        fundingFeePayer: tx.feePayer,
-        senderWallet: incoming.from,
-        amountSol: incoming.amountSol,
-        timestamp: tx.timestamp,
-      };
+      return null;
     }
 
-    this.log.warn("No valid first funding transfer found for bundler", {
+    if (!candidates.length) {
+      this.log.warn("No valid funding transfer found above zero-balance boundary for bundler", {
+        mint,
+        bundlerWallet: buy.wallet,
+        bundlerBuySignature: buy.signature,
+        zeroBoundary,
+        transferCount: txs.length,
+      });
+      return null;
+    }
+
+    const selected = candidates.reduce((best, candidate) =>
+      candidate.incoming.amountSol > best.incoming.amountSol ? candidate : best,
+    );
+    this.log.warn("Bundler funding transfer selected from post-zero window", {
       mint,
       bundlerWallet: buy.wallet,
       bundlerBuySignature: buy.signature,
-      transferCount: txs.length,
+      fundingSignature: selected.tx.signature,
+      fundingFeePayer: selected.tx.feePayer,
+      senderWallet: selected.incoming.from,
+      amountSol: selected.incoming.amountSol,
+      timestamp: selected.tx.timestamp,
+      currentBalance: selected.currentBalance,
+      zeroBoundary,
+      candidateCount: candidates.length,
+      candidates: candidates.map((candidate) => ({
+        signature: candidate.tx.signature,
+        fundingFeePayer: candidate.tx.feePayer,
+        senderWallet: candidate.incoming.from,
+        amountSol: candidate.incoming.amountSol,
+        timestamp: candidate.tx.timestamp,
+        currentBalance: candidate.currentBalance,
+        index: candidate.index,
+      })),
     });
-    return null;
+    return {
+      bundlerWallet: buy.wallet,
+      bundlerBuySignature: buy.signature,
+      fundingSignature: selected.tx.signature,
+      fundingFeePayer: selected.tx.feePayer!,
+      senderWallet: selected.incoming.from,
+      amountSol: selected.incoming.amountSol,
+      timestamp: selected.tx.timestamp,
+    };
   }
 
   private async fetchSolBalanceAt(
