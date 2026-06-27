@@ -54,6 +54,8 @@ const BUNDLER_FUNDER_EXTRA_SOL = 2;
 const BUNDLER_FUNDER_LOW_FUNDING_SOL = 15;
 const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
 const BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT = 50;
+const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
+const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES = 2;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
 const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 50;
@@ -2319,6 +2321,17 @@ export class InsiderBot extends EventEmitter {
       state.minTransferOutSol,
     );
     if (!transferOut) return;
+    if (transferOut.amountSol > BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL) {
+      this.log.info("Skipping feePayer transfer-out above normal-mode max amount", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        signature: tx.signature,
+        amountSol: transferOut.amountSol,
+        maxTransferOutSol: BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL,
+        recipient: transferOut.to,
+      });
+      return;
+    }
     if (this.hasSolIncomingToWallet(tx, state.funderWallet)) {
       this.log.info("Skipping funder transfer-out because same tx also has transfer-in", {
         mint: state.mint,
@@ -2334,6 +2347,25 @@ export class InsiderBot extends EventEmitter {
       state.invalidOutSignatures.has(tx.signature) ||
       state.pendingTransferOut?.signature === tx.signature
     ) {
+      return;
+    }
+    const consideredCandidateCount =
+      state.validOutSignatures.size +
+      state.invalidOutSignatures.size +
+      (state.pendingTransferOut ? 1 : 0);
+    if (
+      consideredCandidateCount >=
+      BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES
+    ) {
+      this.log.info("Skipping feePayer transfer-out because normal-mode candidate cap is reached", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        signature: tx.signature,
+        amountSol: transferOut.amountSol,
+        recipient: transferOut.to,
+        consideredCandidateCount,
+        maxCandidates: BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES,
+      });
       return;
     }
 
@@ -2363,6 +2395,8 @@ export class InsiderBot extends EventEmitter {
         `Recipient: <code>${transferOut.to}</code>`,
         `Amount: <b>${transferOut.amountSol.toFixed(4)} SOL</b>`,
         `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
+        `Max valid transfer-out: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL.toFixed(0)} SOL</b>`,
+        `Candidate count: <b>${consideredCandidateCount + 1}/${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES}</b>`,
         `Tx: <code>${tx.signature}</code>`,
         "",
         "Waiting for the next funder tx. If it is a SOL transfer-in, this candidate is invalid.",
@@ -2730,6 +2764,8 @@ export class InsiderBot extends EventEmitter {
           `Recipient: <code>${watch.wallet}</code>`,
           `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
           `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
+          `Max valid transfer-out: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL.toFixed(0)} SOL</b>`,
+          `Candidate cap: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES}</b>`,
           `Trigger tx: <code>${signature}</code>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
