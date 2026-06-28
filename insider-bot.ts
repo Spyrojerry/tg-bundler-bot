@@ -863,14 +863,19 @@ export class InsiderBot extends EventEmitter {
       this.releaseMint?.(this.claimedMint);
       this.claimedMint = null;
     }
+    this.activePosition = null;
     this.watchingMint = null;
     this.monitoredWallet = null;
     this.insiderState = null;
-    this.phase = this.activePosition ? "holding" : null;
+    this.phase = null;
+    this.bundlerWatch = null;
+    this.bundlerFunderWatch = null;
+    this.clearBundlerAccumulation();
+    this.clearAxiomWatchedWallets();
     this.log.error(
-      "Insider bot stopped because its Helius project has no credits",
+      "Insider bot reset and stopped because Helius usage is exhausted",
       {
-        activePositionMint: this.activePosition?.mint ?? null,
+        activePositionCleared: true,
       },
     );
   }
@@ -1522,9 +1527,40 @@ export class InsiderBot extends EventEmitter {
         },
         latestBundlerBuyTimestamp,
       });
+      if (
+        !this.bundlerFunderWatch ||
+        this.bundlerFunderWatch.mint !== mint ||
+        this.watchingMint !== mint ||
+        this.phase !== "pre_buy"
+      ) {
+        this.log.info(
+          "Shared feePayer flow stopped during low-funding evaluation; skipping normal watcher continuation",
+          {
+            mint,
+            reason: "token flow reset or no longer active",
+          },
+        );
+        return;
+      }
     }
     if (!this.buySubmitted) {
       await this.syncBundlerFunderTransactions(true);
+    }
+    const activeFunderWatch = this.bundlerFunderWatch;
+    if (
+      !activeFunderWatch ||
+      activeFunderWatch.mint !== mint ||
+      this.watchingMint !== mint ||
+      this.phase !== "pre_buy"
+    ) {
+      this.log.info(
+        "Shared feePayer flow stopped before lock notification; skipping stale continuation",
+        {
+          mint,
+          reason: "token flow reset or no longer active",
+        },
+      );
+      return;
     }
 
     this.log.warn("First-four bundler funding feePayer gate passed; shared feePayer watch started", {
@@ -1537,7 +1573,7 @@ export class InsiderBot extends EventEmitter {
       lowFundingSyncStartSignature: lowFundingSyncStart.latestWindowFundingSignature,
       lowFundingSyncStartTimestamp: lowFundingSyncStart.latestWindowFundingTimestamp,
       largestFundingSol,
-      minTransferOutSol: this.bundlerFunderWatch.minTransferOutSol,
+      minTransferOutSol: activeFunderWatch.minTransferOutSol,
       fundingRecords: records,
     });
     void this.sendTelegramSafe(
@@ -1546,7 +1582,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `FeePayer: <code>${funderWallet}</code>`,
         `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b>`,
-        `Watching feePayer transfer-outs: <b>${this.bundlerFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
+        `Watching feePayer transfer-outs: <b>${activeFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
         "",
         "A transfer-out only confirms after the next feePayer tx is not a SOL transfer-in.",
       ].join("\n"),

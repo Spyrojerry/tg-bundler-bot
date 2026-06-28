@@ -243,10 +243,42 @@ async function main(): Promise<void> {
     if (!bot) return;
     const botNumber = getInsiderBotNumber(botIndex);
     const firstNotice = !handledHeliusUsageStops.has(botIndex);
+    const activePosition = bot.getActivePosition();
+    const preBuyMint = bot.getPreBuyMint();
     handledHeliusUsageStops.add(botIndex);
+    if (activePosition) {
+      log.error(
+        `[INSIDER ${botNumber}] Helius usage exhausted while holding; triggering emergency sell before stop`,
+        {
+          source,
+          mint: activePosition.mint,
+          followedWallet: activePosition.followedWallet,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      bot.emit("sellTrigger", {
+        followedWallet: activePosition.followedWallet,
+        positionMint: activePosition.mint,
+        signature: "HELIUS_USAGE_EXHAUSTED",
+        reason:
+          "Emergency sell: Helius key usage exhausted (429 max usage reached)",
+      });
+    } else if (preBuyMint) {
+      log.error(
+        `[INSIDER ${botNumber}] Helius usage exhausted during pre-buy/session; resetting and stopping`,
+        {
+          source,
+          mint: preBuyMint,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+    }
     await bot.stopForHeliusCredits();
-    log.error(`[INSIDER ${botNumber}] Helius RPC/WS usage exhausted`, {
+    log.error(`[INSIDER ${botNumber}] Helius usage exhausted`, {
       source,
+      activePositionMint: activePosition?.mint ?? null,
+      preBuyMint,
+      emergencySellTriggered: !!activePosition,
       error: err instanceof Error ? err.message : String(err),
     });
     if (!firstNotice) return;
@@ -254,11 +286,21 @@ async function main(): Promise<void> {
       [
         `<b>🛑 Insider ${botNumber} Stopped — Helius Usage Exhausted</b>`,
         `Source: <b>${html(source)}</b>`,
+        activePosition
+          ? `Action: <b>Emergency sell submitted, then bot reset/stopped</b>`
+          : preBuyMint
+            ? `Action: <b>Session reset, then bot stopped before buy</b>`
+            : `Action: <b>Bot stopped</b>`,
+        activePosition
+          ? `Position token: <code>${html(activePosition.mint)}</code>`
+          : preBuyMint
+            ? `Session token: <code>${html(preBuyMint)}</code>`
+            : "",
         "",
-        "A Solana RPC/WS request returned <code>429 max usage reached</code>.",
-        "The bot was stopped to avoid repeated failed requests.",
+        "A Helius request returned <code>429 max usage reached</code> or the project credits are exhausted.",
+        "The bot was reset and stopped to avoid repeated failed requests.",
         "Rotate or top up the Helius key for this Insider bot, then restart the bot process.",
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       { pin: true },
     );
   }
@@ -1042,19 +1084,18 @@ async function main(): Promise<void> {
     );
     bot.on("heliusCreditsExhausted", (info) => {
       void (async () => {
-        await bot.stopForHeliusCredits();
-        await telegramBot?.sendDefault(
-          [
-            `<b>🛑 Insider ${definition.botNumber} Stopped — Helius Credits Exhausted</b>`,
-            `Project: <code>${html(info.projectId)}</code>`,
-            `Plan: <b>${html(info.usage.subscriptionDetails?.plan ?? "Unknown")}</b>`,
-            `Credits remaining: <b>${html(String(info.usage.creditsRemaining))}</b>`,
-            `Prepaid credits remaining: <b>${html(String(info.usage.prepaidCreditsRemaining))}</b>`,
-            "",
-            "A Helius request returned 429 and the Admin API confirmed that this project has no remaining credits.",
-            "This bot has been stopped. Other Insider bots continue running.",
-          ].join("\n"),
-          { pin: true },
+        log.error(`[INSIDER ${definition.botNumber}] Helius Admin API confirmed credit exhaustion`, {
+          projectId: info.projectId,
+          plan: info.usage.subscriptionDetails?.plan ?? "Unknown",
+          creditsRemaining: info.usage.creditsRemaining,
+          prepaidCreditsRemaining: info.usage.prepaidCreditsRemaining,
+        });
+        await stopInsiderForHeliusUsageExhaustion(
+          index,
+          new Error(
+            `429 max usage reached: Helius credits exhausted for project ${info.projectId}`,
+          ),
+          "Helius REST credit check",
         );
       })().catch((err) =>
         log.error(
