@@ -356,6 +356,7 @@ interface FunderRecipientWatch {
 interface BundlerFunderWatchState {
   mint: string;
   funderWallet: string;
+  originalFunderWallet: string;
   earliestFundingTimestamp: number;
   earliestFundingSignature: string;
   largestFundingSol: number;
@@ -1504,6 +1505,7 @@ export class InsiderBot extends EventEmitter {
     this.bundlerFunderWatch = {
       mint,
       funderWallet,
+      originalFunderWallet: funderWallet,
       earliestFundingTimestamp: earliest.timestamp,
       earliestFundingSignature: earliest.fundingSignature,
       largestFundingSol,
@@ -2249,6 +2251,46 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private async switchBundlerFunderWatchAddress(
+    state: BundlerFunderWatchState,
+    nextWallet: string,
+    cursorSignature: string,
+    reason: string,
+  ): Promise<void> {
+    if (nextWallet === state.funderWallet) return;
+    if (this.bundlerFunderLogsSubId !== null) {
+      const subId = this.bundlerFunderLogsSubId;
+      this.bundlerFunderLogsSubId = null;
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+    const previousWallet = state.funderWallet;
+    state.funderWallet = nextWallet;
+    state.cursorSignature = cursorSignature;
+    state.pendingTransferOut = null;
+    this.subscribeBundlerFunder(nextWallet);
+    this.log.warn("Shared feePayer address migrated to a new wallet", {
+      mint: state.mint,
+      originalFeePayer: state.originalFunderWallet,
+      previousWallet,
+      nextWallet,
+      cursorSignature,
+      reason,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>🔁 ${this.label} Shared FeePayer Migrated</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `Original FeePayer: <code>${state.originalFunderWallet}</code>`,
+        `Old FeePayer: <code>${previousWallet}</code>`,
+        `New FeePayer: <code>${nextWallet}</code>`,
+        `Handoff tx: <code>${cursorSignature}</code>`,
+        "",
+        reason,
+      ].join("\n"),
+      "shared feePayer migration notification",
+    );
+  }
+
   private scheduleBundlerFunderWsSync(signature: string): void {
     if (this.bundlerFunderWsSyncTimer) {
       this.bundlerFunderSyncPending = true;
@@ -2386,6 +2428,11 @@ export class InsiderBot extends EventEmitter {
     );
     if (!transferOut) return;
     if (transferOut.amountSol > BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL) {
+      await this.maybeMoveBundlerFunderWatchAfterLargeDrain(
+        state,
+        tx,
+        transferOut,
+      );
       this.log.info("Skipping feePayer transfer-out above normal-mode max amount", {
         mint: state.mint,
         funderWallet: state.funderWallet,
@@ -2467,6 +2514,55 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "pending feePayer transfer-out notification",
     );
+  }
+
+  private async maybeMoveBundlerFunderWatchAfterLargeDrain(
+    state: BundlerFunderWatchState,
+    tx: HeliusTransaction,
+    transferOut: { to: string; amountSol: number },
+  ): Promise<void> {
+    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return;
+    if (!transferOut.to || transferOut.to === state.funderWallet) return;
+    try {
+      const balance = await this.withHeliusFallback(
+        (client) =>
+          client.getWalletBalanceAt(
+            state.funderWallet,
+            NATIVE_SOL_BALANCE_MINT,
+            tx.timestamp,
+          ),
+      );
+      const balanceRaw = BigInt(balance.balanceRaw || "0");
+      this.log.info("Checked shared feePayer balance after over-max transfer-out", {
+        mint: state.mint,
+        watchedWallet: state.funderWallet,
+        recipient: transferOut.to,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        amountSol: transferOut.amountSol,
+        balance: balance.balance,
+        balanceRaw: balance.balanceRaw,
+      });
+      if (balanceRaw !== 0n) return;
+
+      await this.switchBundlerFunderWatchAddress(
+        state,
+        transferOut.to,
+        tx.signature,
+        `Over-${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL.toFixed(0)} SOL transfer-out drained watched wallet to zero; continuing this token's feePayer monitor from receiver.`,
+      );
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Failed to check shared feePayer balance after over-max transfer-out", {
+        mint: state.mint,
+        watchedWallet: state.funderWallet,
+        recipient: transferOut.to,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        amountSol: transferOut.amountSol,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   private async resolvePendingBundlerFunderCandidate(
