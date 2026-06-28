@@ -34,6 +34,7 @@ import { EarlyBundlerOrchestrator } from "./early-bundler-orchestrator";
 import { ReverseCopySellOrchestrator } from "./reverse-copysell-orchestrator";
 import { InsiderBot } from "./insider-bot";
 import type { InsiderMintClaimFn } from "./insider-bot";
+import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
 import { PublicKey } from "@solana/web3.js";
 import { randomBytes } from "crypto";
 
@@ -42,6 +43,16 @@ const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const INSIDER_MIN_MARKET_CAP_USD = 5_000;
 const MCAP_CHECK_INTERVAL_MS = 1000; // Increased frequency from 1500ms to 1000ms
+const isHeliusUsageExhaustionError = (err: unknown): boolean => {
+  const message =
+    err instanceof Error
+      ? `${err.name}\n${err.message}\n${err.stack ?? ""}`
+      : String(err);
+  return (
+    /(?:\b429\b|too many requests)/i.test(message) &&
+    /(?:max usage reached|-32429)/i.test(message)
+  );
+};
 
 async function main(): Promise<void> {
   // ── 1. Config ──────────────────────────────────────────────────────────────
@@ -167,6 +178,12 @@ async function main(): Promise<void> {
         gmgnFallbackLimiter,
       ),
   );
+  const insiderDasMarketCapClient = new HeliusDasMarketCapClient(
+    config.insiderHeliusApiKey3 ||
+      insiderBotDefinitions[2]?.heliusApiKey ||
+      config.insiderHeliusApiKey ||
+      config.heliusApiKey,
+  );
 
   let telegramBot: TelegramBot | null = null;
   const insiderBots: InsiderBot[] = [];
@@ -208,6 +225,127 @@ async function main(): Promise<void> {
     string,
     { balance: bigint; quote: SellQuote | null; timestamp: number }
   >();
+  const handledHeliusUsageStops = new Set<number>();
+
+  function html(value: string): string {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  async function stopInsiderForHeliusUsageExhaustion(
+    botIndex: number,
+    err: unknown,
+    source: string,
+  ): Promise<void> {
+    const bot = insiderBots[botIndex];
+    if (!bot) return;
+    const botNumber = getInsiderBotNumber(botIndex);
+    const firstNotice = !handledHeliusUsageStops.has(botIndex);
+    handledHeliusUsageStops.add(botIndex);
+    await bot.stopForHeliusCredits();
+    log.error(`[INSIDER ${botNumber}] Helius RPC/WS usage exhausted`, {
+      source,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    if (!firstNotice) return;
+    await telegramBot?.sendDefault(
+      [
+        `<b>🛑 Insider ${botNumber} Stopped — Helius Usage Exhausted</b>`,
+        `Source: <b>${html(source)}</b>`,
+        "",
+        "A Solana RPC/WS request returned <code>429 max usage reached</code>.",
+        "The bot was stopped to avoid repeated failed requests.",
+        "Rotate or top up the Helius key for this Insider bot, then restart the bot process.",
+      ].join("\n"),
+      { pin: true },
+    );
+  }
+
+  async function followInsiderWalletWithUsageGuard(
+    botIndex: number,
+    address: string,
+    source: string,
+  ): Promise<boolean> {
+    try {
+      await insiderBots[botIndex].followWallet(address);
+      return true;
+    } catch (err) {
+      if (!isHeliusUsageExhaustionError(err)) throw err;
+      await stopInsiderForHeliusUsageExhaustion(botIndex, err, source);
+      return false;
+    }
+  }
+
+  async function fetchInsiderMarketCapUsd(
+    botIndex: number,
+    mint: string,
+  ): Promise<{ marketCap: number; source: string } | null> {
+    if (insiderDasMarketCapClient.isConfigured()) {
+      try {
+        const das = await insiderDasMarketCapClient.fetchMarketCapUsd(mint);
+        if (das.ok) {
+          return { marketCap: das.marketCap, source: das.source };
+        }
+        log.debug(
+          `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Helius DAS unavailable for ${mint}; falling back to client MC`,
+          { reason: das.reason },
+        );
+      } catch (err) {
+        if (isHeliusUsageExhaustionError(err)) {
+          await stopInsiderForHeliusUsageExhaustion(
+            botIndex,
+            err,
+            "Helius DAS market-cap checker",
+          );
+          return null;
+        }
+        log.debug(
+          `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Helius DAS MC fetch failed for ${mint}; falling back to client MC`,
+          { error: err instanceof Error ? err.message : String(err) },
+        );
+      }
+    }
+
+    const clientMc = await gmgnClients[botIndex].fetchTokenMarketCapUsd(mint);
+    return clientMc === null ? null : { marketCap: clientMc, source: "Client" };
+  }
+
+  const handleProcessHeliusUsageExhaustion = (
+    err: unknown,
+    source: string,
+  ): boolean => {
+    if (!isHeliusUsageExhaustionError(err)) return false;
+    void (async () => {
+      const runningIndexes = insiderBots
+        .map((bot, index) => ({ bot, index }))
+        .filter(({ bot }) => bot.isRunning())
+        .map(({ index }) => index);
+      const targetIndexes = runningIndexes.length > 0 ? runningIndexes : [0];
+      for (const botIndex of targetIndexes) {
+        await stopInsiderForHeliusUsageExhaustion(botIndex, err, source);
+      }
+    })().catch((notifyErr) =>
+      log.error("Failed to stop Insider bot after Helius usage exhaustion", {
+        source,
+        error:
+          notifyErr instanceof Error ? notifyErr.message : String(notifyErr),
+      }),
+    );
+    return true;
+  };
+  process.on("unhandledRejection", (reason) => {
+    if (handleProcessHeliusUsageExhaustion(reason, "unhandled rejection")) {
+      return;
+    }
+    log.error("Unhandled promise rejection", reason);
+  });
+  process.on("uncaughtException", (err) => {
+    if (handleProcessHeliusUsageExhaustion(err, "uncaught exception")) return;
+    log.error("Uncaught exception", err);
+    process.exit(1);
+  });
 
   function hasPendingSellForMint(walletAddress: string, mint: string): boolean {
     for (const pending of pendingSells.values()) {
@@ -424,7 +562,7 @@ async function main(): Promise<void> {
                 ? `Exit MC: <b>$${exitMc.toLocaleString()}</b>`
                 : null,
             context === "insider" && insiderProfitExitDisabled
-              ? "Exit MC status: <b>Disabled — waiting for recipient 50% sell</b>"
+              ? "Exit MC status: <b>Disabled — waiting for recipient sell-all/zero-SOL exit</b>"
               : null,
             profitDisplay,
             tokenBalanceLine,
@@ -612,7 +750,14 @@ async function main(): Promise<void> {
               editCurrent: true,
             };
           }
-          await bot.followWallet(followedWallet);
+          const started = await followInsiderWalletWithUsageGuard(
+            0,
+            followedWallet,
+            "telegram resume",
+          );
+          if (!started) {
+            return "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
+          }
           return homeReply(true);
         }
 
@@ -763,8 +908,14 @@ async function main(): Promise<void> {
             return settingsReply(pendingAction.walletAddress);
           }
           if (pendingAction.type === "insiderFollowWallet") {
-            const bot = insiderBots[pendingAction.index];
-            await bot.followWallet(text);
+            const started = await followInsiderWalletWithUsageGuard(
+              pendingAction.index,
+              text,
+              "telegram follow-wallet setup",
+            );
+            if (!started) {
+              return "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
+            }
             return homeReply();
           }
           if (pendingAction.type === "insiderBuySol") {
@@ -837,7 +988,14 @@ async function main(): Promise<void> {
           }
         }
         if (botMode === "insider") {
-          await insiderBots[activeInsiderIndex].followWallet(text);
+          const started = await followInsiderWalletWithUsageGuard(
+            activeInsiderIndex,
+            text,
+            "telegram follow-wallet setup",
+          );
+          if (!started) {
+            return "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
+          }
           return homeReply();
         }
         return walletSummaryReply(text);
@@ -919,7 +1077,12 @@ async function main(): Promise<void> {
       !bot.getActivePosition() &&
       !bot.getPreBuyMint()
     ) {
-      await bot.followWallet(wallet);
+      const started = await followInsiderWalletWithUsageGuard(
+        0,
+        wallet,
+        "startup resume",
+      );
+      if (!started) return;
       log.info("[INSIDER] Resumed primary follow-wallet monitoring", {
         wallet,
         apiPoolBots: insiderBots.length,
@@ -1898,9 +2061,9 @@ async function main(): Promise<void> {
   async function checkInsiderMcapFlow(
     index: number,
     preFetchedMc?: number | null,
+    preFetchedSource?: string,
   ): Promise<void> {
     const bot = insiderBots[index];
-    const client = gmgnClients[index];
     const botNumber = getInsiderBotNumber(index);
     if (bot.isStoppedForHeliusCredits()) return;
     const preBuyMint = bot.getPreBuyMint();
@@ -1911,10 +2074,14 @@ async function main(): Promise<void> {
     const mint = preBuyMint || activePos!.mint;
 
     try {
-      const currentMc =
+      const fetched =
         preFetchedMc !== undefined
-          ? preFetchedMc
-          : await client.fetchTokenMarketCapUsd(mint);
+          ? {
+              marketCap: preFetchedMc,
+              source: preFetchedSource ?? "Prefetched",
+            }
+          : await fetchInsiderMarketCapUsd(index, mint);
+      const currentMc = fetched?.marketCap ?? null;
 
       if (currentMc === null) {
         log.debug(
@@ -1924,7 +2091,7 @@ async function main(): Promise<void> {
       }
 
       log.info(
-        `[INSIDER ${botNumber} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${preFetchedMc !== undefined ? "Prefetched" : "Client"})`,
+        `[INSIDER ${botNumber} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${fetched?.source ?? "Unknown"})`,
       );
 
       if (currentMc < INSIDER_MIN_MARKET_CAP_USD) {
@@ -1983,7 +2150,7 @@ async function main(): Promise<void> {
         const exitMc = bot.getExitMc();
         if (bot.isProfitExitDisabled()) {
           log.info(
-            `[INSIDER ${botNumber} MC EXIT SKIP] Profit MC exit disabled for ${activePos.mint}; waiting for recipient 50% sell exit. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+            `[INSIDER ${botNumber} MC EXIT SKIP] Profit MC exit disabled for ${activePos.mint}; waiting for recipient sell-all or zero-SOL exit. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
           );
           return;
         }
@@ -2030,11 +2197,13 @@ async function main(): Promise<void> {
           if (preBuyMint) {
             tasks.push(
               (async () => {
-                const client = gmgnClients[i];
-                const currentMc =
-                  await client.fetchTokenMarketCapUsd(preBuyMint);
+                const currentMc = await fetchInsiderMarketCapUsd(i, preBuyMint);
                 if (currentMc !== null) {
-                  await checkInsiderMcapFlow(i, currentMc);
+                  await checkInsiderMcapFlow(
+                    i,
+                    currentMc.marketCap,
+                    currentMc.source,
+                  );
                 }
               })(),
             );
@@ -2081,18 +2250,22 @@ async function main(): Promise<void> {
 
             tasks.push(
               (async () => {
-                const client = gmgnClients[i];
-                const currentMc = await client.fetchTokenMarketCapUsd(
+                const currentMc = await fetchInsiderMarketCapUsd(
+                  i,
                   activePos.mint,
                 );
                 if (currentMc !== null) {
                   // checkInsiderMcapFlow handles Exit MC and Flow v2 for active positions
-                  await checkInsiderMcapFlow(i, currentMc);
+                  await checkInsiderMcapFlow(
+                    i,
+                    currentMc.marketCap,
+                    currentMc.source,
+                  );
                   await checkAndSellIfLowMcap(
                     activePos.mint,
                     "insider",
                     i,
-                    currentMc,
+                    currentMc.marketCap,
                   );
                 }
               })(),
@@ -2331,9 +2504,6 @@ async function main(): Promise<void> {
     log.info("Reverse CopySell mode services stopped", { reason });
   }
 
-  const html = (value: string): string =>
-    value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
   function updateMinSol(walletAddress: string, rawValue: string): string {
     const normalized = new PublicKey(walletAddress).toBase58();
     const isTrading = normalized === config.tradingWalletAddress;
@@ -2522,12 +2692,12 @@ async function main(): Promise<void> {
           "2. Skip if the follow-wallet buy MC is above $60,000.",
           "3. First four unique bundler-wallet buy txs are checked; the follow wallet must be one of those first-buy wallets.",
           "4. Each bundler must have a zero-balance funding window; the highest valid funding transfer in that window is selected, and all four selected funding txs must share the same feePayer.",
-          "5. If largest bundler funding is below 15 SOL, check shared feePayer txs from latest funding to the bundler-buy window; buy if transfer-outs <= 5 and no transfer-in is greater than largest bundler funding. This path uses a +50% MC exit.",
-          "6. Otherwise, watch the shared feePayer from the earliest bundler funding tx for transfer-outs >= largest bundler funding + 2 SOL, <= 100 SOL, with at most 2 transfer-out candidates considered.",
+          "5. If largest bundler funding is below 15 SOL, check shared feePayer txs from latest funding to the bundler-buy window; buy if transfer-outs &lt;= 5 and no transfer-in is greater than largest bundler funding. This path uses a +50% MC exit.",
+          "6. Otherwise, watch the shared feePayer from the earliest bundler funding tx for transfer-outs &gt;= largest bundler funding + 2 SOL, &lt;= 100 SOL, with at most 2 transfer-out candidates considered.",
           "7. A transfer-out candidate is only confirmed if the immediate next feePayer tx is not a SOL transfer-in.",
           "8. Buy on the first confirmed transfer-out; keep watching other confirmed transfer-out recipients.",
-          "9. After buy: sell on MC target, rug, or when a confirmed recipient buys then sells at least 50% of its first tracked position.",
-          "10. If that recipient's second token action is a sell, disable the % MC profit exit and stick to the 50% recipient-sell exit; if the second action is another buy, use MC/rug exits.",
+          "9. After buy: MC target is active only until at least one confirmed recipient buys the token in its first 3 post-funding txs.",
+          "10. Once a recipient buy is found, MC target is disabled; sell on rug, recipient sell-all, or recipient SOL balance reaching zero via Helius balance-at.",
           "• API guard: Helius calls use a queued four-key pool, transient-only fallback, per-key backoff, and capped recipient batch sync.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets before buy or sells after buy.`,
         ].join("\n"),

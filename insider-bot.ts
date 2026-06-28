@@ -60,6 +60,7 @@ const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
 const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 50;
 const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 2;
+const BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW = 3;
 const BUNDLER_FUNDER_RECIPIENT_SYNC_INTERVAL_MS = 1_500;
 const BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE = 2;
 const HELIUS_POOL_MAX_CONCURRENT = 2;
@@ -336,6 +337,7 @@ interface BundlerFundingRecord {
 interface FunderRecipientWatch {
   wallet: string;
   fundingSignature: string;
+  fundingTimestamp: number;
   outAmountSol: number;
   heliusPreferredIndex: number;
   tokenActions: Array<{
@@ -343,9 +345,11 @@ interface FunderRecipientWatch {
     signature: string;
     amount: number;
   }>;
+  observedTxSignatures: Set<string>;
+  tokenBuyObserved: boolean;
+  zeroSolBalanceSignatures: Set<string>;
   boughtAmount: number;
   soldAmount: number;
-  followSellExit: boolean;
   firstBuySignature: string | null;
 }
 
@@ -776,18 +780,25 @@ export class InsiderBot extends EventEmitter {
     }
     this.followedWallet = normalized;
 
-    this.followMonitor = new WalletMonitor(this.config, normalized, {
+    const monitor = new WalletMonitor(this.config, normalized, {
       enforceMinBuySol: false,
       rpcUrl: this.rpcUrl,
       wsUrl: this.wsUrl,
       logLabel: `WALLET ${this.label.toUpperCase()}`,
     });
-    this.followMonitor.on("newToken", (event) => {
+    this.followMonitor = monitor;
+    monitor.on("newToken", (event) => {
       void this.handleFollowWalletBuy(event.mint, event.signature);
     });
 
-    await this.followMonitor.start();
-    for (const mint of this.followMonitor.existingMints) {
+    try {
+      await monitor.start();
+    } catch (err) {
+      monitor.stop();
+      this.followMonitor = null;
+      throw err;
+    }
+    for (const mint of monitor.existingMints) {
       this.boughtMints.add(mint);
     }
 
@@ -2236,6 +2247,23 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private removeFunderRecipientWatch(wallet: string, reason: string): void {
+    const state = this.bundlerFunderWatch;
+    state?.recipientWatches.delete(wallet);
+    this.dirtyFunderRecipients.delete(wallet);
+    this.dirtyFunderRecipientSignatures.delete(wallet);
+    const subId = this.recipientLogsSubIds.get(wallet);
+    if (subId !== undefined) {
+      this.recipientLogsSubIds.delete(wallet);
+      void this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+    this.log.info("Stopped watching shared feePayer recipient", {
+      mint: state?.mint,
+      wallet,
+      reason,
+    });
+  }
+
   private async stopBundlerFunderMonitoring(): Promise<void> {
     if (this.bundlerFunderLogsSubId !== null) {
       const subId = this.bundlerFunderLogsSubId;
@@ -2458,13 +2486,16 @@ export class InsiderBot extends EventEmitter {
       watch = {
         wallet: pending.recipient,
         fundingSignature: pending.signature,
+        fundingTimestamp: pending.timestamp,
         outAmountSol: pending.amountSol,
         heliusPreferredIndex:
           state.recipientWatches.size % Math.max(1, this.heliusPool.length || 1),
         tokenActions: [],
+        observedTxSignatures: new Set<string>(),
+        tokenBuyObserved: false,
+        zeroSolBalanceSignatures: new Set<string>(),
         boughtAmount: 0,
         soldAmount: 0,
-        followSellExit: true,
         firstBuySignature: null,
       };
       state.recipientWatches.set(pending.recipient, watch);
@@ -2770,7 +2801,7 @@ export class InsiderBot extends EventEmitter {
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
           "Next-tx check: confirmed; the immediate next feePayer tx was not a SOL transfer-in.",
-          "Sell rule: if this recipient's first token action is a buy, sell when it sells at least 50% of that position. If its second token action is a sell, disable the % MC profit exit and stick to the 50% recipient-sell exit. If its second token action is another buy, use only MC/rug exits.",
+          "Sell rule: MC target remains active only until a confirmed recipient buys this token in its first 3 post-funding txs. After that, MC target is disabled; rug, recipient sell-all, and recipient zero-SOL exits remain active.",
         ].join("\n"),
       });
     } finally {
@@ -2798,8 +2829,10 @@ export class InsiderBot extends EventEmitter {
           );
       const sorted = [...txs].reverse();
       for (const tx of sorted) {
-        if (tx.timestamp < state.earliestFundingTimestamp) continue;
+        if (tx.signature === watch.fundingSignature) continue;
+        if (tx.timestamp < watch.fundingTimestamp) continue;
         await this.applyFunderRecipientTransaction(state, watch, tx);
+        if (!state.recipientWatches.has(wallet)) break;
       }
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
@@ -2891,18 +2924,41 @@ export class InsiderBot extends EventEmitter {
     watch: FunderRecipientWatch,
     tx: HeliusTransaction,
   ): Promise<void> {
-    if (!this.isRelevantMintTx(tx, state.mint)) return;
-    const action = this.classifyTx(tx, watch.wallet, state.mint);
-    if (action !== "buy" && action !== "sell") return;
-    if (watch.tokenActions.some((existing) => existing.signature === tx.signature)) return;
+    const isNewObservedTx = !watch.observedTxSignatures.has(tx.signature);
+    if (isNewObservedTx && !watch.tokenBuyObserved) {
+      watch.observedTxSignatures.add(tx.signature);
+    }
 
+    const isRelevantMintTx = this.isRelevantMintTx(tx, state.mint);
+    if (!isRelevantMintTx) {
+      this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
+      return;
+    }
+    const action = this.classifyTx(tx, watch.wallet, state.mint);
+    if (action !== "buy" && action !== "sell") {
+      this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
+      return;
+    }
     const amount = this.extractTokenAmountForWallet(tx, watch.wallet, state.mint, action);
-    watch.tokenActions.push({ kind: action, signature: tx.signature, amount });
     if (action === "buy") {
+      watch.tokenBuyObserved = true;
+      if (watch.tokenActions.some((existing) => existing.signature === tx.signature)) return;
+      watch.tokenActions.push({ kind: action, signature: tx.signature, amount });
       if (!watch.firstBuySignature) {
         watch.firstBuySignature = tx.signature;
         watch.boughtAmount += amount;
-        this.log.warn("Valid transfer-out recipient bought token; 50% sell watch armed", {
+        if (!this.profitExitDisabled) {
+          this.profitExitDisabled = true;
+          this.log.warn(
+            "Valid transfer-out recipient bought token; disabling MC profit target and using recipient sell-all/zero-SOL exits",
+            {
+              mint: state.mint,
+              wallet: watch.wallet,
+              signature: tx.signature,
+            },
+          );
+        }
+        this.log.warn("Valid transfer-out recipient bought token; sell-all/zero-SOL watch armed", {
           mint: state.mint,
           wallet: watch.wallet,
           signature: tx.signature,
@@ -2916,87 +2972,184 @@ export class InsiderBot extends EventEmitter {
             `Buy tx: <code>${tx.signature}</code>`,
             `Tracked amount: <b>${watch.boughtAmount.toLocaleString()}</b>`,
             "",
-            "50% recipient-sell exit is now armed unless this wallet's next token action is another buy.",
+            "Exit watch armed: MC profit target is disabled. Bot will sell on rug, recipient sell-all, or recipient SOL balance reaching zero.",
           ].join("\n"),
           "recipient first-buy notification",
         );
       } else {
-        watch.followSellExit = false;
-        this.log.warn(
-          "Valid transfer-out recipient made a second buy; disabling 50% recipient-sell exit for this wallet",
-          {
-            mint: state.mint,
-            wallet: watch.wallet,
-            signature: tx.signature,
-            firstBuySignature: watch.firstBuySignature,
-          },
-        );
-        void this.sendTelegramSafe(
-          [
-            `<b>🟠 ${this.label} Recipient Second Buy</b>`,
-            `Token: <code>${state.mint}</code>`,
-            `Recipient: <code>${watch.wallet}</code>`,
-            `Second buy tx: <code>${tx.signature}</code>`,
-            "",
-            "50% recipient-sell exit disabled for this wallet. MC target and rug exits remain active.",
-          ].join("\n"),
-          "recipient second-buy notification",
-        );
+        watch.boughtAmount += amount;
+        this.log.info("Valid transfer-out recipient added to tracked token position", {
+          mint: state.mint,
+          wallet: watch.wallet,
+          signature: tx.signature,
+          boughtAmount: watch.boughtAmount,
+        });
       }
+      await this.sellIfRecipientSolBalanceIsZero(state, watch, tx);
       return;
     }
 
-    if (!watch.firstBuySignature || !watch.followSellExit) return;
-    if (watch.tokenActions.length === 2 && !this.profitExitDisabled) {
-      this.profitExitDisabled = true;
-      this.log.warn(
-        "Recipient second token action is a sell; disabling MC profit exit and keeping 50% recipient-sell exit",
-        {
-          mint: state.mint,
-          wallet: watch.wallet,
-          firstBuySignature: watch.firstBuySignature,
-          secondActionSignature: tx.signature,
-        },
-      );
-      void this.sendTelegramSafe(
-        [
-          `<b>🔵 ${this.label} Exit Mode Changed</b>`,
-          `Token: <code>${state.mint}</code>`,
-          `Recipient: <code>${watch.wallet}</code>`,
-          `First buy: <code>${watch.firstBuySignature}</code>`,
-          `Second token action: <b>SELL</b>`,
-          `Sell tx: <code>${tx.signature}</code>`,
-          "",
-          "% MC profit exit disabled for this position. Bot will wait for this recipient to sell at least 50% of its first tracked buy. Rug protection remains active.",
-        ].join("\n"),
-        "recipient second-action sell notification",
-      );
-    }
+    this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
+    if (!watch.firstBuySignature) return;
+    if (watch.tokenActions.some((existing) => existing.signature === tx.signature)) return;
+    watch.tokenActions.push({ kind: action, signature: tx.signature, amount });
     watch.soldAmount += amount;
-    const soldRatio = watch.boughtAmount > 0 ? watch.soldAmount / watch.boughtAmount : 0;
+    const remainingAmount = this.extractTokenPostBalanceForWallet(
+      tx,
+      watch.wallet,
+      state.mint,
+    );
+    const soldAllByTxBalance = remainingAmount !== null && remainingAmount <= 0;
+    const soldAllByTrackedAmount =
+      watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount;
     this.log.info("Valid transfer-out recipient sell observed", {
       mint: state.mint,
       wallet: watch.wallet,
       signature: tx.signature,
       soldAmount: watch.soldAmount,
       boughtAmount: watch.boughtAmount,
-      soldRatio,
+      remainingAmount,
+      soldAllByTxBalance,
+      soldAllByTrackedAmount,
     });
-    if (soldRatio >= 0.5 && this.phase === "holding") {
+    if ((soldAllByTxBalance || soldAllByTrackedAmount) && this.phase === "holding") {
       await this.triggerPositionSell(
         state.mint,
-        `Shared feePayer recipient ${watch.wallet} sold at least 50% of first buy`,
+        `Shared feePayer recipient ${watch.wallet} sold all tracked token position`,
         [
-          "<b>🚨 Shared-Funder Recipient Sold 50%</b>",
+          "<b>🚨 Shared-Funder Recipient Sold All</b>",
           `Token: <code>${state.mint}</code>`,
           `Recipient: <code>${watch.wallet}</code>`,
           `First buy: <code>${watch.firstBuySignature}</code>`,
           `Sell tx: <code>${tx.signature}</code>`,
-          `Sold: <b>${(soldRatio * 100).toFixed(2)}%</b> of first tracked position`,
+          `Sold tracked: <b>${watch.soldAmount.toLocaleString()}</b> / <b>${watch.boughtAmount.toLocaleString()}</b>`,
+          remainingAmount !== null
+            ? `Post-tx token balance: <b>${remainingAmount.toLocaleString()}</b>`
+            : "",
         ],
         tx.signature,
       );
+      return;
     }
+    await this.sellIfRecipientSolBalanceIsZero(state, watch, tx);
+  }
+
+  private pruneRecipientWithoutEarlyTokenBuy(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+  ): void {
+    if (watch.tokenBuyObserved) return;
+    if (
+      watch.observedTxSignatures.size <
+      BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW
+    ) {
+      return;
+    }
+    this.log.info(
+      "Valid transfer-out recipient skipped: no token buy in first watched transactions",
+      {
+        mint: state.mint,
+        wallet: watch.wallet,
+        fundingSignature: watch.fundingSignature,
+        observedTxCount: watch.observedTxSignatures.size,
+        requiredWindow: BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW,
+      },
+    );
+    state.validOutSignatures.delete(watch.fundingSignature);
+    void this.sendTelegramSafe(
+      [
+        `<b>⚪ ${this.label} Recipient Watch Skipped</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `Recipient: <code>${watch.wallet}</code>`,
+        `Funding tx: <code>${watch.fundingSignature}</code>`,
+        "",
+        `No token buy was found in the first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} recipient txs. This wallet will not be used for recipient sell-all or zero-SOL exit tracking.`,
+      ].join("\n"),
+      "recipient first-3 no-buy notification",
+    );
+    this.removeFunderRecipientWatch(
+      watch.wallet,
+      `no token buy in first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} recipient txs`,
+    );
+  }
+
+  private async sellIfRecipientSolBalanceIsZero(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    if (!watch.firstBuySignature || this.phase !== "holding") return;
+    if (watch.zeroSolBalanceSignatures.has(tx.signature)) return;
+    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return;
+    try {
+      const balance = await this.withHeliusFallback(
+        (client) =>
+          client.getWalletBalanceAt(
+            watch.wallet,
+            NATIVE_SOL_BALANCE_MINT,
+            tx.timestamp,
+          ),
+        watch.heliusPreferredIndex,
+      );
+      const balanceRaw = BigInt(balance.balanceRaw || "0");
+      this.log.info("Checked shared feePayer recipient SOL balance at tx timestamp", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        balance: balance.balance,
+        balanceRaw: balance.balanceRaw,
+      });
+      if (balanceRaw > 0n) return;
+      watch.zeroSolBalanceSignatures.add(tx.signature);
+      await this.triggerPositionSell(
+        state.mint,
+        `Shared feePayer recipient ${watch.wallet} SOL balance reached zero`,
+        [
+          "<b>🚨 Shared-Funder Recipient SOL Balance Zero</b>",
+          `Token: <code>${state.mint}</code>`,
+          `Recipient: <code>${watch.wallet}</code>`,
+          `Trigger tx: <code>${tx.signature}</code>`,
+          `Timestamp: <b>${tx.timestamp}</b>`,
+          `SOL balance at tx: <b>${balance.balance}</b>`,
+        ],
+        tx.signature,
+      );
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Failed to check shared feePayer recipient SOL balance-at", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private extractTokenPostBalanceForWallet(
+    tx: HeliusTransaction,
+    wallet: string,
+    mint: string,
+  ): number | null {
+    const balances = (tx.accountData ?? [])
+      .flatMap((account) => account.tokenBalanceChanges ?? [])
+      .filter(
+        (change) =>
+          change.mint === mint &&
+          (change.userAccount === wallet || change.tokenAccount === wallet),
+      )
+      .map((change) => {
+        const raw = Number(change.rawTokenAmount?.tokenAmount ?? NaN);
+        const decimals = Number(change.rawTokenAmount?.decimals ?? 0);
+        if (!Number.isFinite(raw) || !Number.isInteger(decimals) || decimals < 0) {
+          return null;
+        }
+        return raw / 10 ** decimals;
+      })
+      .filter((value): value is number => value !== null);
+    if (!balances.length) return null;
+    return balances.reduce((sum, value) => sum + value, 0);
   }
 
   private extractTokenAmountForWallet(
