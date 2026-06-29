@@ -1897,11 +1897,7 @@ export class InsiderBot extends EventEmitter {
       return null;
     }
 
-    const selected = candidates.reduce((best, candidate) =>
-      candidate.effectiveFundingSol > best.effectiveFundingSol
-        ? candidate
-        : best,
-    );
+    const selected = candidates[0];
     const latestWindowFunding = candidates[0];
     this.log.warn("Bundler funding transfer selected from post-zero window", {
       mint,
@@ -1918,6 +1914,8 @@ export class InsiderBot extends EventEmitter {
       currentBalance: selected.currentBalance,
       zeroBoundary,
       candidateCount: candidates.length,
+      selectionRule:
+        "latest funding transfer above zero-balance boundary; effective funding uses wallet balance at that timestamp when higher than incoming amount",
       candidates: candidates.map((candidate) => ({
         signature: candidate.tx.signature,
         fundingFeePayer: candidate.tx.feePayer,
