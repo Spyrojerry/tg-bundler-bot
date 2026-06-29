@@ -57,7 +57,6 @@ const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
 const BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT = 50;
 const BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL = 3.5;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
-const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES = 2;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
 const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 50;
@@ -71,6 +70,8 @@ const HELIUS_POOL_REQUEST_TIMEOUT_MS = 10_000;
 const HELIUS_POOL_BASE_BACKOFF_MS = 2_000;
 const HELIUS_POOL_MAX_BACKOFF_MS = 60_000;
 const HELIUS_POOL_METRICS_INTERVAL_MS = 30_000;
+const HELIUS_POOL_MC_RESERVED_INDEX = 3;
+const BUNDLER_FUNDER_MAX_QUEUED_TRANSFER_OUT_CANDIDATES = 20;
 
 type InsiderTxKind = "buy" | "sell" | "transfer_in" | "transfer_out";
 type FlowPhase = "pre_buy" | "holding";
@@ -356,6 +357,13 @@ interface FunderRecipientWatch {
   firstBuySignature: string | null;
 }
 
+interface FunderTransferOutCandidate {
+  signature: string;
+  recipient: string;
+  amountSol: number;
+  timestamp: number;
+}
+
 interface BundlerFunderWatchState {
   mint: string;
   funderWallet: string;
@@ -371,12 +379,8 @@ interface BundlerFunderWatchState {
   validOutSignatures: Set<string>;
   invalidOutSignatures: Set<string>;
   recipientWatches: Map<string, FunderRecipientWatch>;
-  pendingTransferOut: {
-    signature: string;
-    recipient: string;
-    amountSol: number;
-    timestamp: number;
-  } | null;
+  pendingTransferOut: FunderTransferOutCandidate | null;
+  queuedTransferOuts: FunderTransferOutCandidate[];
 }
 
 export class InsiderBot extends EventEmitter {
@@ -1341,11 +1345,32 @@ export class InsiderBot extends EventEmitter {
     offset: number,
   ): HeliusPoolEntry | null {
     const now = Date.now();
-    const ordered = pool.map((_, i) => pool[(preferredIndex + i) % pool.length]);
-    const available = ordered.filter((entry) => entry.unavailableUntil <= now);
-    const coolingDown = ordered.filter((entry) => entry.unavailableUntil > now);
-    const candidates = [...available, ...coolingDown];
-    return candidates[offset] ?? null;
+    const compareEntries = (a: HeliusPoolEntry, b: HeliusPoolEntry) => {
+      const aCooling = a.unavailableUntil > now ? 1 : 0;
+      const bCooling = b.unavailableUntil > now ? 1 : 0;
+      if (aCooling !== bCooling) return aCooling - bCooling;
+      if (a.stats.requests !== b.stats.requests) {
+        return a.stats.requests - b.stats.requests;
+      }
+      if (a.stats.rateLimits !== b.stats.rateLimits) {
+        return a.stats.rateLimits - b.stats.rateLimits;
+      }
+      return a.index - b.index;
+    };
+    const normalPool =
+      preferredIndex === HELIUS_POOL_MC_RESERVED_INDEX
+        ? pool
+        : pool.filter((entry) => entry.index !== HELIUS_POOL_MC_RESERVED_INDEX);
+    const candidates = normalPool.length > 0 ? normalPool : pool;
+    const preferred = candidates.find((entry) => entry.index === preferredIndex);
+    const rest = candidates
+      .filter((entry) => entry !== preferred)
+      .sort(compareEntries);
+    const ordered =
+      preferred && preferredIndex !== 0
+        ? [preferred, ...rest]
+        : [...candidates].sort(compareEntries);
+    return ordered[offset] ?? null;
   }
 
   private async runHeliusPoolRequest<T>(
@@ -1563,6 +1588,7 @@ export class InsiderBot extends EventEmitter {
       invalidOutSignatures: new Set<string>(),
       recipientWatches: new Map<string, FunderRecipientWatch>(),
       pendingTransferOut: null,
+      queuedTransferOuts: [],
     };
 
     this.subscribeBundlerFunder(funderWallet);
@@ -1758,16 +1784,13 @@ export class InsiderBot extends EventEmitter {
     }
 
     for (const entry of transferOuts) {
-      this.addBundlerFunderRecipientWatch(state, {
+      state.validOutSignatures.add(entry.tx.signature);
+      await this.activateOrQueueBundlerFunderCandidate(state, {
         recipient: entry.transferOut.to,
         signature: entry.tx.signature,
         amountSol: entry.transferOut.amountSol,
         timestamp: entry.tx.timestamp,
-        buyTriggersEntry: true,
-      });
-    }
-    if (transferOuts.length > 0) {
-      await this.syncFunderRecipientBatch(true);
+      }, "low-funding window transfer-out above 3.5 SOL");
     }
   }
 
@@ -2485,6 +2508,13 @@ export class InsiderBot extends EventEmitter {
   private async syncBundlerFunderTransactions(force = false): Promise<void> {
     const state = this.bundlerFunderWatch;
     if (!state || this.positionSellTriggered) return;
+    if (this.hasReachedFunderRecipientBuyCap(state)) {
+      await this.stopBundlerFunderSourceDiscovery(
+        state,
+        "recipient buy cap already reached",
+      );
+      return;
+    }
     if (this.isBundlerFunderSyncing) {
       this.bundlerFunderSyncPending = true;
       if (force) this.bundlerFunderSyncPendingForce = true;
@@ -2536,6 +2566,203 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  private countConfirmedFunderRecipientBuys(
+    state: BundlerFunderWatchState,
+  ): number {
+    return [...state.recipientWatches.values()].filter(
+      (watch) => watch.tokenBuyObserved,
+    ).length;
+  }
+
+  private hasReachedFunderRecipientBuyCap(
+    state: BundlerFunderWatchState,
+  ): boolean {
+    return (
+      this.countConfirmedFunderRecipientBuys(state) >=
+      BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES
+    );
+  }
+
+  private isKnownFunderCandidate(
+    state: BundlerFunderWatchState,
+    signature: string,
+  ): boolean {
+    return (
+      state.validOutSignatures.has(signature) ||
+      state.invalidOutSignatures.has(signature) ||
+      state.pendingTransferOut?.signature === signature ||
+      state.queuedTransferOuts.some((candidate) => candidate.signature === signature)
+    );
+  }
+
+  private enqueueBundlerFunderCandidate(
+    state: BundlerFunderWatchState,
+    candidate: FunderTransferOutCandidate,
+    reason: string,
+  ): boolean {
+    if (
+      state.invalidOutSignatures.has(candidate.signature) ||
+      state.pendingTransferOut?.signature === candidate.signature ||
+      state.queuedTransferOuts.some((queued) => queued.signature === candidate.signature)
+    ) {
+      return false;
+    }
+    if (
+      state.queuedTransferOuts.length >=
+      BUNDLER_FUNDER_MAX_QUEUED_TRANSFER_OUT_CANDIDATES
+    ) {
+      this.log.warn("Dropping stacked feePayer transfer-out candidate because queue is full", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        recipient: candidate.recipient,
+        signature: candidate.signature,
+        amountSol: candidate.amountSol,
+        queuedCandidates: state.queuedTransferOuts.length,
+        maxQueuedCandidates: BUNDLER_FUNDER_MAX_QUEUED_TRANSFER_OUT_CANDIDATES,
+        reason,
+      });
+      return false;
+    }
+    state.queuedTransferOuts.push(candidate);
+    state.validOutSignatures.add(candidate.signature);
+    this.log.info("Stacked feePayer transfer-out candidate for later recipient watch", {
+      mint: state.mint,
+      funderWallet: state.funderWallet,
+      recipient: candidate.recipient,
+      signature: candidate.signature,
+      amountSol: candidate.amountSol,
+      queuedCandidates: state.queuedTransferOuts.length,
+      activeRecipientWatches: state.recipientWatches.size,
+      confirmedRecipientBuys: this.countConfirmedFunderRecipientBuys(state),
+      maxConfirmedRecipientBuys: BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES,
+      reason,
+    });
+    return true;
+  }
+
+  private nextRecipientHeliusPreferredIndex(
+    state: BundlerFunderWatchState,
+  ): number {
+    const candidates = this.heliusPool.filter(
+      (entry) => entry.index !== HELIUS_POOL_MC_RESERVED_INDEX,
+    );
+    if (candidates.length === 0) return 0;
+    return candidates[state.recipientWatches.size % candidates.length].index;
+  }
+
+  private async activateOrQueueBundlerFunderCandidate(
+    state: BundlerFunderWatchState,
+    candidate: FunderTransferOutCandidate,
+    reason: string,
+  ): Promise<FunderRecipientWatch | null> {
+    if (this.hasReachedFunderRecipientBuyCap(state)) {
+      await this.stopBundlerFunderSourceDiscovery(
+        state,
+        "two recipients already bought the monitored token",
+      );
+      return null;
+    }
+    if (state.recipientWatches.size >= BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES) {
+      this.enqueueBundlerFunderCandidate(state, candidate, reason);
+      return null;
+    }
+    const watch = this.addBundlerFunderRecipientWatch(state, {
+      recipient: candidate.recipient,
+      signature: candidate.signature,
+      amountSol: candidate.amountSol,
+      timestamp: candidate.timestamp,
+      buyTriggersEntry: true,
+    });
+    if (!watch) {
+      this.enqueueBundlerFunderCandidate(state, candidate, reason);
+      return null;
+    }
+    this.markFunderRecipientDirty(candidate.recipient);
+    await this.syncFunderRecipientBatch(true);
+    return watch;
+  }
+
+  private async promoteQueuedBundlerFunderCandidates(
+    state: BundlerFunderWatchState,
+    reason: string,
+  ): Promise<void> {
+    if (this.hasReachedFunderRecipientBuyCap(state)) {
+      await this.stopBundlerFunderSourceDiscovery(
+        state,
+        "two recipients bought the monitored token",
+      );
+      return;
+    }
+    while (
+      state.recipientWatches.size < BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES &&
+      state.queuedTransferOuts.length > 0
+    ) {
+      const candidate = state.queuedTransferOuts.shift()!;
+      if (state.invalidOutSignatures.has(candidate.signature)) continue;
+      if (state.recipientWatches.has(candidate.recipient)) continue;
+      const watch = this.addBundlerFunderRecipientWatch(state, {
+        recipient: candidate.recipient,
+        signature: candidate.signature,
+        amountSol: candidate.amountSol,
+        timestamp: candidate.timestamp,
+        buyTriggersEntry: true,
+      });
+      if (!watch) continue;
+      this.log.warn("Promoted stacked feePayer transfer-out candidate into recipient watch", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        recipient: candidate.recipient,
+        signature: candidate.signature,
+        amountSol: candidate.amountSol,
+        queuedCandidates: state.queuedTransferOuts.length,
+        activeRecipientWatches: state.recipientWatches.size,
+        reason,
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>🟡 ${this.label} Stacked Candidate Promoted</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `FeePayer: <code>${state.funderWallet}</code>`,
+          `Recipient: <code>${candidate.recipient}</code>`,
+          `Funding tx: <code>${candidate.signature}</code>`,
+          `Amount: <b>${candidate.amountSol.toFixed(4)} SOL</b>`,
+          "",
+          `Watching its first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} post-funding txs for a buy of this token.`,
+        ].join("\n"),
+        "stacked candidate promoted notification",
+      );
+      this.markFunderRecipientDirty(candidate.recipient);
+      await this.syncFunderRecipientBatch(true);
+    }
+  }
+
+  private async stopBundlerFunderSourceDiscovery(
+    state: BundlerFunderWatchState,
+    reason: string,
+  ): Promise<void> {
+    if (this.bundlerFunderLogsSubId !== null) {
+      const subId = this.bundlerFunderLogsSubId;
+      this.bundlerFunderLogsSubId = null;
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+    if (this.bundlerFunderWsSyncTimer) {
+      clearTimeout(this.bundlerFunderWsSyncTimer);
+      this.bundlerFunderWsSyncTimer = null;
+    }
+    this.isBundlerFunderSyncing = false;
+    this.bundlerFunderSyncPending = false;
+    this.bundlerFunderSyncPendingForce = false;
+    state.pendingTransferOut = null;
+    state.queuedTransferOuts = [];
+    this.log.warn("Stopped shared feePayer transfer-out discovery", {
+      mint: state.mint,
+      funderWallet: state.funderWallet,
+      confirmedRecipientBuys: this.countConfirmedFunderRecipientBuys(state),
+      activeRecipientWatches: state.recipientWatches.size,
+      reason,
+    });
+  }
+
   private async inspectBundlerFunderTransaction(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
@@ -2576,29 +2803,15 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
     if (
-      state.validOutSignatures.has(tx.signature) ||
-      state.invalidOutSignatures.has(tx.signature) ||
-      state.pendingTransferOut?.signature === tx.signature
+      this.isKnownFunderCandidate(state, tx.signature)
     ) {
       return false;
     }
-    const consideredCandidateCount =
-      state.validOutSignatures.size +
-      state.invalidOutSignatures.size +
-      (state.pendingTransferOut ? 1 : 0);
-    if (
-      consideredCandidateCount >=
-      BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES
-    ) {
-      this.log.info("Skipping feePayer transfer-out because normal-mode candidate cap is reached", {
-        mint: state.mint,
-        funderWallet: state.funderWallet,
-        signature: tx.signature,
-        amountSol: transferOut.amountSol,
-        recipient: transferOut.to,
-        consideredCandidateCount,
-        maxCandidates: BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES,
-      });
+    if (this.hasReachedFunderRecipientBuyCap(state)) {
+      await this.stopBundlerFunderSourceDiscovery(
+        state,
+        "two recipients already bought the monitored token",
+      );
       return false;
     }
 
@@ -2616,6 +2829,9 @@ export class InsiderBot extends EventEmitter {
       amountSol: transferOut.amountSol,
       minTransferOutSol: state.minTransferOutSol,
       signature: tx.signature,
+      activeRecipientWatches: state.recipientWatches.size,
+      queuedCandidates: state.queuedTransferOuts.length,
+      confirmedRecipientBuys: this.countConfirmedFunderRecipientBuys(state),
       rule:
         "candidate is invalid if the next funder transaction is a SOL transfer-in",
     });
@@ -2629,7 +2845,8 @@ export class InsiderBot extends EventEmitter {
         `Amount: <b>${transferOut.amountSol.toFixed(4)} SOL</b>`,
         `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
         `Max valid transfer-out: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL.toFixed(0)} SOL</b>`,
-        `Candidate count: <b>${consideredCandidateCount + 1}/${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES}</b>`,
+        `Active watches: <b>${state.recipientWatches.size}/${BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES}</b>`,
+        `Stacked candidates: <b>${state.queuedTransferOuts.length}</b>`,
         `Tx: <code>${tx.signature}</code>`,
         "",
         "Waiting for the next funder tx. If it is a SOL transfer-in, this candidate is invalid.",
@@ -2746,14 +2963,11 @@ export class InsiderBot extends EventEmitter {
     }
 
     state.validOutSignatures.add(pending.signature);
-    const watch = this.addBundlerFunderRecipientWatch(state, {
-      recipient: pending.recipient,
-      signature: pending.signature,
-      amountSol: pending.amountSol,
-      timestamp: pending.timestamp,
-      buyTriggersEntry: true,
-    });
-    if (!watch) return;
+    const watch = await this.activateOrQueueBundlerFunderCandidate(
+      state,
+      pending,
+      "next feePayer tx confirmed candidate was not followed by SOL transfer-in",
+    );
 
     this.log.warn("Shared feePayer transfer-out confirmed by next-tx check", {
       mint: state.mint,
@@ -2764,7 +2978,12 @@ export class InsiderBot extends EventEmitter {
       candidateSignature: pending.signature,
       nextSignature: nextTx.signature,
       buySubmitted: this.buySubmitted,
+      activatedRecipientWatch: Boolean(watch),
+      queuedCandidates: state.queuedTransferOuts.length,
+      activeRecipientWatches: state.recipientWatches.size,
     });
+
+    if (!watch) return;
 
     if (state.lowFundingMode) {
       this.log.warn("Low-funding transfer-out recipient confirmed; waiting for recipient token buy before our buy", {
@@ -2784,8 +3003,6 @@ export class InsiderBot extends EventEmitter {
         firstTxWindow: BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW,
       });
     }
-    this.markFunderRecipientDirty(pending.recipient);
-    await this.syncFunderRecipientBatch(true);
   }
 
   private addBundlerFunderRecipientWatch(
@@ -2816,8 +3033,7 @@ export class InsiderBot extends EventEmitter {
       fundingSignature: candidate.signature,
       fundingTimestamp: candidate.timestamp,
       outAmountSol: candidate.amountSol,
-      heliusPreferredIndex:
-        state.recipientWatches.size % Math.max(1, this.heliusPool.length || 1),
+      heliusPreferredIndex: this.nextRecipientHeliusPreferredIndex(state),
       tokenActions: [],
       observedTxSignatures: new Set<string>(),
       tokenBuyObserved: false,
@@ -3183,7 +3399,7 @@ export class InsiderBot extends EventEmitter {
           `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
           `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
           `Max valid transfer-out: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL.toFixed(0)} SOL</b>`,
-          `Candidate cap: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES}</b>`,
+          `Confirmed recipient-buy cap: <b>${BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES}</b>`,
           `Recipient buy tx: <code>${signature}</code>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
@@ -3376,6 +3592,12 @@ export class InsiderBot extends EventEmitter {
             await this.emitBundlerFunderBuy(state, watch, tx.signature);
           }
         }
+        if (this.hasReachedFunderRecipientBuyCap(state)) {
+          await this.stopBundlerFunderSourceDiscovery(
+            state,
+            "two recipients bought the monitored token",
+          );
+        }
       } else {
         watch.boughtAmount += amount;
         this.log.info("Valid transfer-out recipient added to tracked token position", {
@@ -3469,6 +3691,10 @@ export class InsiderBot extends EventEmitter {
     this.removeFunderRecipientWatch(
       watch.wallet,
       `no token buy in first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} recipient txs`,
+    );
+    void this.promoteQueuedBundlerFunderCandidates(
+      state,
+      "recipient failed first-3-tx token-buy gate",
     );
   }
 
