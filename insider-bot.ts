@@ -2329,6 +2329,8 @@ export class InsiderBot extends EventEmitter {
     state.funderWallet = nextWallet;
     state.cursorSignature = cursorSignature;
     state.pendingTransferOut = null;
+    this.bundlerFunderSyncPending = true;
+    this.bundlerFunderSyncPendingForce = true;
     this.subscribeBundlerFunder(nextWallet);
     this.log.warn("Shared feePayer address migrated to a new wallet", {
       mint: state.mint,
@@ -2586,7 +2588,7 @@ export class InsiderBot extends EventEmitter {
     if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return;
     if (!transferOut.to || transferOut.to === state.funderWallet) return;
     try {
-      const balance = await this.withHeliusFallback(
+      let balance = await this.withHeliusFallback(
         (client) =>
           client.getWalletBalanceAt(
             state.funderWallet,
@@ -2594,13 +2596,31 @@ export class InsiderBot extends EventEmitter {
             tx.timestamp,
           ),
       );
-      const balanceRaw = BigInt(balance.balanceRaw || "0");
+      let balanceRaw = BigInt(balance.balanceRaw || "0");
+      let balanceTimestamp = tx.timestamp;
+      if (balanceRaw !== 0n) {
+        const nextSecondBalance = await this.withHeliusFallback(
+          (client) =>
+            client.getWalletBalanceAt(
+              state.funderWallet,
+              NATIVE_SOL_BALANCE_MINT,
+              tx.timestamp + 1,
+            ),
+        );
+        const nextSecondBalanceRaw = BigInt(nextSecondBalance.balanceRaw || "0");
+        if (nextSecondBalanceRaw === 0n) {
+          balance = nextSecondBalance;
+          balanceRaw = nextSecondBalanceRaw;
+          balanceTimestamp = tx.timestamp + 1;
+        }
+      }
       this.log.info("Checked shared feePayer balance after over-max transfer-out", {
         mint: state.mint,
         watchedWallet: state.funderWallet,
         recipient: transferOut.to,
         signature: tx.signature,
         timestamp: tx.timestamp,
+        balanceTimestamp,
         amountSol: transferOut.amountSol,
         balance: balance.balance,
         balanceRaw: balance.balanceRaw,
