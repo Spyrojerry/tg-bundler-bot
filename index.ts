@@ -43,6 +43,7 @@ const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const INSIDER_MIN_MARKET_CAP_USD = 5_000;
 const MCAP_CHECK_INTERVAL_MS = 1000; // Increased frequency from 1500ms to 1000ms
+const INSIDER_DAS_NO_PRICE_COOLDOWN_MS = 10_000;
 const isHeliusUsageExhaustionError = (err: unknown): boolean => {
   const message =
     err instanceof Error
@@ -225,6 +226,8 @@ async function main(): Promise<void> {
     string,
     { balance: bigint; quote: SellQuote | null; timestamp: number }
   >();
+  const activePositionRefreshes = new Set<string>();
+  const insiderDasNoPriceUntil = new Map<string, number>();
   const handledHeliusUsageStops = new Set<number>();
 
   function html(value: string): string {
@@ -324,16 +327,26 @@ async function main(): Promise<void> {
     botIndex: number,
     mint: string,
   ): Promise<{ marketCap: number; source: string } | null> {
-    if (insiderDasMarketCapClient.isConfigured()) {
+    const now = Date.now();
+    const dasNoPriceUntil = insiderDasNoPriceUntil.get(mint) ?? 0;
+    if (insiderDasMarketCapClient.isConfigured() && now >= dasNoPriceUntil) {
       try {
         const das = await insiderDasMarketCapClient.fetchMarketCapUsd(mint);
         if (das.ok) {
+          insiderDasNoPriceUntil.delete(mint);
           return { marketCap: das.marketCap, source: das.source };
         }
+        if (das.reason.includes("price_info")) {
+          insiderDasNoPriceUntil.set(
+            mint,
+            Date.now() + INSIDER_DAS_NO_PRICE_COOLDOWN_MS,
+          );
+        }
         log.debug(
-          `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Helius DAS unavailable for ${mint}; falling back to client MC`,
+          `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Helius DAS unavailable for ${mint}; skipping this MC tick`,
           { reason: das.reason },
         );
+        return null;
       } catch (err) {
         if (isHeliusUsageExhaustionError(err)) {
           await stopInsiderForHeliusUsageExhaustion(
@@ -344,14 +357,13 @@ async function main(): Promise<void> {
           return null;
         }
         log.debug(
-          `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Helius DAS MC fetch failed for ${mint}; falling back to client MC`,
+          `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Helius DAS MC fetch failed for ${mint}; skipping this MC tick`,
           { error: err instanceof Error ? err.message : String(err) },
         );
+        return null;
       }
     }
-
-    const clientMc = await gmgnClients[botIndex].fetchTokenMarketCapUsd(mint);
-    return clientMc === null ? null : { marketCap: clientMc, source: "Client" };
+    return null;
   }
 
   const handleProcessHeliusUsageExhaustion = (
@@ -2255,8 +2267,10 @@ async function main(): Promise<void> {
             const cached = activePositionCache.get(activePos.mint);
             if (
               config.tradingWalletAddress &&
-              (!cached || Date.now() - cached.timestamp > 30_000)
+              (!cached || Date.now() - cached.timestamp > 30_000) &&
+              !activePositionRefreshes.has(activePos.mint)
             ) {
+              activePositionRefreshes.add(activePos.mint);
               const client = gmgnClients[i];
               const owner = new PublicKey(config.tradingWalletAddress);
               const mintPk = new PublicKey(activePos.mint);
@@ -2286,7 +2300,10 @@ async function main(): Promise<void> {
                     `Background balance/quote refresh failed for ${activePos.mint}`,
                     e,
                   ),
-                );
+                )
+                .finally(() => {
+                  activePositionRefreshes.delete(activePos.mint);
+                });
             }
 
             tasks.push(
@@ -2733,10 +2750,10 @@ async function main(): Promise<void> {
           "2. Skip if the follow-wallet buy MC is above $60,000.",
           "3. First four unique bundler-wallet buy txs are checked; the follow wallet must be one of those first-buy wallets.",
           "4. Each bundler must have a zero-balance funding window; the highest valid funding transfer in that window is selected, and all four selected funding txs must share the same feePayer.",
-          "5. If largest bundler funding is below 15 SOL, check shared feePayer txs from latest funding to the bundler-buy window; buy if transfer-outs &lt;= 5 and no transfer-in is greater than largest bundler funding. This path uses a +50% MC exit.",
-          "6. Otherwise, watch the shared feePayer from the earliest bundler funding tx for transfer-outs &gt;= largest bundler funding + 2 SOL, &lt;= 100 SOL, with at most 2 transfer-out candidates considered.",
-          "7. A transfer-out candidate is only confirmed if the immediate next feePayer tx is not a SOL transfer-in.",
-          "8. Buy on the first confirmed transfer-out; keep watching other confirmed transfer-out recipients.",
+          "5. If largest bundler funding is below 15 SOL, low-funding mode first checks feePayer balance after the last initial bundler transfer; if below 15 SOL, buy with +50% MC exit. Otherwise watch transfer-outs above 3.5 SOL and wait for receiver buy within first 3 txs.",
+          "6. Otherwise, normal mode watches the shared feePayer from the earliest bundler funding tx for transfer-outs &gt;= largest bundler funding + 2 SOL, &lt;= 100 SOL, with at most 2 transfer-out candidates considered.",
+          "7. Normal transfer-out candidates confirm only if the immediate next feePayer tx is not a SOL transfer-in.",
+          "8. Normal mode buys on the first confirmed transfer-out; low-funding mode buys only after the candidate recipient buys the token.",
           "9. After buy: MC target is active only until at least one confirmed recipient buys the token in its first 3 post-funding txs.",
           "10. Once a recipient buy is found, MC target is disabled; sell on rug, recipient sell-all, or recipient SOL balance reaching zero via Helius balance-at.",
           "• API guard: Helius calls use a queued four-key pool, transient-only fallback, per-key backoff, and capped recipient batch sync.",

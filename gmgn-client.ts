@@ -958,14 +958,60 @@ export class GmgnClient {
     options: SellOptions & { preFetchedBalance?: bigint },
   ): Promise<SellResult> {
     const venue = await this.detectPumpTradeVenue(mint);
-    return this.executePumpPortalLightningTrade(
-      "sell",
-      walletAddress,
-      mint,
-      options,
-      venue,
-      options.preFetchedBalance,
-    );
+    try {
+      return await this.executePumpPortalLightningTrade(
+        "sell",
+        walletAddress,
+        mint,
+        options,
+        venue,
+        options.preFetchedBalance,
+      );
+    } catch (err) {
+      const balanceAfterLightningFailure = await this.getTokenBalance(
+        walletAddress,
+        mint,
+      ).catch(() => null);
+      if (balanceAfterLightningFailure === 0n) {
+        log.warn(
+          "PumpPortal Lightning sell failed but wallet token balance is zero; treating sell as completed",
+          {
+            mint,
+            walletAddress,
+            venue,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+        return this.pumpPortalResult(
+          "sell",
+          mint,
+          null,
+          options,
+          options.preFetchedBalance ?? 0n,
+          0n,
+          venue,
+          0,
+          "lightning-error-balance-zero",
+        );
+      }
+
+      log.warn("PumpPortal Lightning sell failed; trying direct backup sell", {
+        mint,
+        walletAddress,
+        venue,
+        balanceAfterLightningFailure:
+          balanceAfterLightningFailure?.toString() ?? null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return this.sellTokenForSolViaDirectBackup(
+        walletAddress,
+        mint,
+        options,
+        venue,
+        err,
+        balanceAfterLightningFailure ?? undefined,
+      );
+    }
   }
 
   private async executePumpPortalLightningTrade(
@@ -1506,6 +1552,121 @@ export class GmgnClient {
     }
 
     throw lastError ?? new Error(`PumpSwap AMM sell failed for ${mint}`);
+  }
+
+  private async sellTokenForSolViaDirectBackup(
+    walletAddress: string,
+    mint: string,
+    options: SellOptions & { preFetchedBalance?: bigint },
+    venue: PumpTradeVenue,
+    lightningError: unknown,
+    knownBalance?: bigint,
+  ): Promise<SellResult> {
+    const balanceBefore = knownBalance ?? (await this.getTokenBalance(walletAddress, mint));
+    if (balanceBefore <= 0n) {
+      return this.pumpPortalResult(
+        "sell",
+        mint,
+        null,
+        options,
+        options.preFetchedBalance ?? balanceBefore,
+        0n,
+        venue,
+        0,
+        "direct-backup-already-sold",
+      );
+    }
+
+    const routes =
+      venue === "bonding_curve"
+        ? (["pump", "pump_swap"] as const)
+        : (["pump_swap", "pump"] as const);
+    let lastError: unknown = lightningError;
+
+    for (const route of routes) {
+      try {
+        const result =
+          route === "pump_swap"
+            ? await this.sellTokenForSolViaPumpSwap(
+                walletAddress,
+                mint,
+                balanceBefore,
+                options,
+              )
+            : await this.sellTokenForSolViaPump(
+                walletAddress,
+                mint,
+                balanceBefore,
+                options,
+              );
+        result.raw = {
+          ...result.raw,
+          backupAfterPumpPortalLightningFailure: true,
+          lightningError:
+            lightningError instanceof Error
+              ? lightningError.message
+              : String(lightningError),
+        };
+        log.warn("Direct backup sell confirmed after PumpPortal Lightning failure", {
+          mint,
+          walletAddress,
+          route,
+          signature: result.hash,
+        });
+        return result;
+      } catch (err) {
+        lastError = err;
+        const recoveredBalance = await this.getTokenBalance(
+          walletAddress,
+          mint,
+        ).catch(() => balanceBefore);
+        if (recoveredBalance === 0n) {
+          log.warn("Direct backup sell errored but token balance is zero; treating sell as completed", {
+            mint,
+            walletAddress,
+            route,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return {
+            orderId: null,
+            hash:
+              err instanceof Error
+                ? (err.message.match(/Transaction ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ?? null)
+                : null,
+            status: "confirmed",
+            inputToken: mint,
+            outputToken: SOL_MINT,
+            soldPercent: options.percent,
+            filledInputAmount: balanceBefore.toString(),
+            filledOutputAmount: null,
+            raw: {
+              route: `${route}-direct-backup-balance-recovered`,
+              backupAfterPumpPortalLightningFailure: true,
+              lightningError:
+                lightningError instanceof Error
+                  ? lightningError.message
+                  : String(lightningError),
+              backupError: err instanceof Error ? err.message : String(err),
+              balanceBefore: balanceBefore.toString(),
+              balanceAfter: recoveredBalance.toString(),
+            },
+          };
+        }
+        log.warn("Direct backup sell route failed; trying next route if available", {
+          mint,
+          walletAddress,
+          route,
+          balanceAfter: recoveredBalance.toString(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    throw new Error(
+      `PumpPortal Lightning sell failed and direct backup sell failed for ${mint}: ${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`,
+    );
   }
 
   private async sellTokenForSolViaPump(
