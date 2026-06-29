@@ -1699,6 +1699,12 @@ export class InsiderBot extends EventEmitter {
     const sharedFeePayerBalanceBelowLowFundingThreshold =
       Number.isFinite(sharedFeePayerBalanceSol) &&
       sharedFeePayerBalanceSol < BUNDLER_FUNDER_LOW_FUNDING_SOL;
+    const lowFundingImmediateBuyWindowValid =
+      windowTxs.length > 0 &&
+      windowTxs.length <= BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS;
+    const lowFundingImmediateBuyAllowed =
+      sharedFeePayerBalanceBelowLowFundingThreshold &&
+      lowFundingImmediateBuyWindowValid;
     this.log.warn("Low-funding shared feePayer window evaluated", {
       mint: state.mint,
       sharedFeePayer: state.funderWallet,
@@ -1711,6 +1717,9 @@ export class InsiderBot extends EventEmitter {
       syncStartBundlerWallet: syncStart.bundlerWallet,
       latestBundlerBuyTimestamp,
       txCount: windowTxs.length,
+      minWindowTxsForImmediateBuy: 1,
+      maxWindowTxsForImmediateBuy:
+        BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS,
       transferOutTxCount: transferOuts.length,
       maxTransferOutTxs: BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS,
       largestIncomingSol,
@@ -1718,11 +1727,15 @@ export class InsiderBot extends EventEmitter {
       sharedFeePayerBalanceAtSyncStartRaw:
         sharedFeePayerBalanceAtSyncStart.balanceRaw,
       sharedFeePayerBalanceBelowLowFundingThreshold,
+      lowFundingImmediateBuyWindowValid,
+      lowFundingImmediateBuyAllowed,
       action:
-        sharedFeePayerBalanceBelowLowFundingThreshold
+        lowFundingImmediateBuyAllowed
           ? "buy immediately with low-funding 50% MC exit"
           : transferOuts.length > 0
           ? "watch recipients for token buy in first 3 txs"
+          : sharedFeePayerBalanceBelowLowFundingThreshold
+          ? "skip immediate low-funding buy because window tx count is not between 1 and 5"
           : "waiting for low-funding transfer-out candidate",
       transferOuts: transferOuts.map((entry) => ({
         signature: entry.tx.signature,
@@ -1732,7 +1745,7 @@ export class InsiderBot extends EventEmitter {
       })),
     });
 
-    if (sharedFeePayerBalanceBelowLowFundingThreshold) {
+    if (lowFundingImmediateBuyAllowed) {
       await this.emitLowFundingSharedFeePayerBuy(state, syncStart.signature, {
         windowTxCount: windowTxs.length,
         transferOutTxCount: transferOuts.length,
@@ -2738,7 +2751,7 @@ export class InsiderBot extends EventEmitter {
       signature: pending.signature,
       amountSol: pending.amountSol,
       timestamp: pending.timestamp,
-      buyTriggersEntry: state.lowFundingMode,
+      buyTriggersEntry: true,
     });
     if (!watch) return;
 
@@ -2753,7 +2766,7 @@ export class InsiderBot extends EventEmitter {
       buySubmitted: this.buySubmitted,
     });
 
-    if (watch.buyTriggersEntry) {
+    if (state.lowFundingMode) {
       this.log.warn("Low-funding transfer-out recipient confirmed; waiting for recipient token buy before our buy", {
         mint: state.mint,
         funderWallet: state.funderWallet,
@@ -2762,7 +2775,14 @@ export class InsiderBot extends EventEmitter {
         candidateSignature: pending.signature,
       });
     } else {
-      await this.emitBundlerFunderBuy(state, watch, pending.signature);
+      this.log.warn("Shared feePayer transfer-out recipient confirmed; waiting for recipient token buy before our buy", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        recipient: pending.recipient,
+        amountSol: pending.amountSol,
+        candidateSignature: pending.signature,
+        firstTxWindow: BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW,
+      });
     }
     this.markFunderRecipientDirty(pending.recipient);
     await this.syncFunderRecipientBatch(true);
@@ -3124,14 +3144,14 @@ export class InsiderBot extends EventEmitter {
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) {
         this.log.warn(
-          "Confirmed shared feePayer transfer-out found, but current market cap is unavailable; waiting before buy",
+          "Shared feePayer recipient bought token, but current market cap is unavailable; waiting before buy",
           { mint: state.mint, recipient: watch.wallet, signature },
         );
         return;
       }
       if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
         this.log.warn(
-          "Confirmed shared feePayer transfer-out found, but token is below rug threshold; resetting instead of buying",
+          "Shared feePayer recipient bought token, but token is below rug threshold; resetting instead of buying",
           {
             mint: state.mint,
             recipient: watch.wallet,
@@ -3157,18 +3177,19 @@ export class InsiderBot extends EventEmitter {
         entryMc: currentMc,
         monitoredWallet: watch.wallet,
         tradersListStr: [
-          "<b>Shared Bundler FeePayer Buy Gate Passed</b>",
+          "<b>Shared Bundler Recipient Buy Gate Passed</b>",
           `FeePayer: <code>${state.funderWallet}</code>`,
           `Recipient: <code>${watch.wallet}</code>`,
           `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
           `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
           `Max valid transfer-out: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL.toFixed(0)} SOL</b>`,
           `Candidate cap: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES}</b>`,
-          `Trigger tx: <code>${signature}</code>`,
+          `Recipient buy tx: <code>${signature}</code>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
           "Next-tx check: confirmed; the immediate next feePayer tx was not a SOL transfer-in.",
-          "Sell rule: MC target remains active only until a confirmed recipient buys this token in its first 3 post-funding txs. After that, MC target is disabled; rug, recipient sell-all, and recipient zero-SOL exits remain active.",
+          `Buy rule: recipient bought this token within its first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} post-funding txs.`,
+          "Sell rule: MC target is disabled; rug, recipient sell-all, and recipient zero-SOL exits remain active.",
         ].join("\n"),
       });
     } finally {
@@ -3349,7 +3370,11 @@ export class InsiderBot extends EventEmitter {
           "recipient first-buy notification",
         );
         if (watch.buyTriggersEntry && !this.buySubmitted) {
-          await this.emitLowFundingRecipientBuy(state, watch, tx.signature);
+          if (state.lowFundingMode) {
+            await this.emitLowFundingRecipientBuy(state, watch, tx.signature);
+          } else {
+            await this.emitBundlerFunderBuy(state, watch, tx.signature);
+          }
         }
       } else {
         watch.boughtAmount += amount;
