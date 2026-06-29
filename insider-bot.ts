@@ -50,6 +50,8 @@ const AXIOM_EXIT_NEAR_ZERO_SINGLE_SELL_THRESHOLD = 2;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 60_000;
 const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
+const BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS = 3;
+const BUNDLER_FUNDER_FUNDING_RECORD_RETRY_DELAY_MS = 500;
 const BUNDLER_FUNDER_EXTRA_SOL = 2;
 const BUNDLER_FUNDER_LOW_FUNDING_SOL = 15;
 const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
@@ -1466,14 +1468,49 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const fundingRecords = await Promise.all(
-      firstFour.map((buy, index) =>
-        this.findValidBundlerFundingRecord(mint, buy, index),
-      ),
-    );
-    if (fundingRecords.some((record) => !record)) {
-      this.log.warn("Could not validate all four bundler funding records; resetting", {
+    let fundingRecords: Array<BundlerFundingRecord | null> = [];
+    for (
+      let attempt = 1;
+      attempt <= BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS;
+      attempt += 1
+    ) {
+      fundingRecords = await Promise.all(
+        firstFour.map((buy, index) =>
+          this.findValidBundlerFundingRecord(mint, buy, index),
+        ),
+      );
+
+      const missingCount = fundingRecords.filter((record) => !record).length;
+      if (missingCount === 0) {
+        if (attempt > 1) {
+          this.log.warn("Bundler funding records validated after retry", {
+            mint,
+            attempt,
+            maxAttempts: BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS,
+            fundingRecords,
+          });
+        }
+        break;
+      }
+
+      if (attempt < BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS) {
+        this.log.warn("Could not validate all four bundler funding records; retrying", {
+          mint,
+          attempt,
+          maxAttempts: BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS,
+          missingCount,
+          fundingRecords,
+        });
+        await new Promise((resolve) =>
+          setTimeout(resolve, BUNDLER_FUNDER_FUNDING_RECORD_RETRY_DELAY_MS),
+        );
+        continue;
+      }
+
+      this.log.warn("Could not validate all four bundler funding records after retries; resetting", {
         mint,
+        attempts: BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS,
+        missingCount,
         fundingRecords,
       });
       await this.resetForNewToken(true);
