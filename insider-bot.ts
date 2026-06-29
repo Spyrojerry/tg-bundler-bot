@@ -361,6 +361,7 @@ interface BundlerFunderWatchState {
   mint: string;
   funderWallet: string;
   originalFunderWallet: string;
+  migrationCount: number;
   lowFundingMode: boolean;
   earliestFundingTimestamp: number;
   earliestFundingSignature: string;
@@ -1549,6 +1550,7 @@ export class InsiderBot extends EventEmitter {
       mint,
       funderWallet,
       originalFunderWallet: funderWallet,
+      migrationCount: 0,
       lowFundingMode,
       earliestFundingTimestamp: earliest.timestamp,
       earliestFundingSignature: earliest.fundingSignature,
@@ -2364,6 +2366,7 @@ export class InsiderBot extends EventEmitter {
     }
     const previousWallet = state.funderWallet;
     state.funderWallet = nextWallet;
+    state.migrationCount += 1;
     state.cursorSignature = cursorSignature;
     state.pendingTransferOut = null;
     this.bundlerFunderSyncPending = true;
@@ -2374,6 +2377,7 @@ export class InsiderBot extends EventEmitter {
       originalFeePayer: state.originalFunderWallet,
       previousWallet,
       nextWallet,
+      migrationCount: state.migrationCount,
       cursorSignature,
       reason,
     });
@@ -2384,6 +2388,7 @@ export class InsiderBot extends EventEmitter {
         `Original FeePayer: <code>${state.originalFunderWallet}</code>`,
         `Old FeePayer: <code>${previousWallet}</code>`,
         `New FeePayer: <code>${nextWallet}</code>`,
+        `Migration #: <b>${state.migrationCount}</b>`,
         `Handoff tx: <code>${cursorSignature}</code>`,
         "",
         reason,
@@ -2485,20 +2490,23 @@ export class InsiderBot extends EventEmitter {
 
     this.isBundlerFunderSyncing = true;
     this.lastBundlerFunderSyncAt = Date.now();
+    const syncingWallet = state.funderWallet;
     try {
       const txs = await this.withHeliusFallback((client) =>
         client.getAddressTransactionsAsc(
-          state.funderWallet,
+          syncingWallet,
           state.cursorSignature ?? undefined,
           BUNDLER_FUNDER_SYNC_LIMIT,
         ),
       );
       for (const tx of txs) {
+        if (state.funderWallet !== syncingWallet) break;
         if (state.processedSignatures.has(tx.signature)) continue;
         state.processedSignatures.add(tx.signature);
         state.cursorSignature = tx.signature;
         await this.resolvePendingBundlerFunderCandidate(state, tx);
-        await this.inspectBundlerFunderTransaction(state, tx);
+        const migrated = await this.inspectBundlerFunderTransaction(state, tx);
+        if (migrated) break;
       }
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
@@ -2521,28 +2529,31 @@ export class InsiderBot extends EventEmitter {
   private async inspectBundlerFunderTransaction(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const transferOut = this.extractSolTransferOutFromWallet(
       tx,
       state.funderWallet,
       state.minTransferOutSol,
     );
-    if (!transferOut) return;
+    if (!transferOut) return false;
     if (transferOut.amountSol > BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL) {
-      await this.maybeMoveBundlerFunderWatchAfterLargeDrain(
+      const watchedWallet = state.funderWallet;
+      const migrated = await this.maybeMoveBundlerFunderWatchAfterLargeDrain(
         state,
         tx,
         transferOut,
       );
       this.log.info("Skipping feePayer transfer-out above normal-mode max amount", {
         mint: state.mint,
-        funderWallet: state.funderWallet,
+        funderWallet: watchedWallet,
+        currentFunderWallet: state.funderWallet,
         signature: tx.signature,
         amountSol: transferOut.amountSol,
         maxTransferOutSol: BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL,
         recipient: transferOut.to,
+        migrated,
       });
-      return;
+      return migrated;
     }
     if (this.hasSolIncomingToWallet(tx, state.funderWallet)) {
       this.log.info("Skipping funder transfer-out because same tx also has transfer-in", {
@@ -2552,14 +2563,14 @@ export class InsiderBot extends EventEmitter {
         amountSol: transferOut.amountSol,
         recipient: transferOut.to,
       });
-      return;
+      return false;
     }
     if (
       state.validOutSignatures.has(tx.signature) ||
       state.invalidOutSignatures.has(tx.signature) ||
       state.pendingTransferOut?.signature === tx.signature
     ) {
-      return;
+      return false;
     }
     const consideredCandidateCount =
       state.validOutSignatures.size +
@@ -2578,7 +2589,7 @@ export class InsiderBot extends EventEmitter {
         consideredCandidateCount,
         maxCandidates: BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_CANDIDATES,
       });
-      return;
+      return false;
     }
 
     state.pendingTransferOut = {
@@ -2615,15 +2626,16 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "pending feePayer transfer-out notification",
     );
+    return false;
   }
 
   private async maybeMoveBundlerFunderWatchAfterLargeDrain(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
     transferOut: { to: string; amountSol: number },
-  ): Promise<void> {
-    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return;
-    if (!transferOut.to || transferOut.to === state.funderWallet) return;
+  ): Promise<boolean> {
+    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return false;
+    if (!transferOut.to || transferOut.to === state.funderWallet) return false;
     try {
       let balance = await this.withHeliusFallback(
         (client) =>
@@ -2662,7 +2674,7 @@ export class InsiderBot extends EventEmitter {
         balance: balance.balance,
         balanceRaw: balance.balanceRaw,
       });
-      if (balanceRaw !== 0n) return;
+      if (balanceRaw !== 0n) return false;
 
       await this.switchBundlerFunderWatchAddress(
         state,
@@ -2670,6 +2682,7 @@ export class InsiderBot extends EventEmitter {
         tx.signature,
         `Over-${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL.toFixed(0)} SOL transfer-out drained watched wallet to zero; continuing this token's feePayer monitor from receiver.`,
       );
+      return true;
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
       this.log.warn("Failed to check shared feePayer balance after over-max transfer-out", {
@@ -2681,6 +2694,7 @@ export class InsiderBot extends EventEmitter {
         amountSol: transferOut.amountSol,
         error: err instanceof Error ? err.message : String(err),
       });
+      return false;
     }
   }
 
