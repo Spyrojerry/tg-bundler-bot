@@ -3540,11 +3540,17 @@ export class InsiderBot extends EventEmitter {
 
     const isRelevantMintTx = this.isRelevantMintTx(tx, state.mint);
     if (!isRelevantMintTx) {
+      if (await this.skipRecipientIfEarlySolBalanceBelowHalf(state, watch, tx)) {
+        return;
+      }
       this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
       return;
     }
     const action = this.classifyTx(tx, watch.wallet, state.mint);
     if (action !== "buy" && action !== "sell") {
+      if (await this.skipRecipientIfEarlySolBalanceBelowHalf(state, watch, tx)) {
+        return;
+      }
       this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
       return;
     }
@@ -3611,6 +3617,11 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
+    if (!watch.firstBuySignature) {
+      if (await this.skipRecipientIfEarlySolBalanceBelowHalf(state, watch, tx)) {
+        return;
+      }
+    }
     this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
     if (!watch.firstBuySignature) return;
     if (watch.tokenActions.some((existing) => existing.signature === tx.signature)) return;
@@ -3696,6 +3707,99 @@ export class InsiderBot extends EventEmitter {
       state,
       "recipient failed first-3-tx token-buy gate",
     );
+  }
+
+  private async skipRecipientIfEarlySolBalanceBelowHalf(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+    tx: HeliusTransaction,
+  ): Promise<boolean> {
+    if (watch.tokenBuyObserved || watch.firstBuySignature) return false;
+    if (
+      watch.observedTxSignatures.size === 0 ||
+      watch.observedTxSignatures.size >
+        BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW
+    ) {
+      return false;
+    }
+    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return false;
+
+    const halfFundingSol = watch.outAmountSol / 2;
+    try {
+      const balance = await this.withHeliusFallback(
+        (client) =>
+          client.getWalletBalanceAt(
+            watch.wallet,
+            NATIVE_SOL_BALANCE_MINT,
+            tx.timestamp,
+          ),
+        watch.heliusPreferredIndex,
+      );
+      const balanceSol = Number(balance.balance);
+      this.log.info("Checked early recipient SOL balance during first-3 buy gate", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        observedTxCount: watch.observedTxSignatures.size,
+        fundingSignature: watch.fundingSignature,
+        transferOutSol: watch.outAmountSol,
+        halfFundingSol,
+        balance: balance.balance,
+        balanceRaw: balance.balanceRaw,
+      });
+      if (!Number.isFinite(balanceSol) || balanceSol >= halfFundingSol) {
+        return false;
+      }
+
+      this.log.warn("Valid transfer-out recipient skipped: early SOL balance fell below half of funding before token buy", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        fundingSignature: watch.fundingSignature,
+        triggerSignature: tx.signature,
+        observedTxCount: watch.observedTxSignatures.size,
+        transferOutSol: watch.outAmountSol,
+        halfFundingSol,
+        balanceSol,
+      });
+      state.validOutSignatures.delete(watch.fundingSignature);
+      void this.sendTelegramSafe(
+        [
+          `<b>⚪ ${this.label} Recipient Watch Skipped</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `Recipient: <code>${watch.wallet}</code>`,
+          `Funding tx: <code>${watch.fundingSignature}</code>`,
+          `Trigger tx: <code>${tx.signature}</code>`,
+          `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
+          `Half threshold: <b>${halfFundingSol.toFixed(4)} SOL</b>`,
+          `SOL balance: <b>${balanceSol.toFixed(4)} SOL</b>`,
+          "",
+          "No token buy was found before the recipient SOL balance dropped below half of its feePayer funding. Promoting the next stacked candidate.",
+        ].join("\n"),
+        "recipient early balance below half notification",
+      );
+      this.removeFunderRecipientWatch(
+        watch.wallet,
+        "SOL balance fell below half of feePayer funding before token buy",
+      );
+      void this.promoteQueuedBundlerFunderCandidates(
+        state,
+        "recipient early SOL balance below half of feePayer funding",
+      );
+      return true;
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Failed to check early recipient SOL balance during first-3 buy gate", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        transferOutSol: watch.outAmountSol,
+        halfFundingSol,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
   }
 
   private async sellIfRecipientSolBalanceIsZero(
