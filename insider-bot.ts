@@ -52,7 +52,6 @@ const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
 const BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_RETRY_DELAY_MS = 500;
-const BUNDLER_FUNDER_EXTRA_SOL = 2;
 const BUNDLER_FUNDER_LOW_FUNDING_SOL = 15;
 const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
 const BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT = 50;
@@ -1557,7 +1556,7 @@ export class InsiderBot extends EventEmitter {
       largestFundingSol,
       minTransferOutSol: lowFundingMode
         ? BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL
-        : largestFundingSol + BUNDLER_FUNDER_EXTRA_SOL,
+        : largestFundingSol,
       cursorSignature: earliest.fundingSignature,
       processedSignatures: new Set(records.map((record) => record.fundingSignature)),
       validOutSignatures: new Set<string>(),

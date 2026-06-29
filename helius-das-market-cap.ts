@@ -1,7 +1,7 @@
 import { createLogger } from "./logger";
 
 const log = createLogger("HELIUS-DAS-MC");
-const REQUEST_TIMEOUT_MS = 4_000;
+const REQUEST_TIMEOUT_MS = 1_000;
 
 type CachedSupply = {
   supply: number;

@@ -35,6 +35,7 @@ import { ReverseCopySellOrchestrator } from "./reverse-copysell-orchestrator";
 import { InsiderBot } from "./insider-bot";
 import type { InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
+import { PumpReserveMarketCapClient } from "./pump-reserve-market-cap";
 import { PublicKey } from "@solana/web3.js";
 import { randomBytes } from "crypto";
 
@@ -42,7 +43,8 @@ const log = createLogger("MAIN");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const INSIDER_MIN_MARKET_CAP_USD = 5_000;
-const MCAP_CHECK_INTERVAL_MS = 1000; // Increased frequency from 1500ms to 1000ms
+const MCAP_CHECK_INTERVAL_MS = 2_000;
+const MCAP_FETCH_GRACE_MS = 1_000;
 const INSIDER_DAS_NO_PRICE_COOLDOWN_MS = 10_000;
 const isHeliusUsageExhaustionError = (err: unknown): boolean => {
   const message =
@@ -180,6 +182,20 @@ async function main(): Promise<void> {
       ),
   );
   const insiderDasMarketCapClient = new HeliusDasMarketCapClient(
+    config.insiderHeliusApiKey3 ||
+      insiderBotDefinitions[2]?.heliusApiKey ||
+      config.insiderHeliusApiKey ||
+      config.heliusApiKey,
+  );
+  const insiderPumpReserveMarketCapClient = new PumpReserveMarketCapClient(
+    insiderBotDefinitions[2]?.rpcUrl ||
+      insiderBotDefinitions[0]?.rpcUrl ||
+      config.insiderSolanaRpcUrl ||
+      config.solanaRpcUrl,
+    insiderBotDefinitions[2]?.wsUrl ||
+      insiderBotDefinitions[0]?.wsUrl ||
+      config.insiderSolanaWsUrl ||
+      config.solanaWsUrl,
     config.insiderHeliusApiKey3 ||
       insiderBotDefinitions[2]?.heliusApiKey ||
       config.insiderHeliusApiKey ||
@@ -327,11 +343,53 @@ async function main(): Promise<void> {
     botIndex: number,
     mint: string,
   ): Promise<{ marketCap: number; source: string } | null> {
+    const startedAt = Date.now();
+    const remainingGraceMs = (): number =>
+      Math.max(1, MCAP_FETCH_GRACE_MS - (Date.now() - startedAt));
+    const withGrace = async <T>(task: Promise<T>): Promise<T | null> => {
+      let timer: NodeJS.Timeout | null = null;
+      try {
+        return await Promise.race([
+          task,
+          new Promise<null>((resolve) => {
+            timer = setTimeout(resolve, remainingGraceMs(), null);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    const reserve = await withGrace(
+      insiderPumpReserveMarketCapClient.fetchMarketCapUsd(mint),
+    );
+    if (reserve === null) {
+      log.debug(
+        `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Pump reserve MC missed ${MCAP_FETCH_GRACE_MS}ms grace for ${mint}; skipping this MC tick`,
+      );
+      return null;
+    }
+    if (reserve.ok) {
+      return { marketCap: reserve.marketCap, source: reserve.source };
+    }
+    log.debug(
+      `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Pump reserve MC unavailable for ${mint}; trying Helius DAS`,
+      { reason: reserve.reason },
+    );
+
     const now = Date.now();
     const dasNoPriceUntil = insiderDasNoPriceUntil.get(mint) ?? 0;
     if (insiderDasMarketCapClient.isConfigured() && now >= dasNoPriceUntil) {
       try {
-        const das = await insiderDasMarketCapClient.fetchMarketCapUsd(mint);
+        const das = await withGrace(
+          insiderDasMarketCapClient.fetchMarketCapUsd(mint),
+        );
+        if (das === null) {
+          log.debug(
+            `[INSIDER ${getInsiderBotNumber(botIndex)} MC] Helius DAS missed ${MCAP_FETCH_GRACE_MS}ms grace for ${mint}; skipping this MC tick`,
+          );
+          return null;
+        }
         if (das.ok) {
           insiderDasNoPriceUntil.delete(mint);
           return { marketCap: das.marketCap, source: das.source };
@@ -2751,7 +2809,7 @@ async function main(): Promise<void> {
           "3. First four unique bundler-wallet buy txs are checked; the follow wallet must be one of those first-buy wallets.",
           "4. Each bundler must have a zero-balance funding window; the highest valid funding transfer in that window is selected, and all four selected funding txs must share the same feePayer.",
           "5. If largest bundler funding is below 15 SOL, low-funding mode first checks feePayer balance after the last initial bundler transfer; if below 15 SOL, buy with +50% MC exit. Otherwise watch transfer-outs above 3.5 SOL and wait for receiver buy within first 3 txs.",
-          "6. Otherwise, normal mode watches the shared feePayer from the earliest bundler funding tx for transfer-outs &gt;= largest bundler funding + 2 SOL, &lt;= 100 SOL, with at most 2 transfer-out candidates considered.",
+          "6. Otherwise, normal mode watches the shared feePayer from the earliest bundler funding tx for transfer-outs &gt;= the exact largest bundler funding, &lt;= 100 SOL, with at most 2 transfer-out candidates considered.",
           "7. Normal transfer-out candidates confirm only if the immediate next feePayer tx is not a SOL transfer-in.",
           "8. Normal mode buys on the first confirmed transfer-out; low-funding mode buys only after the candidate recipient buys the token.",
           "9. After buy: MC target is active only until at least one confirmed recipient buys the token in its first 3 post-funding txs.",
