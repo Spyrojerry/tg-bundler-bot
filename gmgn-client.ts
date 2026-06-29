@@ -1348,8 +1348,12 @@ export class GmgnClient {
     return { status: "unknown", error: null };
   }
 
-  private pumpPortalPoolForVenue(venue: PumpTradeVenue): "pump" | "auto" {
-    return venue === "bonding_curve" ? "pump" : "auto";
+  private pumpPortalPoolForVenue(
+    venue: PumpTradeVenue,
+  ): "pump" | "pump-amm" | "auto" {
+    if (venue === "bonding_curve") return "pump";
+    if (venue === "pump_swap") return "pump-amm";
+    return "auto";
   }
 
   private extractPumpPortalSignature(data: unknown): string | null {
