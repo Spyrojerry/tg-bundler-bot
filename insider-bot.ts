@@ -2739,6 +2739,15 @@ export class InsiderBot extends EventEmitter {
       this.enqueueBundlerFunderCandidate(state, candidate, reason);
       return null;
     }
+    await this.syncThenSubscribeFunderRecipient(state, watch, "accepted candidate");
+    if (!state.recipientWatches.has(candidate.recipient)) {
+      void this.promoteQueuedBundlerFunderCandidates(
+        state,
+        "recipient failed first sync",
+      );
+      return null;
+    }
+    if (this.buySubmitted || watch.tokenBuyObserved) return watch;
     const acceptedBySwapHistory = await this.maybeBuyFromRecipientSwapHistory(
       state,
       watch,
@@ -2750,8 +2759,6 @@ export class InsiderBot extends EventEmitter {
       );
       return null;
     }
-    this.markFunderRecipientDirty(candidate.recipient);
-    await this.syncFunderRecipientBatch(true);
     return watch;
   }
 
@@ -2804,13 +2811,14 @@ export class InsiderBot extends EventEmitter {
         ].join("\n"),
         "stacked candidate promoted notification",
       );
-      this.markFunderRecipientDirty(candidate.recipient);
+      await this.syncThenSubscribeFunderRecipient(state, watch, "promoted stacked candidate");
+      if (!state.recipientWatches.has(candidate.recipient)) continue;
+      if (this.buySubmitted || watch.tokenBuyObserved) continue;
       const acceptedBySwapHistory = await this.maybeBuyFromRecipientSwapHistory(
         state,
         watch,
       );
       if (!acceptedBySwapHistory) continue;
-      await this.syncFunderRecipientBatch(true);
     }
   }
 
@@ -3052,8 +3060,37 @@ export class InsiderBot extends EventEmitter {
       firstBuySignature: null,
     };
     state.recipientWatches.set(candidate.recipient, watch);
-    this.subscribeFunderRecipient(candidate.recipient);
     return watch;
+  }
+
+  private async syncThenSubscribeFunderRecipient(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+    reason: string,
+  ): Promise<void> {
+    this.log.info("Syncing shared feePayer recipient before websocket subscribe", {
+      mint: state.mint,
+      wallet: watch.wallet,
+      fundingSignature: watch.fundingSignature,
+      fundingTimestamp: watch.fundingTimestamp,
+      reason,
+    });
+    this.markFunderRecipientDirty(watch.wallet);
+    await this.syncFunderRecipientBatch(true);
+    if (!state.recipientWatches.has(watch.wallet)) return;
+
+    this.subscribeFunderRecipient(watch.wallet);
+
+    this.markFunderRecipientDirty(watch.wallet);
+    await this.syncFunderRecipientBatch(true);
+    this.log.info("Shared feePayer recipient synced and subscribed", {
+      mint: state.mint,
+      wallet: watch.wallet,
+      fundingSignature: watch.fundingSignature,
+      observedTxCount: watch.observedTxSignatures.size,
+      tokenBuyObserved: watch.tokenBuyObserved,
+      reason,
+    });
   }
 
   private extractSolTransferOutFromWallet(
