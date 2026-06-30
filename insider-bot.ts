@@ -381,6 +381,7 @@ interface BundlerFunderWatchState {
   processedSignatures: Set<string>;
   validOutSignatures: Set<string>;
   invalidOutSignatures: Set<string>;
+  bundlerWallets: Set<string>;
   recipientWatches: Map<string, FunderRecipientWatch>;
   pendingTransferOut: FunderTransferOutCandidate | null;
   queuedTransferOuts: FunderTransferOutCandidate[];
@@ -1591,6 +1592,7 @@ export class InsiderBot extends EventEmitter {
       processedSignatures: new Set(records.map((record) => record.fundingSignature)),
       validOutSignatures: new Set<string>(),
       invalidOutSignatures: new Set<string>(),
+      bundlerWallets: new Set(records.map((record) => record.bundlerWallet)),
       recipientWatches: new Map<string, FunderRecipientWatch>(),
       pendingTransferOut: null,
       queuedTransferOuts: [],
@@ -1710,7 +1712,8 @@ export class InsiderBot extends EventEmitter {
     const transferOuts = allTransferOuts.filter(
       (entry) =>
         entry.transferOut.amountSol >
-        BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL,
+          BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL &&
+        !state.bundlerWallets.has(entry.transferOut.to),
     );
     const largestIncomingSol = Math.max(
       0,
@@ -1771,6 +1774,14 @@ export class InsiderBot extends EventEmitter {
         recipient: entry.transferOut.to,
         amountSol: entry.transferOut.amountSol,
       })),
+      skippedBundlerRecipients: allTransferOuts
+        .filter((entry) => state.bundlerWallets.has(entry.transferOut.to))
+        .map((entry) => ({
+          signature: entry.tx.signature,
+          timestamp: entry.tx.timestamp,
+          recipient: entry.transferOut.to,
+          amountSol: entry.transferOut.amountSol,
+        })),
     });
 
     if (lowFundingImmediateBuyAllowed) {
@@ -2846,6 +2857,17 @@ export class InsiderBot extends EventEmitter {
         signature: tx.signature,
         amountSol: transferOut.amountSol,
         recipient: transferOut.to,
+      });
+      return false;
+    }
+    if (state.bundlerWallets.has(transferOut.to)) {
+      this.log.info("Skipping feePayer transfer-out because recipient is one of the first-four bundlers", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        signature: tx.signature,
+        amountSol: transferOut.amountSol,
+        recipient: transferOut.to,
+        bundlerWallets: [...state.bundlerWallets],
       });
       return false;
     }
