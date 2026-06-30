@@ -383,7 +383,6 @@ interface BundlerFunderWatchState {
   invalidOutSignatures: Set<string>;
   bundlerWallets: Set<string>;
   recipientWatches: Map<string, FunderRecipientWatch>;
-  pendingTransferOut: FunderTransferOutCandidate | null;
   queuedTransferOuts: FunderTransferOutCandidate[];
 }
 
@@ -1103,7 +1102,7 @@ export class InsiderBot extends EventEmitter {
         `Follow wallet: <code>${this.followedWallet}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
-        "Finding each bundler's zero-balance funding window, selecting the highest valid funding transfer in that window, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs with an immediate next-tx transfer-in invalidation check.",
+        "Finding each bundler's zero-balance funding window, selecting the latest valid funding transfer in that window, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs for recipient buy confirmation.",
       ].join("\n"),
       "flow-start notification",
     );
@@ -1594,7 +1593,6 @@ export class InsiderBot extends EventEmitter {
       invalidOutSignatures: new Set<string>(),
       bundlerWallets: new Set(records.map((record) => record.bundlerWallet)),
       recipientWatches: new Map<string, FunderRecipientWatch>(),
-      pendingTransferOut: null,
       queuedTransferOuts: [],
     };
 
@@ -1666,7 +1664,7 @@ export class InsiderBot extends EventEmitter {
         `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b>`,
         `Watching feePayer transfer-outs: <b>${activeFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
         "",
-        "A transfer-out only confirms after the next feePayer tx is not a SOL transfer-in.",
+        "Transfer-outs that pass the filters are watched until the recipient buys this token.",
       ].join("\n"),
       "shared feePayer notification",
     );
@@ -2027,6 +2025,32 @@ export class InsiderBot extends EventEmitter {
       confirmedBalanceRaw: confirmed.balanceRaw,
       firstAsOf: first.asOf,
       confirmedAsOf: confirmed.asOf,
+    });
+    return confirmed;
+  }
+
+  private async getConfirmedWalletSwapHistory(
+    wallet: string,
+    limit: number,
+    preferredClientIndex = 0,
+  ): Promise<HeliusTransaction[]> {
+    const first = await this.withHeliusFallback(
+      (client) => client.getWalletSwapHistory(wallet, limit),
+      preferredClientIndex,
+    );
+    const confirmed = await this.withHeliusFallback(
+      (client) => client.getWalletSwapHistory(wallet, limit),
+      preferredClientIndex,
+    );
+    this.log.debug("Confirmed Helius wallet SWAP history with second request", {
+      wallet,
+      limit,
+      firstCount: first.length,
+      confirmedCount: confirmed.length,
+      firstNewestSignature: first[0]?.signature ?? null,
+      confirmedNewestSignature: confirmed[0]?.signature ?? null,
+      firstNewestTimestamp: first[0]?.timestamp ?? null,
+      confirmedNewestTimestamp: confirmed[0]?.timestamp ?? null,
     });
     return confirmed;
   }
@@ -2443,7 +2467,6 @@ export class InsiderBot extends EventEmitter {
     state.funderWallet = nextWallet;
     state.migrationCount += 1;
     state.cursorSignature = cursorSignature;
-    state.pendingTransferOut = null;
     this.bundlerFunderSyncPending = true;
     this.bundlerFunderSyncPendingForce = true;
     this.subscribeBundlerFunder(nextWallet);
@@ -2586,7 +2609,6 @@ export class InsiderBot extends EventEmitter {
         if (state.processedSignatures.has(tx.signature)) continue;
         state.processedSignatures.add(tx.signature);
         state.cursorSignature = tx.signature;
-        await this.resolvePendingBundlerFunderCandidate(state, tx);
         const migrated = await this.inspectBundlerFunderTransaction(state, tx);
         if (migrated) break;
       }
@@ -2632,7 +2654,6 @@ export class InsiderBot extends EventEmitter {
     return (
       state.validOutSignatures.has(signature) ||
       state.invalidOutSignatures.has(signature) ||
-      state.pendingTransferOut?.signature === signature ||
       state.queuedTransferOuts.some((candidate) => candidate.signature === signature)
     );
   }
@@ -2644,7 +2665,6 @@ export class InsiderBot extends EventEmitter {
   ): boolean {
     if (
       state.invalidOutSignatures.has(candidate.signature) ||
-      state.pendingTransferOut?.signature === candidate.signature ||
       state.queuedTransferOuts.some((queued) => queued.signature === candidate.signature)
     ) {
       return false;
@@ -2810,7 +2830,6 @@ export class InsiderBot extends EventEmitter {
     this.isBundlerFunderSyncing = false;
     this.bundlerFunderSyncPending = false;
     this.bundlerFunderSyncPendingForce = false;
-    state.pendingTransferOut = null;
     state.queuedTransferOuts = [];
     this.log.warn("Stopped shared feePayer transfer-out discovery", {
       mint: state.mint,
@@ -2884,14 +2903,20 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    state.pendingTransferOut = {
+    const candidate: FunderTransferOutCandidate = {
       signature: tx.signature,
       recipient: transferOut.to,
       amountSol: transferOut.amountSol,
       timestamp: tx.timestamp,
     };
+    state.validOutSignatures.add(candidate.signature);
+    const watch = await this.activateOrQueueBundlerFunderCandidate(
+      state,
+      candidate,
+      "feePayer transfer-out accepted after transfer-out filters",
+    );
 
-    this.log.warn("Shared feePayer transfer-out candidate pending next-tx check", {
+    this.log.warn("Shared feePayer transfer-out candidate accepted", {
       mint: state.mint,
       funderWallet: state.funderWallet,
       recipient: transferOut.to,
@@ -2901,13 +2926,13 @@ export class InsiderBot extends EventEmitter {
       activeRecipientWatches: state.recipientWatches.size,
       queuedCandidates: state.queuedTransferOuts.length,
       confirmedRecipientBuys: this.countConfirmedFunderRecipientBuys(state),
-      rule:
-        "candidate is invalid if the next funder transaction is a SOL transfer-in",
+      activatedRecipientWatch: Boolean(watch),
+      rule: "recipient must buy the monitored token before bot copybuy",
     });
 
     void this.sendTelegramSafe(
       [
-        `<b>🟡 ${this.label} FeePayer Transfer-Out Candidate</b>`,
+        `<b>🟡 ${this.label} FeePayer Transfer-Out Accepted</b>`,
         `Token: <code>${state.mint}</code>`,
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Recipient: <code>${transferOut.to}</code>`,
@@ -2918,9 +2943,9 @@ export class InsiderBot extends EventEmitter {
         `Stacked candidates: <b>${state.queuedTransferOuts.length}</b>`,
         `Tx: <code>${tx.signature}</code>`,
         "",
-        "Waiting for the next funder tx. If it is a SOL transfer-in, this candidate is invalid.",
+        "Watching this recipient for a buy of the current token.",
       ].join("\n"),
-      "pending feePayer transfer-out notification",
+      "accepted feePayer transfer-out notification",
     );
     return false;
   }
@@ -2985,86 +3010,6 @@ export class InsiderBot extends EventEmitter {
         error: err instanceof Error ? err.message : String(err),
       });
       return false;
-    }
-  }
-
-  private async resolvePendingBundlerFunderCandidate(
-    state: BundlerFunderWatchState,
-    nextTx: HeliusTransaction,
-  ): Promise<void> {
-    const pending = state.pendingTransferOut;
-    if (!pending || nextTx.signature === pending.signature) return;
-
-    state.pendingTransferOut = null;
-    if (this.hasSolIncomingToWallet(nextTx, state.funderWallet)) {
-      state.invalidOutSignatures.add(pending.signature);
-      this.log.warn(
-        "Shared feePayer transfer-out candidate invalidated by immediate next SOL transfer-in",
-        {
-          mint: state.mint,
-          funderWallet: state.funderWallet,
-          candidateSignature: pending.signature,
-          nextSignature: nextTx.signature,
-          recipient: pending.recipient,
-          amountSol: pending.amountSol,
-        },
-      );
-      void this.sendTelegramSafe(
-        [
-          `<b>🔴 ${this.label} FeePayer Candidate Invalid</b>`,
-          `Token: <code>${state.mint}</code>`,
-          `FeePayer: <code>${state.funderWallet}</code>`,
-          `Candidate tx: <code>${pending.signature}</code>`,
-          `Next tx: <code>${nextTx.signature}</code>`,
-          "Reason: the immediate next funder transaction was a SOL transfer-in.",
-          "",
-          "Continuing to watch for the next valid transfer-out.",
-        ].join("\n"),
-        "invalid feePayer transfer-out notification",
-      );
-      return;
-    }
-
-    state.validOutSignatures.add(pending.signature);
-    const watch = await this.activateOrQueueBundlerFunderCandidate(
-      state,
-      pending,
-      "next feePayer tx confirmed candidate was not followed by SOL transfer-in",
-    );
-
-    this.log.warn("Shared feePayer transfer-out confirmed by next-tx check", {
-      mint: state.mint,
-      funderWallet: state.funderWallet,
-      recipient: pending.recipient,
-      amountSol: pending.amountSol,
-      minTransferOutSol: state.minTransferOutSol,
-      candidateSignature: pending.signature,
-      nextSignature: nextTx.signature,
-      buySubmitted: this.buySubmitted,
-      activatedRecipientWatch: Boolean(watch),
-      queuedCandidates: state.queuedTransferOuts.length,
-      activeRecipientWatches: state.recipientWatches.size,
-    });
-
-    if (!watch) return;
-
-    if (state.lowFundingMode) {
-      this.log.warn("Low-funding transfer-out recipient confirmed; waiting for recipient token buy before our buy", {
-        mint: state.mint,
-        funderWallet: state.funderWallet,
-        recipient: pending.recipient,
-        amountSol: pending.amountSol,
-        candidateSignature: pending.signature,
-      });
-    } else {
-      this.log.warn("Shared feePayer transfer-out recipient confirmed; waiting for recipient token buy before our buy", {
-        mint: state.mint,
-        funderWallet: state.funderWallet,
-        recipient: pending.recipient,
-        amountSol: pending.amountSol,
-        candidateSignature: pending.signature,
-        firstTxWindow: BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW,
-      });
     }
   }
 
@@ -3489,7 +3434,6 @@ export class InsiderBot extends EventEmitter {
           `Buy gate: <b>${gateDescription}</b>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
-          "Next-tx check: confirmed; the immediate next feePayer tx was not a SOL transfer-in.",
           disableProfitExitAfterBuy
             ? "Sell rule: MC target is disabled; rug, recipient sell-all, and recipient zero-SOL exits remain active."
             : "Recipient watcher stays active for the current token; MC target remains active until a current-token recipient buy is confirmed.",
@@ -3506,8 +3450,9 @@ export class InsiderBot extends EventEmitter {
   ): Promise<boolean> {
     if (this.buySubmitted || watch.tokenBuyObserved) return true;
     try {
-      const history = await this.withHeliusFallback(
-        (client) => client.getWalletSwapHistory(watch.wallet, 50),
+      const history = await this.getConfirmedWalletSwapHistory(
+        watch.wallet,
+        50,
         watch.heliusPreferredIndex,
       );
       const swaps = history.filter((tx) => !tx.type || tx.type === "SWAP");
