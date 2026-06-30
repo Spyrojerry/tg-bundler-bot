@@ -64,6 +64,7 @@ const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 50;
 const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 2;
 const BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW = 3;
 const BUNDLER_FUNDER_RECIPIENT_SWAP_HISTORY_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1_000;
+const BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD = 200;
 const BUNDLER_FUNDER_RECIPIENT_SYNC_INTERVAL_MS = 1_500;
 const BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE = 2;
 const HELIUS_POOL_MAX_CONCURRENT = 2;
@@ -920,6 +921,8 @@ export class InsiderBot extends EventEmitter {
     void this.syncAuthorityTransactions();
     void this.syncLargeBuyerAtaBalances();
     void this.syncBundlerFunderTransactions();
+    void this.syncFunderRecipientBatch(true);
+    void this.auditFunderRecipientsAfterBuy();
   }
 
   private resetTokenTxCounts(): void {
@@ -3317,6 +3320,7 @@ export class InsiderBot extends EventEmitter {
     signature: string,
     gateDescription = "recipient bought token",
     disableProfitExitAfterBuy = true,
+    triggerTx?: HeliusTransaction,
   ): Promise<void> {
     if (
       this.buySubmitted ||
@@ -3347,6 +3351,12 @@ export class InsiderBot extends EventEmitter {
           },
         );
         await this.resetForNewToken(true);
+        return;
+      }
+      if (
+        triggerTx &&
+        !(await this.ensureRecipientBuyMeetsMinUsd(state, watch, triggerTx))
+      ) {
         return;
       }
 
@@ -3391,6 +3401,7 @@ export class InsiderBot extends EventEmitter {
     signature: string,
     gateDescription = `recipient bought this token within its first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} post-funding txs`,
     disableProfitExitAfterBuy = true,
+    triggerTx?: HeliusTransaction,
   ): Promise<void> {
     if (
       this.buySubmitted ||
@@ -3421,6 +3432,12 @@ export class InsiderBot extends EventEmitter {
           },
         );
         await this.resetForNewToken(true);
+        return;
+      }
+      if (
+        triggerTx &&
+        !(await this.ensureRecipientBuyMeetsMinUsd(state, watch, triggerTx))
+      ) {
         return;
       }
 
@@ -3567,6 +3584,12 @@ export class InsiderBot extends EventEmitter {
         ].join("\n"),
         "recipient swap history buy gate notification",
       );
+      this.anchorFunderRecipientInitialBuyFromTx(
+        state,
+        watch,
+        currentTokenSwap,
+        "recent Helius wallet SWAP history",
+      );
       if (state.lowFundingMode) {
         await this.emitLowFundingRecipientBuy(
           state,
@@ -3574,6 +3597,7 @@ export class InsiderBot extends EventEmitter {
           currentTokenSwap.signature,
           "recipient Helius SWAP history includes this token within 3 days",
           true,
+          currentTokenSwap,
         );
       } else {
         await this.emitBundlerFunderBuy(
@@ -3582,6 +3606,7 @@ export class InsiderBot extends EventEmitter {
           currentTokenSwap.signature,
           "recipient Helius SWAP history includes this token within 3 days",
           true,
+          currentTokenSwap,
         );
       }
       return true;
@@ -3595,6 +3620,115 @@ export class InsiderBot extends EventEmitter {
       });
       return true;
     }
+  }
+
+  private anchorFunderRecipientInitialBuyFromTx(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+    tx: HeliusTransaction,
+    source: string,
+  ): void {
+    if (watch.firstBuySignature) return;
+    const action = this.classifyTx(tx, watch.wallet, state.mint);
+    if (action !== "buy") return;
+    const amount = this.extractTokenAmountForWallet(
+      tx,
+      watch.wallet,
+      state.mint,
+      "buy",
+    );
+    watch.tokenBuyObserved = true;
+    watch.firstBuySignature = tx.signature;
+    watch.boughtAmount += amount;
+    if (!watch.tokenActions.some((entry) => entry.signature === tx.signature)) {
+      watch.tokenActions.push({ kind: "buy", signature: tx.signature, amount });
+    }
+    this.log.warn("Anchored transfer-out recipient initial buy for post-buy audit", {
+      mint: state.mint,
+      wallet: watch.wallet,
+      signature: tx.signature,
+      amount,
+      source,
+    });
+  }
+
+  private async ensureRecipientBuyMeetsMinUsd(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+    tx: HeliusTransaction,
+  ): Promise<boolean> {
+    const buySol = this.estimateRecipientBuySolSpent(tx, watch.wallet);
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    const buyUsd =
+      buySol !== null && solPriceUsd !== null ? buySol * solPriceUsd : null;
+    const passed =
+      buyUsd !== null && buyUsd >= BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD;
+    this.log.warn("Checked recipient buy USD gate before copybuy", {
+      mint: state.mint,
+      wallet: watch.wallet,
+      signature: tx.signature,
+      buySol,
+      solPriceUsd,
+      buyUsd,
+      minBuyUsd: BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD,
+      passed,
+    });
+    if (passed) return true;
+
+    state.validOutSignatures.delete(watch.fundingSignature);
+    void this.sendTelegramSafe(
+      [
+        `<b>⚪ ${this.label} Recipient Buy Too Small</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `Recipient: <code>${watch.wallet}</code>`,
+        `Funding tx: <code>${watch.fundingSignature}</code>`,
+        `Buy tx: <code>${tx.signature}</code>`,
+        buySol !== null ? `Buy SOL: <b>${buySol.toFixed(6)} SOL</b>` : "Buy SOL: <b>unknown</b>",
+        solPriceUsd !== null ? `SOL price: <b>$${solPriceUsd.toFixed(2)}</b>` : "SOL price: <b>unknown</b>",
+        buyUsd !== null ? `Buy USD: <b>$${buyUsd.toFixed(2)}</b>` : "Buy USD: <b>unknown</b>",
+        `Required: <b>$${BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD.toFixed(0)}+</b>`,
+        "",
+        "Candidate skipped. Promoting the next stacked candidate.",
+      ].join("\n"),
+      "recipient buy below minimum usd notification",
+    );
+    this.removeFunderRecipientWatch(
+      watch.wallet,
+      `recipient buy below $${BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD.toFixed(0)} minimum`,
+    );
+    void this.promoteQueuedBundlerFunderCandidates(
+      state,
+      "recipient buy below minimum USD gate",
+    );
+    return false;
+  }
+
+  private estimateRecipientBuySolSpent(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): number | null {
+    const nativeSpent = this.estimateWalletSolSpent(tx, wallet);
+    if (nativeSpent !== null) return nativeSpent;
+
+    const wrappedSolSpent = (tx.tokenTransfers ?? [])
+      .filter(
+        (transfer) =>
+          transfer.mint === SOL_MINT &&
+          transfer.fromUserAccount === wallet &&
+          (transfer.tokenAmount ?? 0) > 0,
+      )
+      .reduce((sum, transfer) => sum + (transfer.tokenAmount ?? 0), 0);
+    if (wrappedSolSpent > 0) return Number(wrappedSolSpent.toFixed(6));
+
+    const balanceChangeSpent = (tx.balanceChanges ?? [])
+      .filter(
+        (change) =>
+          (change.mint === NATIVE_SOL_BALANCE_MINT || change.mint === SOL_MINT) &&
+          (change.amount ?? 0) < 0,
+      )
+      .reduce((sum, change) => sum + Math.abs(change.amount ?? 0), 0);
+    if (balanceChangeSpent > 0) return Number(balanceChangeSpent.toFixed(6));
+    return null;
   }
 
   private async syncFunderRecipientTransactions(
@@ -3629,6 +3763,111 @@ export class InsiderBot extends EventEmitter {
         wallet,
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+  }
+
+  private async auditFunderRecipientsAfterBuy(): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    if (!state || this.phase !== "holding" || this.positionSellTriggered) return;
+    const watched = [...state.recipientWatches.values()].filter(
+      (watch) => Boolean(watch.firstBuySignature),
+    );
+    if (watched.length === 0) return;
+
+    this.log.warn("Post-buy recipient history audit started", {
+      mint: state.mint,
+      watchedRecipients: watched.map((watch) => watch.wallet),
+    });
+
+    for (const watch of watched) {
+      if (this.positionSellTriggered) return;
+      try {
+        const txs = await this.withHeliusFallback(
+          (client) =>
+            client.getWalletTransactionsDesc(watch.wallet, INSIDER_HISTORY_LIMIT),
+          watch.heliusPreferredIndex,
+        );
+        const sorted = [...txs].reverse();
+        let afterInitialBuy = false;
+        let additionalBuyCountAfterFirst = 0;
+        for (const tx of sorted) {
+          if (tx.timestamp < watch.fundingTimestamp) continue;
+          if (tx.signature === watch.firstBuySignature) {
+            afterInitialBuy = true;
+            continue;
+          }
+          if (!afterInitialBuy) continue;
+          if (!this.isRelevantMintTx(tx, state.mint)) continue;
+
+          const action = this.classifyTx(tx, watch.wallet, state.mint);
+          if (action === "buy") {
+            additionalBuyCountAfterFirst += 1;
+            if (additionalBuyCountAfterFirst >= 2) {
+              this.log.warn("Post-buy audit found two recipient buys after initial buy", {
+                mint: state.mint,
+                wallet: watch.wallet,
+                firstBuySignature: watch.firstBuySignature,
+                triggerSignature: tx.signature,
+                additionalBuyCountAfterFirst,
+              });
+              await this.triggerPositionSell(
+                state.mint,
+                `Shared feePayer recipient ${watch.wallet} made two additional buys after initial tracked buy`,
+                [
+                  "<b>🚨 Shared-Funder Recipient Added Buys</b>",
+                  `Token: <code>${state.mint}</code>`,
+                  `Recipient: <code>${watch.wallet}</code>`,
+                  `Initial buy: <code>${watch.firstBuySignature}</code>`,
+                  `Second extra buy tx: <code>${tx.signature}</code>`,
+                  `Extra buys after initial: <b>${additionalBuyCountAfterFirst}</b>`,
+                ],
+                tx.signature,
+              );
+              return;
+            }
+          }
+
+          const remainingAmount = await this.getRecipientTokenBalanceAtTx(
+            state,
+            watch,
+            tx,
+          );
+          this.log.info("Post-buy recipient token balance audit checked tx", {
+            mint: state.mint,
+            wallet: watch.wallet,
+            signature: tx.signature,
+            action,
+            remainingAmount,
+          });
+          if (remainingAmount !== null && remainingAmount <= 0) {
+            await this.triggerPositionSell(
+              state.mint,
+              `Shared feePayer recipient ${watch.wallet} exited token position after initial buy`,
+              [
+                "<b>🚨 Shared-Funder Recipient Exited Token</b>",
+                `Token: <code>${state.mint}</code>`,
+                `Recipient: <code>${watch.wallet}</code>`,
+                `Initial buy: <code>${watch.firstBuySignature}</code>`,
+                `Exit tx: <code>${tx.signature}</code>`,
+                `Post-tx token balance: <b>${remainingAmount.toLocaleString()}</b>`,
+              ],
+              tx.signature,
+            );
+            return;
+          }
+
+          await this.sellIfRecipientSolBalanceIsZero(state, watch, tx);
+          if (this.positionSellTriggered) return;
+        }
+      } catch (err) {
+        void this.heliusClient.handlePossibleRateLimitError(err);
+        this.log.warn("Post-buy recipient history audit failed", {
+          mint: state.mint,
+          wallet: watch.wallet,
+          firstBuySignature: watch.firstBuySignature,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -3771,9 +4010,23 @@ export class InsiderBot extends EventEmitter {
         );
         if (watch.buyTriggersEntry && !this.buySubmitted) {
           if (state.lowFundingMode) {
-            await this.emitLowFundingRecipientBuy(state, watch, tx.signature);
+            await this.emitLowFundingRecipientBuy(
+              state,
+              watch,
+              tx.signature,
+              "recipient bought this token within its first 3 post-funding txs",
+              true,
+              tx,
+            );
           } else {
-            await this.emitBundlerFunderBuy(state, watch, tx.signature);
+            await this.emitBundlerFunderBuy(
+              state,
+              watch,
+              tx.signature,
+              `recipient bought this token within its first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} post-funding txs`,
+              true,
+              tx,
+            );
           }
         }
         if (this.hasReachedFunderRecipientBuyCap(state)) {
@@ -3784,12 +4037,37 @@ export class InsiderBot extends EventEmitter {
         }
       } else {
         watch.boughtAmount += amount;
+        const additionalBuyCountAfterFirst = Math.max(
+          0,
+          watch.tokenActions.filter((entry) => entry.kind === "buy").length - 1,
+        );
         this.log.info("Valid transfer-out recipient added to tracked token position", {
           mint: state.mint,
           wallet: watch.wallet,
           signature: tx.signature,
           boughtAmount: watch.boughtAmount,
+          firstBuySignature: watch.firstBuySignature,
+          additionalBuyCountAfterFirst,
+          additionalBuySellTriggerCount: 2,
         });
+        if (additionalBuyCountAfterFirst >= 2 && this.phase === "holding") {
+          await this.triggerPositionSell(
+            state.mint,
+            `Shared feePayer recipient ${watch.wallet} made two additional buys after initial tracked buy`,
+            [
+              "<b>🚨 Shared-Funder Recipient Added Buys</b>",
+              `Token: <code>${state.mint}</code>`,
+              `Recipient: <code>${watch.wallet}</code>`,
+              `Initial buy: <code>${watch.firstBuySignature}</code>`,
+              `Second extra buy tx: <code>${tx.signature}</code>`,
+              `Extra buys after initial: <b>${additionalBuyCountAfterFirst}</b>`,
+              "",
+              "Recipient made two more buys after the initial post-funding buy. Selling position.",
+            ],
+            tx.signature,
+          );
+          return;
+        }
       }
       await this.sellIfRecipientSolBalanceIsZero(state, watch, tx);
       return;

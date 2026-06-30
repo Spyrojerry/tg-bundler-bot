@@ -25,6 +25,11 @@ export interface HeliusTransaction {
     toUserAccount: string;
     amount: number;
   }>;
+  balanceChanges?: Array<{
+    mint?: string;
+    amount?: number;
+    decimals?: number;
+  }>;
   accountData?: Array<{
     account: string;
     nativeBalanceChange?: number;
