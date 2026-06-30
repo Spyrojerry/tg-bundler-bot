@@ -12,6 +12,7 @@ import {
 } from "@solana/spl-token";
 import { createLogger, Logger } from "./logger";
 import {
+  HeliusBalanceAtResponse,
   HeliusClient,
   HeliusCreditExhaustionInfo,
   HeliusTransaction,
@@ -62,6 +63,7 @@ const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
 const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 50;
 const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 2;
 const BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW = 3;
+const BUNDLER_FUNDER_RECIPIENT_SWAP_HISTORY_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1_000;
 const BUNDLER_FUNDER_RECIPIENT_SYNC_INTERVAL_MS = 1_500;
 const BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE = 2;
 const HELIUS_POOL_MAX_CONCURRENT = 2;
@@ -1713,13 +1715,10 @@ export class InsiderBot extends EventEmitter {
         this.extractSolIncomingAmountToWallet(tx, state.funderWallet),
       ),
     );
-    const sharedFeePayerBalanceAtSyncStart = await this.withHeliusFallback(
-      (client) =>
-        client.getWalletBalanceAt(
-          state.funderWallet,
-          NATIVE_SOL_BALANCE_MINT,
-          syncStart.timestamp,
-        ),
+    const sharedFeePayerBalanceAtSyncStart = await this.getConfirmedWalletBalanceAt(
+      state.funderWallet,
+      NATIVE_SOL_BALANCE_MINT,
+      syncStart.timestamp,
     );
     const sharedFeePayerBalanceSol = Number(sharedFeePayerBalanceAtSyncStart.balance);
     const sharedFeePayerBalanceBelowLowFundingThreshold =
@@ -1980,13 +1979,42 @@ export class InsiderBot extends EventEmitter {
     timestamp: number,
     preferredClientIndex: number,
   ): Promise<number> {
-    const balance = await this.withHeliusFallback(
-      (client) =>
-        client.getWalletBalanceAt(wallet, NATIVE_SOL_BALANCE_MINT, timestamp),
+    const balance = await this.getConfirmedWalletBalanceAt(
+      wallet,
+      NATIVE_SOL_BALANCE_MINT,
+      timestamp,
       preferredClientIndex,
     );
     const parsed = Number(balance.balance);
     return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private async getConfirmedWalletBalanceAt(
+    wallet: string,
+    mint: string,
+    timestamp: number,
+    preferredClientIndex = 0,
+  ): Promise<HeliusBalanceAtResponse> {
+    const first = await this.withHeliusFallback(
+      (client) => client.getWalletBalanceAt(wallet, mint, timestamp),
+      preferredClientIndex,
+    );
+    const confirmed = await this.withHeliusFallback(
+      (client) => client.getWalletBalanceAt(wallet, mint, timestamp),
+      preferredClientIndex,
+    );
+    this.log.debug("Confirmed Helius balance-at with second request", {
+      wallet,
+      mint,
+      timestamp,
+      firstBalance: first.balance,
+      firstBalanceRaw: first.balanceRaw,
+      confirmedBalance: confirmed.balance,
+      confirmedBalanceRaw: confirmed.balanceRaw,
+      firstAsOf: first.asOf,
+      confirmedAsOf: confirmed.asOf,
+    });
+    return confirmed;
   }
 
   private extractSolIncomingToWallet(
@@ -2677,6 +2705,17 @@ export class InsiderBot extends EventEmitter {
       this.enqueueBundlerFunderCandidate(state, candidate, reason);
       return null;
     }
+    const acceptedBySwapHistory = await this.maybeBuyFromRecipientSwapHistory(
+      state,
+      watch,
+    );
+    if (!acceptedBySwapHistory) {
+      void this.promoteQueuedBundlerFunderCandidates(
+        state,
+        "recipient missing recent swap history",
+      );
+      return null;
+    }
     this.markFunderRecipientDirty(candidate.recipient);
     await this.syncFunderRecipientBatch(true);
     return watch;
@@ -2732,6 +2771,11 @@ export class InsiderBot extends EventEmitter {
         "stacked candidate promoted notification",
       );
       this.markFunderRecipientDirty(candidate.recipient);
+      const acceptedBySwapHistory = await this.maybeBuyFromRecipientSwapHistory(
+        state,
+        watch,
+      );
+      if (!acceptedBySwapHistory) continue;
       await this.syncFunderRecipientBatch(true);
     }
   }
@@ -2864,24 +2908,18 @@ export class InsiderBot extends EventEmitter {
     if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return false;
     if (!transferOut.to || transferOut.to === state.funderWallet) return false;
     try {
-      let balance = await this.withHeliusFallback(
-        (client) =>
-          client.getWalletBalanceAt(
-            state.funderWallet,
-            NATIVE_SOL_BALANCE_MINT,
-            tx.timestamp,
-          ),
+      let balance = await this.getConfirmedWalletBalanceAt(
+        state.funderWallet,
+        NATIVE_SOL_BALANCE_MINT,
+        tx.timestamp,
       );
       let balanceRaw = BigInt(balance.balanceRaw || "0");
       let balanceTimestamp = tx.timestamp;
       if (balanceRaw !== 0n) {
-        const nextSecondBalance = await this.withHeliusFallback(
-          (client) =>
-            client.getWalletBalanceAt(
-              state.funderWallet,
-              NATIVE_SOL_BALANCE_MINT,
-              tx.timestamp + 1,
-            ),
+        const nextSecondBalance = await this.getConfirmedWalletBalanceAt(
+          state.funderWallet,
+          NATIVE_SOL_BALANCE_MINT,
+          tx.timestamp + 1,
         );
         const nextSecondBalanceRaw = BigInt(nextSecondBalance.balanceRaw || "0");
         if (nextSecondBalanceRaw === 0n) {
@@ -3277,6 +3315,8 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     watch: FunderRecipientWatch,
     signature: string,
+    gateDescription = "recipient bought token",
+    disableProfitExitAfterBuy = true,
   ): Promise<void> {
     if (
       this.buySubmitted ||
@@ -3317,7 +3357,7 @@ export class InsiderBot extends EventEmitter {
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
-      this.disableProfitExitAfterBuy = true;
+      this.disableProfitExitAfterBuy = disableProfitExitAfterBuy;
       this.emit("buyTrigger", {
         followedWallet: this.followedWallet!,
         mint: state.mint,
@@ -3331,10 +3371,13 @@ export class InsiderBot extends EventEmitter {
           `Recipient: <code>${watch.wallet}</code>`,
           `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
           `Low-funding candidate threshold: <b>${BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL.toFixed(2)} SOL</b>`,
-          `Recipient buy tx: <code>${signature}</code>`,
+          `Trigger tx: <code>${signature}</code>`,
+          `Buy gate: <b>${gateDescription}</b>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
-          "MC profit target will be disabled after buy confirmation. Sell path: rug, recipient sell-all, or recipient SOL balance reaching zero.",
+          disableProfitExitAfterBuy
+            ? "MC profit target will be disabled after buy confirmation. Sell path: rug, recipient sell-all, or recipient SOL balance reaching zero."
+            : "Recipient watcher stays active for the current token; MC target remains active until a current-token recipient buy is confirmed.",
         ].join("\n"),
       });
     } finally {
@@ -3346,6 +3389,8 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     watch: FunderRecipientWatch,
     signature: string,
+    gateDescription = `recipient bought this token within its first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} post-funding txs`,
+    disableProfitExitAfterBuy = true,
   ): Promise<void> {
     if (
       this.buySubmitted ||
@@ -3385,6 +3430,7 @@ export class InsiderBot extends EventEmitter {
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
+      this.disableProfitExitAfterBuy = disableProfitExitAfterBuy;
       this.emit("buyTrigger", {
         followedWallet: this.followedWallet!,
         mint: state.mint,
@@ -3400,16 +3446,154 @@ export class InsiderBot extends EventEmitter {
           `Threshold: <b>${state.minTransferOutSol.toFixed(4)} SOL</b>`,
           `Max valid transfer-out: <b>${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL.toFixed(0)} SOL</b>`,
           `Confirmed recipient-buy cap: <b>${BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES}</b>`,
-          `Recipient buy tx: <code>${signature}</code>`,
+          `Trigger tx: <code>${signature}</code>`,
+          `Buy gate: <b>${gateDescription}</b>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
           "Next-tx check: confirmed; the immediate next feePayer tx was not a SOL transfer-in.",
-          `Buy rule: recipient bought this token within its first ${BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW} post-funding txs.`,
-          "Sell rule: MC target is disabled; rug, recipient sell-all, and recipient zero-SOL exits remain active.",
+          disableProfitExitAfterBuy
+            ? "Sell rule: MC target is disabled; rug, recipient sell-all, and recipient zero-SOL exits remain active."
+            : "Recipient watcher stays active for the current token; MC target remains active until a current-token recipient buy is confirmed.",
         ].join("\n"),
       });
     } finally {
       this.isBuyGateEvaluating = false;
+    }
+  }
+
+  private async maybeBuyFromRecipientSwapHistory(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+  ): Promise<boolean> {
+    if (this.buySubmitted || watch.tokenBuyObserved) return true;
+    try {
+      const history = await this.withHeliusFallback(
+        (client) => client.getWalletSwapHistory(watch.wallet, 50),
+        watch.heliusPreferredIndex,
+      );
+      const swaps = history.filter((tx) => !tx.type || tx.type === "SWAP");
+      const minRecentSwapTimestamp = Math.floor(
+        (Date.now() - BUNDLER_FUNDER_RECIPIENT_SWAP_HISTORY_MAX_AGE_MS) / 1_000,
+      );
+      const recentSwaps = swaps.filter(
+        (tx) =>
+          Number.isFinite(tx.timestamp) &&
+          tx.timestamp >= minRecentSwapTimestamp,
+      );
+      const currentTokenSwap = recentSwaps.find((tx) =>
+        this.isRelevantMintTx(tx, state.mint),
+      );
+      const newestSwap = swaps.reduce<HeliusTransaction | null>(
+        (newest, tx) =>
+          !newest || tx.timestamp > newest.timestamp ? tx : newest,
+        null,
+      );
+      this.log.info("Checked recipient Helius SWAP history for buy gate", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        fundingSignature: watch.fundingSignature,
+        swapCount: swaps.length,
+        recentSwapCount: recentSwaps.length,
+        maxSwapAgeDays: 3,
+        newestSwapSignature: newestSwap?.signature ?? null,
+        newestSwapTimestamp: newestSwap?.timestamp ?? null,
+        currentTokenSwapSignature: currentTokenSwap?.signature ?? null,
+      });
+      if (recentSwaps.length === 0) {
+        this.log.warn("Valid transfer-out recipient skipped: no recent swap history found", {
+          mint: state.mint,
+          wallet: watch.wallet,
+          fundingSignature: watch.fundingSignature,
+          swapCount: swaps.length,
+          recentSwapCount: recentSwaps.length,
+          maxSwapAgeDays: 3,
+          newestSwapSignature: newestSwap?.signature ?? null,
+          newestSwapTimestamp: newestSwap?.timestamp ?? null,
+        });
+        state.validOutSignatures.delete(watch.fundingSignature);
+        void this.sendTelegramSafe(
+          [
+            `<b>⚪ ${this.label} Recipient Watch Skipped</b>`,
+            `Token: <code>${state.mint}</code>`,
+            `Recipient: <code>${watch.wallet}</code>`,
+            `Funding tx: <code>${watch.fundingSignature}</code>`,
+            `Swap history checked: <b>${swaps.length}</b> txs`,
+            `Recent swaps within 3 days: <b>${recentSwaps.length}</b>`,
+            "",
+            "No recent SWAP history was found. Promoting the next stacked candidate.",
+          ].join("\n"),
+          "recipient recent swap history missing notification",
+        );
+        this.removeFunderRecipientWatch(
+          watch.wallet,
+          "no recent swap in Helius wallet history",
+        );
+        return false;
+      }
+      if (!currentTokenSwap) {
+        this.log.info("Recipient has recent swap history for other token; continuing first-3-tx token-buy watch", {
+          mint: state.mint,
+          wallet: watch.wallet,
+          fundingSignature: watch.fundingSignature,
+          swapCount: swaps.length,
+          recentSwapCount: recentSwaps.length,
+          maxSwapAgeDays: 3,
+          newestSwapSignature: newestSwap?.signature ?? null,
+          newestSwapTimestamp: newestSwap?.timestamp ?? null,
+        });
+        return true;
+      }
+
+      this.log.warn("Recipient current-token SWAP history found; triggering buy immediately", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        fundingSignature: watch.fundingSignature,
+        triggerSignature: currentTokenSwap.signature,
+        swapCount: swaps.length,
+        recentSwapCount: recentSwaps.length,
+        maxSwapAgeDays: 3,
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>🟢 ${this.label} Recipient Swap History Gate</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `Recipient: <code>${watch.wallet}</code>`,
+          `Funding tx: <code>${watch.fundingSignature}</code>`,
+          `Swap history tx: <code>${currentTokenSwap.signature}</code>`,
+          "Current-token swap found: <b>yes</b>",
+          "History age rule: <b>latest accepted swap must be within 3 days</b>",
+          "",
+          "Buy gate passed from recent Helius wallet SWAP history for this token.",
+        ].join("\n"),
+        "recipient swap history buy gate notification",
+      );
+      if (state.lowFundingMode) {
+        await this.emitLowFundingRecipientBuy(
+          state,
+          watch,
+          currentTokenSwap.signature,
+          "recipient Helius SWAP history includes this token within 3 days",
+          true,
+        );
+      } else {
+        await this.emitBundlerFunderBuy(
+          state,
+          watch,
+          currentTokenSwap.signature,
+          "recipient Helius SWAP history includes this token within 3 days",
+          true,
+        );
+      }
+      return true;
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Recipient Helius SWAP history check failed; continuing first-3-tx watch", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        fundingSignature: watch.fundingSignature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return true;
     }
   }
 
@@ -3540,17 +3724,11 @@ export class InsiderBot extends EventEmitter {
 
     const isRelevantMintTx = this.isRelevantMintTx(tx, state.mint);
     if (!isRelevantMintTx) {
-      if (await this.skipRecipientIfEarlySolBalanceBelowHalf(state, watch, tx)) {
-        return;
-      }
       this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
       return;
     }
     const action = this.classifyTx(tx, watch.wallet, state.mint);
     if (action !== "buy" && action !== "sell") {
-      if (await this.skipRecipientIfEarlySolBalanceBelowHalf(state, watch, tx)) {
-        return;
-      }
       this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
       return;
     }
@@ -3617,11 +3795,6 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    if (!watch.firstBuySignature) {
-      if (await this.skipRecipientIfEarlySolBalanceBelowHalf(state, watch, tx)) {
-        return;
-      }
-    }
     this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
     if (!watch.firstBuySignature) return;
     if (watch.tokenActions.some((existing) => existing.signature === tx.signature)) return;
@@ -3709,99 +3882,6 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private async skipRecipientIfEarlySolBalanceBelowHalf(
-    state: BundlerFunderWatchState,
-    watch: FunderRecipientWatch,
-    tx: HeliusTransaction,
-  ): Promise<boolean> {
-    if (watch.tokenBuyObserved || watch.firstBuySignature) return false;
-    if (
-      watch.observedTxSignatures.size === 0 ||
-      watch.observedTxSignatures.size >
-        BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW
-    ) {
-      return false;
-    }
-    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return false;
-
-    const halfFundingSol = watch.outAmountSol / 2;
-    try {
-      const balance = await this.withHeliusFallback(
-        (client) =>
-          client.getWalletBalanceAt(
-            watch.wallet,
-            NATIVE_SOL_BALANCE_MINT,
-            tx.timestamp,
-          ),
-        watch.heliusPreferredIndex,
-      );
-      const balanceSol = Number(balance.balance);
-      this.log.info("Checked early recipient SOL balance during first-3 buy gate", {
-        mint: state.mint,
-        wallet: watch.wallet,
-        signature: tx.signature,
-        timestamp: tx.timestamp,
-        observedTxCount: watch.observedTxSignatures.size,
-        fundingSignature: watch.fundingSignature,
-        transferOutSol: watch.outAmountSol,
-        halfFundingSol,
-        balance: balance.balance,
-        balanceRaw: balance.balanceRaw,
-      });
-      if (!Number.isFinite(balanceSol) || balanceSol >= halfFundingSol) {
-        return false;
-      }
-
-      this.log.warn("Valid transfer-out recipient skipped: early SOL balance fell below half of funding before token buy", {
-        mint: state.mint,
-        wallet: watch.wallet,
-        fundingSignature: watch.fundingSignature,
-        triggerSignature: tx.signature,
-        observedTxCount: watch.observedTxSignatures.size,
-        transferOutSol: watch.outAmountSol,
-        halfFundingSol,
-        balanceSol,
-      });
-      state.validOutSignatures.delete(watch.fundingSignature);
-      void this.sendTelegramSafe(
-        [
-          `<b>⚪ ${this.label} Recipient Watch Skipped</b>`,
-          `Token: <code>${state.mint}</code>`,
-          `Recipient: <code>${watch.wallet}</code>`,
-          `Funding tx: <code>${watch.fundingSignature}</code>`,
-          `Trigger tx: <code>${tx.signature}</code>`,
-          `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
-          `Half threshold: <b>${halfFundingSol.toFixed(4)} SOL</b>`,
-          `SOL balance: <b>${balanceSol.toFixed(4)} SOL</b>`,
-          "",
-          "No token buy was found before the recipient SOL balance dropped below half of its feePayer funding. Promoting the next stacked candidate.",
-        ].join("\n"),
-        "recipient early balance below half notification",
-      );
-      this.removeFunderRecipientWatch(
-        watch.wallet,
-        "SOL balance fell below half of feePayer funding before token buy",
-      );
-      void this.promoteQueuedBundlerFunderCandidates(
-        state,
-        "recipient early SOL balance below half of feePayer funding",
-      );
-      return true;
-    } catch (err) {
-      void this.heliusClient.handlePossibleRateLimitError(err);
-      this.log.warn("Failed to check early recipient SOL balance during first-3 buy gate", {
-        mint: state.mint,
-        wallet: watch.wallet,
-        signature: tx.signature,
-        timestamp: tx.timestamp,
-        transferOutSol: watch.outAmountSol,
-        halfFundingSol,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return false;
-    }
-  }
-
   private async sellIfRecipientSolBalanceIsZero(
     state: BundlerFunderWatchState,
     watch: FunderRecipientWatch,
@@ -3811,13 +3891,10 @@ export class InsiderBot extends EventEmitter {
     if (watch.zeroSolBalanceSignatures.has(tx.signature)) return;
     if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return;
     try {
-      const balance = await this.withHeliusFallback(
-        (client) =>
-          client.getWalletBalanceAt(
-            watch.wallet,
-            NATIVE_SOL_BALANCE_MINT,
-            tx.timestamp,
-          ),
+      const balance = await this.getConfirmedWalletBalanceAt(
+        watch.wallet,
+        NATIVE_SOL_BALANCE_MINT,
+        tx.timestamp,
         watch.heliusPreferredIndex,
       );
       const balanceRaw = BigInt(balance.balanceRaw || "0");
@@ -3863,9 +3940,10 @@ export class InsiderBot extends EventEmitter {
   ): Promise<number | null> {
     if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return null;
     try {
-      const balance = await this.withHeliusFallback(
-        (client) =>
-          client.getWalletBalanceAt(watch.wallet, state.mint, tx.timestamp),
+      const balance = await this.getConfirmedWalletBalanceAt(
+        watch.wallet,
+        state.mint,
+        tx.timestamp,
         watch.heliusPreferredIndex,
       );
       const parsed = Number(balance.balance);

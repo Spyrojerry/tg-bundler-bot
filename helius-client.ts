@@ -462,6 +462,27 @@ export class HeliusClient {
     throw lastError ?? new Error('Failed to fetch wallet transactions');
   }
 
+  async getWalletSwapHistory(
+    address: string,
+    limit: number = 50,
+  ): Promise<HeliusTransaction[]> {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      tokenAccounts: 'balanceChanged',
+      type: 'SWAP',
+      'api-key': this.apiKey,
+    });
+    const url = `https://api.helius.xyz/v1/wallet/${address}/history?${params.toString()}`;
+
+    const response = await this.fetchWithCreditCheck(url);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Helius wallet history API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+    const json = await response.json() as HeliusTransaction[] | { data?: HeliusTransaction[] };
+    return Array.isArray(json) ? json : json.data ?? [];
+  }
+
   /**
    * Fetches recent transactions for a wallet address.
    */
