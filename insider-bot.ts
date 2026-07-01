@@ -359,6 +359,7 @@ interface FunderRecipientWatch {
   boughtAmount: number;
   soldAmount: number;
   firstBuySignature: string | null;
+  firstBuyTimestamp: number | null;
   normalTinyTransferMode: boolean;
   postEntrySwapBaselineSignatures: Set<string>;
 }
@@ -2907,7 +2908,7 @@ export class InsiderBot extends EventEmitter {
         return false;
       }
       if (transferOutUsd >= BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD) {
-        this.log.info("Skipping normal-mode feePayer transfer-out above tiny-recipient USD cap", {
+        this.log.debug("Skipping normal-mode feePayer transfer-out above tiny-recipient USD cap", {
           mint: state.mint,
           funderWallet: state.funderWallet,
           signature: tx.signature,
@@ -2920,7 +2921,7 @@ export class InsiderBot extends EventEmitter {
       }
     }
     if (this.hasSolIncomingToWallet(tx, state.funderWallet)) {
-      this.log.info("Skipping funder transfer-out because same tx also has transfer-in", {
+      this.log.debug("Skipping funder transfer-out because same tx also has transfer-in", {
         mint: state.mint,
         funderWallet: state.funderWallet,
         signature: tx.signature,
@@ -3126,6 +3127,7 @@ export class InsiderBot extends EventEmitter {
       boughtAmount: 0,
       soldAmount: 0,
       firstBuySignature: null,
+      firstBuyTimestamp: null,
       normalTinyTransferMode: candidate.normalTinyTransferMode,
       postEntrySwapBaselineSignatures: new Set<string>(),
     };
@@ -3148,6 +3150,21 @@ export class InsiderBot extends EventEmitter {
     this.markFunderRecipientDirty(watch.wallet);
     await this.syncFunderRecipientBatch(true);
     if (!state.recipientWatches.has(watch.wallet)) return;
+    if (watch.normalTinyTransferMode && !watch.tokenBuyObserved) {
+      this.log.info("Normal tiny recipient skipped: no current-token buy before tiny funding", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        fundingSignature: watch.fundingSignature,
+        fundingTimestamp: watch.fundingTimestamp,
+        reason,
+      });
+      state.validOutSignatures.delete(watch.fundingSignature);
+      this.removeFunderRecipientWatch(
+        watch.wallet,
+        "no current-token buy before normal tiny funding",
+      );
+      return;
+    }
 
     this.subscribeFunderRecipient(watch.wallet);
 
@@ -3720,6 +3737,7 @@ export class InsiderBot extends EventEmitter {
     );
     watch.tokenBuyObserved = true;
     watch.firstBuySignature = tx.signature;
+    watch.firstBuyTimestamp = tx.timestamp;
     watch.boughtAmount += amount;
     if (!watch.tokenActions.some((entry) => entry.signature === tx.signature)) {
       watch.tokenActions.push({ kind: "buy", signature: tx.signature, amount });
@@ -3833,7 +3851,7 @@ export class InsiderBot extends EventEmitter {
       const sorted = [...txs].reverse();
       for (const tx of sorted) {
         if (tx.signature === watch.fundingSignature) continue;
-        if (tx.timestamp < watch.fundingTimestamp) continue;
+        if (!watch.normalTinyTransferMode && tx.timestamp < watch.fundingTimestamp) continue;
         await this.applyFunderRecipientTransaction(state, watch, tx);
         if (!state.recipientWatches.has(wallet)) break;
       }
@@ -4049,11 +4067,27 @@ export class InsiderBot extends EventEmitter {
     }
     const amount = this.extractTokenAmountForWallet(tx, watch.wallet, state.mint, action);
     if (action === "buy") {
+      if (
+        watch.normalTinyTransferMode &&
+        !watch.firstBuySignature &&
+        tx.timestamp > watch.fundingTimestamp
+      ) {
+        this.log.info("Normal tiny recipient buy ignored because it occurred after tiny funding", {
+          mint: state.mint,
+          wallet: watch.wallet,
+          fundingSignature: watch.fundingSignature,
+          fundingTimestamp: watch.fundingTimestamp,
+          buySignature: tx.signature,
+          buyTimestamp: tx.timestamp,
+        });
+        return;
+      }
       watch.tokenBuyObserved = true;
       if (watch.tokenActions.some((existing) => existing.signature === tx.signature)) return;
       watch.tokenActions.push({ kind: action, signature: tx.signature, amount });
-        if (!watch.firstBuySignature) {
+      if (!watch.firstBuySignature) {
         watch.firstBuySignature = tx.signature;
+        watch.firstBuyTimestamp = tx.timestamp;
         watch.boughtAmount += amount;
         if (
           !state.lowFundingMode &&
