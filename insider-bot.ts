@@ -361,6 +361,7 @@ interface FunderRecipientWatch {
   firstBuySignature: string | null;
   firstBuyTimestamp: number | null;
   normalTinyTransferMode: boolean;
+  postEntrySwapSignature: string | null;
   postEntrySwapBaselineSignatures: Set<string>;
 }
 
@@ -3129,6 +3130,7 @@ export class InsiderBot extends EventEmitter {
       firstBuySignature: null,
       firstBuyTimestamp: null,
       normalTinyTransferMode: candidate.normalTinyTransferMode,
+      postEntrySwapSignature: null,
       postEntrySwapBaselineSignatures: new Set<string>(),
     };
     state.recipientWatches.set(candidate.recipient, watch);
@@ -3852,7 +3854,12 @@ export class InsiderBot extends EventEmitter {
       for (const tx of sorted) {
         if (tx.signature === watch.fundingSignature) continue;
         if (!watch.normalTinyTransferMode && tx.timestamp < watch.fundingTimestamp) continue;
-        await this.applyFunderRecipientTransaction(state, watch, tx);
+        await this.applyFunderRecipientTransaction(
+          state,
+          watch,
+          tx,
+          signature ? "notification" : "history",
+        );
         if (!state.recipientWatches.has(wallet)) break;
       }
     } catch (err) {
@@ -4040,6 +4047,7 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     watch: FunderRecipientWatch,
     tx: HeliusTransaction,
+    source: "history" | "notification" = "history",
   ): Promise<void> {
     const isNewObservedTx = !watch.observedTxSignatures.has(tx.signature);
     if (isNewObservedTx && !watch.tokenBuyObserved) {
@@ -4048,6 +4056,14 @@ export class InsiderBot extends EventEmitter {
 
     if (watch.firstBuySignature) {
       if (!state.lowFundingMode && !watch.normalTinyTransferMode) {
+        await this.sellIfRecipientSolBalanceIsZero(state, watch, tx);
+        if (this.positionSellTriggered) return;
+      } else if (
+        !state.lowFundingMode &&
+        watch.normalTinyTransferMode &&
+        source === "notification" &&
+        tx.timestamp > watch.fundingTimestamp
+      ) {
         await this.sellIfRecipientSolBalanceIsZero(state, watch, tx);
         if (this.positionSellTriggered) return;
       }
@@ -4127,7 +4143,7 @@ export class InsiderBot extends EventEmitter {
             `Tracked amount: <b>${watch.boughtAmount.toLocaleString()}</b>`,
             "",
             watch.normalTinyTransferMode
-              ? "Exit watch armed: configured % MC target remains active. Bot will also sell on rug or any later recipient swap/buy/sell activity."
+              ? "Exit watch armed: configured % MC target remains active. Bot will also sell on rug, any later recipient swap/buy/sell activity, or recipient SOL balance reaching zero on a new post-funding tx notification."
               : state.lowFundingMode
               ? `Exit watch armed: low-funding +${BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT}% MC target remains active.`
               : "Exit watch armed: MC profit target is disabled. Bot will sell on rug, recipient sell-all, or recipient SOL balance reaching zero.",
@@ -4178,6 +4194,13 @@ export class InsiderBot extends EventEmitter {
         });
       }
       if (!state.lowFundingMode && !watch.normalTinyTransferMode) {
+        await this.sellIfRecipientSolBalanceIsZero(state, watch, tx);
+      } else if (
+        !state.lowFundingMode &&
+        watch.normalTinyTransferMode &&
+        source === "notification" &&
+        tx.timestamp > watch.fundingTimestamp
+      ) {
         await this.sellIfRecipientSolBalanceIsZero(state, watch, tx);
       }
       return;
@@ -4302,17 +4325,56 @@ export class InsiderBot extends EventEmitter {
     }
 
     watch.postEntrySwapBaselineSignatures.add(tx.signature);
+    watch.postEntrySwapSignature = tx.signature;
+    const qualifiedTinyRecipients = [...state.recipientWatches.values()].filter(
+      (candidate) =>
+        candidate.normalTinyTransferMode && Boolean(candidate.firstBuySignature),
+    );
+    const pendingTinyRecipients = qualifiedTinyRecipients.filter(
+      (candidate) => !candidate.postEntrySwapSignature,
+    );
+    if (qualifiedTinyRecipients.length >= 2 && pendingTinyRecipients.length > 0) {
+      this.log.warn("Normal tiny recipient post-entry swap observed; waiting for second tiny recipient confirmation", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        signature: tx.signature,
+        qualifiedTinyRecipients: qualifiedTinyRecipients.map((candidate) => candidate.wallet),
+        pendingTinyRecipients: pendingTinyRecipients.map((candidate) => candidate.wallet),
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>🟡 ${this.label} Normal Tiny Recipient Moved</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `Recipient: <code>${watch.wallet}</code>`,
+          `Trigger tx: <code>${tx.signature}</code>`,
+          "",
+          "Waiting for the other valid tiny recipient to also make a post-entry buy/sell/swap before selling.",
+        ].join("\n"),
+        "normal tiny first post-entry swap notification",
+      );
+      return;
+    }
+
     await this.triggerPositionSell(
       state.mint,
-      `Normal-mode tiny recipient ${watch.wallet} made a later swap after entry`,
+      qualifiedTinyRecipients.length >= 2
+        ? "Both normal-mode tiny recipients made a post-entry buy/sell/swap"
+        : `Normal-mode tiny recipient ${watch.wallet} made a later swap after entry`,
       [
         "<b>🚨 Normal Tiny Recipient Swapped Again</b>",
         `Token: <code>${state.mint}</code>`,
         `Recipient: <code>${watch.wallet}</code>`,
         `Initial buy: <code>${watch.firstBuySignature}</code>`,
         `Trigger tx: <code>${tx.signature}</code>`,
+        qualifiedTinyRecipients.length >= 2
+          ? `Confirmed tiny recipients: <b>${qualifiedTinyRecipients
+              .map((candidate) => candidate.wallet)
+              .join(", ")}</b>`
+          : "",
         "",
-        "Recipient made another buy/sell/swap after our entry. Selling position.",
+        qualifiedTinyRecipients.length >= 2
+          ? "Both tiny recipients have now made a post-entry buy/sell/swap. Selling position."
+          : "Only one valid tiny recipient is active and it made a post-entry buy/sell/swap. Selling position.",
       ],
       tx.signature,
     );
