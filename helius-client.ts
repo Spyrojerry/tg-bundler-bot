@@ -231,15 +231,18 @@ export class HeliusClient {
     return false;
   }
 
-  private async fetchProjectUsage(): Promise<HeliusProjectUsage> {
-    const projectId = encodeURIComponent(this.projectId!);
-    const params = new URLSearchParams({ 'api-key': this.apiKey });
+  static async fetchProjectUsageForProject(
+    apiKey: string,
+    projectId: string,
+  ): Promise<HeliusProjectUsage> {
+    const encodedProjectId = encodeURIComponent(projectId);
+    const params = new URLSearchParams({ 'api-key': apiKey });
     const url =
-      `https://admin-api.helius.xyz/v0/projects/${projectId}/usage?${params.toString()}`;
+      `https://admin-api.helius.xyz/v0/projects/${encodedProjectId}/usage?${params.toString()}`;
     const response = await globalThis.fetch(url, {
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        'X-API-Key': this.apiKey,
+        Authorization: `Bearer ${apiKey}`,
+        'X-API-Key': apiKey,
       },
     });
     if (!response.ok) {
@@ -249,6 +252,13 @@ export class HeliusClient {
       );
     }
     return await response.json() as HeliusProjectUsage;
+  }
+
+  private async fetchProjectUsage(): Promise<HeliusProjectUsage> {
+    return await HeliusClient.fetchProjectUsageForProject(
+      this.apiKey,
+      this.projectId!,
+    );
   }
 
   /**

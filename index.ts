@@ -36,6 +36,8 @@ import { InsiderBot } from "./insider-bot";
 import type { InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
 import { PumpReserveMarketCapClient } from "./pump-reserve-market-cap";
+import { HeliusClient } from "./helius-client";
+import type { HeliusCreditExhaustionInfo, HeliusProjectUsage } from "./helius-client";
 import { PublicKey } from "@solana/web3.js";
 import { randomBytes } from "crypto";
 
@@ -245,6 +247,8 @@ async function main(): Promise<void> {
   const activePositionRefreshes = new Set<string>();
   const insiderDasNoPriceUntil = new Map<string, number>();
   const handledHeliusUsageStops = new Set<number>();
+  let heliusUsageProcessStopRequested = false;
+  let requestFullShutdown: ((signal: string) => void) | null = null;
 
   function html(value: string): string {
     return value
@@ -252,11 +256,142 @@ async function main(): Promise<void> {
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
   }
+  type HeliusUsageReportEntry = {
+    label: string;
+    projectId: string;
+    exhausted: boolean;
+    usage: HeliusProjectUsage | null;
+    remainingPercent: number | null;
+    error: string | null;
+  };
+
+  function getHeliusRemainingPercent(usage: HeliusProjectUsage): number | null {
+    const creditsRemaining = Number(usage.creditsRemaining);
+    const prepaidCreditsRemaining = Number(usage.prepaidCreditsRemaining);
+    const creditsLimit = Number(usage.subscriptionDetails?.creditsLimit);
+    const prepaidCreditsUsed = Number(usage.prepaidCreditsUsed);
+    const totalRemaining =
+      (Number.isFinite(creditsRemaining) ? creditsRemaining : 0) +
+      (Number.isFinite(prepaidCreditsRemaining) ? prepaidCreditsRemaining : 0);
+    const totalLimit =
+      (Number.isFinite(creditsLimit) && creditsLimit > 0 ? creditsLimit : 0) +
+      (Number.isFinite(prepaidCreditsUsed) && prepaidCreditsUsed > 0 ? prepaidCreditsUsed : 0) +
+      (Number.isFinite(prepaidCreditsRemaining) && prepaidCreditsRemaining > 0 ? prepaidCreditsRemaining : 0);
+    if (totalLimit <= 0) return null;
+    return Math.max(0, Math.min(100, (totalRemaining / totalLimit) * 100));
+  }
+
+  function formatHeliusUsageReportLine(entry: HeliusUsageReportEntry): string {
+    if (!entry.projectId) {
+      return `• <b>${html(entry.label)}</b>: project ID missing`;
+    }
+    if (entry.error || !entry.usage) {
+      return `• <b>${html(entry.label)}</b>: usage unavailable (${html(entry.error ?? "unknown error")})`;
+    }
+    const usage = entry.usage;
+    const remainingPercent = entry.remainingPercent === null
+      ? "unknown"
+      : `${entry.remainingPercent.toFixed(2)}%`;
+    const marker = entry.exhausted ? " <b>USED UP</b>" : "";
+    return [
+      `• <b>${html(entry.label)}</b>${marker}`,
+      `Project: <code>${html(entry.projectId)}</code>`,
+      `Plan: <b>${html(usage.subscriptionDetails?.plan ?? "Unknown")}</b>`,
+      `Credits remaining: <b>${Number(usage.creditsRemaining).toLocaleString()}</b>`,
+      `Prepaid remaining: <b>${Number(usage.prepaidCreditsRemaining).toLocaleString()}</b>`,
+      `Remaining: <b>${remainingPercent}</b>`,
+    ].join("\n  ");
+  }
+
+  async function collectInsiderHeliusUsageReport(
+    exhaustedInfo?: HeliusCreditExhaustionInfo,
+  ): Promise<HeliusUsageReportEntry[]> {
+    const definitions = [
+      {
+        label: "Insider Helius 1",
+        apiKey: config.insiderHeliusApiKey || config.heliusApiKey,
+        projectId: config.insiderHeliusProjectId,
+      },
+      {
+        label: "Insider Helius 2",
+        apiKey: config.insiderHeliusApiKey2,
+        projectId: config.insiderHeliusProjectId2,
+      },
+      {
+        label: "Insider Helius 3 / MC",
+        apiKey: config.insiderHeliusApiKey3,
+        projectId: config.insiderHeliusProjectId3,
+      },
+      {
+        label: "Insider Helius 4",
+        apiKey: config.insiderHeliusApiKey4,
+        projectId: config.insiderHeliusProjectId4,
+      },
+    ];
+
+    return await Promise.all(
+      definitions.map(async (definition) => {
+        if (!definition.apiKey || !definition.projectId) {
+          return {
+            label: definition.label,
+            projectId: definition.projectId,
+            exhausted: false,
+            usage: null,
+            remainingPercent: null,
+            error: !definition.apiKey ? "API key missing" : "project ID missing",
+          };
+        }
+        try {
+          const usage = await HeliusClient.fetchProjectUsageForProject(
+            definition.apiKey,
+            definition.projectId,
+          );
+          const creditsRemaining = Number(usage.creditsRemaining);
+          const prepaidCreditsRemaining = Number(usage.prepaidCreditsRemaining);
+          const exhausted =
+            definition.projectId === exhaustedInfo?.projectId ||
+            (Number.isFinite(creditsRemaining) &&
+              Number.isFinite(prepaidCreditsRemaining) &&
+              creditsRemaining <= 0 &&
+              prepaidCreditsRemaining <= 0);
+          return {
+            label: definition.label,
+            projectId: definition.projectId,
+            exhausted,
+            usage,
+            remainingPercent: getHeliusRemainingPercent(usage),
+            error: null,
+          };
+        } catch (err) {
+          return {
+            label: definition.label,
+            projectId: definition.projectId,
+            exhausted: definition.projectId === exhaustedInfo?.projectId,
+            usage: null,
+            remainingPercent: null,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }),
+    );
+  }
+
+  function requestHeliusUsageProcessStop(): void {
+    if (heliusUsageProcessStopRequested) return;
+    heliusUsageProcessStopRequested = true;
+    log.error("Helius usage exhausted; stopping whole bot process");
+    if (requestFullShutdown) {
+      setTimeout(() => requestFullShutdown?.("HELIUS_USAGE_EXHAUSTED"), 250);
+      return;
+    }
+    setTimeout(() => process.exit(1), 1_500);
+  }
 
   async function stopInsiderForHeliusUsageExhaustion(
     botIndex: number,
     err: unknown,
     source: string,
+    exhaustedInfo?: HeliusCreditExhaustionInfo,
   ): Promise<void> {
     const bot = insiderBots[botIndex];
     if (!bot) return;
@@ -300,7 +435,15 @@ async function main(): Promise<void> {
       emergencySellTriggered: !!activePosition,
       error: err instanceof Error ? err.message : String(err),
     });
-    if (!firstNotice) return;
+
+    const usageReport = firstNotice
+      ? await collectInsiderHeliusUsageReport(exhaustedInfo)
+      : [];
+    if (!firstNotice) {
+      requestHeliusUsageProcessStop();
+      return;
+    }
+
     await telegramBot?.sendDefault(
       [
         `<b>🛑 Insider ${botNumber} Stopped — Helius Usage Exhausted</b>`,
@@ -318,12 +461,30 @@ async function main(): Promise<void> {
         "",
         "A Helius request returned <code>429 max usage reached</code> or the project credits are exhausted.",
         "The bot was reset and stopped to avoid repeated failed requests.",
-        "Rotate or top up the Helius key for this Insider bot, then restart the bot process.",
+        "The whole bot process will now shut down.",
+        "",
+        "<b>Helius API usage</b>",
+        ...usageReport.map(formatHeliusUsageReportLine),
+        "",
+        "Rotate or top up the used-up Helius key, then restart the bot process.",
       ].filter(Boolean).join("\n"),
       { pin: true },
     );
+    log.error(`[INSIDER ${botNumber}] Helius usage report before process stop`, {
+      source,
+      exhaustedProjectId: exhaustedInfo?.projectId ?? null,
+      usageReport: usageReport.map((entry) => ({
+        label: entry.label,
+        projectId: entry.projectId,
+        exhausted: entry.exhausted,
+        remainingPercent: entry.remainingPercent,
+        creditsRemaining: entry.usage?.creditsRemaining ?? null,
+        prepaidCreditsRemaining: entry.usage?.prepaidCreditsRemaining ?? null,
+        error: entry.error,
+      })),
+    });
+    requestHeliusUsageProcessStop();
   }
-
   async function followInsiderWalletWithUsageGuard(
     botIndex: number,
     address: string,
@@ -1166,7 +1327,7 @@ async function main(): Promise<void> {
             `429 max usage reached: Helius credits exhausted for project ${info.projectId}`,
           ),
           "Helius REST credit check",
-        );
+        info,`r`n        );
       })().catch((err) =>
         log.error(
           `[INSIDER ${definition.botNumber}] Failed to stop or notify after Helius credit exhaustion`,
@@ -3239,6 +3400,9 @@ async function main(): Promise<void> {
 
   // ── 7. Graceful shutdown ──────────────────────────────────────────────────
   let shutting_down = false;
+  requestFullShutdown = (signal: string): void => {
+    void shutdown(signal);
+  };
 
   async function shutdown(signal: string): Promise<void> {
     if (shutting_down) return;
