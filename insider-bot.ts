@@ -373,6 +373,7 @@ interface FunderRecipientWatch {
   lowFundingTinyUsdBand: "2_5_to_5" | "gt5" | null;
   postEntrySwapSignature: string | null;
   postEntrySwapBaselineSignatures: Set<string>;
+  soldAllSignature: string | null;
 }
 
 interface FunderTransferOutCandidate {
@@ -2993,6 +2994,9 @@ export class InsiderBot extends EventEmitter {
     watch.tokenBuyObserved = true;
     watch.firstBuySignature = tx.signature;
     watch.firstBuyTimestamp = tx.timestamp;
+    this.subscribeFunderRecipient(watch.wallet);
+    this.markFunderRecipientDirty(watch.wallet);
+    void this.syncFunderRecipientBatch(true);
 
     this.log.warn("Normal-mode shared feePayer tiny transfer accepted for immediate buy", {
       mint: state.mint,
@@ -3140,6 +3144,7 @@ export class InsiderBot extends EventEmitter {
       lowFundingTinyUsdBand: null,
       postEntrySwapSignature: null,
       postEntrySwapBaselineSignatures: new Set<string>(),
+      soldAllSignature: null,
     };
     state.recipientWatches.set(candidate.recipient, watch);
     return watch;
@@ -3598,11 +3603,9 @@ export class InsiderBot extends EventEmitter {
           );
         }
       }
-      if (copySellOnSellAll) {
-        this.subscribeFunderRecipient(watch.wallet);
-        this.markFunderRecipientDirty(watch.wallet);
-        void this.syncFunderRecipientBatch(true);
-      }
+      this.subscribeFunderRecipient(watch.wallet);
+      this.markFunderRecipientDirty(watch.wallet);
+      void this.syncFunderRecipientBatch(true);
       state.lowFundingTinyBoughtUsdBands.add(buyUsdBand);
       await this.emitLowFundingRecipientBuy(
         state,
@@ -4497,12 +4500,20 @@ export class InsiderBot extends EventEmitter {
     this.pruneRecipientWithoutEarlyTokenBuy(state, watch);
     if (!watch.firstBuySignature) return;
     if (watch.tokenActions.some((existing) => existing.signature === tx.signature)) return;
-    if (state.lowFundingMode && !watch.lowFundingCopySellOnSellAll) {
-      this.log.info("Low-funding recipient sell observed; ignoring recipient sell for $2.50-$5 tiny band", {
+
+    if (
+      (watch.normalTinyTransferMode || state.lowFundingMode) &&
+      tx.timestamp <= watch.fundingTimestamp
+    ) {
+      this.log.info("Tiny recipient sell ignored because it is not after tiny funding", {
         mint: state.mint,
         wallet: watch.wallet,
         signature: tx.signature,
-        firstBuySignature: watch.firstBuySignature,
+        fundingSignature: watch.fundingSignature,
+        fundingTimestamp: watch.fundingTimestamp,
+        txTimestamp: tx.timestamp,
+        lowFundingMode: state.lowFundingMode,
+        normalTinyTransferMode: watch.normalTinyTransferMode,
       });
       return;
     }
@@ -4516,30 +4527,60 @@ export class InsiderBot extends EventEmitter {
     const soldAllByTxBalance = remainingAmount !== null && remainingAmount <= 0;
     const soldAllByTrackedAmount =
       watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount;
+    const tinySellAllMode = watch.normalTinyTransferMode || state.lowFundingMode;
     this.log.info(
-      state.lowFundingMode && watch.lowFundingCopySellOnSellAll
-        ? "Low-funding >$5 tiny recipient sell observed"
+      state.lowFundingMode
+        ? "Low-funding tiny recipient sell observed"
+        : watch.normalTinyTransferMode
+        ? "Normal tiny recipient sell observed"
         : "Valid transfer-out recipient sell observed",
       {
-      mint: state.mint,
-      wallet: watch.wallet,
-      signature: tx.signature,
-      soldAmount: watch.soldAmount,
-      boughtAmount: watch.boughtAmount,
-      remainingAmount,
-      soldAllByTxBalance,
-      soldAllByTrackedAmount,
-      lowFundingCopySellOnSellAll: watch.lowFundingCopySellOnSellAll,
+        mint: state.mint,
+        wallet: watch.wallet,
+        signature: tx.signature,
+        soldAmount: watch.soldAmount,
+        boughtAmount: watch.boughtAmount,
+        remainingAmount,
+        soldAllByTxBalance,
+        soldAllByTrackedAmount,
+        lowFundingCopySellOnSellAll: watch.lowFundingCopySellOnSellAll,
+        lowFundingTinyUsdBand: watch.lowFundingTinyUsdBand,
+        normalTinyTransferMode: watch.normalTinyTransferMode,
       },
     );
     if ((soldAllByTxBalance || soldAllByTrackedAmount) && this.phase === "holding") {
+      watch.soldAllSignature = tx.signature;
       if (state.lowFundingMode && watch.lowFundingTinyUsdBand) {
         state.lowFundingTinySoldUsdBands.add(watch.lowFundingTinyUsdBand);
       }
+      const tinyWatches = tinySellAllMode
+        ? [...state.recipientWatches.values()].filter(
+            (entry) =>
+              Boolean(entry.firstBuySignature) &&
+              (entry.normalTinyTransferMode || state.lowFundingMode),
+          )
+        : [];
+      const tinySoldAllCount = tinyWatches.filter((entry) => entry.soldAllSignature).length;
+      if (tinySellAllMode && tinyWatches.length > 0 && tinySoldAllCount < tinyWatches.length) {
+        this.log.info("Tiny recipient sold all; waiting for remaining tracked tiny recipients", {
+          mint: state.mint,
+          wallet: watch.wallet,
+          signature: tx.signature,
+          soldAllCount: tinySoldAllCount,
+          trackedTinyWallets: tinyWatches.length,
+          trackedWallets: tinyWatches.map((entry) => entry.wallet),
+          soldWallets: tinyWatches
+            .filter((entry) => entry.soldAllSignature)
+            .map((entry) => entry.wallet),
+        });
+        return;
+      }
       await this.triggerPositionSell(
         state.mint,
-        state.lowFundingMode && watch.lowFundingCopySellOnSellAll
-          ? `Low-funding >$5 tiny recipient ${watch.wallet} sold all token position`
+        state.lowFundingMode
+          ? `Low-funding tiny recipient sell-all threshold reached (${tinySoldAllCount}/${tinyWatches.length || 1})`
+          : watch.normalTinyTransferMode
+          ? `Normal tiny recipient sell-all threshold reached (${tinySoldAllCount}/${tinyWatches.length || 1})`
           : `Shared feePayer recipient ${watch.wallet} sold all tracked token position`,
         [
           "<b>🚨 Shared-Funder Recipient Sold All</b>",
@@ -4547,6 +4588,9 @@ export class InsiderBot extends EventEmitter {
           `Recipient: <code>${watch.wallet}</code>`,
           `First buy: <code>${watch.firstBuySignature}</code>`,
           `Sell tx: <code>${tx.signature}</code>`,
+          tinySellAllMode
+            ? `Tiny wallets sold all: <b>${tinySoldAllCount}/${tinyWatches.length || 1}</b>`
+            : "",
           `Sold tracked: <b>${watch.soldAmount.toLocaleString()}</b> / <b>${watch.boughtAmount.toLocaleString()}</b>`,
           remainingAmount !== null
             ? `Post-tx token balance: <b>${remainingAmount.toLocaleString()}</b>`
