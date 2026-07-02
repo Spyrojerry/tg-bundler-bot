@@ -1326,8 +1326,9 @@ async function main(): Promise<void> {
           new Error(
             `429 max usage reached: Helius credits exhausted for project ${info.projectId}`,
           ),
-          "Helius REST credit check",
-        info,`r`n        );
+               "Helius REST credit check",
+          info,
+        );
       })().catch((err) =>
         log.error(
           `[INSIDER ${definition.botNumber}] Failed to stop or notify after Helius credit exhaustion`,
