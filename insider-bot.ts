@@ -57,6 +57,9 @@ const BUNDLER_FUNDER_LOW_FUNDING_SOL = 15;
 const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
 const BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT = 50;
 const BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL = 3.5;
+const BUNDLER_FUNDER_LOW_FUNDING_LARGE_EXIT_PERCENT = 200;
+const BUNDLER_FUNDER_LOW_FUNDING_TINY_EXIT_MC_USD = 25_000;
+const BUNDLER_FUNDER_LOW_FUNDING_LARGE_SWAP_HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS = 10;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD = 2.5;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD = 5;
@@ -371,6 +374,7 @@ interface FunderRecipientWatch {
   normalTinyExitPercent: number | null;
   lowFundingCopySellOnSellAll: boolean;
   lowFundingTinyUsdBand: "2_5_to_5" | "gt5" | null;
+  lowFundingLargeTransferMode: boolean;
   postEntrySwapSignature: string | null;
   postEntrySwapBaselineSignatures: Set<string>;
   soldAllSignature: string | null;
@@ -410,6 +414,10 @@ interface BundlerFunderWatchState {
   lowFundingTinySellGroupSignatures: Set<string>;
   lowFundingTinyBoughtUsdBands: Set<"2_5_to_5" | "gt5">;
   lowFundingTinySoldUsdBands: Set<"2_5_to_5" | "gt5">;
+  lowFundingPendingTinyBuyWallets: Set<string>;
+  lowFundingDevBuySignatures: Set<string>;
+  lowFundingDevSecondBuySignature: string | null;
+  lowFundingLargeTransferBuyUsed: boolean;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -1613,7 +1621,7 @@ export class InsiderBot extends EventEmitter {
       minTransferOutSol: lowFundingMode
         ? BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL
         : largestFundingSol,
-      cursorSignature: earliest.fundingSignature,
+      cursorSignature: latest.fundingSignature,
       processedSignatures: new Set(records.map((record) => record.fundingSignature)),
       validOutSignatures: new Set<string>(),
       invalidOutSignatures: new Set<string>(),
@@ -1629,6 +1637,10 @@ export class InsiderBot extends EventEmitter {
       lowFundingTinySellGroupSignatures: new Set<string>(),
       lowFundingTinyBoughtUsdBands: new Set<"2_5_to_5" | "gt5">(),
       lowFundingTinySoldUsdBands: new Set<"2_5_to_5" | "gt5">(),
+      lowFundingPendingTinyBuyWallets: new Set<string>(),
+      lowFundingDevBuySignatures: new Set<string>(),
+      lowFundingDevSecondBuySignature: null,
+      lowFundingLargeTransferBuyUsed: false,
     };
 
     this.subscribeBundlerFunder(funderWallet);
@@ -2633,6 +2645,7 @@ export class InsiderBot extends EventEmitter {
         const migrated = await this.inspectBundlerFunderTransaction(state, tx);
         if (migrated) break;
       }
+      await this.maybeTriggerLowFundingPendingTinyBuys(state, "shared feePayer sync");
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
       this.log.warn("Shared bundler funder sync failed", {
@@ -2910,6 +2923,70 @@ export class InsiderBot extends EventEmitter {
       });
       return migrated;
     }
+    if (state.lowFundingMode) {
+      if (this.hasSolIncomingToWallet(tx, state.funderWallet)) return false;
+      if (
+        transferOut.amountSol >= BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL &&
+        !state.bundlerWallets.has(transferOut.to) &&
+        !state.lowFundingLargeTransferBuyUsed &&
+        !this.buySubmitted
+      ) {
+        const preferredIndex = this.nextRecipientHeliusPreferredIndex(state);
+        const validation = await this.isValidLowFundingLargeTransferRecipient(
+          state,
+          transferOut.to,
+          tx.timestamp,
+          preferredIndex,
+        );
+        if (validation.valid) {
+          state.lowFundingLargeTransferBuyUsed = true;
+          const watch = this.addBundlerFunderRecipientWatch(state, {
+            recipient: transferOut.to,
+            signature: tx.signature,
+            amountSol: transferOut.amountSol,
+            timestamp: tx.timestamp,
+            buyTriggersEntry: false,
+            normalTinyTransferMode: false,
+          });
+          if (watch) {
+            watch.tokenBuyObserved = true;
+            watch.firstBuySignature = validation.activitySignature ?? tx.signature;
+            watch.firstBuyTimestamp = tx.timestamp;
+            this.subscribeFunderRecipient(watch.wallet);
+            this.markFunderRecipientDirty(watch.wallet);
+            void this.syncFunderRecipientBatch(true);
+            this.log.warn("Low-funding valid 3.5 SOL+ transfer-out accepted; buying with +200% MC exit", {
+              mint: state.mint,
+              funderWallet: state.funderWallet,
+              recipient: transferOut.to,
+              amountSol: transferOut.amountSol,
+              signature: tx.signature,
+              validationReason: validation.reason,
+              activitySignature: validation.activitySignature ?? null,
+            });
+            await this.emitLowFundingRecipientBuy(
+              state,
+              watch,
+              tx.signature,
+              `valid 3.5 SOL+ low-funding transfer-out accepted: ${validation.reason}`,
+              false,
+              undefined,
+              { exitPercent: BUNDLER_FUNDER_LOW_FUNDING_LARGE_EXIT_PERCENT, disableProfitExit: false },
+            );
+          }
+          return false;
+        }
+        this.log.info("Low-funding 3.5 SOL+ transfer-out skipped: invalid recipient", {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          recipient: transferOut.to,
+          amountSol: transferOut.amountSol,
+          signature: tx.signature,
+          validationReason: validation.reason,
+        });
+        return false;
+      }
+    }
     let transferOutUsd: number | null = null;
     const solPriceUsd = await this.getCachedSolPriceUsd();
     transferOutUsd = solPriceUsd !== null ? transferOut.amountSol * solPriceUsd : null;
@@ -2925,7 +3002,6 @@ export class InsiderBot extends EventEmitter {
     }
     if (state.lowFundingMode) {
       if (transferOutUsd >= BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD) return false;
-      if (this.hasSolIncomingToWallet(tx, state.funderWallet)) return false;
       await this.handleLowFundingTinyTransferOut(state, tx, transferOut, transferOutUsd);
       return false;
     }
@@ -3178,6 +3254,7 @@ export class InsiderBot extends EventEmitter {
       normalTinyExitPercent: null,
       lowFundingCopySellOnSellAll: false,
       lowFundingTinyUsdBand: null,
+      lowFundingLargeTransferMode: false,
       postEntrySwapSignature: null,
       postEntrySwapBaselineSignatures: new Set<string>(),
       soldAllSignature: null,
@@ -3491,6 +3568,132 @@ export class InsiderBot extends EventEmitter {
     }
     return group;
   }
+  private async hasRecentAnyTokenSwapHistory(
+    wallet: string,
+    preferredClientIndex: number,
+  ): Promise<boolean> {
+    const history = await this.getConfirmedWalletSwapHistory(
+      wallet,
+      50,
+      preferredClientIndex,
+    );
+    const minTimestamp = Math.floor(
+      (Date.now() - BUNDLER_FUNDER_LOW_FUNDING_LARGE_SWAP_HISTORY_MAX_AGE_MS) / 1_000,
+    );
+    return history.some(
+      (tx) =>
+        (!tx.type || tx.type === "SWAP") &&
+        Number.isFinite(tx.timestamp) &&
+        tx.timestamp >= minTimestamp,
+    );
+  }
+
+  private async isValidLowFundingLargeTransferRecipient(
+    state: BundlerFunderWatchState,
+    wallet: string,
+    timestamp: number,
+    preferredClientIndex: number,
+  ): Promise<{ valid: boolean; reason: string; activitySignature?: string | null }> {
+    const txs = await this.withHeliusFallback(
+      (client) => client.getWalletTransactionsDesc(wallet, INSIDER_HISTORY_LIMIT),
+      preferredClientIndex,
+    );
+    const currentTokenBuy = txs.find((tx) => {
+      if (tx.timestamp > timestamp) return false;
+      if (!this.isRelevantMintTx(tx, state.mint)) return false;
+      return this.classifyTx(tx, wallet, state.mint) === "buy";
+    });
+    if (currentTokenBuy) {
+      return {
+        valid: true,
+        reason: "recipient already has current-token buy activity",
+        activitySignature: currentTokenBuy.signature,
+      };
+    }
+    const hasRecentSwap = await this.hasRecentAnyTokenSwapHistory(
+      wallet,
+      preferredClientIndex,
+    );
+    return {
+      valid: hasRecentSwap,
+      reason: hasRecentSwap
+        ? "recipient has any-token SWAP history within 1 day"
+        : "recipient has no current-token buy and no 1-day SWAP history",
+      activitySignature: null,
+    };
+  }
+
+  private async maybeTriggerLowFundingPendingTinyBuys(
+    state: BundlerFunderWatchState,
+    source: string,
+  ): Promise<void> {
+    if (!state.lowFundingMode || this.buySubmitted || this.buyDisabled) return;
+    if (!this.devWallet || state.lowFundingPendingTinyBuyWallets.size === 0) return;
+    try {
+      const txs = await this.withHeliusFallback(
+        (client) => client.getWalletTransactionsDesc(this.devWallet!, INSIDER_HISTORY_LIMIT),
+        HELIUS_POOL_MC_RESERVED_INDEX,
+      );
+      const devBuys = txs
+        .filter((tx) => this.isRelevantMintTx(tx, state.mint))
+        .filter((tx) => this.classifyTx(tx, this.devWallet!, state.mint) === "buy")
+        .sort((a, b) => a.timestamp - b.timestamp);
+      for (const tx of devBuys) state.lowFundingDevBuySignatures.add(tx.signature);
+      const secondDevBuy = devBuys[1] ?? null;
+      if (!secondDevBuy) {
+        this.log.info("Low-funding tiny buy gate waiting for dev second buy", {
+          mint: state.mint,
+          devWallet: this.devWallet,
+          devBuyCount: devBuys.length,
+          pendingWallets: [...state.lowFundingPendingTinyBuyWallets],
+          source,
+        });
+        return;
+      }
+      state.lowFundingDevSecondBuySignature = secondDevBuy.signature;
+      const pendingWallets = [...state.lowFundingPendingTinyBuyWallets];
+      this.log.warn("Low-funding tiny dev second-buy gate passed", {
+        mint: state.mint,
+        devWallet: this.devWallet,
+        secondDevBuySignature: secondDevBuy.signature,
+        pendingWallets,
+        source,
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>🟢 ${this.label} Low-Funding Dev 2nd Buy Gate</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `Dev: <code>${this.devWallet}</code>`,
+          `Second dev buy: <code>${secondDevBuy.signature}</code>`,
+          `Pending tiny wallets: <b>${pendingWallets.length}</b>`,
+          "",
+          "Low-funding tiny candidate is now allowed to buy with fixed $25k MC exit.",
+        ].join("\n"),
+        "low-funding dev second buy gate notification",
+      );
+      const watch = pendingWallets
+        .map((wallet) => state.recipientWatches.get(wallet))
+        .find((entry): entry is FunderRecipientWatch => Boolean(entry));
+      if (!watch) return;
+      await this.emitLowFundingRecipientBuy(
+        state,
+        watch,
+        secondDevBuy.signature,
+        "dev wallet made its 2nd buy after low-funding tiny gate",
+        false,
+        undefined,
+        { fixedExitMc: BUNDLER_FUNDER_LOW_FUNDING_TINY_EXIT_MC_USD, disableProfitExit: false },
+      );
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Low-funding dev second-buy gate check failed", {
+        mint: state.mint,
+        devWallet: this.devWallet,
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   private async handleLowFundingTinyTransferOut(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
@@ -3537,29 +3740,6 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (this.buySubmitted || this.phase === "holding") {
-      const sellGroup = this.findCleanLowFundingBundlerTinyGroup(
-        state,
-        state.lowFundingTinyEntryTimestamp ?? 0,
-      );
-      if (!sellGroup) return;
-      const sellGroupKey = sellGroup.map((entry) => entry.signature).join(":");
-      if (state.lowFundingTinySellGroupSignatures.has(sellGroupKey)) return;
-      state.lowFundingTinySellGroupSignatures.add(sellGroupKey);
-      state.lowFundingTinySoldUsdBands.add("2_5_to_5");
-      await this.triggerPositionSell(
-        state.mint,
-        "Low-funding shared feePayer made a clean post-entry 4-bundler tiny-transfer group",
-        [
-          "<b>🚨 Low-Funding Tiny Bundler Exit</b>",
-          `Token: <code>${state.mint}</code>`,
-          `FeePayer: <code>${state.funderWallet}</code>`,
-          `Window: <b>${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s</b>`,
-          `Bundler txs: <b>${sellGroup.length}</b>`,
-          "",
-          "A clean post-entry group of 4 tiny transfers to the initial bundlers was detected. Selling position.",
-        ],
-        tx.signature,
-      );
       return;
     }
 
@@ -3679,15 +3859,29 @@ export class InsiderBot extends EventEmitter {
       this.markFunderRecipientDirty(watch.wallet);
       void this.syncFunderRecipientBatch(true);
       state.lowFundingTinyBoughtUsdBands.add(buyUsdBand);
-      await this.emitLowFundingRecipientBuy(
-        state,
-        watch,
-        tx.signature,
-        copySellOnSellAll
-          ? "low-funding under-$10 recipient had prior token activity; >$5 band uses recipient sell-all copy-sell"
-          : "low-funding under-$10 recipient had prior token activity; $2.50-$5 band uses clean 4-bundler exit",
-        false,
+      state.lowFundingPendingTinyBuyWallets.add(watch.wallet);
+      this.log.warn("Low-funding tiny recipient pending dev second-buy gate", {
+        mint: state.mint,
+        wallet: watch.wallet,
+        fundingSignature: tx.signature,
+        tinyUsdBand: buyUsdBand,
+        devWallet: this.devWallet,
+        pendingWallets: [...state.lowFundingPendingTinyBuyWallets],
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>🟡 ${this.label} Low-Funding Tiny Candidate Pending</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `Recipient: <code>${watch.wallet}</code>`,
+          `Band: <b>${buyUsdBand === "gt5" ? ">$5-$10" : "$2.50-$5"}</b>`,
+          `Funding tx: <code>${tx.signature}</code>`,
+          `Dev: <code>${this.devWallet ?? "unknown"}</code>`,
+          "",
+          "Waiting for the dev wallet's 2nd buy before bot buy. Exit will be fixed $25k MC if the dev gate passes.",
+        ].join("\n"),
+        "low-funding tiny pending dev gate notification",
       );
+      await this.maybeTriggerLowFundingPendingTinyBuys(state, "low-funding tiny candidate qualified");
     }
   }
   private async emitLowFundingSharedFeePayerBuy(
@@ -3763,7 +3957,7 @@ export class InsiderBot extends EventEmitter {
           `Low-funding sync start tx: <code>${details.syncStart.signature}</code>`,
           `Sync-start bundler: <code>${details.syncStart.bundlerWallet}</code>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-          "Sell rule: <b>MC profit target disabled</b>; waiting for clean post-entry 4-bundler tiny-transfer exit or rug.",
+          "Sell rule: <b>MC profit target disabled</b>; rug, recipient sell-all, and recipient zero-SOL exits remain active.",
         ].join("\n"),
       });
     } finally {
@@ -3778,6 +3972,7 @@ export class InsiderBot extends EventEmitter {
     gateDescription = "recipient bought token",
     disableProfitExitAfterBuy = false,
     triggerTx?: HeliusTransaction,
+    exitOptions: { fixedExitMc?: number; exitPercent?: number; disableProfitExit?: boolean } = {},
   ): Promise<void> {
     if (
       this.buySubmitted ||
@@ -3818,11 +4013,17 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
+      const exitMc = exitOptions.fixedExitMc ?? (
+        exitOptions.exitPercent !== undefined
+          ? currentMc * (1 + exitOptions.exitPercent / 100)
+          : null
+      );
+      if (exitMc !== null) this.setExitMc(exitMc);
       this.setEntryMc(currentMc);
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
-      this.disableProfitExitAfterBuy = true;
+      this.disableProfitExitAfterBuy = exitOptions.disableProfitExit ?? true;
       this.emit("buyTrigger", {
         followedWallet: this.followedWallet!,
         mint: state.mint,
@@ -3841,7 +4042,9 @@ export class InsiderBot extends EventEmitter {
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           "",
           "",
-          "Sell rule: <b>MC profit target disabled</b>; waiting for clean post-entry 4-bundler tiny-transfer exit or rug.",
+          exitMc !== null
+            ? `Sell rule: <b>MC exit active at $${exitMc.toLocaleString()}</b>; rug, tiny sell-all, and tiny SOL-zero exits remain active.`
+            : "Sell rule: <b>MC profit target disabled</b>; rug, recipient sell-all, and recipient zero-SOL exits remain active.",
         ].join("\n"),
       });
     } finally {
