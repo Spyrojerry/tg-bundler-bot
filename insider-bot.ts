@@ -4319,6 +4319,53 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private async sellIfLowFundingLargeRecipientBuyTooSmall(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+    tx: HeliusTransaction,
+  ): Promise<boolean> {
+    if (!state.lowFundingMode || !watch.lowFundingLargeTransferMode) return false;
+    if (this.phase !== "holding" || this.positionSellTriggered) return false;
+    const buySol = this.estimateRecipientBuySolSpent(tx, watch.wallet);
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    const buyUsd =
+      buySol !== null && solPriceUsd !== null ? buySol * solPriceUsd : null;
+    const shouldSell =
+      buyUsd !== null && buyUsd < BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD;
+    this.log.warn("Checked low-funding large recipient buy USD after bot entry", {
+      mint: state.mint,
+      wallet: watch.wallet,
+      signature: tx.signature,
+      fundingSignature: watch.fundingSignature,
+      buySol,
+      solPriceUsd,
+      buyUsd,
+      minBuyUsd: BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD,
+      shouldSell,
+    });
+    if (!shouldSell) return false;
+
+    await this.triggerPositionSell(
+      state.mint,
+      `Low-funding 3.5 SOL+ recipient ${watch.wallet} bought below $${BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD.toFixed(0)} after bot entry`,
+      [
+        `<b>🚨 ${this.label} Low-Funding Recipient Buy Too Small</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `Recipient: <code>${watch.wallet}</code>`,
+        `Funding tx: <code>${watch.fundingSignature}</code>`,
+        `Buy tx: <code>${tx.signature}</code>`,
+        buySol !== null ? `Buy SOL: <b>${buySol.toFixed(6)} SOL</b>` : "Buy SOL: <b>unknown</b>",
+        solPriceUsd !== null ? `SOL price: <b>$${solPriceUsd.toFixed(2)}</b>` : "SOL price: <b>unknown</b>",
+        buyUsd !== null ? `Buy USD: <b>$${buyUsd.toFixed(2)}</b>` : "Buy USD: <b>unknown</b>",
+        `Required: <b>$${BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD.toFixed(0)}+</b>`,
+        "",
+        "Bot already entered from the valid 3.5 SOL+ low-funding path, so selling now.",
+      ],
+      tx.signature,
+    );
+    return true;
+  }
+
   private async ensureRecipientBuyMeetsMinUsd(
     state: BundlerFunderWatchState,
     watch: FunderRecipientWatch,
@@ -4754,6 +4801,14 @@ export class InsiderBot extends EventEmitter {
           additionalBuyCountAfterFirst,
           additionalBuySellTriggerDisabled: true,
         });
+        if (
+          watch.lowFundingLargeTransferMode &&
+          watch.tokenActions.filter((entry) => entry.kind === "buy").length === 1
+        ) {
+          if (await this.sellIfLowFundingLargeRecipientBuyTooSmall(state, watch, tx)) {
+            return;
+          }
+        }
       }
       const tinyWalletMode = watch.normalTinyTransferMode || state.lowFundingMode;
       if (!tinyWalletMode) {
