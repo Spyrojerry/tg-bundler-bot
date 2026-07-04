@@ -509,6 +509,7 @@ export class InsiderBot extends EventEmitter {
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
   private bundlerFunderLogsSubId: number | null = null;
   private recipientLogsSubIds = new Map<string, number>();
+  private recipientSolBalanceSubIds = new Map<string, number>();
   private isBundlerFunderSyncing = false;
   private bundlerFunderSyncPending = false;
   private bundlerFunderSyncPendingForce = false;
@@ -2557,11 +2558,68 @@ export class InsiderBot extends EventEmitter {
       "processed",
     );
     this.recipientLogsSubIds.set(wallet, subId);
+    if (!this.recipientSolBalanceSubIds.has(wallet)) {
+      const balanceSubId = this.connection.onAccountChange(
+        new PublicKey(wallet),
+        (accountInfo) => {
+          void this.handleFunderRecipientSolAccountChange(
+            wallet,
+            BigInt(accountInfo.lamports),
+          );
+        },
+        "processed",
+      );
+      this.recipientSolBalanceSubIds.set(wallet, balanceSubId);
+    }
     this.log.info("Subscribed to valid funder transfer-out recipient", {
       wallet,
+      solBalanceSubscription: this.recipientSolBalanceSubIds.has(wallet),
     });
   }
-
+  private async handleFunderRecipientSolAccountChange(
+    wallet: string,
+    lamports: bigint,
+  ): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    const watch = state?.recipientWatches.get(wallet);
+    if (!state || !watch) return;
+    if (!watch.firstBuySignature || this.phase !== "holding") return;
+    if (this.positionSellTriggered || lamports > 0n) return;
+    const marker = `account-subscribe-sol-zero:${wallet}`;
+    if (watch.zeroSolBalanceSignatures.has(marker)) return;
+    watch.zeroSolBalanceSignatures.add(marker);
+    watch.soldAllSignature = marker;
+    const mode = state.lowFundingMode
+      ? watch.lowFundingLargeTransferMode
+        ? "Low-funding large"
+        : "Low-funding tiny"
+      : watch.normalTinyTransferMode
+      ? "Normal tiny"
+      : "Normal";
+    this.log.warn("Recipient SOL account subscription reached zero; selling position", {
+      mint: state.mint,
+      wallet,
+      mode,
+      lamports: lamports.toString(),
+      fundingSignature: watch.fundingSignature,
+      firstBuySignature: watch.firstBuySignature,
+    });
+    await this.triggerPositionSell(
+      state.mint,
+      `${mode} recipient ${wallet} SOL balance reached zero by account subscription`,
+      [
+        "<b>🚨 Shared-Funder Recipient SOL Balance Zero</b>",
+        `Token: <code>${state.mint}</code>`,
+        `Recipient: <code>${wallet}</code>`,
+        `Mode: <b>${mode}</b>`,
+        `Funding tx: <code>${watch.fundingSignature}</code>`,
+        `First buy: <code>${watch.firstBuySignature}</code>`,
+        "Source: <b>live account subscription</b>",
+        "SOL balance: <b>0</b>",
+      ],
+      marker,
+    );
+  }
   private removeFunderRecipientWatch(wallet: string, reason: string): void {
     const state = this.bundlerFunderWatch;
     state?.recipientWatches.delete(wallet);
@@ -2571,6 +2629,11 @@ export class InsiderBot extends EventEmitter {
     if (subId !== undefined) {
       this.recipientLogsSubIds.delete(wallet);
       void this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+    const balanceSubId = this.recipientSolBalanceSubIds.get(wallet);
+    if (balanceSubId !== undefined) {
+      this.recipientSolBalanceSubIds.delete(wallet);
+      void this.connection.removeAccountChangeListener(balanceSubId).catch(() => undefined);
     }
     this.log.info("Stopped watching shared feePayer recipient", {
       mint: state?.mint,
@@ -2592,6 +2655,10 @@ export class InsiderBot extends EventEmitter {
     for (const [wallet, subId] of this.recipientLogsSubIds) {
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
       this.recipientLogsSubIds.delete(wallet);
+    }
+    for (const [wallet, subId] of this.recipientSolBalanceSubIds) {
+      await this.connection.removeAccountChangeListener(subId).catch(() => undefined);
+      this.recipientSolBalanceSubIds.delete(wallet);
     }
     this.bundlerFunderWatch = null;
     this.isBundlerFunderSyncing = false;
@@ -2950,6 +3017,7 @@ export class InsiderBot extends EventEmitter {
           });
           if (watch) {
             watch.tokenBuyObserved = true;
+            watch.lowFundingLargeTransferMode = true;
             watch.firstBuySignature = validation.activitySignature ?? tx.signature;
             watch.firstBuyTimestamp = tx.timestamp;
             this.subscribeFunderRecipient(watch.wallet);
@@ -4759,6 +4827,9 @@ export class InsiderBot extends EventEmitter {
           ].join("\n"),
           "recipient first-buy notification",
         );
+        if (await this.sellIfLowFundingLargeRecipientBuyTooSmall(state, watch, tx)) {
+          return;
+        }
         if (watch.buyTriggersEntry && !this.buySubmitted) {
           if (state.lowFundingMode) {
             await this.emitLowFundingRecipientBuy(
@@ -5002,93 +5073,12 @@ export class InsiderBot extends EventEmitter {
     watch: FunderRecipientWatch,
     tx: HeliusTransaction,
   ): Promise<void> {
-    if (!watch.firstBuySignature || this.phase !== "holding") return;
-    if (watch.zeroSolBalanceSignatures.has(tx.signature)) return;
-    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return;
-    try {
-      const balance = await this.getConfirmedWalletBalanceAt(
-        watch.wallet,
-        NATIVE_SOL_BALANCE_MINT,
-        tx.timestamp,
-        watch.heliusPreferredIndex,
-      );
-      const balanceRaw = BigInt(balance.balanceRaw || "0");
-      this.log.info("Checked shared feePayer recipient SOL balance at tx timestamp", {
-        mint: state.mint,
-        wallet: watch.wallet,
-        signature: tx.signature,
-        timestamp: tx.timestamp,
-        balance: balance.balance,
-        balanceRaw: balance.balanceRaw,
-      });
-      if (balanceRaw > 0n) return;
-      watch.zeroSolBalanceSignatures.add(tx.signature);
-      const tinyWalletMode = watch.normalTinyTransferMode || state.lowFundingMode;
-      if (tinyWalletMode) {
-        watch.soldAllSignature = tx.signature;
-        const tinyWatches = [...state.recipientWatches.values()].filter(
-          (entry) =>
-            Boolean(entry.firstBuySignature) &&
-            (entry.normalTinyTransferMode || state.lowFundingMode),
-        );
-        const tinyExitedCount = tinyWatches.filter((entry) => entry.soldAllSignature).length;
-        if (tinyWatches.length > 0 && tinyExitedCount < tinyWatches.length) {
-          this.log.info("Tiny recipient SOL balance reached zero; waiting for remaining tracked tiny recipients", {
-            mint: state.mint,
-            wallet: watch.wallet,
-            signature: tx.signature,
-            exitedCount: tinyExitedCount,
-            trackedTinyWallets: tinyWatches.length,
-            trackedWallets: tinyWatches.map((entry) => entry.wallet),
-            exitedWallets: tinyWatches
-              .filter((entry) => entry.soldAllSignature)
-              .map((entry) => entry.wallet),
-          });
-          return;
-        }
-        await this.triggerPositionSell(
-          state.mint,
-          state.lowFundingMode
-            ? `Low-funding tiny recipient SOL-zero threshold reached (${tinyExitedCount}/${tinyWatches.length || 1})`
-            : `Normal tiny recipient SOL-zero threshold reached (${tinyExitedCount}/${tinyWatches.length || 1})`,
-          [
-            "<b>🚨 Shared-Funder Tiny Recipient SOL Balance Zero</b>",
-            `Token: <code>${state.mint}</code>`,
-            `Recipient: <code>${watch.wallet}</code>`,
-            `Trigger tx: <code>${tx.signature}</code>`,
-            `Timestamp: <b>${tx.timestamp}</b>`,
-            `SOL balance at tx: <b>${balance.balance}</b>`,
-            `Tiny wallets exited: <b>${tinyExitedCount}/${tinyWatches.length || 1}</b>`,
-          ],
-          tx.signature,
-        );
-        return;
-      }
-      await this.triggerPositionSell(
-        state.mint,
-        `Shared feePayer recipient ${watch.wallet} SOL balance reached zero`,
-        [
-          "<b>🚨 Shared-Funder Recipient SOL Balance Zero</b>",
-          `Token: <code>${state.mint}</code>`,
-          `Recipient: <code>${watch.wallet}</code>`,
-          `Trigger tx: <code>${tx.signature}</code>`,
-          `Timestamp: <b>${tx.timestamp}</b>`,
-          `SOL balance at tx: <b>${balance.balance}</b>`,
-        ],
-        tx.signature,
-      );
-    } catch (err) {
-      void this.heliusClient.handlePossibleRateLimitError(err);
-      this.log.warn("Failed to check shared feePayer recipient SOL balance-at", {
-        mint: state.mint,
-        wallet: watch.wallet,
-        signature: tx.signature,
-        timestamp: tx.timestamp,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    this.log.debug("Skipping recipient SOL balance-at check; live account subscription handles SOL-zero exits", {
+      mint: state.mint,
+      wallet: watch.wallet,
+      signature: tx.signature,
+    });
   }
-
   private async getRecipientTokenBalanceAtTx(
     state: BundlerFunderWatchState,
     watch: FunderRecipientWatch,
