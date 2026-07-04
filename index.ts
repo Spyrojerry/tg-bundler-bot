@@ -2428,6 +2428,12 @@ async function main(): Promise<void> {
           return;
         }
         if (currentMc >= exitMc) {
+          if (await bot.deferProfitExitUntilDevSwap(currentMc)) {
+            log.warn(
+              `[INSIDER ${botNumber} MC EXIT PENDING] Current MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}, waiting for dev swap confirmation.`,
+            );
+            return;
+          }
           log.warn(
             `[INSIDER ${botNumber} EXIT] Current MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}. Triggering SELL.`,
           );

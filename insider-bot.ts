@@ -212,6 +212,7 @@ export interface InsiderBot {
   getEntryMc(): number;
   getExitMc(): number;
   isProfitExitDisabled(): boolean;
+  deferProfitExitUntilDevSwap(currentMc: number): Promise<boolean>;
   setExitMc(value: number): void;
   getExitPercent(): number;
   setExitPercent(value: number): void;
@@ -418,6 +419,11 @@ interface BundlerFunderWatchState {
   lowFundingPendingTinyBuyWallets: Set<string>;
   lowFundingDevBuySignatures: Set<string>;
   lowFundingDevBuyAfterCreateSignature: string | null;
+  lowFundingDevBuyAfterCreateTimestamp: number | null;
+  lowFundingDevBuyAfterCreateSlot: number | null;
+  lowFundingTinyMcExitPending: boolean;
+  lowFundingTinyMcExitReachedMc: number | null;
+  lowFundingTinyDevExitSwapSignature: string | null;
   lowFundingLargeTransferBuyUsed: boolean;
 }
 
@@ -730,6 +736,51 @@ export class InsiderBot extends EventEmitter {
     return this.profitExitDisabled;
   }
 
+  async deferProfitExitUntilDevSwap(currentMc: number): Promise<boolean> {
+    const state = this.bundlerFunderWatch;
+    if (!state?.lowFundingMode) return false;
+    if (!this.activePosition || this.activePosition.mint !== state.mint) return false;
+    if (!state.lowFundingDevBuyAfterCreateSignature) return false;
+    if (state.lowFundingTinyDevExitSwapSignature) return false;
+
+    this.subscribeLowFundingDevWallet(state);
+    const devSwap = await this.findLowFundingTinyDevSwapAfterEntry(state);
+    if (devSwap) {
+      state.lowFundingTinyDevExitSwapSignature = devSwap.signature;
+      this.log.warn("Low-funding tiny MC exit can proceed; dev swap after entry already seen", {
+        mint: state.mint,
+        devWallet: this.devWallet,
+        devEntrySignature: state.lowFundingDevBuyAfterCreateSignature,
+        devExitSwapSignature: devSwap.signature,
+        currentMc,
+      });
+      return false;
+    }
+
+    state.lowFundingTinyMcExitPending = true;
+    state.lowFundingTinyMcExitReachedMc = currentMc;
+    this.log.warn("Low-funding tiny MC exit reached; waiting for dev swap before selling", {
+      mint: state.mint,
+      devWallet: this.devWallet,
+      devEntrySignature: state.lowFundingDevBuyAfterCreateSignature,
+      currentMc,
+      exitMc: this.exitMc,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>⏳ ${this.label} Low-Funding Tiny MC Exit Pending</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+        `Exit MC: <b>$${this.exitMc.toLocaleString()}</b>`,
+        `Dev: <code>${this.devWallet ?? "unknown"}</code>`,
+        `Entry dev swap: <code>${state.lowFundingDevBuyAfterCreateSignature}</code>`,
+        "",
+        "MC target reached. Waiting for the next dev swap before selling.",
+      ].join("\n"),
+      "low-funding tiny mc exit pending notification",
+    );
+    return true;
+  }
   setExitPercent(value: number): void {
     if (!Number.isFinite(value) || value < 0) {
       throw new Error("Exit percent must be a non-negative number");
@@ -1649,6 +1700,11 @@ export class InsiderBot extends EventEmitter {
       lowFundingPendingTinyBuyWallets: new Set<string>(),
       lowFundingDevBuySignatures: new Set<string>(),
       lowFundingDevBuyAfterCreateSignature: null,
+      lowFundingDevBuyAfterCreateTimestamp: null,
+      lowFundingDevBuyAfterCreateSlot: null,
+      lowFundingTinyMcExitPending: false,
+      lowFundingTinyMcExitReachedMc: null,
+      lowFundingTinyDevExitSwapSignature: null,
       lowFundingLargeTransferBuyUsed: false,
     };
 
@@ -2576,6 +2632,73 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private async handleLowFundingDevWalletNotification(
+    state: BundlerFunderWatchState,
+    source: string,
+  ): Promise<void> {
+    if (
+      this.activePosition?.mint === state.mint &&
+      state.lowFundingDevBuyAfterCreateSignature
+    ) {
+      const devSwap = await this.findLowFundingTinyDevSwapAfterEntry(state);
+      if (devSwap && !state.lowFundingTinyDevExitSwapSignature) {
+        state.lowFundingTinyDevExitSwapSignature = devSwap.signature;
+        this.log.warn("Low-funding tiny dev swap after entry observed", {
+          mint: state.mint,
+          devWallet: this.devWallet,
+          devEntrySignature: state.lowFundingDevBuyAfterCreateSignature,
+          devExitSwapSignature: devSwap.signature,
+          mcExitPending: state.lowFundingTinyMcExitPending,
+          source,
+        });
+        if (state.lowFundingTinyMcExitPending) {
+          await this.stopLowFundingDevWalletSubscription("low-funding tiny dev swap completed pending MC exit");
+          await this.triggerPositionSell(
+            state.mint,
+            `Low-funding tiny MC exit reached and dev swapped after entry`,
+            [
+              `<b>🚨 ${this.label} Low-Funding Tiny Dev Swap Exit</b>`,
+              `Token: <code>${state.mint}</code>`,
+              `Dev: <code>${this.devWallet ?? "unknown"}</code>`,
+              `Entry dev swap: <code>${state.lowFundingDevBuyAfterCreateSignature}</code>`,
+              `Exit dev swap: <code>${devSwap.signature}</code>`,
+              state.lowFundingTinyMcExitReachedMc !== null
+                ? `MC when target was reached: <b>$${state.lowFundingTinyMcExitReachedMc.toLocaleString()}</b>`
+                : "",
+              `Exit MC: <b>$${this.exitMc.toLocaleString()}</b>`,
+            ],
+            devSwap.signature,
+          );
+        }
+      }
+      return;
+    }
+
+    await this.maybeTriggerLowFundingPendingTinyBuys(state, source);
+  }
+
+  private async findLowFundingTinyDevSwapAfterEntry(
+    state: BundlerFunderWatchState,
+  ): Promise<HeliusTransaction | null> {
+    if (!this.devWallet || !state.lowFundingDevBuyAfterCreateSignature) return null;
+    const txs = await this.withHeliusFallback(
+      (client) => client.getWalletTransactionsDesc(this.devWallet!, LOW_FUNDING_DEV_BUY_SYNC_LIMIT),
+      HELIUS_POOL_MC_RESERVED_INDEX,
+    );
+    const sorted = txs
+      .filter((tx) => this.isRelevantMintTx(tx, state.mint))
+      .filter((tx) => tx.signature !== state.lowFundingDevBuyAfterCreateSignature)
+      .filter((tx) =>
+        state.lowFundingDevBuyAfterCreateTimestamp === null ||
+        tx.timestamp > state.lowFundingDevBuyAfterCreateTimestamp,
+      )
+      .filter((tx) => {
+        const action = this.classifyTx(tx, this.devWallet!, state.mint);
+        return action === "buy" || action === "sell" || this.isWalletSwapTx(tx, this.devWallet!);
+      })
+      .sort((a, b) => a.timestamp - b.timestamp || a.slot - b.slot);
+    return sorted[0] ?? null;
+  }
   private async stopLowFundingDevWalletSubscription(reason: string): Promise<void> {
     if (this.lowFundingDevLogsSubId === null) return;
     const subId = this.lowFundingDevLogsSubId;
@@ -3739,10 +3862,7 @@ export class InsiderBot extends EventEmitter {
     source: string,
   ): Promise<void> {
     if (!state.lowFundingMode || this.buyDisabled) return;
-    if (this.buySubmitted) {
-      await this.stopLowFundingDevWalletSubscription("low-funding tiny buy already submitted");
-      return;
-    }
+    if (this.buySubmitted) return;
     if (!this.devWallet || state.lowFundingPendingTinyBuyWallets.size === 0) {
       await this.stopLowFundingDevWalletSubscription("no pending low-funding tiny wallets");
       return;
@@ -3777,6 +3897,8 @@ export class InsiderBot extends EventEmitter {
         return;
       }
       state.lowFundingDevBuyAfterCreateSignature = devBuyAfterCreate.signature;
+      state.lowFundingDevBuyAfterCreateTimestamp = devBuyAfterCreate.timestamp;
+      state.lowFundingDevBuyAfterCreateSlot = devBuyAfterCreate.slot;
       const pendingWallets = [...state.lowFundingPendingTinyBuyWallets];
       this.log.warn("Low-funding tiny dev buy-after-create gate passed", {
         mint: state.mint,
@@ -3805,7 +3927,6 @@ export class InsiderBot extends EventEmitter {
         .map((wallet) => state.recipientWatches.get(wallet))
         .find((entry): entry is FunderRecipientWatch => Boolean(entry));
       if (!watch) return;
-      await this.stopLowFundingDevWalletSubscription("low-funding tiny dev buy-after-create gate passed");
       await this.emitLowFundingRecipientBuy(
         state,
         watch,
