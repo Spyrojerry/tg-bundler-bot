@@ -26,6 +26,7 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const NATIVE_SOL_BALANCE_MINT =
   "So11111111111111111111111111111111111111111";
 const INSIDER_HISTORY_LIMIT = 21;
+const LOW_FUNDING_DEV_BUY_SYNC_LIMIT = 10;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const AXIOM_TRADER_SCAN_LIMIT = 50;
 const AXIOM_AUTHORITY_CANDIDATE_COUNT = 5;
@@ -416,7 +417,7 @@ interface BundlerFunderWatchState {
   lowFundingTinySoldUsdBands: Set<"2_5_to_5" | "gt5">;
   lowFundingPendingTinyBuyWallets: Set<string>;
   lowFundingDevBuySignatures: Set<string>;
-  lowFundingDevSecondBuySignature: string | null;
+  lowFundingDevBuyAfterCreateSignature: string | null;
   lowFundingLargeTransferBuyUsed: boolean;
 }
 
@@ -469,6 +470,8 @@ export class InsiderBot extends EventEmitter {
   private initialInsiderWallets = new Set<string>();
   /** Token dev wallet (CREATE tx fee payer) — fixed at flow start for trader-scan exclusions. */
   private devWallet: string | null = null;
+  private devCreateSignature: string | null = null;
+  private devCreateTimestamp: number | null = null;
   private axiomTraderWatchActive = false;
   private axiomWatchedWallets = new Map<string, AxiomWatchedWallet>();
   private axiomSkippedMultiBuyWallets = new Set<string>();
@@ -508,6 +511,7 @@ export class InsiderBot extends EventEmitter {
   private largeBuyerWatch: LargeBuyerWatchState | null = null;
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
   private bundlerFunderLogsSubId: number | null = null;
+  private lowFundingDevLogsSubId: number | null = null;
   private recipientLogsSubIds = new Map<string, number>();
   private recipientSolBalanceSubIds = new Map<string, number>();
   private isBundlerFunderSyncing = false;
@@ -1117,10 +1121,14 @@ export class InsiderBot extends EventEmitter {
       client.getMintCreateTransaction(mint),
     );
     this.devWallet = createTx?.feePayer ?? null;
+    this.devCreateSignature = createTx?.signature ?? null;
+    this.devCreateTimestamp = createTx?.timestamp ?? null;
     if (this.devWallet) {
       this.log.info("Dev wallet identified for trader-scan exclusions", {
         mint,
         devWallet: this.devWallet,
+        devCreateSignature: this.devCreateSignature,
+        devCreateTimestamp: this.devCreateTimestamp,
       });
     }
     this.preBuyStopped = false;
@@ -1640,7 +1648,7 @@ export class InsiderBot extends EventEmitter {
       lowFundingTinySoldUsdBands: new Set<"2_5_to_5" | "gt5">(),
       lowFundingPendingTinyBuyWallets: new Set<string>(),
       lowFundingDevBuySignatures: new Set<string>(),
-      lowFundingDevSecondBuySignature: null,
+      lowFundingDevBuyAfterCreateSignature: null,
       lowFundingLargeTransferBuyUsed: false,
     };
 
@@ -2545,6 +2553,39 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private subscribeLowFundingDevWallet(state: BundlerFunderWatchState): void {
+    if (!state.lowFundingMode || !this.devWallet) return;
+    if (this.lowFundingDevLogsSubId !== null) return;
+    this.lowFundingDevLogsSubId = this.connection.onLogs(
+      new PublicKey(this.devWallet),
+      (logInfo) => {
+        if (!logInfo.err) {
+          void this.maybeTriggerLowFundingPendingTinyBuys(
+            state,
+            `dev wallet websocket notification ${logInfo.signature}`,
+          );
+        }
+      },
+      "processed",
+    );
+    this.log.info("Subscribed to dev wallet for low-funding tiny buy gate", {
+      mint: state.mint,
+      devWallet: this.devWallet,
+      devCreateSignature: this.devCreateSignature,
+      devCreateTimestamp: this.devCreateTimestamp,
+    });
+  }
+
+  private async stopLowFundingDevWalletSubscription(reason: string): Promise<void> {
+    if (this.lowFundingDevLogsSubId === null) return;
+    const subId = this.lowFundingDevLogsSubId;
+    this.lowFundingDevLogsSubId = null;
+    await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    this.log.info("Stopped low-funding dev wallet subscription", {
+      devWallet: this.devWallet,
+      reason,
+    });
+  }
   private subscribeFunderRecipient(wallet: string): void {
     if (this.recipientLogsSubIds.has(wallet)) return;
     const subId = this.connection.onLogs(
@@ -2643,6 +2684,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async stopBundlerFunderMonitoring(): Promise<void> {
+    await this.stopLowFundingDevWalletSubscription("bundler funder monitoring stopped");
     if (this.bundlerFunderLogsSubId !== null) {
       const subId = this.bundlerFunderLogsSubId;
       this.bundlerFunderLogsSubId = null;
@@ -2938,6 +2980,7 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     reason: string,
   ): Promise<void> {
+    await this.stopLowFundingDevWalletSubscription("bundler funder monitoring stopped");
     if (this.bundlerFunderLogsSubId !== null) {
       const subId = this.bundlerFunderLogsSubId;
       this.bundlerFunderLogsSubId = null;
@@ -3695,68 +3738,90 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     source: string,
   ): Promise<void> {
-    if (!state.lowFundingMode || this.buySubmitted || this.buyDisabled) return;
-    if (!this.devWallet || state.lowFundingPendingTinyBuyWallets.size === 0) return;
+    if (!state.lowFundingMode || this.buyDisabled) return;
+    if (this.buySubmitted) {
+      await this.stopLowFundingDevWalletSubscription("low-funding tiny buy already submitted");
+      return;
+    }
+    if (!this.devWallet || state.lowFundingPendingTinyBuyWallets.size === 0) {
+      await this.stopLowFundingDevWalletSubscription("no pending low-funding tiny wallets");
+      return;
+    }
+    this.subscribeLowFundingDevWallet(state);
     try {
       const txs = await this.withHeliusFallback(
-        (client) => client.getWalletTransactionsDesc(this.devWallet!, INSIDER_HISTORY_LIMIT),
+        (client) => client.getWalletTransactionsDesc(this.devWallet!, LOW_FUNDING_DEV_BUY_SYNC_LIMIT),
         HELIUS_POOL_MC_RESERVED_INDEX,
       );
       const devBuys = txs
         .filter((tx) => this.isRelevantMintTx(tx, state.mint))
+        .filter((tx) => tx.signature !== this.devCreateSignature)
+        .filter((tx) =>
+          this.devCreateTimestamp === null || tx.timestamp > this.devCreateTimestamp,
+        )
         .filter((tx) => this.classifyTx(tx, this.devWallet!, state.mint) === "buy")
-        .sort((a, b) => a.timestamp - b.timestamp);
+        .sort((a, b) => a.timestamp - b.timestamp || a.slot - b.slot);
       for (const tx of devBuys) state.lowFundingDevBuySignatures.add(tx.signature);
-      const secondDevBuy = devBuys[1] ?? null;
-      if (!secondDevBuy) {
-        this.log.info("Low-funding tiny buy gate waiting for dev second buy", {
+      const devBuyAfterCreate = devBuys[0] ?? null;
+      if (!devBuyAfterCreate) {
+        this.log.info("Low-funding tiny buy gate waiting for dev buy after create", {
           mint: state.mint,
           devWallet: this.devWallet,
-          devBuyCount: devBuys.length,
+          devBuyCountAfterCreate: devBuys.length,
+          syncedDevTxLimit: LOW_FUNDING_DEV_BUY_SYNC_LIMIT,
+          devCreateSignature: this.devCreateSignature,
+          devCreateTimestamp: this.devCreateTimestamp,
           pendingWallets: [...state.lowFundingPendingTinyBuyWallets],
           source,
         });
         return;
       }
-      state.lowFundingDevSecondBuySignature = secondDevBuy.signature;
+      state.lowFundingDevBuyAfterCreateSignature = devBuyAfterCreate.signature;
       const pendingWallets = [...state.lowFundingPendingTinyBuyWallets];
-      this.log.warn("Low-funding tiny dev second-buy gate passed", {
+      this.log.warn("Low-funding tiny dev buy-after-create gate passed", {
         mint: state.mint,
         devWallet: this.devWallet,
-        secondDevBuySignature: secondDevBuy.signature,
+        devBuyAfterCreateSignature: devBuyAfterCreate.signature,
+        syncedDevTxLimit: LOW_FUNDING_DEV_BUY_SYNC_LIMIT,
+        devCreateSignature: this.devCreateSignature,
+        devCreateTimestamp: this.devCreateTimestamp,
         pendingWallets,
         source,
       });
       void this.sendTelegramSafe(
         [
-          `<b>🟢 ${this.label} Low-Funding Dev 2nd Buy Gate</b>`,
+          `<b>🟢 ${this.label} Low-Funding Dev Buy Gate</b>`,
           `Token: <code>${state.mint}</code>`,
           `Dev: <code>${this.devWallet}</code>`,
-          `Second dev buy: <code>${secondDevBuy.signature}</code>`,
+          `Mint/create tx: <code>${this.devCreateSignature ?? "unknown"}</code>`,
+          `Dev buy after create: <code>${devBuyAfterCreate.signature}</code>`,
           `Pending tiny wallets: <b>${pendingWallets.length}</b>`,
           "",
           "Low-funding tiny candidate is now allowed to buy with fixed $25k MC exit.",
         ].join("\n"),
-        "low-funding dev second buy gate notification",
+        "low-funding dev buy-after-create gate notification",
       );
       const watch = pendingWallets
         .map((wallet) => state.recipientWatches.get(wallet))
         .find((entry): entry is FunderRecipientWatch => Boolean(entry));
       if (!watch) return;
+      await this.stopLowFundingDevWalletSubscription("low-funding tiny dev buy-after-create gate passed");
       await this.emitLowFundingRecipientBuy(
         state,
         watch,
-        secondDevBuy.signature,
-        "dev wallet made its 2nd buy after low-funding tiny gate",
+        devBuyAfterCreate.signature,
+        "dev wallet bought again after the mint/create tx and low-funding tiny gate",
         false,
         undefined,
         { fixedExitMc: BUNDLER_FUNDER_LOW_FUNDING_TINY_EXIT_MC_USD, disableProfitExit: false },
       );
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
-      this.log.warn("Low-funding dev second-buy gate check failed", {
+      this.log.warn("Low-funding dev buy-after-create gate check failed", {
         mint: state.mint,
         devWallet: this.devWallet,
+        devCreateSignature: this.devCreateSignature,
+        devCreateTimestamp: this.devCreateTimestamp,
         source,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -3928,12 +3993,15 @@ export class InsiderBot extends EventEmitter {
       void this.syncFunderRecipientBatch(true);
       state.lowFundingTinyBoughtUsdBands.add(buyUsdBand);
       state.lowFundingPendingTinyBuyWallets.add(watch.wallet);
-      this.log.warn("Low-funding tiny recipient pending dev second-buy gate", {
+      this.subscribeLowFundingDevWallet(state);
+      this.log.warn("Low-funding tiny recipient pending dev buy-after-create gate", {
         mint: state.mint,
         wallet: watch.wallet,
         fundingSignature: tx.signature,
         tinyUsdBand: buyUsdBand,
         devWallet: this.devWallet,
+        devCreateSignature: this.devCreateSignature,
+        devCreateTimestamp: this.devCreateTimestamp,
         pendingWallets: [...state.lowFundingPendingTinyBuyWallets],
       });
       void this.sendTelegramSafe(
@@ -3945,7 +4013,7 @@ export class InsiderBot extends EventEmitter {
           `Funding tx: <code>${tx.signature}</code>`,
           `Dev: <code>${this.devWallet ?? "unknown"}</code>`,
           "",
-          "Waiting for the dev wallet's 2nd buy before bot buy. Exit will be fixed $25k MC if the dev gate passes.",
+          "Waiting for a dev wallet buy after the mint/create tx before bot buy. Exit will be fixed $25k MC if the dev gate passes.",
         ].join("\n"),
         "low-funding tiny pending dev gate notification",
       );
@@ -7847,6 +7915,8 @@ export class InsiderBot extends EventEmitter {
     this.insiderWalletChain.clear();
     this.isSwitchingInsiderWallet = false;
     this.devWallet = null;
+    this.devCreateSignature = null;
+    this.devCreateTimestamp = null;
     this.axiomTraderWatchActive = false;
     this.clearAxiomWatchedWallets();
     this.preBuyStopped = false;
@@ -7883,6 +7953,8 @@ export class InsiderBot extends EventEmitter {
     this.clearBundlerAccumulation();
     this.initialInsiderWallets.clear();
     this.devWallet = null;
+    this.devCreateSignature = null;
+    this.devCreateTimestamp = null;
     this.axiomTraderWatchActive = false;
     this.clearAxiomWatchedWallets();
     this.preBuyStopped = false;
