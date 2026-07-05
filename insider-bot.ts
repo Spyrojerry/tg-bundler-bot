@@ -2748,6 +2748,16 @@ export class InsiderBot extends EventEmitter {
       solBalanceSubscription: this.recipientSolBalanceSubIds.has(wallet),
     });
   }
+  private isNormalHighBandTinyWatch(
+    state: BundlerFunderWatchState,
+    watch: FunderRecipientWatch,
+  ): boolean {
+    return (
+      !state.lowFundingMode &&
+      watch.normalTinyTransferMode &&
+      watch.normalTinyExitPercent === BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT
+    );
+  }
   private async handleFunderRecipientSolAccountChange(
     wallet: string,
     lamports: bigint,
@@ -2756,6 +2766,7 @@ export class InsiderBot extends EventEmitter {
     const watch = state?.recipientWatches.get(wallet);
     if (!state || !watch) return;
     if (!watch.firstBuySignature || this.phase !== "holding") return;
+    if (this.isNormalHighBandTinyWatch(state, watch)) return;
     if (this.positionSellTriggered || lamports > 0n) return;
     const marker = `account-subscribe-sol-zero:${wallet}`;
     if (watch.zeroSolBalanceSignatures.has(marker)) return;
@@ -5012,7 +5023,9 @@ export class InsiderBot extends EventEmitter {
             `Tracked amount: <b>${watch.boughtAmount.toLocaleString()}</b>`,
             "",
             watch.normalTinyTransferMode
-              ? "Exit watch armed: configured % MC target remains active. Bot will also sell on rug, any later recipient swap/buy/sell activity, or recipient SOL balance reaching zero on a new post-funding tx notification."
+              ? this.isNormalHighBandTinyWatch(state, watch)
+                ? "Exit watch armed: +180% MC target remains active; rug exits remain active. Recipient sell-all and SOL-zero exits are disabled for this normal >$5-$10 tiny path."
+                : "Exit watch armed: configured % MC target remains active. Bot will also sell on rug, recipient sell-all, or recipient SOL balance reaching zero on a new post-funding tx notification."
               : state.lowFundingMode
               ? "Exit watch armed: MC profit target is disabled. Bot will sell on rug or clean post-entry 4-bundler tiny-transfer exit."
               : "Exit watch armed: MC profit target is disabled. Bot will sell on rug, recipient sell-all, or recipient SOL balance reaching zero.",
@@ -5133,7 +5146,11 @@ export class InsiderBot extends EventEmitter {
         normalTinyTransferMode: watch.normalTinyTransferMode,
       },
     );
-    if ((soldAllByTxBalance || soldAllByTrackedAmount) && this.phase === "holding") {
+    if (
+      (soldAllByTxBalance || soldAllByTrackedAmount) &&
+      this.phase === "holding" &&
+      !this.isNormalHighBandTinyWatch(state, watch)
+    ) {
       watch.soldAllSignature = tx.signature;
       if (state.lowFundingMode && watch.lowFundingTinyUsdBand) {
         state.lowFundingTinySoldUsdBands.add(watch.lowFundingTinyUsdBand);

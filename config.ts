@@ -161,7 +161,7 @@ export function loadConfig(): ServiceConfig {
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
-  const sellAutoSlippage = optionalBoolean('SELL_AUTO_SLIPPAGE', true);
+  const sellAutoSlippage = optionalBoolean('SELL_AUTO_SLIPPAGE', false);
   const sellAntiMev      = optionalBoolean('SELL_ANTI_MEV', true);
 
   const walletPollInterval     = optionalInt('WALLET_POLL_INTERVAL', 5_000);
@@ -171,7 +171,7 @@ export function loadConfig(): ServiceConfig {
   const rateLimitMinTime       = optionalInt('RATE_LIMIT_MIN_TIME', 500);
   const rateLimitMaxConcurrent = optionalInt('RATE_LIMIT_MAX_CONCURRENT', 1);
   const sellPercent            = optionalNumber('SELL_PERCENT', 100);
-  const sellSlippage           = optionalNumber('SELL_SLIPPAGE', 0.3);
+  const sellSlippage           = optionalNumber('SELL_SLIPPAGE', 50);
   const sellPriorityFeeSol     = optionalNumber('SELL_PRIORITY_FEE_SOL', 0.000012);
   const insiderBuySol          = optionalNumber('INSIDER_BUY_SOL', 0.01);
   const insiderEntryMc         = optionalNumber('INSIDER_ENTRY_MC', 15_000);
