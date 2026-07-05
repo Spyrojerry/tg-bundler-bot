@@ -3166,68 +3166,6 @@ export class InsiderBot extends EventEmitter {
     }
     if (state.lowFundingMode) {
       if (this.hasSolIncomingToWallet(tx, state.funderWallet)) return false;
-      if (
-        transferOut.amountSol >= BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL &&
-        !state.bundlerWallets.has(transferOut.to) &&
-        !state.lowFundingLargeTransferBuyUsed &&
-        !this.buySubmitted
-      ) {
-        const preferredIndex = this.nextRecipientHeliusPreferredIndex(state);
-        const validation = await this.isValidLowFundingLargeTransferRecipient(
-          state,
-          transferOut.to,
-          tx.timestamp,
-          preferredIndex,
-        );
-        if (validation.valid) {
-          state.lowFundingLargeTransferBuyUsed = true;
-          const watch = this.addBundlerFunderRecipientWatch(state, {
-            recipient: transferOut.to,
-            signature: tx.signature,
-            amountSol: transferOut.amountSol,
-            timestamp: tx.timestamp,
-            buyTriggersEntry: false,
-            normalTinyTransferMode: false,
-          });
-          if (watch) {
-            watch.tokenBuyObserved = true;
-            watch.lowFundingLargeTransferMode = true;
-            watch.firstBuySignature = validation.activitySignature ?? tx.signature;
-            watch.firstBuyTimestamp = tx.timestamp;
-            this.subscribeFunderRecipient(watch.wallet);
-            this.markFunderRecipientDirty(watch.wallet);
-            void this.syncFunderRecipientBatch(true);
-            this.log.warn("Low-funding valid 3.5 SOL+ transfer-out accepted; buying with +200% MC exit", {
-              mint: state.mint,
-              funderWallet: state.funderWallet,
-              recipient: transferOut.to,
-              amountSol: transferOut.amountSol,
-              signature: tx.signature,
-              validationReason: validation.reason,
-              activitySignature: validation.activitySignature ?? null,
-            });
-            await this.emitLowFundingRecipientBuy(
-              state,
-              watch,
-              tx.signature,
-              `valid 3.5 SOL+ low-funding transfer-out accepted: ${validation.reason}`,
-              false,
-              undefined,
-              { exitPercent: BUNDLER_FUNDER_LOW_FUNDING_LARGE_EXIT_PERCENT, disableProfitExit: false },
-            );
-          }
-          return false;
-        }
-        this.log.info("Low-funding 3.5 SOL+ transfer-out skipped: invalid recipient", {
-          mint: state.mint,
-          funderWallet: state.funderWallet,
-          recipient: transferOut.to,
-          amountSol: transferOut.amountSol,
-          signature: tx.signature,
-          validationReason: validation.reason,
-        });
-        return false;
-      }
     }
     let transferOutUsd: number | null = null;
     const solPriceUsd = await this.getCachedSolPriceUsd();
