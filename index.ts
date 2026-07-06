@@ -226,6 +226,8 @@ async function main(): Promise<void> {
         type:
           | "insiderFollowWallet"
           | "insiderBuySol"
+          | "insiderNormalBuySol"
+          | "insiderLowFundingBuySol"
           | "insiderExitPercent"
           | "insiderBundlerMinUsd"
           | "insiderBundlerMaxUsd";
@@ -234,6 +236,7 @@ async function main(): Promise<void> {
     | { type: "bundlerFollowWallet" | "bundlerBuySol" | "bundlerExitPercent" }
     | { type: "reverseTargetWallet" };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
+
   const pendingSells = new Map<
     string,
     { event: FilterFailEvent; createdAt: number; executing: boolean }
@@ -979,6 +982,30 @@ async function main(): Promise<void> {
             editCurrent: true,
           };
         }
+        if (data === "insider:normalbuysol") {
+          activeInsiderIndex = 0;
+          pendingTelegramActions.set(chatId, {
+            type: "insiderNormalBuySol",
+            index: 0,
+          });
+          return {
+            text: "Send the SOL amount Insider Bot should buy with in normal-funding mode.",
+            trackPrompt: true,
+            editCurrent: true,
+          };
+        }
+        if (data === "insider:lowfundingbuysol") {
+          activeInsiderIndex = 0;
+          pendingTelegramActions.set(chatId, {
+            type: "insiderLowFundingBuySol",
+            index: 0,
+          });
+          return {
+            text: "Send the SOL amount Insider Bot should buy with in low-funding mode.",
+            trackPrompt: true,
+            editCurrent: true,
+          };
+        }
         if (data === "insider:exitpercent") {
           activeInsiderIndex = 0;
           pendingTelegramActions.set(chatId, {
@@ -1197,6 +1224,22 @@ async function main(): Promise<void> {
             if (!Number.isFinite(value) || value <= 0)
               return "Send a SOL amount greater than 0.";
             bot.setBuySol(value);
+            return homeReply();
+          }
+          if (pendingAction.type === "insiderNormalBuySol") {
+            const bot = insiderBots[pendingAction.index];
+            const value = Number(text.trim());
+            if (!Number.isFinite(value) || value <= 0)
+              return "Send a SOL amount greater than 0.";
+            bot.setNormalFundingBuySol(value);
+            return homeReply();
+          }
+          if (pendingAction.type === "insiderLowFundingBuySol") {
+            const bot = insiderBots[pendingAction.index];
+            const value = Number(text.trim());
+            if (!Number.isFinite(value) || value <= 0)
+              return "Send a SOL amount greater than 0.";
+            bot.setLowFundingBuySol(value);
             return homeReply();
           }
           if (pendingAction.type === "insiderExitPercent") {
@@ -2967,21 +3010,20 @@ async function main(): Promise<void> {
           monitoredWallet
             ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
             : "",
-          `Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
+          `Default Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
+          `Normal Funding Buy SOL: <b>${html(String(bot.getNormalFundingBuySol()))}</b>`,
+          `Low-Funding Buy SOL: <b>${html(String(bot.getLowFundingBuySol()))}</b>`,
           `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% Current MC from Entry</b>`,
           `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
           "",
           "<b>Flow</b>",
-          "1. Bot 1 follows one wallet; Insider API keys 1–4 are used as the Helius fallback/key pool.",
+          "1. Bot 1 follows one wallet; Insider API keys 1-4 are used as the Helius fallback/key pool.",
           "2. Skip if the follow-wallet buy MC is above $60,000.",
           "3. First four unique bundler-wallet buy txs are checked; the follow wallet must be one of those first-buy wallets.",
-          "4. Each bundler must have a zero-balance funding window; the highest valid funding transfer in that window is selected, and all four selected funding txs must share the same feePayer.",
-          "5. If largest bundler funding is below 15 SOL, low-funding mode first checks feePayer balance after the last initial bundler transfer; if balance is below 15 SOL and the window has 1-5 txs, buy with +50% MC exit. Otherwise watch transfer-outs above 3.5 SOL and wait for receiver buy within first 3 txs.",
-          "6. Otherwise, normal mode watches the shared feePayer from the earliest bundler funding tx for transfer-outs &gt;= the exact largest bundler funding, &lt;= 100 SOL, with at most 2 transfer-out candidates considered.",
-          "7. Normal transfer-out candidates confirm only if the immediate next feePayer tx is not a SOL transfer-in.",
-          "8. Normal and low-funding transfer-out candidates must have the recipient buy this token within its first 3 post-funding txs before the bot copybuys.",
-          "9. After buy: MC target is disabled for recipient-copybuy entries.",
-          "10. Sell on rug, recipient sell-all, or recipient SOL balance reaching zero via Helius balance-at.",
+          "4. Each bundler must have a zero-balance funding window; all four selected funding txs must share one feePayer.",
+          "5. Low-funding mode uses tiny same-band feePayer transfer groups only; normal mode uses normal tiny same-band groups.",
+          "6. Mode-specific buy amounts are used for normal-funding and low-funding entries.",
+          "7. Sell rules depend on the mode/band shown in the buy card; rug exits remain active.",
           "• API guard: Helius calls use a queued four-key pool, transient-only fallback, per-key backoff, and capped recipient batch sync.",
           `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets before buy or sells after buy.`,
         ].join("\n"),
@@ -2993,7 +3035,11 @@ async function main(): Promise<void> {
             ],
             [
               { text: "Follow wallet", callback_data: "insider:follow" },
-              { text: "Buy SOL", callback_data: "insider:buysol" },
+              { text: "Default Buy SOL", callback_data: "insider:buysol" },
+            ],
+            [
+              { text: "Normal Buy SOL", callback_data: "insider:normalbuysol" },
+              { text: "Low-Funding Buy SOL", callback_data: "insider:lowfundingbuysol" },
             ],
             [
               { text: "Set Exit %", callback_data: "insider:exitpercent" },
@@ -3156,7 +3202,9 @@ async function main(): Promise<void> {
         "<b>Primary Insider Bot</b>",
         `Status: ${status}`,
         `Follow: ${followed ?? "not set"}`,
-        `Buy: ${bot?.getBuySol() ?? config.insiderBuySol} SOL`,
+        `Default Buy: ${bot?.getBuySol() ?? config.insiderBuySol} SOL`,
+        `Normal Buy: ${bot?.getNormalFundingBuySol() ?? config.insiderNormalBuySol} SOL`,
+        `Low-Funding Buy: ${bot?.getLowFundingBuySol() ?? config.insiderLowFundingBuySol} SOL`,
         `Helius key pool: ${insiderBots.length} key${insiderBots.length === 1 ? "" : "s"}`,
       ].join("\n");
 

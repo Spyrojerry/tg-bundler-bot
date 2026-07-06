@@ -173,6 +173,8 @@ export interface ServiceConfig {
   insiderSolanaRpcUrl4: string;
   insiderSolanaWsUrl4: string;
   insiderBuySol: number;
+  insiderNormalBuySol: number;
+  insiderLowFundingBuySol: number;
   insiderEntryMc: number;
   insiderExitMc: number;
   insiderExitPercent: number;

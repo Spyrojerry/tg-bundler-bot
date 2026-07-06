@@ -452,6 +452,8 @@ export class InsiderBot extends EventEmitter {
 
   private followedWallet: string | null = null;
   private buySol: number;
+  private normalFundingBuySol: number;
+  private lowFundingBuySol: number;
   private entryMc: number;
   private exitMc: number;
   private exitPercent: number;
@@ -644,6 +646,8 @@ export class InsiderBot extends EventEmitter {
     this.label = label;
     this.log = createLogger(label.toUpperCase());
     this.buySol = config.insiderBuySol;
+    this.normalFundingBuySol = config.insiderNormalBuySol;
+    this.lowFundingBuySol = config.insiderLowFundingBuySol;
     this.entryMc = config.insiderEntryMc;
     this.exitMc = config.insiderExitMc;
     this.exitPercent = config.insiderExitPercent;
@@ -700,10 +704,14 @@ export class InsiderBot extends EventEmitter {
     void this.resetForNewToken(true);
   }
 
-  setBuySol(value: number): void {
+  private assertBuySol(value: number, label = "Insider buy SOL"): void {
     if (!Number.isFinite(value) || value <= 0) {
-      throw new Error("Insider buy SOL must be greater than 0");
+      throw new Error(`${label} must be greater than 0`);
     }
+  }
+
+  setBuySol(value: number): void {
+    this.assertBuySol(value);
     this.buySol = value;
   }
 
@@ -711,6 +719,27 @@ export class InsiderBot extends EventEmitter {
     return this.buySol;
   }
 
+  setNormalFundingBuySol(value: number): void {
+    this.assertBuySol(value, "Insider normal-funding buy SOL");
+    this.normalFundingBuySol = value;
+  }
+
+  getNormalFundingBuySol() {
+    return this.normalFundingBuySol;
+  }
+
+  setLowFundingBuySol(value: number): void {
+    this.assertBuySol(value, "Insider low-funding buy SOL");
+    this.lowFundingBuySol = value;
+  }
+
+  getLowFundingBuySol() {
+    return this.lowFundingBuySol;
+  }
+
+  private getBuySolForFundingMode(lowFundingMode: boolean): number {
+    return lowFundingMode ? this.lowFundingBuySol : this.normalFundingBuySol;
+  }
   setEntryMc(value: number): void {
     if (!Number.isFinite(value) || value < 0) {
       throw new Error("Entry MC must be a non-negative number");
@@ -1682,7 +1711,7 @@ export class InsiderBot extends EventEmitter {
       earliestFundingSignature: earliest.fundingSignature,
       largestFundingSol,
       minTransferOutSol: lowFundingMode
-        ? BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL
+        ? 0
         : largestFundingSol,
       cursorSignature: latest.fundingSignature,
       processedSignatures: new Set(records.map((record) => record.fundingSignature)),
@@ -1778,9 +1807,13 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `FeePayer: <code>${funderWallet}</code>`,
         `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b>`,
-        `Watching feePayer transfer-outs: <b>${activeFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
+        activeFunderWatch.lowFundingMode
+          ? `Watching feePayer tiny transfer-outs: <b>$${BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD.toFixed(2)}-$${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)}</b>`
+          : `Watching feePayer transfer-outs: <b>${activeFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
         "",
-        "Transfer-outs that pass the filters are watched until the recipient buys this token.",
+        activeFunderWatch.lowFundingMode
+          ? "Low-funding mode uses tiny same-band groups only."
+          : "Transfer-outs that pass the filters are watched until the recipient buys this token.",
       ].join("\n"),
       "shared feePayer notification",
     );
@@ -1855,8 +1888,7 @@ export class InsiderBot extends EventEmitter {
       sharedFeePayer: state.funderWallet,
       largestFundingSol: state.largestFundingSol,
       lowFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
-      lowFundingCandidateMinTransferOutSol:
-        BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL,
+      lowFundingTinyTransferUsdBand: `$${BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD.toFixed(2)}-$${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)}`,
       syncStartSignature: syncStart.signature,
       syncStartTimestamp: syncStart.timestamp,
       syncStartBundlerWallet: syncStart.bundlerWallet,
@@ -1865,7 +1897,7 @@ export class InsiderBot extends EventEmitter {
       minWindowTxsForImmediateBuy: 1,
       maxWindowTxsForImmediateBuy:
         BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS,
-      transferOutTxCount: transferOuts.length,
+      legacyLargeTransferOutTxCount: 0,
       maxTransferOutTxs: BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS,
       largestIncomingSol,
       sharedFeePayerBalanceAtSyncStart: sharedFeePayerBalanceAtSyncStart.balance,
@@ -1877,17 +1909,10 @@ export class InsiderBot extends EventEmitter {
       action:
         lowFundingImmediateBuyAllowed
           ? "use low-funding tiny-transfer grouping flow"
-          : transferOuts.length > 0
-          ? "watch recipients for token buy in first 3 txs"
           : sharedFeePayerBalanceBelowLowFundingThreshold
           ? "skip immediate low-funding buy because window tx count is not between 1 and 5"
-          : "waiting for low-funding transfer-out candidate",
-      transferOuts: transferOuts.map((entry) => ({
-        signature: entry.tx.signature,
-        timestamp: entry.tx.timestamp,
-        recipient: entry.transferOut.to,
-        amountSol: entry.transferOut.amountSol,
-      })),
+          : "waiting for low-funding tiny transfer grouping",
+      legacyLargeTransferOuts: [],
       skippedBundlerRecipients: allTransferOuts
         .filter((entry) => state.bundlerWallets.has(entry.transferOut.to))
         .map((entry) => ({
@@ -1898,7 +1923,7 @@ export class InsiderBot extends EventEmitter {
         })),
     });
 
-    this.log.info("Low-funding immediate/>3.5 SOL buy path disabled; using tiny transfer grouping flow", {
+    this.log.info("Low-funding large-transfer buy path disabled; using tiny transfer grouping flow", {
       mint: state.mint,
       sharedFeePayer: state.funderWallet,
       tinyTransferMaxUsd: BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD,
@@ -4211,7 +4236,7 @@ export class InsiderBot extends EventEmitter {
         followedWallet: this.followedWallet!,
         mint: state.mint,
         signature,
-        buySol: this.buySol,
+        buySol: this.getBuySolForFundingMode(state.lowFundingMode),
         entryMc: currentMc,
         monitoredWallet: state.funderWallet,
         tradersListStr: [
@@ -4299,7 +4324,7 @@ export class InsiderBot extends EventEmitter {
         followedWallet: this.followedWallet!,
         mint: state.mint,
         signature,
-        buySol: this.buySol,
+        buySol: this.getBuySolForFundingMode(state.lowFundingMode),
         entryMc: currentMc,
         monitoredWallet: watch.wallet,
         tradersListStr: [
@@ -4307,7 +4332,7 @@ export class InsiderBot extends EventEmitter {
           `FeePayer: <code>${state.funderWallet}</code>`,
           `Recipient: <code>${watch.wallet}</code>`,
           `Transfer-out: <b>${watch.outAmountSol.toFixed(4)} SOL</b>`,
-          `Low-funding candidate threshold: <b>${BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL.toFixed(2)} SOL</b>`,
+          `Low-funding tiny band: <b>$${BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD.toFixed(2)}-$${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)}</b>`,
           `Trigger tx: <code>${signature}</code>`,
           `Buy gate: <b>${gateDescription}</b>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
@@ -4385,7 +4410,7 @@ export class InsiderBot extends EventEmitter {
         followedWallet: this.followedWallet!,
         mint: state.mint,
         signature,
-        buySol: this.buySol,
+        buySol: this.getBuySolForFundingMode(state.lowFundingMode),
         entryMc: currentMc,
         monitoredWallet: watch.wallet,
         tradersListStr: [
@@ -4618,7 +4643,7 @@ export class InsiderBot extends EventEmitter {
 
     await this.triggerPositionSell(
       state.mint,
-      `Low-funding 3.5 SOL+ recipient ${watch.wallet} bought below $${BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD.toFixed(0)} after bot entry`,
+      `Low-funding large-transfer recipient ${watch.wallet} bought below $${BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD.toFixed(0)} after bot entry`,
       [
         `<b>🚨 ${this.label} Low-Funding Recipient Buy Too Small</b>`,
         `Token: <code>${state.mint}</code>`,
@@ -4630,7 +4655,7 @@ export class InsiderBot extends EventEmitter {
         buyUsd !== null ? `Buy USD: <b>$${buyUsd.toFixed(2)}</b>` : "Buy USD: <b>unknown</b>",
         `Required: <b>$${BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD.toFixed(0)}+</b>`,
         "",
-        "Bot already entered from the valid 3.5 SOL+ low-funding path, so selling now.",
+        "Bot already entered from the legacy low-funding large-transfer path, so selling now.",
       ],
       tx.signature,
     );

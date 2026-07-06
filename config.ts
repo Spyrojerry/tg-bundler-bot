@@ -174,6 +174,8 @@ export function loadConfig(): ServiceConfig {
   const sellSlippage           = optionalNumber('SELL_SLIPPAGE', 50);
   const sellPriorityFeeSol     = optionalNumber('SELL_PRIORITY_FEE_SOL', 0.000012);
   const insiderBuySol          = optionalNumber('INSIDER_BUY_SOL', 0.01);
+  const insiderNormalBuySol    = optionalNumber('INSIDER_NORMAL_BUY_SOL', insiderBuySol);
+  const insiderLowFundingBuySol = optionalNumber('INSIDER_LOW_FUNDING_BUY_SOL', insiderBuySol);
   const insiderEntryMc         = optionalNumber('INSIDER_ENTRY_MC', 15_000);
   const insiderExitMc          = optionalNumber('INSIDER_EXIT_MC', 30_000);
   const insiderExitPercent     = optionalNumber('INSIDER_EXIT_PERCENT', 40);
@@ -257,6 +259,8 @@ export function loadConfig(): ServiceConfig {
     insiderSolanaRpcUrl4,
     insiderSolanaWsUrl4,
     insiderBuySol,
+    insiderNormalBuySol,
+    insiderLowFundingBuySol,
     insiderEntryMc,
     insiderExitMc,
     insiderExitPercent,
