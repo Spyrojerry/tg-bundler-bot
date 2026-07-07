@@ -62,9 +62,9 @@ const BUNDLER_FUNDER_LOW_FUNDING_LARGE_EXIT_PERCENT = 180;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_EXIT_MC_USD = 25_000;
 const BUNDLER_FUNDER_LOW_FUNDING_LARGE_SWAP_HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS = 10;
-const BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD = 2.5;
+const BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD = 2;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD = 5;
-const BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD = 2.5;
+const BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD = 2;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD = 5;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
@@ -2773,14 +2773,13 @@ export class InsiderBot extends EventEmitter {
       solBalanceSubscription: this.recipientSolBalanceSubIds.has(wallet),
     });
   }
-  private isNormalHighBandTinyWatch(
+  private isNormalTinyWalletExitDisabled(
     state: BundlerFunderWatchState,
     watch: FunderRecipientWatch,
   ): boolean {
     return (
       !state.lowFundingMode &&
-      watch.normalTinyTransferMode &&
-      watch.normalTinyExitPercent === BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT
+      watch.normalTinyTransferMode
     );
   }
   private async handleFunderRecipientSolAccountChange(
@@ -2791,7 +2790,7 @@ export class InsiderBot extends EventEmitter {
     const watch = state?.recipientWatches.get(wallet);
     if (!state || !watch) return;
     if (!watch.firstBuySignature || this.phase !== "holding") return;
-    if (this.isNormalHighBandTinyWatch(state, watch)) return;
+    if (this.isNormalTinyWalletExitDisabled(state, watch)) return;
     if (this.positionSellTriggered || lamports > 0n) return;
     const marker = `account-subscribe-sol-zero:${wallet}`;
     if (watch.zeroSolBalanceSignatures.has(marker)) return;
@@ -3345,7 +3344,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${state.mint}</code>`,
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Group: <b>${selectedGroup.length}/${BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES}</b> same USD band within ${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s`,
-        `Band: <b>${tinyUsdBand === "2_5_to_5" ? "$2.50-$5.00" : ">$5.00-$10.00"}</b>`,
+        `Band: <b>${tinyUsdBand === "2_5_to_5" ? "$2.00-$5.00" : ">$5.00-$10.00"}</b>`,
         `Selected exit: <b>+${exitPercent}% MC</b>`,
         ...selectedGroup.map((entry, index) => `${index + 1}. <code>${entry.recipient}</code> — $${entry.amountUsd.toFixed(2)} — <code>${entry.signature}</code>`),
       ].join("\n"),
@@ -4001,7 +4000,7 @@ export class InsiderBot extends EventEmitter {
             `Bundler tiny transfers: <b>${bundlerGroup.length}</b>`,
             `Window: <b>${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s</b>`,
             "",
-            "Waiting for the next $2.50-$5 tiny transfer to a non-bundler wallet with prior activity in this token.",
+            "Waiting for the next $2-$5 tiny transfer to a non-bundler wallet with prior activity in this token.",
           ].join("\n"),
           "low-funding tiny bundler gate notification",
         );
@@ -4168,7 +4167,7 @@ export class InsiderBot extends EventEmitter {
           `<b>🟡 ${this.label} Low-Funding Tiny Candidate Pending</b>`,
           `Token: <code>${state.mint}</code>`,
           `Recipient: <code>${watch.wallet}</code>`,
-          `Band: <b>$2.50-$5</b>`,
+          `Band: <b>$2-$5</b>`,
           `Funding tx: <code>${tx.signature}</code>`,
           `Dev: <code>${this.devWallet ?? "unknown"}</code>`,
           "",
@@ -5048,8 +5047,8 @@ export class InsiderBot extends EventEmitter {
             `Tracked amount: <b>${watch.boughtAmount.toLocaleString()}</b>`,
             "",
             watch.normalTinyTransferMode
-              ? this.isNormalHighBandTinyWatch(state, watch)
-                ? "Exit watch armed: +180% MC target remains active; rug exits remain active. Recipient sell-all and SOL-zero exits are disabled for this normal >$5-$10 tiny path."
+              ? this.isNormalTinyWalletExitDisabled(state, watch)
+                ? "Exit watch armed: configured MC target remains active; rug exits remain active. Recipient sell-all and SOL-zero exits are disabled for normal tiny paths."
                 : "Exit watch armed: configured % MC target remains active. Bot will also sell on rug, recipient sell-all, or recipient SOL balance reaching zero on a new post-funding tx notification."
               : state.lowFundingMode
               ? "Exit watch armed: MC profit target is disabled. Bot will sell on rug or clean post-entry 4-bundler tiny-transfer exit."
@@ -5174,7 +5173,7 @@ export class InsiderBot extends EventEmitter {
     if (
       (soldAllByTxBalance || soldAllByTrackedAmount) &&
       this.phase === "holding" &&
-      !this.isNormalHighBandTinyWatch(state, watch)
+      !this.isNormalTinyWalletExitDisabled(state, watch)
     ) {
       watch.soldAllSignature = tx.signature;
       if (state.lowFundingMode && watch.lowFundingTinyUsdBand) {
