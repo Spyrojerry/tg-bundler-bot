@@ -1347,8 +1347,6 @@ async function main(): Promise<void> {
       definition.rpcUrl,
       definition.wsUrl,
       gmgnClients[index],
-      gmgnClients[index],
-      gmgnClients[index],
       definition.heliusApiKey,
       definition.heliusProjectId,
       telegramBot,

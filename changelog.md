@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-07-08
+
+### Removed legacy Axiom/authority-pattern-matching code
+
+- Deleted the entire dead Axiom single-buy trader scan and lookup-table-authority pattern-matching subsystem from `insider-bot.ts` (~2,600 lines): `AxiomWatchedWallet`, `AuthorityMonitorState`, `AuthorityPatternWalletState`, `AuthorityCandidateWallet`, `LargeBuyerWatchState`, `ExistingAtaWalletSolBalance`, and `SimilarSolBalanceGroup` interfaces; all `axiom*`/`authority*`/`largeBuyer*` state fields, timers, and WS subscription maps; and ~30 methods (`startAxiomAtaPollLoop`, `checkAxiomWatchedWalletAtaExits`, `startAuthorityTriggerFlow`, `syncAuthorityTransactions`, `syncLargeBuyerAtaBalances`, `scanAxiomSingleBuyTradersPreBuy/PostBuy`, etc.).
+- This flow had already been superseded by the shared feePayer tracing system (see below) and was unreachable dead code — its only entry points were behind conditions (`this.monitoredWallet`, `this.authorityMonitor`) that current buy flows never set.
+- Trimmed `InsiderBot`'s constructor from 3 `GmgnClient` params to 1 (`bundlerGmgnClient` and `preBuyAxiomGmgnClient` were only used by the removed Axiom scans); updated the `index.ts` instantiation to match.
+- `rearmPositionMonitoringAfterSellFailure` and `markPositionBought` now re-sync the shared feePayer / funder-recipient watchers instead of the removed authority monitor.
+- Behavior is unchanged for the live flow — the shared feePayer buy/sell/exit logic was not touched.
+
+### Shared feePayer tracing rewrite (retroactive summary)
+
+The insider bot's core detection/entry logic was rewritten to trace the shared **feePayer** funding early bundler buyers, replacing the old GMGN/Axiom trader-scan and lookup-table-authority pattern-matching approach:
+
+- **Normal-funding mode** (feePayer holds ≥15 SOL): watches small ($2–$10) same-band transfer-outs from the feePayer to recipient wallets to trigger buys. Exit is +90% MC for the $2–$5 band or +180% MC for the $5–$10 band.
+- **Low-funding mode** (feePayer holds <15 SOL): uses its own tiny same-band grouping, gated by a dev-wallet buy-after-create event, with a fixed $25k MC exit.
+- **Live SOL-zero exit**: real-time sell trigger via `onAccountChange` when a recipient wallet's SOL balance drops to zero.
+- **Shared feePayer migration**: automatically switches the monitored feePayer if the current one drains >100 SOL, so tracking follows the active funding wallet.
+- **Helius API pooling**: requests rotate across multiple Helius API keys with backoff and rate-limit handling for reliability.
+
 ## 2026-06-15
 
 ### Telegram refresh P/L & MC fixes
