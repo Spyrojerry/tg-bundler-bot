@@ -5,7 +5,7 @@
 //    1. Load + validate environment config
 //    2. Open SQLite database
 //    3. Initialise RateLimiter + GmgnClient
-//    4. Initialise EarlyBundlerOrchestrator
+//    4. Initialise TokenTransferOrchestrator
 //    5. Initialise TelegramBot
 //    6. Register SIGINT/SIGTERM for graceful shutdown
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,10 +28,8 @@ import {
   NewTokenEvent,
   SellResult,
   SellQuote,
-  TokenExitEvent,
 } from "./types";
-import { EarlyBundlerOrchestrator } from "./early-bundler-orchestrator";
-import { ReverseCopySellOrchestrator } from "./reverse-copysell-orchestrator";
+import { TokenTransferOrchestrator } from "./token-transfer-orchestrator";
 import { InsiderBot } from "./insider-bot";
 import type { InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
@@ -208,16 +206,13 @@ async function main(): Promise<void> {
   const insiderBots: InsiderBot[] = [];
   let activeInsiderIndex = 0; // Insider UI is pinned to bot 1; keys 2-4 provide API capacity.
 
-  // ── 4. Early Bundler Orchestrator ─────────────────────────────────────────
-  let earlyBundlerOrchestrator: EarlyBundlerOrchestrator;
-  let reverseCopySellOrchestrator: ReverseCopySellOrchestrator;
-  let botMode: "insider" | "bundler" | "reverse_copysell" =
-    config.defaultBotMode;
-  let bundlerBuyInProgress = false;
+  // ── 4. Token Transfer Orchestrator ────────────────────────────────────────
+  let tokenTransferOrchestrator: TokenTransferOrchestrator;
+  let botMode: "insider" | "tokentransfer" = config.defaultBotMode;
+  let tokenTransferBuyInProgress = false;
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
-  let tradingWalletMonitor: WalletMonitor | null = null;
   const pendingTradingBuys = new Map<string, NewTokenEvent>();
   type PendingTelegramAction =
     | { type: "addwallet" | "removewallet" }
@@ -233,8 +228,7 @@ async function main(): Promise<void> {
           | "insiderBundlerMaxUsd";
         index: number;
       }
-    | { type: "bundlerFollowWallet" | "bundlerBuySol" | "bundlerExitPercent" }
-    | { type: "reverseTargetWallet" };
+    | { type: "tokenTransferDevAddress" | "tokenTransferBuySol" };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
 
   const pendingSells = new Map<
@@ -667,13 +661,11 @@ async function main(): Promise<void> {
         if (data === "menu:refresh") return homeReply(true);
         if (data.startsWith("r:m:")) {
           const [, , mint, contextCode] = parts;
-          let context: "insider" | "bundler" | "reverse_copysell" = "bundler";
+          let context: "insider" | "tokentransfer" = "tokentransfer";
           let resolvedBotIndex: number | null = null;
 
-          if (contextCode === "b") {
-            context = "bundler";
-          } else if (contextCode === "r") {
-            context = "reverse_copysell";
+          if (contextCode === "t") {
+            context = "tokentransfer";
           } else if (contextCode === "i" || contextCode?.startsWith("i")) {
             context = "insider";
             if (contextCode && contextCode.length > 1) {
@@ -773,28 +765,13 @@ async function main(): Promise<void> {
             entryMc = bot.getEntryMc();
             exitMc = bot.getExitMc();
             insiderProfitExitDisabled = bot.isProfitExitDisabled();
-          } else if (context === "bundler") {
-            const position = earlyBundlerOrchestrator.getActivePosition();
-            buySol = position?.buySol ?? earlyBundlerOrchestrator.getBuySol();
+          } else if (context === "tokentransfer") {
+            const position = tokenTransferOrchestrator.getActivePosition();
+            buySol = position?.buySol ?? tokenTransferOrchestrator.getBuySol();
             entryMc = position?.entryMc ?? null;
-            exitMc =
-              entryMc !== null
-                ? entryMc *
-                  (1 + earlyBundlerOrchestrator.getExitPercent() / 100)
-                : null;
-          } else if (context === "reverse_copysell") {
-            buySol =
-              reverseCopySellOrchestrator.getActivePosition()?.buySol ?? 0;
-          }
-
-          if (buySol === 0 && config.tradingWalletAddress) {
-            const dbPosition = db.getActiveEarlyBundlerPosition(
-              config.tradingWalletAddress,
-              mint,
-            );
-            if (dbPosition?.buySol) {
-              buySol = dbPosition.buySol;
-            }
+            // Token Transfer mode has no automatic MC exit target — the
+            // position is only ever closed via the manual Sell Position button.
+            exitMc = null;
           }
 
           const marketCapPnlPct =
@@ -812,18 +789,12 @@ async function main(): Promise<void> {
               : null;
 
           const refreshContextCode =
-            context === "insider"
-              ? `i${effectiveBotIndex}`
-              : context === "reverse_copysell"
-                ? "r"
-                : "b";
+            context === "insider" ? `i${effectiveBotIndex}` : "t";
 
           const lines = [
             context === "insider"
               ? `<b>Insider ${getInsiderBotNumber(effectiveBotIndex)} Position Update</b>`
-              : context === "reverse_copysell"
-                ? "<b>Reverse CopySell Update</b>"
-                : "<b>Bundler Position Update</b>",
+              : "<b>Token Transfer Position Update</b>",
             `Token: <code>${html(mint)}</code>`,
             entryMc !== null
               ? `Entry MC: <b>$${entryMc.toLocaleString()}</b>`
@@ -834,9 +805,7 @@ async function main(): Promise<void> {
               : null,
             context === "insider" && exitMc !== null
               ? `Exit MC: <b>$${exitMc.toLocaleString()}</b>`
-              : context === "bundler" && exitMc !== null
-                ? `Exit MC: <b>$${exitMc.toLocaleString()}</b>`
-                : null,
+              : null,
             context === "insider" && insiderProfitExitDisabled
               ? "Exit MC status: <b>Disabled — waiting for recipient sell-all/zero-SOL exit</b>"
               : null,
@@ -848,10 +817,13 @@ async function main(): Promise<void> {
 
           const buttons = [];
 
-          if (context === "insider" && !balanceIsZero) {
+          if ((context === "insider" || context === "tokentransfer") && !balanceIsZero) {
             buttons.push({
               text: "🔴 Sell Position",
-              callback_data: `sell:insider:${mint}:${effectiveBotIndex}`,
+              callback_data:
+                context === "insider"
+                  ? `sell:insider:${mint}:${effectiveBotIndex}`
+                  : `sell:tokentransfer:${mint}`,
             });
             buttons.push({
               text: "🔄 Refresh",
@@ -894,64 +866,90 @@ async function main(): Promise<void> {
 
           return "Sell signal sent.";
         }
+        if (data.startsWith("sell:tokentransfer:")) {
+          const [, , mint] = parts;
+          const position = tokenTransferOrchestrator.getActivePosition();
+          if (!position || position.mint !== mint) {
+            return "No active Token Transfer position for that token.";
+          }
+          if (!config.tradingWalletAddress) {
+            return "No TRADING_WALLET_ADDRESS configured.";
+          }
+          if (
+            hasPendingSellForMint(config.tradingWalletAddress, mint)
+          ) {
+            return "Sell already pending for this token.";
+          }
+
+          const event: FilterFailEvent = {
+            walletAddress: config.tradingWalletAddress,
+            mint,
+            sampleNumber: 0,
+            elapsedSec: 0,
+            reasons: ["Manual sell requested via Telegram button (Token Transfer mode)."],
+            settings: db.getWalletSettings(config.tradingWalletAddress),
+            metrics: {
+              mint,
+              timestamp: new Date().toISOString(),
+              bundlersPercent: null,
+              bundlersCount: null,
+              initialBaseReserve: null,
+              topWallets: null,
+              top10HolderRate: null,
+              bundledAmountRate: null,
+            },
+            buySol: position.buySol,
+            matchingWallets: [],
+          };
+
+          const sellId = randomBytes(5).toString("hex");
+          pendingSells.set(sellId, {
+            event,
+            createdAt: Date.now(),
+            executing: true,
+          });
+          tokenTransferOrchestrator.clearActivePosition();
+
+          void executeSellAndNotify(chatId, sellId, telegramBot);
+          return "Sell signal sent.";
+        }
         if (data === "menu:wallets") return walletsReply(chatId, true);
         if (data === "menu:status") return statusReply(true);
         if (data === "mode:insider") {
-          await stopBundlerModeServices("Switched to Insider mode");
-          await stopReverseCopySellModeServices("Switched to Insider mode");
+          // Insider and Token Transfer run independently of each other and
+          // stay active in the background regardless of which one is on
+          // screen — this button only changes which card is shown/edited.
           botMode = "insider";
           await resumePrimaryInsiderBot();
           return homeReply(true);
         }
-        if (data === "mode:bundler") {
-          for (const bot of insiderBots) bot.pause();
-          await stopReverseCopySellModeServices("Switched to Bundler mode");
-          botMode = "bundler";
-          await startBundlerModeServices();
+        if (data === "mode:tokentransfer") {
+          botMode = "tokentransfer";
+          await startTokenTransferModeServices();
           return homeReply(true);
         }
-        if (data === "bundler:follow") {
-          pendingTelegramActions.set(chatId, { type: "bundlerFollowWallet" });
+        if (data === "tokentransfer:setdev") {
+          pendingTelegramActions.set(chatId, { type: "tokenTransferDevAddress" });
           return {
-            text: "Send the wallet address for Bundler mode to follow.",
+            text: "Send the dev wallet address for Token Transfer mode to watch.",
             trackPrompt: true,
             editCurrent: true,
           };
         }
-        if (data === "bundler:buysol") {
-          pendingTelegramActions.set(chatId, { type: "bundlerBuySol" });
+        if (data === "tokentransfer:buysol") {
+          pendingTelegramActions.set(chatId, { type: "tokenTransferBuySol" });
           return {
-            text: "Send the SOL amount Bundler mode should buy with.",
+            text: "Send the SOL amount Token Transfer mode should buy with.",
             trackPrompt: true,
             editCurrent: true,
           };
         }
-        if (data === "bundler:exitpercent") {
-          pendingTelegramActions.set(chatId, { type: "bundlerExitPercent" });
-          return {
-            text: "Send the Bundler exit profit percentage increase.\nExample: <code>50</code> for a 50% increase from entry market cap.",
-            trackPrompt: true,
-            editCurrent: true,
-          };
-        }
-        if (data === "bundler:stop") {
-          await earlyBundlerOrchestrator.stopActiveMonitoring(
-            "Stopped from Telegram",
-          );
+        if (data === "tokentransfer:start") {
+          await tokenTransferOrchestrator.start();
           return homeReply(true);
         }
-        if (data === "bundler:resume") {
-          const followedWallet = earlyBundlerOrchestrator.getFollowedWallet();
-          if (!followedWallet) {
-            pendingTelegramActions.set(chatId, { type: "bundlerFollowWallet" });
-            return {
-              text: "Send the wallet address for Bundler mode to follow.",
-              trackPrompt: true,
-              editCurrent: true,
-            };
-          }
-          earlyBundlerOrchestrator.setEnabled(true);
-          await earlyBundlerOrchestrator.followWallet(followedWallet);
+        if (data === "tokentransfer:stop") {
+          tokenTransferOrchestrator.stop("Stopped from Telegram");
           return homeReply(true);
         }
         if (data.startsWith("insider:select:")) {
@@ -1108,14 +1106,6 @@ async function main(): Promise<void> {
           };
         }
         if (callbackKind === "reverse" && callbackAction) {
-          if (callbackAction === "set_target") {
-            pendingTelegramActions.set(chatId, { type: "reverseTargetWallet" });
-            return {
-              text: "Send the Solana wallet address for Reverse CopySell to watch.",
-              trackPrompt: true,
-              editCurrent: true,
-            };
-          }
           if (callbackAddress) {
             const normalized = new PublicKey(callbackAddress).toBase58();
             if (callbackAction === "add") {
@@ -1266,41 +1256,16 @@ async function main(): Promise<void> {
             bot.setBundlerBuyMaxUsd(value);
             return homeReply();
           }
-          if (pendingAction.type === "bundlerFollowWallet") {
-            await earlyBundlerOrchestrator.followWallet(text);
+          if (pendingAction.type === "tokenTransferDevAddress") {
+            tokenTransferOrchestrator.setDevAddress(text.trim());
             return homeReply();
           }
-          if (pendingAction.type === "bundlerBuySol") {
+          if (pendingAction.type === "tokenTransferBuySol") {
             const value = Number(text.trim());
             if (!Number.isFinite(value) || value <= 0)
               return "Send a SOL amount greater than 0.";
-            earlyBundlerOrchestrator.setBuySol(value);
+            tokenTransferOrchestrator.setBuySol(value);
             return homeReply();
-          }
-          if (pendingAction.type === "bundlerExitPercent") {
-            const value = Number(text.trim());
-            if (!Number.isFinite(value) || value < 0)
-              return "Send a valid percentage.";
-            earlyBundlerOrchestrator.setExitPercent(value);
-            return homeReply();
-          }
-          if (pendingAction.type === "reverseTargetWallet") {
-            const trimmed = text.trim().toLowerCase();
-            if (
-              trimmed === "off" ||
-              trimmed === "none" ||
-              trimmed === "clear"
-            ) {
-              config.reverseCopySellTargetWallet = null;
-              return homeReply();
-            }
-            try {
-              const pubkey = new PublicKey(text.trim());
-              config.reverseCopySellTargetWallet = pubkey.toBase58();
-              return homeReply();
-            } catch {
-              return 'Invalid Solana wallet address. Send a valid address, or "off" to clear.';
-            }
           }
         }
         if (botMode === "insider") {
@@ -1436,45 +1401,39 @@ async function main(): Promise<void> {
     telegramBot.start();
   }
 
-  earlyBundlerOrchestrator = new EarlyBundlerOrchestrator(
+  tokenTransferOrchestrator = new TokenTransferOrchestrator(
     config,
-    db,
-    telegramBot,
-    gmgnClients[0],
-  );
-  reverseCopySellOrchestrator = new ReverseCopySellOrchestrator(
-    config,
-    db,
     telegramBot,
   );
 
-  earlyBundlerOrchestrator.on("buyTrigger", (trigger) => {
-    if (botMode !== "bundler") {
+  tokenTransferOrchestrator.on("buyTrigger", (trigger) => {
+    // Token Transfer's dev-wallet watch is started/stopped explicitly via its
+    // own Start/Stop buttons, independent of which card is currently shown —
+    // so a buy trigger here is always honored, even while Insider mode's
+    // card is on screen. (Insider mode's buys are likewise never gated on
+    // which card is shown.) Both can run and buy/sell concurrently.
+    if (!config.tradingWalletAddress) {
+      log.warn("[TOKEN TRANSFER BUY SKIP] No trading wallet configured", trigger);
+      tokenTransferOrchestrator.clearActivePosition();
+      return;
+    }
+
+    if (tokenTransferBuyInProgress) {
       log.info(
-        "[BUNDLER BUY SKIP] Ignoring buy trigger because Bundler mode is inactive",
-        {
-          mint: trigger.position.mint,
-          mode: botMode,
-        },
+        "[TOKEN TRANSFER BUY SKIP] A buy is already in progress",
+        trigger,
       );
       return;
     }
 
-    if (!config.tradingWalletAddress) {
-      log.warn("[BUNDLER BUY SKIP] No trading wallet configured", trigger);
-      earlyBundlerOrchestrator.clearActivePosition();
-      return;
-    }
-
     void (async () => {
-      const { position, matchedWallet } = trigger;
-      bundlerBuyInProgress = true;
+      tokenTransferBuyInProgress = true;
       try {
         const result = await gmgnClients[0].buyTokenWithSol(
           config.tradingWalletAddress!,
-          position.mint,
+          trigger.mint,
           {
-            solAmount: earlyBundlerOrchestrator.getBuySol(),
+            solAmount: tokenTransferOrchestrator.getBuySol(),
             slippage: config.sellSlippage,
             autoSlippage: config.sellAutoSlippage,
             priorityFeeSol: config.sellPriorityFeeSol,
@@ -1482,43 +1441,34 @@ async function main(): Promise<void> {
         );
 
         const entryMc = await gmgnClients[0]
-          .fetchTokenMarketCapUsd(position.mint)
+          .fetchTokenMarketCapUsd(trigger.mint)
           .catch(() => null);
-        earlyBundlerOrchestrator.markPositionBought(
-          {
-            ...position,
-            tradingWallet: config.tradingWalletAddress!,
-            buySol: earlyBundlerOrchestrator.getBuySol(),
-          },
-          entryMc,
-        );
-
-        const exitMc =
-          entryMc !== null
-            ? entryMc * (1 + earlyBundlerOrchestrator.getExitPercent() / 100)
-            : null;
+        tokenTransferOrchestrator.markPositionBought(entryMc);
 
         await telegramBot?.sendDefault(
           [
-            "<b>✅ Bundler Buy Completed</b>",
-            `Token: <code>${html(position.mint)}</code>`,
-            `Repeated feePayer: <code>${html(matchedWallet)}</code>`,
-            `Actual Entry MC: <b>$${html(entryMc?.toLocaleString() ?? "Unknown")}</b>`,
-            exitMc !== null
-              ? `Exit MC: <b>$${html(exitMc.toLocaleString())}</b>`
-              : `Exit: <b>+${html(String(earlyBundlerOrchestrator.getExitPercent()))}% after entry MC is known</b>`,
+            "<b>✅ Token Transfer Buy Completed</b>",
+            `Token: <code>${html(trigger.mint)}</code>`,
+            `Dev wallet: <code>${html(trigger.devAddress)}</code>`,
+            `Sent to: <code>${html(trigger.recipient)}</code>`,
+            `Entry MC: <b>$${html(entryMc?.toLocaleString() ?? "Unknown")}</b>`,
             `Status: <b>${html(result.status)}</b>`,
             result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : "",
           ]
             .filter(Boolean)
             .join("\n"),
           {
+            pin: true,
             replyMarkup: {
               inline_keyboard: [
                 [
                   {
+                    text: "🔴 Sell Position",
+                    callback_data: `sell:tokentransfer:${trigger.mint}`,
+                  },
+                  {
                     text: "🔄 Refresh P/L & MC",
-                    callback_data: `r:m:${position.mint}:b`,
+                    callback_data: `r:m:${trigger.mint}:t`,
                   },
                 ],
               ],
@@ -1526,173 +1476,19 @@ async function main(): Promise<void> {
           },
         );
       } catch (err) {
-        log.error("Bundler buy failed", err);
-        earlyBundlerOrchestrator.clearActivePosition();
+        log.error("Token Transfer buy failed", err);
+        tokenTransferOrchestrator.clearActivePosition();
         await telegramBot?.sendDefault(
           [
-            "<b>❌ Bundler Buy Failed</b>",
-            `Token: <code>${html(position.mint)}</code>`,
+            "<b>❌ Token Transfer Buy Failed</b>",
+            `Token: <code>${html(trigger.mint)}</code>`,
             `Error: ${html(err instanceof Error ? err.message : String(err))}`,
           ].join("\n"),
         );
       } finally {
-        bundlerBuyInProgress = false;
+        tokenTransferBuyInProgress = false;
       }
     })();
-  });
-
-  earlyBundlerOrchestrator.on("sellTrigger", (trigger) => {
-    if (botMode !== "bundler") {
-      log.info(
-        "[BUNDLER SELL SKIP] Ignoring sell trigger because Bundler mode is inactive",
-        {
-          mint: trigger.position.mint,
-          mode: botMode,
-          reason: trigger.reason,
-        },
-      );
-      return;
-    }
-
-    if (!config.tradingWalletAddress) {
-      log.warn("[BUNDLER SELL SKIP] No trading wallet configured", trigger);
-      return;
-    }
-
-    if (
-      hasPendingSellForMint(config.tradingWalletAddress, trigger.position.mint)
-    ) {
-      log.info(
-        `[BUNDLER SELL SKIP] Sell already pending for ${trigger.position.mint}`,
-      );
-      return;
-    }
-
-    void (async () => {
-      const owner = new PublicKey(config.tradingWalletAddress!);
-      const mintPk = new PublicKey(trigger.position.mint);
-      const balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
-
-      if (balance <= 0n) {
-        log.info(
-          "[BUNDLER SELL SKIP] No position held; resetting orchestrator",
-          {
-            mint: trigger.position.mint,
-            reason: trigger.reason,
-          },
-        );
-        earlyBundlerOrchestrator.clearActivePosition();
-        return;
-      }
-
-      const event: FilterFailEvent = {
-        walletAddress: config.tradingWalletAddress!,
-        mint: trigger.position.mint,
-        sampleNumber: 0,
-        elapsedSec: 0,
-        reasons: [
-          trigger.reason ??
-            "Bundler creator_hold_rate is 0; selling existing position.",
-        ],
-        settings: db.getWalletSettings(config.tradingWalletAddress!),
-        metrics: {
-          mint: trigger.position.mint,
-          timestamp: new Date().toISOString(),
-          bundlersPercent: null,
-          bundlersCount: null,
-          initialBaseReserve: null,
-          topWallets: null,
-          top10HolderRate: null,
-          bundledAmountRate: null,
-        },
-        buySol: trigger.position.buySol,
-        matchingWallets: trigger.position.matchedWallet
-          ? [trigger.position.matchedWallet]
-          : [],
-      };
-
-      const sellId = randomBytes(5).toString("hex");
-      activePositionCache.set(trigger.position.mint, {
-        balance,
-        quote: null,
-        timestamp: Date.now(),
-      });
-      pendingSells.set(sellId, {
-        event,
-        createdAt: Date.now(),
-        executing: true,
-      });
-
-      telegramBot
-        ?.sendDefault(
-          [
-            "<b>🚨 Bundler Creator Hold Sell Triggered</b>",
-            `Token: <code>${html(trigger.position.mint)}</code>`,
-            `Reason: <b>${html(trigger.reason ?? "creator_hold_rate is 0")}</b>`,
-            `Action: submit sell for <b>${config.sellPercent}%</b>.`,
-          ].join("\n"),
-        )
-        .catch((err) =>
-          log.warn("Telegram bundler creator-hold sell alert failed", err),
-        );
-
-      void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
-    })();
-  });
-
-  reverseCopySellOrchestrator.on("sellTrigger", (data) => {
-    if (botMode !== "reverse_copysell") return;
-
-    const { position, targetWallet } = data;
-
-    // Check if sell already pending
-    if (hasPendingSellForMint(position.tradingWallet, position.mint)) {
-      log.info(
-        `[REVERSE-COPYSELL SELL SKIP] Sell already pending for ${position.mint}`,
-      );
-      return;
-    }
-
-    pendingTradingBuys.delete(position.mint);
-
-    const event: FilterFailEvent = {
-      walletAddress: position.tradingWallet,
-      mint: position.mint,
-      sampleNumber: 0,
-      elapsedSec: 0,
-      reasons: [
-        `Reverse CopySell trigger: Target wallet ${targetWallet} bought the token`,
-      ],
-      settings: db.getWalletSettings(position.tradingWallet),
-      metrics: {
-        mint: position.mint,
-        timestamp: new Date().toISOString(),
-        bundlersPercent: null,
-        bundlersCount: null,
-        initialBaseReserve: null,
-        topWallets: null,
-        top10HolderRate: null,
-        bundledAmountRate: null,
-      },
-      buySol: position.buySol,
-      matchingWallets: [targetWallet],
-    };
-
-    const sellId = randomBytes(5).toString("hex");
-    pendingSells.set(sellId, {
-      event,
-      createdAt: Date.now(),
-      executing: true,
-    });
-
-    log.info(
-      `[REVERSE-COPYSELL SELL TRIGGER] Target ${targetWallet} for ${position.mint}`,
-      {
-        sellId,
-      },
-    );
-
-    void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
   });
 
   insiderBots.forEach((bot, index) => {
@@ -2107,40 +1903,9 @@ async function main(): Promise<void> {
     void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
   }
 
-  function wireTradingWalletMonitor(walletMonitor: WalletMonitor): void {
-    walletMonitor.on("newToken", (event: NewTokenEvent) => {
-      if (botMode === "reverse_copysell") {
-        log.info(
-          `[REVERSE-COPYSELL POSITION OPEN] Wallet: ${event.walletAddress} Mint: ${event.mint}`,
-        );
-        reverseCopySellOrchestrator
-          .handleTradingWalletBuy(event)
-          .catch((err) => {
-            log.error("Failed to trigger reverse-copysell detection", err);
-          });
-      }
-    });
-
-    walletMonitor.on("tokenExited", (event: TokenExitEvent) => {
-      if (botMode === "reverse_copysell") {
-        log.info(
-          `[REVERSE-COPYSELL POSITION EXITED] Wallet: ${event.walletAddress} Mint: ${event.mint}`,
-        );
-        reverseCopySellOrchestrator
-          .handleTradingWalletExit(event)
-          .catch((err) => {
-            log.error(
-              "Failed to notify reverse-copysell orchestrator of exit",
-              err,
-            );
-          });
-      }
-    });
-  }
-
   function wireWatchedWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on("newToken", (event: NewTokenEvent) => {
-      if (botMode !== "bundler") return;
+      if (botMode !== "tokentransfer") return;
       log.info(
         `[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`,
       );
@@ -2161,7 +1926,7 @@ async function main(): Promise<void> {
 
   async function checkAndSellIfLowMcap(
     mint: string,
-    context: "insider" | "bundler" | "reverse_copysell",
+    context: "insider",
     botIndex?: number,
     preFetchedMc?: number | null,
   ): Promise<void> {
@@ -2170,9 +1935,7 @@ async function main(): Promise<void> {
 
     try {
       const client =
-        context === "insider" && botIndex !== undefined
-          ? gmgnClients[botIndex]
-          : gmgnClients[0];
+        botIndex !== undefined ? gmgnClients[botIndex] : gmgnClients[0];
       const currentMc =
         preFetchedMc !== undefined
           ? preFetchedMc
@@ -2219,18 +1982,10 @@ async function main(): Promise<void> {
             top10HolderRate: null,
             bundledAmountRate: null,
           },
-          buySol:
-            context === "insider"
-              ? (
-                  insiderBots.find(
-                    (b) => b.getActivePosition()?.mint === mint,
-                  ) || insiderBots[0]
-                ).getBuySol()
-              : context === "reverse_copysell"
-                ? (reverseCopySellOrchestrator.getActivePosition()?.buySol ??
-                  null)
-                : (earlyBundlerOrchestrator.getActivePosition()?.buySol ??
-                  null),
+          buySol: (
+            insiderBots.find((b) => b.getActivePosition()?.mint === mint) ||
+            insiderBots[0]
+          ).getBuySol(),
           matchingWallets: [],
         };
 
@@ -2241,17 +1996,8 @@ async function main(): Promise<void> {
           executing: true,
         });
 
-        if (context === "insider") {
-          // Keep the active position until the sell is confirmed. The pending
-          // sell map suppresses duplicate MC-triggered attempts meanwhile.
-        } else if (context === "bundler") {
-          earlyBundlerOrchestrator.clearActivePosition();
-          pendingTradingBuys.delete(mint);
-        } else if (context === "reverse_copysell") {
-          reverseCopySellOrchestrator.stopActiveMonitoring(
-            "Market cap fell below minimum",
-          );
-        }
+        // Keep the active position until the sell is confirmed. The pending
+        // sell map suppresses duplicate MC-triggered attempts meanwhile.
 
         telegramBot
           ?.sendDefault(
@@ -2269,106 +2015,6 @@ async function main(): Promise<void> {
       }
     } catch (err) {
       log.error(`Failed to check market cap for ${mint}`, err);
-    }
-  }
-
-  async function checkBundlerMcapFlow(
-    preFetchedMc?: number | null,
-  ): Promise<void> {
-    const position = earlyBundlerOrchestrator.getActivePosition();
-    if (bundlerBuyInProgress) return;
-    if (!position || !config.tradingWalletAddress) return;
-    if (hasPendingSellForMint(config.tradingWalletAddress, position.mint))
-      return;
-
-    try {
-      const currentMc =
-        preFetchedMc !== undefined
-          ? preFetchedMc
-          : await gmgnClients[0].fetchTokenMarketCapUsd(position.mint);
-      if (currentMc === null) return;
-
-      await checkAndSellIfLowMcap(
-        position.mint,
-        "bundler",
-        undefined,
-        currentMc,
-      );
-      if (!earlyBundlerOrchestrator.getActivePosition()) return;
-
-      let entryMc = position.entryMc ?? null;
-      if (entryMc === null) {
-        entryMc = currentMc;
-        earlyBundlerOrchestrator.markPositionBought(position, entryMc);
-      }
-
-      const exitMc =
-        entryMc * (1 + earlyBundlerOrchestrator.getExitPercent() / 100);
-      if (currentMc < exitMc) return;
-
-      const event: FilterFailEvent = {
-        walletAddress: config.tradingWalletAddress,
-        mint: position.mint,
-        sampleNumber: 0,
-        elapsedSec: 0,
-        reasons: [
-          `Bundler exit market cap $${currentMc.toLocaleString()} reached target $${exitMc.toLocaleString()}.`,
-          `Exit percentage: ${earlyBundlerOrchestrator.getExitPercent()}% from entry MC $${entryMc.toLocaleString()}.`,
-        ],
-        settings: db.getWalletSettings(config.tradingWalletAddress),
-        metrics: {
-          mint: position.mint,
-          timestamp: new Date().toISOString(),
-          bundlersPercent: null,
-          bundlersCount: null,
-          initialBaseReserve: null,
-          topWallets: null,
-          top10HolderRate: null,
-          bundledAmountRate: null,
-        },
-        buySol: earlyBundlerOrchestrator.getBuySol(),
-        matchingWallets: position.matchedWallet ? [position.matchedWallet] : [],
-      };
-
-      const owner = new PublicKey(config.tradingWalletAddress);
-      const mintPk = new PublicKey(position.mint);
-      const balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
-
-      if (balance <= 0n) {
-        log.info(
-          "[BUNDLER MCAP SELL SKIP] No position held; resetting orchestrator",
-          {
-            mint: position.mint,
-          },
-        );
-        earlyBundlerOrchestrator.clearActivePosition();
-        return;
-      }
-
-      const sellId = randomBytes(5).toString("hex");
-      pendingSells.set(sellId, {
-        event,
-        createdAt: Date.now(),
-        executing: true,
-      });
-
-      earlyBundlerOrchestrator.clearActivePosition();
-
-      telegramBot
-        ?.sendDefault(
-          [
-            "<b>🚨 Bundler Exit Triggered</b>",
-            `Token: <code>${html(position.mint)}</code>`,
-            `Market Cap: <b>$${html(currentMc.toLocaleString())}</b>`,
-            `Exit MC: <b>$${html(exitMc.toLocaleString())}</b>`,
-            `Action: submit sell for <b>${config.sellPercent}%</b>.`,
-          ].join("\n"),
-        )
-        .catch((err) => log.warn("Telegram bundler exit alert failed", err));
-
-      void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
-    } catch (err) {
-      log.error(`Failed to check Bundler MC flow for ${position.mint}`, err);
     }
   }
 
@@ -2562,12 +2208,27 @@ async function main(): Promise<void> {
                     timestamp: Date.now(),
                   });
                 })
-                .catch((e) =>
-                  log.error(
-                    `Background balance/quote refresh failed for ${activePos.mint}`,
-                    e,
-                  ),
-                )
+                .catch((e) => {
+                  // Right after a fresh buy, the RPC node may not have indexed
+                  // the new token account yet ("could not find mint" / -32602).
+                  // This is a transient condition that resolves itself within a
+                  // few seconds once indexing catches up, so it's logged as a
+                  // warning rather than an error to avoid alarming noise.
+                  const message = e instanceof Error ? e.message : String(e);
+                  const isTransientIndexingLag =
+                    message.includes("could not find mint") ||
+                    (e as { code?: number } | undefined)?.code === -32602;
+                  if (isTransientIndexingLag) {
+                    log.warn(
+                      `Background balance/quote refresh temporarily failed for ${activePos.mint} (RPC still indexing new token account, will retry)`,
+                    );
+                  } else {
+                    log.error(
+                      `Background balance/quote refresh failed for ${activePos.mint}`,
+                      e,
+                    );
+                  }
+                })
                 .finally(() => {
                   activePositionRefreshes.delete(activePos.mint);
                 });
@@ -2609,42 +2270,9 @@ async function main(): Promise<void> {
       }, MCAP_CHECK_INTERVAL_MS);
     });
 
-    // 2. Bundler / Reverse Mode loop
-    let isBundlerChecking = false;
-    setInterval(async () => {
-      if (isBundlerChecking) return;
-      isBundlerChecking = true;
-
-      try {
-        const checkPromises: Promise<void>[] = [];
-
-        if (config.tradingWalletAddress) {
-          // Bundler Mode positions
-          if (botMode === "bundler") {
-            const bundlerPos = earlyBundlerOrchestrator.getActivePosition();
-            if (bundlerPos) {
-              checkPromises.push(checkBundlerMcapFlow());
-            }
-          }
-
-          // Reverse CopySell positions
-          if (botMode === "reverse_copysell") {
-            const revPos = reverseCopySellOrchestrator.getActivePosition();
-            if (revPos) {
-              checkPromises.push(
-                checkAndSellIfLowMcap(revPos.mint, "reverse_copysell"),
-              );
-            }
-          }
-        }
-
-        await Promise.all(checkPromises);
-      } catch (err) {
-        log.error("Error in Bundler/Reverse MC loop", err);
-      } finally {
-        isBundlerChecking = false;
-      }
-    }, MCAP_CHECK_INTERVAL_MS);
+    // Token Transfer mode has no automatic sell — its own dedicated
+    // Helius-4-backed MC monitor runs inside TokenTransferOrchestrator
+    // purely for display purposes.
   }
 
   function startWatchedWalletSummary(event: NewTokenEvent): void {
@@ -2716,15 +2344,6 @@ async function main(): Promise<void> {
   function pauseWallet(address: string): string {
     const normalized = new PublicKey(address).toBase58();
 
-    if (normalized === config.tradingWalletAddress) {
-      if (!tradingWalletMonitor) return `Trading wallet is not active.`;
-      if (pausedWallets.has(normalized))
-        return `Trading wallet is already paused.`;
-      tradingWalletMonitor.stop();
-      pausedWallets.add(normalized);
-      return `Paused monitoring your TRADING wallet <code>${normalized}</code>`;
-    }
-
     const monitor = walletMonitors.get(normalized);
     if (!monitor) return `Wallet is not monitored: <code>${normalized}</code>`;
     if (pausedWallets.has(normalized))
@@ -2737,15 +2356,6 @@ async function main(): Promise<void> {
   async function resumeWallet(address: string): Promise<string> {
     const normalized = new PublicKey(address).toBase58();
 
-    if (normalized === config.tradingWalletAddress) {
-      if (!tradingWalletMonitor) return `Trading wallet is not active.`;
-      if (!pausedWallets.has(normalized))
-        return `Trading wallet is already running.`;
-      pausedWallets.delete(normalized);
-      await tradingWalletMonitor.start();
-      return `Continued monitoring your TRADING wallet <code>${normalized}</code>`;
-    }
-
     const monitor = walletMonitors.get(normalized);
     if (!monitor) return `Wallet is not monitored: <code>${normalized}</code>`;
     if (!pausedWallets.has(normalized))
@@ -2755,78 +2365,14 @@ async function main(): Promise<void> {
     return `Continued monitoring <code>${normalized}</code>`;
   }
 
-  async function startBundlerModeServices(): Promise<void> {
-    earlyBundlerOrchestrator.setEnabled(true);
-    const followedWallet = earlyBundlerOrchestrator.getFollowedWallet();
-    if (followedWallet) {
-      await earlyBundlerOrchestrator.followWallet(followedWallet);
-    } else {
-      log.info(
-        "Bundler mode started without follow wallet; set one from Telegram.",
-      );
-    }
-
-    log.info("Bundler mode services started", {
-      followedWallet,
-      running: earlyBundlerOrchestrator.isRunning(),
+  async function startTokenTransferModeServices(): Promise<void> {
+    // Token Transfer mode never auto-starts the dev-wallet watch — the user
+    // must set a dev address and press Start explicitly.
+    log.info("Token Transfer mode services started", {
+      devAddress: tokenTransferOrchestrator.getDevAddress(),
+      buySol: tokenTransferOrchestrator.getBuySol(),
+      running: tokenTransferOrchestrator.isRunning(),
     });
-  }
-
-  async function stopBundlerModeServices(
-    reason = "Bundler mode stopped",
-  ): Promise<void> {
-    for (const monitor of walletMonitors.values()) {
-      monitor.stop();
-    }
-    walletMonitors.clear();
-
-    tradingWalletMonitor?.stop();
-    tradingWalletMonitor = null;
-    pendingTradingBuys.clear();
-    pausedWallets.clear();
-
-    await earlyBundlerOrchestrator.stopActiveMonitoring(reason);
-
-    log.info("Bundler mode services stopped", { reason });
-  }
-
-  async function startReverseCopySellModeServices(): Promise<void> {
-    reverseCopySellOrchestrator.setEnabled(true);
-
-    if (config.tradingWalletAddress && !tradingWalletMonitor) {
-      tradingWalletMonitor = new WalletMonitor(
-        config,
-        config.tradingWalletAddress,
-        {
-          enforceMinBuySol: false,
-          logLabel: "WALLET TRADING 1",
-        },
-      );
-      wireTradingWalletMonitor(tradingWalletMonitor);
-      await tradingWalletMonitor.start();
-    } else if (!config.tradingWalletAddress) {
-      log.warn(
-        "No TRADING_WALLET_ADDRESS configured; reverse-copysell flow cannot detect your buys.",
-      );
-    }
-
-    log.info("Reverse CopySell mode services started", {
-      tradingWalletActive: !!tradingWalletMonitor,
-    });
-  }
-
-  async function stopReverseCopySellModeServices(
-    reason = "Reverse CopySell mode stopped",
-  ): Promise<void> {
-    tradingWalletMonitor?.stop();
-    tradingWalletMonitor = null;
-    pendingTradingBuys.clear();
-    pausedWallets.clear();
-
-    await reverseCopySellOrchestrator.stopActiveMonitoring(reason);
-    reverseCopySellOrchestrator.setEnabled(false);
-
-    log.info("Reverse CopySell mode services stopped", { reason });
   }
 
   function updateMinSol(walletAddress: string, rawValue: string): string {
@@ -2860,9 +2406,7 @@ async function main(): Promise<void> {
   ): TelegramReply {
     const normalized = new PublicKey(address).toBase58();
     const isTrading = normalized === config.tradingWalletAddress;
-    const isMonitoring = isTrading
-      ? !!tradingWalletMonitor
-      : walletMonitors.has(normalized);
+    const isMonitoring = isTrading ? false : walletMonitors.has(normalized);
     const isPaused = pausedWallets.has(normalized);
     const reverseBuyEnabled = !isTrading && db.isReverseBuyWallet(normalized);
     const settings = db.getWalletSettings(normalized);
@@ -3029,7 +2573,7 @@ async function main(): Promise<void> {
           inline_keyboard: [
             [
               { text: "Insider", callback_data: "mode:insider" },
-              { text: "Bundler", callback_data: "mode:bundler" },
+              { text: "Token Transfer", callback_data: "mode:tokentransfer" },
             ],
             [
               { text: "Follow wallet", callback_data: "insider:follow" },
@@ -3054,84 +2598,46 @@ async function main(): Promise<void> {
       };
     }
 
-    if (botMode === "reverse_copysell") {
-      const targetWallet = config.reverseCopySellTargetWallet;
-      const activePosition = reverseCopySellOrchestrator.getActivePosition();
-      return {
-        text: [
-          "<b>Reverse CopySell Bot</b>",
-          "",
-          `Mode: <b>Reverse CopySell</b>`,
-          `Target: ${targetWallet ? `<code>${html(targetWallet)}</code>` : "<b>Not set</b>"}`,
-          activePosition
-            ? `Monitoring: <code>${html(activePosition.mint)}</code>`
-            : "Status: <b>Waiting for buy...</b>",
-          "",
-          "<b>Flow</b>",
-          "• Watches your trading wallet for new buys.",
-          "• Once you buy, I watch the target wallet for the same token.",
-          "• When the target wallet buys, I sell 100% of your position.",
-        ].join("\n"),
-        replyMarkup: {
-          inline_keyboard: [
-            [
-              { text: "Insider", callback_data: "mode:insider" },
-              { text: "Bundler", callback_data: "mode:bundler" },
-            ],
-            [
-              {
-                text: "Set Target Wallet",
-                callback_data: "reverse:set_target",
-              },
-              { text: "Refresh", callback_data: "menu:refresh" },
-            ],
-          ],
-        },
-        editCurrent,
-      };
-    }
-
-    const followedWallet = earlyBundlerOrchestrator.getFollowedWallet();
-    const activePosition = earlyBundlerOrchestrator.getActivePosition();
-    const watchingMint = earlyBundlerOrchestrator.getWatchingMint();
-    const bundlerRunning = earlyBundlerOrchestrator.isRunning();
+    const devAddress = tokenTransferOrchestrator.getDevAddress();
+    const buySol = tokenTransferOrchestrator.getBuySol();
+    const isRunning = tokenTransferOrchestrator.isRunning();
+    const activePosition = tokenTransferOrchestrator.getActivePosition();
 
     let status = "Idle";
     if (activePosition)
       status = `Holding token ${html(activePosition.mint.slice(0, 8))}...`;
-    else if (watchingMint)
-      status = `Checking token ${html(watchingMint.slice(0, 8))}...`;
-    else if (bundlerRunning) status = "Running";
-    else if (followedWallet) status = "Paused";
+    else if (isRunning) status = "Watching dev wallet for a transfer-out...";
+    else if (devAddress) status = "Stopped";
 
-    const stopResumeButton =
-      followedWallet && !bundlerRunning && !activePosition && !watchingMint
-        ? { text: "Resume", callback_data: "bundler:resume" }
-        : { text: "Stop", callback_data: "bundler:stop" };
+    const startStopButton = activePosition
+      ? {
+          text: "🔴 Sell Position",
+          callback_data: `sell:tokentransfer:${activePosition.mint}`,
+        }
+      : isRunning
+        ? { text: "Stop", callback_data: "tokentransfer:stop" }
+        : { text: "Start", callback_data: "tokentransfer:start" };
 
     return {
       text: [
-        "<b>Bundler Bot</b>",
+        "<b>Token Transfer Bot</b>",
         "",
-        `Mode: <b>Bundler</b>`,
+        `Mode: <b>Token Transfer</b>`,
         `Status: <b>${status}</b>`,
-        `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : "<b>Not set</b>"}`,
-        `Buy SOL: <b>${html(String(earlyBundlerOrchestrator.getBuySol()))}</b>`,
-        `Exit Strategy: <b>+${html(String(earlyBundlerOrchestrator.getExitPercent()))}% from Entry MC</b>`,
+        `Dev address: ${devAddress ? `<code>${html(devAddress)}</code>` : "<b>Not set</b>"}`,
+        `Buy SOL: <b>${html(String(buySol))}</b>`,
+        activePosition
+          ? `Recipient: <code>${html(activePosition.recipient)}</code>`
+          : "",
         activePosition?.entryMc
           ? `Entry MC: <b>$${html(activePosition.entryMc.toLocaleString())}</b>`
           : "",
-        activePosition?.matchedWallet
-          ? `Matched feePayer: <code>${html(activePosition.matchedWallet)}</code>`
-          : "",
         "",
         "<b>Flow</b>",
-        "1. Set a follow wallet.",
-        "2. Bot waits for that wallet to buy a new token within 10 minutes of creation.",
-        "3. Bot checks Helius system transfers every 2s for up to 2 minutes, waiting for 10 records.",
-        "4. creator_hold_rate must be greater than 0; if it is 0 and you already hold, bot sells.",
-        "5. Once 10 records are available, bot buys only if a repeated feePayer has buy + buy as its first two actions.",
-        `6. Bot exits at your % MC increase or sells on rug below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
+        "1. Set the dev wallet address to watch.",
+        "2. Click Start; the bot watches that wallet's transactions (Helius key 4) for a plain token transfer-out.",
+        "3. Once the dev wallet sends the token to another wallet, the bot buys it immediately with your configured SOL amount.",
+        "4. There is no automatic sell — click \"Sell Position\" whenever you want to exit; MC is monitored (Helius key 4) for display only.",
       ]
         .filter(Boolean)
         .join("\n"),
@@ -3139,20 +2645,17 @@ async function main(): Promise<void> {
         inline_keyboard: [
           [
             { text: "Insider", callback_data: "mode:insider" },
-            { text: "Bundler", callback_data: "mode:bundler" },
+            { text: "Token Transfer", callback_data: "mode:tokentransfer" },
           ],
           [
-            { text: "Follow wallet", callback_data: "bundler:follow" },
-            { text: "Buy SOL", callback_data: "bundler:buysol" },
+            { text: "Set Dev Address", callback_data: "tokentransfer:setdev" },
+            { text: "Buy SOL", callback_data: "tokentransfer:buysol" },
           ],
           [
-            { text: "Set Exit %", callback_data: "bundler:exitpercent" },
             { text: "Status", callback_data: "menu:status" },
-          ],
-          [
             { text: "Refresh", callback_data: "menu:refresh" },
-            stopResumeButton,
           ],
+          [startStopButton],
         ],
       },
       editCurrent,
@@ -3215,26 +2718,15 @@ async function main(): Promise<void> {
         "",
         primaryInfo,
       ].join("\n");
-    } else if (botMode === "reverse_copysell") {
-      const targetWallet = config.reverseCopySellTargetWallet;
-      const activePosition = reverseCopySellOrchestrator.getActivePosition();
-      text = [
-        "<b>Bot Status</b>",
-        "Mode: Reverse CopySell",
-        `Target: ${targetWallet ?? "not set"}`,
-        `Monitoring: ${activePosition ? activePosition.mint : "none"}`,
-      ].join("\n");
     } else {
-      const activePosition = earlyBundlerOrchestrator.getActivePosition();
+      const activePosition = tokenTransferOrchestrator.getActivePosition();
       text = [
         "<b>Bot Status</b>",
-        "Mode: Bundler",
-        `Follow: ${earlyBundlerOrchestrator.getFollowedWallet() ?? "not set"}`,
-        `Running: ${earlyBundlerOrchestrator.isRunning() ? "yes" : "no"}`,
-        `Watching: ${earlyBundlerOrchestrator.getWatchingMint() ?? "none"}`,
+        "Mode: Token Transfer",
+        `Dev address: ${tokenTransferOrchestrator.getDevAddress() ?? "not set"}`,
+        `Running: ${tokenTransferOrchestrator.isRunning() ? "yes" : "no"}`,
         `Holding: ${activePosition ? activePosition.mint : "none"}`,
-        `Buy: ${earlyBundlerOrchestrator.getBuySol()} SOL`,
-        `Exit: +${earlyBundlerOrchestrator.getExitPercent()}%`,
+        `Buy: ${tokenTransferOrchestrator.getBuySol()} SOL`,
       ].join("\n");
     }
 
@@ -3438,17 +2930,14 @@ async function main(): Promise<void> {
   }
 
   // ── 6. Start active mode ──────────────────────────────────────────────────
-  if (botMode === "bundler") {
-    for (const bot of insiderBots) bot.pause();
-    await startBundlerModeServices();
-  } else {
-    await stopBundlerModeServices("Service started in Insider mode");
-    await resumePrimaryInsiderBot();
-  }
+  // Insider and Token Transfer are independent and both come up active at
+  // startup; `botMode` only picks which card /start shows first.
+  await startTokenTransferModeServices();
+  await resumePrimaryInsiderBot();
   startMarketCapChecker();
 
   log.info(
-    `Service fully started — mode=${botMode}, bundler running=${earlyBundlerOrchestrator.isRunning()}`,
+    `Service fully started — mode=${botMode}, token transfer running=${tokenTransferOrchestrator.isRunning()}`,
   );
 
   // ── 7. Graceful shutdown ──────────────────────────────────────────────────
@@ -3466,12 +2955,10 @@ async function main(): Promise<void> {
     for (const monitor of walletMonitors.values()) {
       monitor.stop();
     }
-    tradingWalletMonitor?.stop();
     telegramBot?.stop();
     healthServer.close();
 
-    await earlyBundlerOrchestrator.shutdown();
-    await reverseCopySellOrchestrator.shutdown();
+    await tokenTransferOrchestrator.shutdown();
 
     await Promise.all(
       [...gmgnLimiters, gmgnFallbackLimiter].map((limiter, index) =>

@@ -72,7 +72,7 @@ function isValidGmgnFetchMode(s: string): s is ServiceConfig['gmgnFetchMode'] {
 }
 
 function isValidDefaultBotMode(s: string): s is ServiceConfig['defaultBotMode'] {
-  return ['insider', 'bundler'].includes(s);
+  return ['insider', 'tokentransfer'].includes(s);
 }
 
 export function loadConfig(): ServiceConfig {
@@ -157,7 +157,6 @@ export function loadConfig(): ServiceConfig {
   const insiderFollowWallet3 = optionalNullable('INSIDER_FOLLOW_WALLET_3');
   const insiderFollowWallet4 = optionalNullable('INSIDER_FOLLOW_WALLET_4');
   const defaultBotMode = optional('DEFAULT_BOT_MODE', 'insider').toLowerCase();
-  const reverseCopySellTargetWallet = optionalNullable('REVERSE_COPYSELL_TARGET_WALLET');
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
@@ -192,7 +191,7 @@ export function loadConfig(): ServiceConfig {
     throw new Error(`GMGN_FETCH_MODE must be one of auto|direct|cli, got: ${gmgnFetchMode}`);
   }
   if (!isValidDefaultBotMode(defaultBotMode)) {
-    throw new Error(`DEFAULT_BOT_MODE must be one of insider|bundler, got: ${defaultBotMode}`);
+    throw new Error(`DEFAULT_BOT_MODE must be one of insider|tokentransfer, got: ${defaultBotMode}`);
   }
 
   // Sanity checks
@@ -273,7 +272,6 @@ export function loadConfig(): ServiceConfig {
     insiderFollowWallet3,
     insiderFollowWallet4,
     defaultBotMode,
-    reverseCopySellTargetWallet,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,

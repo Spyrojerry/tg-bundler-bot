@@ -326,6 +326,7 @@ interface BundlerFunderWatchState {
   lowFundingTinyDevExitBaselineSignature: string | null;
   lowFundingTinyDevExitBaselineTimestamp: number | null;
   lowFundingLargeTransferBuyUsed: boolean;
+  discoveryStopped: boolean;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -1588,6 +1589,7 @@ export class InsiderBot extends EventEmitter {
       lowFundingTinyDevExitBaselineSignature: null,
       lowFundingTinyDevExitBaselineTimestamp: null,
       lowFundingLargeTransferBuyUsed: false,
+      discoveryStopped: false,
     };
 
     this.subscribeBundlerFunder(funderWallet);
@@ -2534,6 +2536,7 @@ export class InsiderBot extends EventEmitter {
   private async syncBundlerFunderTransactions(force = false): Promise<void> {
     const state = this.bundlerFunderWatch;
     if (!state || this.positionSellTriggered) return;
+    if (state.discoveryStopped) return;
     if (this.hasReachedFunderRecipientBuyCap(state)) {
       await this.stopBundlerFunderSourceDiscovery(
         state,
@@ -2567,6 +2570,7 @@ export class InsiderBot extends EventEmitter {
       );
       for (const tx of txs) {
         if (state.funderWallet !== syncingWallet) break;
+        if (this.hasReachedFunderRecipientBuyCap(state)) break;
         if (state.processedSignatures.has(tx.signature)) continue;
         state.processedSignatures.add(tx.signature);
         state.cursorSignature = tx.signature;
@@ -2799,6 +2803,8 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     reason: string,
   ): Promise<void> {
+    if (state.discoveryStopped) return;
+    state.discoveryStopped = true;
     await this.stopLowFundingDevWalletSubscription("bundler funder monitoring stopped");
     if (this.bundlerFunderLogsSubId !== null) {
       const subId = this.bundlerFunderLogsSubId;
