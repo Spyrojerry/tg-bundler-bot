@@ -908,7 +908,9 @@ async function main(): Promise<void> {
             createdAt: Date.now(),
             executing: true,
           });
-          tokenTransferOrchestrator.clearActivePosition();
+          tokenTransferOrchestrator.clearActivePosition(
+            "Manual sell requested via Telegram button",
+          );
 
           void executeSellAndNotify(chatId, sellId, telegramBot);
           return "Sell signal sent.";
@@ -919,11 +921,13 @@ async function main(): Promise<void> {
           // Insider and Token Transfer run independently of each other and
           // stay active in the background regardless of which one is on
           // screen — this button only changes which card is shown/edited.
+          log.info("[MODE SWITCH] Displaying Insider card");
           botMode = "insider";
           await resumePrimaryInsiderBot();
           return homeReply(true);
         }
         if (data === "mode:tokentransfer") {
+          log.info("[MODE SWITCH] Displaying Token Transfer card");
           botMode = "tokentransfer";
           await startTokenTransferModeServices();
           return homeReply(true);
@@ -1214,6 +1218,9 @@ async function main(): Promise<void> {
             if (!Number.isFinite(value) || value <= 0)
               return "Send a SOL amount greater than 0.";
             bot.setBuySol(value);
+            log.info(
+              `[SETTINGS] Insider ${getInsiderBotNumber(pendingAction.index)} default buy SOL set to ${value}`,
+            );
             return homeReply();
           }
           if (pendingAction.type === "insiderNormalBuySol") {
@@ -1222,6 +1229,9 @@ async function main(): Promise<void> {
             if (!Number.isFinite(value) || value <= 0)
               return "Send a SOL amount greater than 0.";
             bot.setNormalFundingBuySol(value);
+            log.info(
+              `[SETTINGS] Insider ${getInsiderBotNumber(pendingAction.index)} normal-funding buy SOL set to ${value}`,
+            );
             return homeReply();
           }
           if (pendingAction.type === "insiderLowFundingBuySol") {
@@ -1230,6 +1240,9 @@ async function main(): Promise<void> {
             if (!Number.isFinite(value) || value <= 0)
               return "Send a SOL amount greater than 0.";
             bot.setLowFundingBuySol(value);
+            log.info(
+              `[SETTINGS] Insider ${getInsiderBotNumber(pendingAction.index)} low-funding buy SOL set to ${value}`,
+            );
             return homeReply();
           }
           if (pendingAction.type === "insiderExitPercent") {
@@ -1238,6 +1251,9 @@ async function main(): Promise<void> {
             if (!Number.isFinite(value) || value < 0)
               return "Send a valid percentage.";
             bot.setExitPercent(value);
+            log.info(
+              `[SETTINGS] Insider ${getInsiderBotNumber(pendingAction.index)} exit percent set to ${value}%`,
+            );
             return homeReply();
           }
           if (pendingAction.type === "insiderBundlerMinUsd") {
@@ -1246,6 +1262,9 @@ async function main(): Promise<void> {
             if (!Number.isFinite(value) || value < 0)
               return "Send a valid USD amount.";
             bot.setBundlerBuyMinUsd(value);
+            log.info(
+              `[SETTINGS] Insider ${getInsiderBotNumber(pendingAction.index)} bundler min USD set to ${value}`,
+            );
             return homeReply();
           }
           if (pendingAction.type === "insiderBundlerMaxUsd") {
@@ -1254,6 +1273,9 @@ async function main(): Promise<void> {
             if (!Number.isFinite(value) || value < 0)
               return "Send a valid USD amount.";
             bot.setBundlerBuyMaxUsd(value);
+            log.info(
+              `[SETTINGS] Insider ${getInsiderBotNumber(pendingAction.index)} bundler max USD set to ${value}`,
+            );
             return homeReply();
           }
           if (pendingAction.type === "tokenTransferDevAddress") {
@@ -1397,9 +1419,11 @@ async function main(): Promise<void> {
     }
   });
 
-  if (telegramBot) {
-    telegramBot.start();
-  }
+  // Telegram polling is intentionally NOT started yet — it's started further
+  // down, once every orchestrator/bot event listener is wired up. Otherwise
+  // an incoming /start (or a queued update from before a restart) could be
+  // handled while `tokenTransferOrchestrator` or the insider buyTrigger/
+  // sellTrigger listeners don't exist yet, silently dropping that update.
 
   tokenTransferOrchestrator = new TokenTransferOrchestrator(
     config,
@@ -1414,7 +1438,7 @@ async function main(): Promise<void> {
     // which card is shown.) Both can run and buy/sell concurrently.
     if (!config.tradingWalletAddress) {
       log.warn("[TOKEN TRANSFER BUY SKIP] No trading wallet configured", trigger);
-      tokenTransferOrchestrator.clearActivePosition();
+      tokenTransferOrchestrator.clearActivePosition("No trading wallet configured");
       return;
     }
 
@@ -1477,7 +1501,7 @@ async function main(): Promise<void> {
         );
       } catch (err) {
         log.error("Token Transfer buy failed", err);
-        tokenTransferOrchestrator.clearActivePosition();
+        tokenTransferOrchestrator.clearActivePosition("Buy execution failed");
         await telegramBot?.sendDefault(
           [
             "<b>❌ Token Transfer Buy Failed</b>",
@@ -2270,9 +2294,62 @@ async function main(): Promise<void> {
       }, MCAP_CHECK_INTERVAL_MS);
     });
 
-    // Token Transfer mode has no automatic sell — its own dedicated
-    // Helius-4-backed MC monitor runs inside TokenTransferOrchestrator
-    // purely for display purposes.
+    // 2. Token Transfer balance-zero watch. Token Transfer mode has no
+    // automatic MC-based sell — its own dedicated Helius-4-backed MC monitor
+    // runs inside TokenTransferOrchestrator purely for display purposes.
+    // This loop only exists to notice when the trading wallet's balance for
+    // the held token reaches zero (sold manually via the "Sell Position"
+    // button already clears it immediately, but this also covers a sell
+    // made outside the bot entirely) so the mode is explicitly marked idle
+    // rather than silently still "holding" a position that's already gone.
+    let isTokenTransferBalanceChecking = false;
+    setInterval(async () => {
+      if (isTokenTransferBalanceChecking) return;
+      const activePosition = tokenTransferOrchestrator.getActivePosition();
+      if (!activePosition || !config.tradingWalletAddress) return;
+      if (hasPendingSellForMint(config.tradingWalletAddress, activePosition.mint)) return;
+
+      isTokenTransferBalanceChecking = true;
+      try {
+        const cached = activePositionCache.get(activePosition.mint);
+        let balance: bigint | null = cached ? cached.balance : null;
+        if (!cached || Date.now() - cached.timestamp > 30_000) {
+          const owner = new PublicKey(config.tradingWalletAddress);
+          const mintPk = new PublicKey(activePosition.mint);
+          balance = await getTokenRawBalance(owner, mintPk).catch(() => balance);
+          activePositionCache.set(activePosition.mint, {
+            balance: balance ?? 0n,
+            quote: cached?.quote ?? null,
+            timestamp: Date.now(),
+          });
+        }
+
+        if (balance !== null && balance <= 0n) {
+          log.warn(
+            `[TOKEN TRANSFER AUTO-STOP] Trading wallet balance for ${activePosition.mint} is zero; treating position as sold`,
+          );
+          tokenTransferOrchestrator.clearActivePosition(
+            "Trading wallet balance reached zero (sold outside the Sell Position button)",
+          );
+          await telegramBot
+            ?.sendDefault(
+              [
+                "<b>🔴 Token Transfer Position Closed</b>",
+                `Token: <code>${html(activePosition.mint)}</code>`,
+                "Detected that the trading wallet's balance for this token is now zero.",
+                "Token Transfer mode is now idle — press Start to watch a dev wallet again.",
+              ].join("\n"),
+            )
+            .catch((err) =>
+              log.warn("Telegram token-transfer auto-stop alert failed", err),
+            );
+        }
+      } catch (err) {
+        log.error("Error in Token Transfer balance-zero check", err);
+      } finally {
+        isTokenTransferBalanceChecking = false;
+      }
+    }, MCAP_CHECK_INTERVAL_MS);
   }
 
   function startWatchedWalletSummary(event: NewTokenEvent): void {
@@ -2323,6 +2400,7 @@ async function main(): Promise<void> {
     pausedWallets.delete(normalized);
     await monitor.start();
     walletMonitors.set(normalized, monitor);
+    log.info(`[WALLET ADD] Started monitoring ${normalized}`);
     return `Monitoring wallet <code>${normalized}</code>`;
   }
 
@@ -2338,6 +2416,7 @@ async function main(): Promise<void> {
     walletMonitors.delete(normalized);
     pausedWallets.delete(normalized);
     db.removeWallet(normalized);
+    log.info(`[WALLET REMOVE] Stopped monitoring ${normalized}`);
     return `Stopped monitoring <code>${normalized}</code>`;
   }
 
@@ -2350,6 +2429,7 @@ async function main(): Promise<void> {
       return `Wallet is already paused: <code>${normalized}</code>`;
     monitor.stop();
     pausedWallets.add(normalized);
+    log.info(`[WALLET PAUSE] Paused monitoring ${normalized}`);
     return `Paused monitoring <code>${normalized}</code>`;
   }
 
@@ -2362,6 +2442,7 @@ async function main(): Promise<void> {
       return `Wallet is already running: <code>${normalized}</code>`;
     pausedWallets.delete(normalized);
     await monitor.start();
+    log.info(`[WALLET RESUME] Resumed monitoring ${normalized}`);
     return `Continued monitoring <code>${normalized}</code>`;
   }
 
@@ -2602,11 +2683,14 @@ async function main(): Promise<void> {
     const buySol = tokenTransferOrchestrator.getBuySol();
     const isRunning = tokenTransferOrchestrator.isRunning();
     const activePosition = tokenTransferOrchestrator.getActivePosition();
+    const watchedCandidates = tokenTransferOrchestrator.getWatchedCandidateMints();
 
     let status = "Idle";
     if (activePosition)
       status = `Holding token ${html(activePosition.mint.slice(0, 8))}...`;
-    else if (isRunning) status = "Watching dev wallet for a transfer-out...";
+    else if (isRunning && watchedCandidates.length > 0)
+      status = `Watching ${watchedCandidates.length} newly bought token(s) for a transfer-out...`;
+    else if (isRunning) status = "Watching dev wallet for a new-token swap buy...";
     else if (devAddress) status = "Stopped";
 
     const startStopButton = activePosition
@@ -2635,9 +2719,11 @@ async function main(): Promise<void> {
         "",
         "<b>Flow</b>",
         "1. Set the dev wallet address to watch.",
-        "2. Click Start; the bot watches that wallet's transactions (Helius key 4) for a plain token transfer-out.",
-        "3. Once the dev wallet sends the token to another wallet, the bot buys it immediately with your configured SOL amount.",
-        "4. There is no automatic sell — click \"Sell Position\" whenever you want to exit; MC is monitored (Helius key 4) for display only.",
+        "2. Click Start; the bot watches that wallet's transactions (Helius key 4) for a SWAP where it buys a new token.",
+        "3. Once flagged, the bot watches specifically for that token being sent out (a plain transfer, not a sell) to another wallet.",
+        "4. The moment that transfer-out happens, the bot buys it immediately with your configured SOL amount.",
+        "5. There is no automatic sell — click \"Sell Position\" whenever you want to exit (MC is monitored via Helius key 4 for display only). The mode also auto-stops and clears the position if your trading wallet's balance for that token is ever seen at zero.",
+        "6. Either way, once the position closes the dev-wallet watch stays stopped until you press Start again.",
       ]
         .filter(Boolean)
         .join("\n"),
@@ -2720,11 +2806,13 @@ async function main(): Promise<void> {
       ].join("\n");
     } else {
       const activePosition = tokenTransferOrchestrator.getActivePosition();
+      const watchedCandidates = tokenTransferOrchestrator.getWatchedCandidateMints();
       text = [
         "<b>Bot Status</b>",
         "Mode: Token Transfer",
         `Dev address: ${tokenTransferOrchestrator.getDevAddress() ?? "not set"}`,
         `Running: ${tokenTransferOrchestrator.isRunning() ? "yes" : "no"}`,
+        `Watching for transfer-out: ${watchedCandidates.length ? watchedCandidates.join(", ") : "none yet"}`,
         `Holding: ${activePosition ? activePosition.mint : "none"}`,
         `Buy: ${tokenTransferOrchestrator.getBuySol()} SOL`,
       ].join("\n");
@@ -2934,11 +3022,45 @@ async function main(): Promise<void> {
   // startup; `botMode` only picks which card /start shows first.
   await startTokenTransferModeServices();
   await resumePrimaryInsiderBot();
+
+  // Only now, with every orchestrator/bot fully wired up, do we start
+  // draining Telegram's update queue — see the note above `tokenTransferOrchestrator`'s
+  // construction for why this was moved down from right after `new TelegramBot(...)`.
+  if (telegramBot) {
+    telegramBot.start();
+  }
   startMarketCapChecker();
 
   log.info(
     `Service fully started — mode=${botMode}, token transfer running=${tokenTransferOrchestrator.isRunning()}`,
   );
+
+  // Send a one-off Telegram summary so it's obvious the process actually
+  // came up (and with what config) without having to check server logs.
+  await telegramBot
+    ?.sendDefault(
+      [
+        "<b>🟢 Bot Started</b>",
+        `Displayed mode: <b>${botMode === "insider" ? "Insider" : "Token Transfer"}</b>`,
+        "",
+        "<b>Insider</b>",
+        `Enabled bots: <b>${insiderBots.length}</b> (Helius key pool)`,
+        `Bot 1 follow wallet: ${insiderBots[0]?.getFollowedWallet() ? `<code>${html(insiderBots[0]!.getFollowedWallet()!)}</code>` : "not set"}`,
+        `Bot 1 running: <b>${insiderBots[0]?.isRunning() ? "yes" : "no"}</b>`,
+        "",
+        "<b>Token Transfer</b>",
+        `Dev address: ${tokenTransferOrchestrator.getDevAddress() ? `<code>${html(tokenTransferOrchestrator.getDevAddress()!)}</code>` : "not set"}`,
+        `Buy SOL: <b>${tokenTransferOrchestrator.getBuySol()}</b>`,
+        `Watching dev wallet: <b>${tokenTransferOrchestrator.isRunning() ? "yes" : "no"}</b>`,
+        "",
+        `Trading wallet: ${config.tradingWalletAddress ? `<code>${html(config.tradingWalletAddress)}</code>` : "not set"}`,
+        `Watched wallets: <b>${walletMonitors.size}</b>`,
+        `Health server port: <b>${config.port}</b>`,
+        "",
+        "Send /start or /status any time for a live status card.",
+      ].join("\n"),
+    )
+    .catch((err) => log.warn("Telegram startup summary failed to send", err));
 
   // ── 7. Graceful shutdown ──────────────────────────────────────────────────
   let shutting_down = false;

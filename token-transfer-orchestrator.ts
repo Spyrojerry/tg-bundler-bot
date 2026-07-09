@@ -2,11 +2,23 @@
 //  token-transfer-orchestrator.ts  —  "Token Transfer" mode
 //
 //  Manually started/stopped mode: watches a user-supplied dev wallet's
-//  transactions for a plain SPL token transfer-out (the dev sending a token
-//  directly to another wallet, not a swap/sell), buys that token the moment
-//  the transfer is seen, then stops watching the dev wallet and switches to
-//  market-cap monitoring only. There is no automatic sell — the position is
-//  closed manually via the Telegram "Sell Position" button.
+//  transactions in two steps:
+//    1. A SWAP tx where the dev wallet receives a token it isn't already
+//       being watched for (i.e. a fresh buy) marks that mint as a
+//       "candidate" — something the dev has newly acquired.
+//    2. A plain SPL token TRANSFER (not a swap/sell) where the dev sends a
+//       *candidate* mint out to another wallet triggers the buy.
+//  This two-step gate means only tokens the dev wallet actually just bought
+//  are eligible to trigger a buy on transfer-out — an unrelated transfer of
+//  some old/unrelated token the dev happens to hold is ignored.
+//
+//  Once a transfer-out fires, the bot stops watching the dev wallet and
+//  switches to market-cap monitoring only. There is no automatic sell — the
+//  position is closed manually via the Telegram "Sell Position" button, or
+//  automatically cleared (and the mode left stopped) if the trading wallet's
+//  balance for that token is independently observed to reach zero. Either
+//  way, the dev-wallet watch stays stopped until the user presses Start
+//  again.
 //
 //  Dedicated to Helius API key 4 (config.insiderHeliusApiKey4) for both the
 //  dev-wallet transaction polling and the post-buy market-cap monitoring, so
@@ -23,6 +35,7 @@ import { TelegramBot } from './telegram-bot';
 
 const log = createLogger('TOKEN TRANSFER');
 
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEV_WALLET_POLL_INTERVAL_MS = 4_000;
 const MC_MONITOR_INTERVAL_MS = 5_000;
 const DEV_WALLET_TX_FETCH_LIMIT = 25;
@@ -63,6 +76,8 @@ export class TokenTransferOrchestrator extends EventEmitter {
   private mcMonitorTimer: NodeJS.Timeout | null = null;
   private cursorSignature: string | null = null;
   private readonly processedSignatures = new Set<string>();
+  /** Mints the dev wallet has been seen buying (via SWAP) that we're now watching for a transfer-out. */
+  private readonly candidateMints = new Set<string>();
   private activePosition: TokenTransferPosition | null = null;
   private latestMarketCapUsd: number | null = null;
   private latestMarketCapSource: string | null = null;
@@ -96,6 +111,7 @@ export class TokenTransferOrchestrator extends EventEmitter {
     this.devAddress = normalized;
     this.cursorSignature = null;
     this.processedSignatures.clear();
+    this.candidateMints.clear();
     log.info('Token Transfer dev address set', { devAddress: normalized });
     return normalized;
   }
@@ -104,11 +120,17 @@ export class TokenTransferOrchestrator extends EventEmitter {
     return this.devAddress;
   }
 
+  /** Mints currently identified as "newly bought by the dev wallet" and being watched for a transfer-out. */
+  getWatchedCandidateMints(): string[] {
+    return [...this.candidateMints];
+  }
+
   setBuySol(value: number): void {
     if (!Number.isFinite(value) || value <= 0) {
       throw new Error('Token Transfer buy SOL must be greater than 0');
     }
     this.buySol = value;
+    log.info('Token Transfer buy SOL updated', { buySol: value });
   }
 
   getBuySol(): number {
@@ -176,10 +198,11 @@ export class TokenTransferOrchestrator extends EventEmitter {
       }
     }
 
-    log.info('Token Transfer mode started; watching dev wallet for a token transfer-out', {
+    log.info('Token Transfer mode started; watching dev wallet for new-token swap buys and transfer-outs', {
       devAddress: this.devAddress,
       buySol: this.buySol,
       baselineSignature: this.cursorSignature,
+      alreadyWatchedCandidates: [...this.candidateMints],
     });
     this.schedulePoll(0);
   }
@@ -199,10 +222,20 @@ export class TokenTransferOrchestrator extends EventEmitter {
     }
   }
 
-  clearActivePosition(): void {
+  /**
+   * Clears the held position (after a manual or auto-detected sell) and
+   * makes sure the dev-wallet watch stays stopped — the mode is fully idle
+   * until the user presses Start again.
+   */
+  clearActivePosition(reason = 'Position closed'): void {
+    const mint = this.activePosition?.mint ?? null;
     this.activePosition = null;
     this.stopMarketCapMonitoring();
-    log.info('Token Transfer active position cleared');
+    this.stop(reason);
+    log.info('Token Transfer active position cleared; mode is idle until Start is pressed again', {
+      mint,
+      reason,
+    });
   }
 
   async shutdown(): Promise<void> {
@@ -246,6 +279,17 @@ export class TokenTransferOrchestrator extends EventEmitter {
         this.processedSignatures.add(tx.signature);
         this.cursorSignature = tx.signature;
 
+        const newCandidateMint = this.findNewTokenSwapBuy(tx, watchedAddress);
+        if (newCandidateMint && !this.candidateMints.has(newCandidateMint)) {
+          this.candidateMints.add(newCandidateMint);
+          log.info('Dev wallet swap-bought a new token; now watching it for a transfer-out', {
+            devAddress: watchedAddress,
+            mint: newCandidateMint,
+            signature: tx.signature,
+            totalWatchedCandidates: this.candidateMints.size,
+          });
+        }
+
         const found = this.findTokenTransferOut(tx, watchedAddress);
         if (found) {
           await this.handleTransferOutDetected(tx, found);
@@ -265,8 +309,27 @@ export class TokenTransferOrchestrator extends EventEmitter {
   }
 
   /**
+   * Matches a SWAP tx where the dev wallet is the *recipient* of a
+   * non-SOL token — i.e. the dev buying into a token — for a mint that
+   * isn't already an active candidate. Returns that mint so it can be
+   * added to the watch set.
+   */
+  private findNewTokenSwapBuy(tx: HeliusTransaction, devAddress: string): string | null {
+    if (tx.type !== 'SWAP') return null;
+    const bought = tx.tokenTransfers?.find(
+      (t) =>
+        t.toUserAccount === devAddress &&
+        t.fromUserAccount !== devAddress &&
+        t.mint !== SOL_MINT &&
+        !this.candidateMints.has(t.mint),
+    );
+    return bought?.mint ?? null;
+  }
+
+  /**
    * Matches a plain wallet-to-wallet SPL token transfer (not a SWAP) where
-   * the dev wallet is the sender and some other wallet is the recipient.
+   * the dev wallet is the sender, some other wallet is the recipient, and
+   * the mint is one we've already flagged as a recent dev swap-buy.
    */
   private findTokenTransferOut(
     tx: HeliusTransaction,
@@ -277,7 +340,8 @@ export class TokenTransferOrchestrator extends EventEmitter {
       (t) =>
         t.fromUserAccount === devAddress &&
         !!t.toUserAccount &&
-        t.toUserAccount !== devAddress,
+        t.toUserAccount !== devAddress &&
+        this.candidateMints.has(t.mint),
     );
     if (!transfer) return null;
     return { mint: transfer.mint, recipient: transfer.toUserAccount };
@@ -289,6 +353,7 @@ export class TokenTransferOrchestrator extends EventEmitter {
   ): Promise<void> {
     const devAddress = this.devAddress!;
     this.stop('Token transfer-out detected; switching to market-cap monitoring');
+    this.candidateMints.clear();
 
     this.activePosition = {
       mint: found.mint,
