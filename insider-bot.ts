@@ -378,6 +378,8 @@ export class InsiderBot extends EventEmitter {
   private devWallet: string | null = null;
   private devCreateSignature: string | null = null;
   private devCreateTimestamp: number | null = null;
+  /** Highest market cap observed for the current token across all pre-buy MC fetches — used to skip normal-mode buys that would already be past their own exit target. */
+  private highestObservedMarketCapUsd: number | null = null;
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private profitExitDisabled = false;
@@ -1021,6 +1023,7 @@ export class InsiderBot extends EventEmitter {
     this.resetTokenTxCounts();
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
+    this.highestObservedMarketCapUsd = null;
     this.clearBundlerAccumulation();
 
     const swaps = await this.withHeliusFallback((client) =>
@@ -3863,6 +3866,7 @@ export class InsiderBot extends EventEmitter {
         );
         return;
       }
+      this.recordObservedMarketCapUsd(currentMc);
       if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
         this.log.warn(
           "Low-funding shared feePayer condition passed, but token is below rug threshold; resetting instead of buying",
@@ -3937,6 +3941,7 @@ export class InsiderBot extends EventEmitter {
         );
         return;
       }
+      this.recordObservedMarketCapUsd(currentMc);
       if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
         this.log.warn(
           "Low-funding recipient bought token, but token is below rug threshold; resetting instead of buying",
@@ -4024,6 +4029,7 @@ export class InsiderBot extends EventEmitter {
         );
         return;
       }
+      this.recordObservedMarketCapUsd(currentMc);
       if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
         this.log.warn(
           "Shared feePayer recipient bought token, but token is below rug threshold; resetting instead of buying",
@@ -4047,6 +4053,25 @@ export class InsiderBot extends EventEmitter {
 
       const exitPercent = exitPercentOverride ?? watch.normalTinyExitPercent ?? this.exitPercent;
       const newExitMc = currentMc * (1 + exitPercent / 100);
+      if (
+        !state.lowFundingMode &&
+        watch.normalTinyTransferMode &&
+        this.highestObservedMarketCapUsd !== null &&
+        this.highestObservedMarketCapUsd >= newExitMc
+      ) {
+        this.log.warn(
+          "Skipping normal-mode tiny-band buy because a previously observed market cap already reached this band's exit target",
+          {
+            mint: state.mint,
+            recipient: watch.wallet,
+            currentMc,
+            exitPercent,
+            wouldBeExitMc: newExitMc,
+            highestObservedMarketCapUsd: this.highestObservedMarketCapUsd,
+          },
+        );
+        return;
+      }
       this.setExitMc(newExitMc);
       this.setEntryMc(currentMc);
       this.setBuyExecuting(true);
@@ -5393,6 +5418,15 @@ export class InsiderBot extends EventEmitter {
     return this.cachedSolPriceUsd;
   }
 
+  private recordObservedMarketCapUsd(marketCapUsd: number): void {
+    if (
+      this.highestObservedMarketCapUsd === null ||
+      marketCapUsd > this.highestObservedMarketCapUsd
+    ) {
+      this.highestObservedMarketCapUsd = marketCapUsd;
+    }
+  }
+
   private parseBuyVolumeUsd(entry: Record<string, unknown>): number | null {
     const raw = entry.buy_volume_cur ?? entry.history_bought_cost;
     const n = typeof raw === "number" ? raw : Number(raw);
@@ -5525,6 +5559,7 @@ export class InsiderBot extends EventEmitter {
     this.devWallet = null;
     this.devCreateSignature = null;
     this.devCreateTimestamp = null;
+    this.highestObservedMarketCapUsd = null;
     this.preBuyStopped = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
@@ -5561,6 +5596,7 @@ export class InsiderBot extends EventEmitter {
     this.devWallet = null;
     this.devCreateSignature = null;
     this.devCreateTimestamp = null;
+    this.highestObservedMarketCapUsd = null;
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.profitExitDisabled = false;
