@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-11
+
+### Normal mode's $1-$5 band buy gate now requires that group to be the *first* tiny transfer-out group for the token
+
+- `insider-bot.ts`: `inspectBundlerFunderTransaction` now records every qualifying feePayer transfer-out into `state.normalTinyTransferOuts` — including sub-$1 amounts that fall below `BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD` and were previously never tracked at all (they were dropped before the recording call even ran). Recording now happens before the minimum-USD check; the check itself still gates whether processing continues past that point.
+- When a $1-$5 ("2_5_to_5") same-band group of ≥2 recipients forms, a new guard checks whether any other transfer-out already recorded for this token/feePayer (of any size, including that newly-tracked sub-$1 dust) has an earlier timestamp than the group's earliest member. If one exists, the $1-$5 group is rejected outright: it isn't the first tiny transfer-out activity seen for the token, so it no longer qualifies as the buy signal. A `⏭️ ... Normal $1-$5 Band Buy Skipped — Not The First Group` Telegram notice is sent and `resetForNewToken(true)` is called, mirroring the existing staleness-skip pattern.
+- This check only applies to the $1-$5 band (as requested) — the >$5-$10 band's grouping/buy logic is unaffected by it, though it now also benefits from the more accurate `normalTinyTransferOuts` data (a dust transfer-out landing inside its own 10s lookback window already caused group-rejection via the pre-existing mixed-band check, now that dust is actually visible there).
+- Net effect: the $1-$5 band now only ever triggers a buy off the very first cluster of tiny transfer-outs seen for a token — any $1-$5 group that follows an earlier transfer-out of any size (dust or otherwise) is ignored and the bot resets to wait for the next token.
+
 ## 2026-07-10
 
 ### Both normal- and low-funding modes' tiny same-band group are now $1-$5 (was $2-$5)

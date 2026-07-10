@@ -2922,6 +2922,22 @@ export class InsiderBot extends EventEmitter {
     ) {
       return false;
     }
+    const tinyUsdBand = this.getTinyUsdBand(transferOutUsd);
+    // Record every qualifying feePayer transfer-out — including ones below
+    // the minimum buy USD ("lt2_5" band, i.e. sub-$1 dust) — purely so we can
+    // tell whether a later $1-$5 band group is genuinely the *first* tiny
+    // transfer-out activity seen for this token (see the "not the first
+    // group" guard below), rather than a group that just happens to follow
+    // some earlier, smaller transfer-out that was itself skipped as too tiny
+    // to buy on.
+    this.recordNormalTinyTransferOut(state, {
+      signature: tx.signature,
+      timestamp: tx.timestamp,
+      recipient: transferOut.to,
+      amountSol: transferOut.amountSol,
+      amountUsd: transferOutUsd,
+    });
+
     if (transferOutUsd < BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD) {
       this.log.info("Skipping normal-mode feePayer tiny transfer below minimum buy USD", {
         mint: state.mint,
@@ -2935,15 +2951,7 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    const tinyUsdBand = this.getTinyUsdBand(transferOutUsd);
     if (tinyUsdBand === "lt2_5") return false;
-    this.recordNormalTinyTransferOut(state, {
-      signature: tx.signature,
-      timestamp: tx.timestamp,
-      recipient: transferOut.to,
-      amountSol: transferOut.amountSol,
-      amountUsd: transferOutUsd,
-    });
     const sameBandGroup = this.getNormalTinySameBandGroup(
       state,
       tx.timestamp,
@@ -2964,6 +2972,49 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (tinyUsdBand === "2_5_to_5") {
+      // The $1-$5 band only qualifies as a buy signal if it's the very first
+      // tiny transfer-out group observed for this token — i.e. no earlier
+      // feePayer transfer-out of any size (including sub-$1 dust, now
+      // tracked in `normalTinyTransferOuts` above precisely for this check)
+      // happened before this group's earliest member.
+      const groupSignatures = new Set(sameBandGroup.map((entry) => entry.signature));
+      const earliestGroupTimestamp = Math.min(...sameBandGroup.map((entry) => entry.timestamp));
+      const earlierTransferOut = state.normalTinyTransferOuts.find(
+        (entry) =>
+          !groupSignatures.has(entry.signature) &&
+          entry.timestamp < earliestGroupTimestamp,
+      );
+      if (earlierTransferOut) {
+        this.log.warn(
+          "Skipping normal-mode $1-$5 band buy gate because it is not the first tiny transfer-out group seen for this token",
+          {
+            mint: state.mint,
+            funderWallet: state.funderWallet,
+            signature: tx.signature,
+            tinyUsdBand,
+            earlierSignature: earlierTransferOut.signature,
+            earlierAmountUsd: earlierTransferOut.amountUsd,
+            earlierTimestamp: earlierTransferOut.timestamp,
+            groupEarliestTimestamp: earliestGroupTimestamp,
+          },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>⏭️ ${this.label} Normal $1-$5 Band Buy Skipped — Not The First Group</b>`,
+            `Token: <code>${state.mint}</code>`,
+            `FeePayer: <code>${state.funderWallet}</code>`,
+            `An earlier feePayer transfer-out ($${earlierTransferOut.amountUsd.toFixed(2)}, <code>${earlierTransferOut.signature}</code>) happened before this $1-$5 group — it isn't the first tiny transfer-out group for this token.`,
+            "Skipping this token — resetting to watch for the next one.",
+          ].join("\n"),
+          "normal tiny $1-5 band not-first skip notification",
+        );
+        await this.resetForNewToken(true);
+        // Signal the caller to stop processing this tx batch — `state` is now
+        // detached from `this.bundlerFunderWatch` (reset/cleared above), so
+        // continuing to inspect further txs against it would be stale work.
+        return true;
+      }
+
       const lockAgeMs = Date.now() - state.lockedAt;
       if (lockAgeMs >= BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS) {
         this.log.warn(
