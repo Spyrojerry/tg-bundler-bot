@@ -43,6 +43,8 @@ const BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD = 5;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
+/** Normal-mode $2-$5 band buy gates are skipped if this long has passed since the shared feePayer was locked. */
+const BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS = 30 * 60 * 1_000;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
@@ -327,6 +329,8 @@ interface BundlerFunderWatchState {
   lowFundingTinyDevExitBaselineTimestamp: number | null;
   lowFundingLargeTransferBuyUsed: boolean;
   discoveryStopped: boolean;
+  /** Wall-clock time (ms) the shared feePayer was locked (i.e. when the "Shared FeePayer Locked" notification fired). Used to time out stale normal-mode $2-$5 band buy gates. */
+  lockedAt: number;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -1590,6 +1594,7 @@ export class InsiderBot extends EventEmitter {
       lowFundingTinyDevExitBaselineTimestamp: null,
       lowFundingLargeTransferBuyUsed: false,
       discoveryStopped: false,
+      lockedAt: Date.now(),
     };
 
     this.subscribeBundlerFunder(funderWallet);
@@ -2956,6 +2961,38 @@ export class InsiderBot extends EventEmitter {
         groupWindowSeconds: BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS,
       });
       return false;
+    }
+
+    if (tinyUsdBand === "2_5_to_5") {
+      const lockAgeMs = Date.now() - state.lockedAt;
+      if (lockAgeMs >= BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS) {
+        this.log.warn(
+          "Skipping normal-mode $2-$5 band buy gate because too much time has passed since the shared feePayer was locked",
+          {
+            mint: state.mint,
+            funderWallet: state.funderWallet,
+            signature: tx.signature,
+            tinyUsdBand,
+            lockAgeMs,
+            maxLockAgeMs: BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS,
+          },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>⏭️ ${this.label} Normal $2-$5 Band Buy Skipped — Too Stale</b>`,
+            `Token: <code>${state.mint}</code>`,
+            `FeePayer: <code>${state.funderWallet}</code>`,
+            `Time since Shared FeePayer Locked: <b>${Math.round(lockAgeMs / 60_000)} min</b> (limit ${Math.round(BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS / 60_000)} min)`,
+            "Skipping this token — resetting to watch for the next one.",
+          ].join("\n"),
+          "normal tiny $2-5 band stale skip notification",
+        );
+        await this.resetForNewToken(true);
+        // Signal the caller to stop processing this tx batch — `state` is now
+        // detached from `this.bundlerFunderWatch` (reset/cleared above), so
+        // continuing to inspect further txs against it would be stale work.
+        return true;
+      }
     }
 
     const exitPercent = tinyUsdBand === "2_5_to_5"

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-10
+
+### Skip stale normal-mode $2-$5 band buys (30+ min since shared feePayer lock)
+
+- `insider-bot.ts`: `BundlerFunderWatchState` gained a `lockedAt` timestamp, set to `Date.now()` the moment the shared feePayer is confirmed and the `✅ ... Shared FeePayer Locked` notification is sent. It's preserved across feePayer migration (only the large-drain migration path mutates `funderWallet` in place; the state object itself, and its `lockedAt`, is unchanged).
+- In `inspectBundlerFunderTransaction`, right before a normal-mode same-band tiny group would pass the buy gate (i.e. right before the `🟢 ... Normal FeePayer Tiny Funding Group Buy Gate` notification), if the band is specifically **$2.00-$5.00** and `Date.now() - state.lockedAt` is **≥ 30 minutes**, the buy is skipped entirely: a `⏭️ ... Normal $2-$5 Band Buy Skipped — Too Stale` Telegram notice is sent, and the bot calls `resetForNewToken(true)` to fully drop this token and resume watching the followed wallet for the next one. The >$5-$10 band is unaffected and still buys regardless of elapsed time.
+- This targets exactly the scenario reported: a $2-$5 band buy gate that took a very long time (tens of minutes) to form after the feePayer lock — by then the token has likely already moved without the bot, so buying in is skipped instead of chasing a stale signal.
+
 ## 2026-07-09
 
 ### Token Transfer mode: gate transfer-out buys on a prior dev swap-buy; auto-stop on zero balance; startup Telegram summary; more action logging
