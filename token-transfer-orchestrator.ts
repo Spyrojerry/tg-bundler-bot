@@ -12,13 +12,18 @@
 //  are eligible to trigger a buy on transfer-out — an unrelated transfer of
 //  some old/unrelated token the dev happens to hold is ignored.
 //
-//  Once a transfer-out fires, the bot stops watching the dev wallet and
-//  switches to market-cap monitoring only. There is no automatic sell — the
-//  position is closed manually via the Telegram "Sell Position" button, or
-//  automatically cleared (and the mode left stopped) if the trading wallet's
-//  balance for that token is independently observed to reach zero. Either
-//  way, the dev-wallet watch stays stopped until the user presses Start
-//  again.
+//  Once a transfer-out fires, the buy is triggered immediately — but unlike
+//  before, the dev-wallet watch does NOT stop. It keeps polling the same
+//  wallet, now looking for a plain transfer-IN of that *same* mint back to
+//  the dev wallet. The moment an incoming transfer's USD worth is the same
+//  as or greater than the original outgoing transfer's USD worth, that's
+//  treated as a sell signal and the position is closed automatically. There
+//  is otherwise no automatic sell — the position can also be closed any time
+//  via the Telegram "Sell Position" button, or automatically cleared (and
+//  the mode left stopped) if the trading wallet's balance for that token is
+//  independently observed to reach zero. Whichever way the position closes,
+//  the dev-wallet watch stops at that point and stays stopped until the user
+//  presses Start again.
 //
 //  Dedicated to Helius API key 4 (config.insiderHeliusApiKey4) for both the
 //  dev-wallet transaction polling and the post-buy market-cap monitoring, so
@@ -47,6 +52,10 @@ export interface TokenTransferPosition {
   transferSignature: string;
   buySol: number;
   entryMc: number | null;
+  /** Raw token amount the dev wallet originally sent out (the transfer-out that triggered the buy). */
+  transferOutTokenAmount: number;
+  /** USD worth of that outgoing transfer, captured lazily once a price is available (via the MC monitor). Null until then. */
+  transferOutUsdValue: number | null;
 }
 
 export interface TokenTransferBuyTrigger {
@@ -56,10 +65,24 @@ export interface TokenTransferBuyTrigger {
   signature: string;
 }
 
+export interface TokenTransferSellSignal {
+  mint: string;
+  signature: string;
+  /** Wallet that sent the token back to the dev wallet. */
+  from: string;
+  tokenAmount: number;
+  /** USD worth of the incoming transfer, if a price was available at detection time. */
+  incomingUsdValue: number | null;
+  transferOutTokenAmount: number;
+  transferOutUsdValue: number | null;
+}
+
 export interface TokenTransferOrchestrator {
   on(event: 'buyTrigger', listener: (trigger: TokenTransferBuyTrigger) => void): this;
+  on(event: 'sellSignal', listener: (signal: TokenTransferSellSignal) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
   emit(event: 'buyTrigger', trigger: TokenTransferBuyTrigger): boolean;
+  emit(event: 'sellSignal', signal: TokenTransferSellSignal): boolean;
   emit(event: 'error', error: Error): boolean;
 }
 
@@ -279,6 +302,18 @@ export class TokenTransferOrchestrator extends EventEmitter {
         this.processedSignatures.add(tx.signature);
         this.cursorSignature = tx.signature;
 
+        // While holding a position, the only thing we watch for is a
+        // transfer-in of that same mint back to the dev wallet — the
+        // new-token-candidate / transfer-out detection below is irrelevant
+        // until the current position closes.
+        if (this.activePosition) {
+          const incoming = this.findMatchingTransferIn(tx, watchedAddress, this.activePosition.mint);
+          if (incoming) {
+            await this.evaluateSellSignal(tx, incoming);
+          }
+          continue;
+        }
+
         const newCandidateMint = this.findNewTokenSwapBuy(tx, watchedAddress);
         if (newCandidateMint && !this.candidateMints.has(newCandidateMint)) {
           this.candidateMints.add(newCandidateMint);
@@ -293,7 +328,6 @@ export class TokenTransferOrchestrator extends EventEmitter {
         const found = this.findTokenTransferOut(tx, watchedAddress);
         if (found) {
           await this.handleTransferOutDetected(tx, found);
-          return;
         }
       }
     } catch (err) {
@@ -334,7 +368,7 @@ export class TokenTransferOrchestrator extends EventEmitter {
   private findTokenTransferOut(
     tx: HeliusTransaction,
     devAddress: string,
-  ): { mint: string; recipient: string } | null {
+  ): { mint: string; recipient: string; tokenAmount: number } | null {
     if (tx.type && tx.type !== 'TRANSFER') return null;
     const transfer = tx.tokenTransfers?.find(
       (t) =>
@@ -344,16 +378,42 @@ export class TokenTransferOrchestrator extends EventEmitter {
         this.candidateMints.has(t.mint),
     );
     if (!transfer) return null;
-    return { mint: transfer.mint, recipient: transfer.toUserAccount };
+    return { mint: transfer.mint, recipient: transfer.toUserAccount, tokenAmount: transfer.tokenAmount };
+  }
+
+  /**
+   * Matches a plain wallet-to-wallet SPL token transfer (not a SWAP) where
+   * the dev wallet is the *recipient* of the held mint — i.e. someone
+   * sending that same token back to the dev wallet while we're holding a
+   * position bought off the back of its transfer-out.
+   */
+  private findMatchingTransferIn(
+    tx: HeliusTransaction,
+    devAddress: string,
+    mint: string,
+  ): { from: string; tokenAmount: number } | null {
+    if (tx.type && tx.type !== 'TRANSFER') return null;
+    const transfer = tx.tokenTransfers?.find(
+      (t) =>
+        t.mint === mint &&
+        t.toUserAccount === devAddress &&
+        !!t.fromUserAccount &&
+        t.fromUserAccount !== devAddress,
+    );
+    if (!transfer) return null;
+    return { from: transfer.fromUserAccount, tokenAmount: transfer.tokenAmount };
   }
 
   private async handleTransferOutDetected(
     tx: HeliusTransaction,
-    found: { mint: string; recipient: string },
+    found: { mint: string; recipient: string; tokenAmount: number },
   ): Promise<void> {
     const devAddress = this.devAddress!;
-    this.stop('Token transfer-out detected; switching to market-cap monitoring');
     this.candidateMints.clear();
+    // Deliberately NOT calling this.stop() here — the dev-wallet watch keeps
+    // running so it can catch a same-or-greater-value transfer-in of this
+    // mint back to the dev wallet, which is treated as a sell signal (see
+    // findMatchingTransferIn / evaluateSellSignal below).
 
     this.activePosition = {
       mint: found.mint,
@@ -362,12 +422,15 @@ export class TokenTransferOrchestrator extends EventEmitter {
       transferSignature: tx.signature,
       buySol: this.buySol,
       entryMc: null,
+      transferOutTokenAmount: found.tokenAmount,
+      transferOutUsdValue: null,
     };
 
     log.warn('Dev wallet token transfer-out detected; triggering buy', {
       devAddress,
       mint: found.mint,
       recipient: found.recipient,
+      tokenAmount: found.tokenAmount,
       signature: tx.signature,
     });
 
@@ -378,6 +441,77 @@ export class TokenTransferOrchestrator extends EventEmitter {
       devAddress,
       recipient: found.recipient,
       signature: tx.signature,
+    });
+  }
+
+  /**
+   * Evaluated for every transfer-in of the held mint back to the dev wallet
+   * while a position is open. Prices both the original transfer-out and this
+   * incoming transfer; if the incoming USD value is the same as or greater
+   * than the outgoing one, emits a sell signal. Falls back to a raw
+   * token-amount comparison if a price isn't available yet (e.g. right after
+   * a very fresh buy, before the MC monitor's first tick has priced it).
+   */
+  private async evaluateSellSignal(
+    tx: HeliusTransaction,
+    incoming: { from: string; tokenAmount: number },
+  ): Promise<void> {
+    const position = this.activePosition;
+    if (!position) return;
+
+    let incomingUsdValue: number | null = null;
+    try {
+      const priceResult = await this.marketCapClient.fetchMarketCapUsd(position.mint);
+      if (priceResult.ok) {
+        incomingUsdValue = incoming.tokenAmount * priceResult.priceUsd;
+        if (position.transferOutUsdValue === null) {
+          position.transferOutUsdValue = position.transferOutTokenAmount * priceResult.priceUsd;
+        }
+      }
+    } catch (err) {
+      log.warn('Failed to price a dev-wallet transfer-in while evaluating a sell signal', {
+        mint: position.mint,
+        signature: tx.signature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    const meetsThreshold =
+      position.transferOutUsdValue !== null && incomingUsdValue !== null
+        ? incomingUsdValue >= position.transferOutUsdValue
+        : incoming.tokenAmount >= position.transferOutTokenAmount;
+
+    if (!meetsThreshold) {
+      log.info('Dev wallet received a transfer-in of the held token, but it did not match/exceed the original transfer-out', {
+        mint: position.mint,
+        signature: tx.signature,
+        from: incoming.from,
+        tokenAmount: incoming.tokenAmount,
+        incomingUsdValue,
+        transferOutTokenAmount: position.transferOutTokenAmount,
+        transferOutUsdValue: position.transferOutUsdValue,
+      });
+      return;
+    }
+
+    log.warn('Dev wallet received a transfer-in worth the same or more than the original transfer-out; sell signal', {
+      mint: position.mint,
+      signature: tx.signature,
+      from: incoming.from,
+      tokenAmount: incoming.tokenAmount,
+      incomingUsdValue,
+      transferOutTokenAmount: position.transferOutTokenAmount,
+      transferOutUsdValue: position.transferOutUsdValue,
+    });
+
+    this.emit('sellSignal', {
+      mint: position.mint,
+      signature: tx.signature,
+      from: incoming.from,
+      tokenAmount: incoming.tokenAmount,
+      incomingUsdValue,
+      transferOutTokenAmount: position.transferOutTokenAmount,
+      transferOutUsdValue: position.transferOutUsdValue,
     });
   }
 
@@ -395,6 +529,16 @@ export class TokenTransferOrchestrator extends EventEmitter {
             marketCap: result.marketCap,
             source: result.source,
           });
+          if (this.activePosition.transferOutUsdValue === null) {
+            this.activePosition.transferOutUsdValue =
+              this.activePosition.transferOutTokenAmount * result.priceUsd;
+            log.info('Captured USD value of the original dev-wallet transfer-out; watching for a same-or-greater transfer-in as a sell signal', {
+              mint,
+              transferOutTokenAmount: this.activePosition.transferOutTokenAmount,
+              priceUsd: result.priceUsd,
+              transferOutUsdValue: this.activePosition.transferOutUsdValue,
+            });
+          }
         }
       } catch (err) {
         log.warn('Token Transfer market cap monitoring tick failed', {

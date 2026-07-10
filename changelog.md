@@ -2,6 +2,28 @@
 
 ## 2026-07-10
 
+### Both normal- and low-funding modes' tiny same-band group are now $1-$5 (was $2-$5)
+
+- `insider-bot.ts`: `BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD` changed from `2` to `1`. This is the lower bound `getTinyUsdBand` uses to classify a normal-mode feePayer transfer-out into the mid band (previously $2.00-$5.00, now $1.00-$5.00) vs. skipped-as-too-small (`lt2_5`, now effectively "less than $1"). The upper bound (`BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD = 5`) and the >$5-$10 band are unchanged.
+- Updated the corresponding log messages and Telegram notification text ("Normal $2-$5 Band Buy Skipped — Too Stale" → "Normal $1-$5 Band Buy Skipped — Too Stale", the buy-gate card's `Band:` line, etc.) to say $1-$5 instead of $2-$5.
+- Followed up by also changing `BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD` from `2` to `1`, so low-funding mode's own (separate) tiny band — used for its bundler gate and dev-buy-after-create gate — is likewise now $1.00-$5.00 instead of $2.00-$5.00. Updated the "Low-Funding Tiny Bundler Gate" and "Low-Funding Tiny Candidate Pending" notification text accordingly. The overall watched range shown at the "Shared FeePayer Locked" step and in low-funding status logs (built from this constant plus the shared $10 upper bound) also shifts from $2.00-$10 to $1.00-$10.
+- Net effect: **both** funding modes now start grouping/gating tiny transfer-outs at $1 instead of $2; anything below $1 is still ignored as too small in either mode.
+
+## 2026-07-10
+
+### Token Transfer mode: dev-wallet watch no longer stops after buy; return transfer-in is now an automatic sell signal
+
+- `token-transfer-orchestrator.ts`: `handleTransferOutDetected` no longer calls `stop()` after a transfer-out triggers a buy. The dev-wallet poll loop keeps running for the lifetime of the position, so the wallet is never left unwatched between buy and sell.
+- While a position is open, the poll loop's per-tx branching skips the swap-buy/transfer-out candidate logic entirely and instead calls the new `findMatchingTransferIn`, which matches a plain `TRANSFER` where the dev wallet is the *recipient* of the currently-held mint from some other wallet.
+- `TokenTransferPosition` gained `transferOutTokenAmount` (the raw token amount originally sent out) and `transferOutUsdValue` (its USD worth). The USD value isn't known synchronously at buy time — pricing a brand-new position can lag — so it's captured lazily by whichever fires first: the existing MC-monitor tick (every 5s) or the pricing lookup inside a transfer-in evaluation.
+- New `evaluateSellSignal` prices each qualifying transfer-in via the same Helius-key-4-backed `PumpReserveMarketCapClient.fetchMarketCapUsd` used for MC monitoring (which now also returns `priceUsd`), and emits a `sellSignal` event the moment an incoming transfer's USD value is the same as or greater than the recorded transfer-out's USD value. If a price genuinely isn't available yet on either side, it falls back to comparing raw token amounts (incoming >= outgoing) rather than blocking the signal entirely.
+- `index.ts`: new `tokenTransferOrchestrator.on("sellSignal", ...)` listener sends a Telegram alert (amounts + USD values on both sides) and calls a new shared `triggerTokenTransferSell(mint, reason, chatId)` helper to execute the sell through the existing pipeline — this same helper now backs the manual "Sell Position" button too (previously duplicated inline in the `sell:tokentransfer:` callback handler).
+- Sell signals are evaluated per-transfer-in (not accumulated across multiple partial transfers-in) — a single incoming transfer must alone match or exceed the original outgoing USD value to trigger the sell.
+- Home/status cards for Token Transfer mode now show the priced (or pending-priced) transfer-out value while a position is held, e.g. "Watching dev wallet for a return transfer-in worth >= $1,234 as a sell signal".
+- The existing zero-balance auto-stop (previous entry below) and the manual "Sell Position" button both still work unchanged and continue to fully stop the dev-wallet watch once the position closes, regardless of which of the three ways (manual, sell-signal, zero-balance) closed it.
+
+## 2026-07-10
+
 ### Skip stale normal-mode $2-$5 band buys (30+ min since shared feePayer lock)
 
 - `insider-bot.ts`: `BundlerFunderWatchState` gained a `lockedAt` timestamp, set to `Date.now()` the moment the shared feePayer is confirmed and the `✅ ... Shared FeePayer Locked` notification is sent. It's preserved across feePayer migration (only the large-drain migration path mutates `funderWallet` in place; the state object itself, and its `lockedAt`, is unchanged).

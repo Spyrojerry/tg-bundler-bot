@@ -36,14 +36,14 @@ const BUNDLER_FUNDER_LOW_FUNDING_LARGE_EXIT_PERCENT = 180;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_EXIT_MC_USD = 25_000;
 const BUNDLER_FUNDER_LOW_FUNDING_LARGE_SWAP_HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS = 10;
-const BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD = 2;
+const BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD = 1;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD = 5;
-const BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD = 2;
+const BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD = 1;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD = 5;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
-/** Normal-mode $2-$5 band buy gates are skipped if this long has passed since the shared feePayer was locked. */
+/** Normal-mode $1-$5 band buy gates are skipped if this long has passed since the shared feePayer was locked. */
 const BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS = 30 * 60 * 1_000;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
@@ -329,7 +329,7 @@ interface BundlerFunderWatchState {
   lowFundingTinyDevExitBaselineTimestamp: number | null;
   lowFundingLargeTransferBuyUsed: boolean;
   discoveryStopped: boolean;
-  /** Wall-clock time (ms) the shared feePayer was locked (i.e. when the "Shared FeePayer Locked" notification fired). Used to time out stale normal-mode $2-$5 band buy gates. */
+  /** Wall-clock time (ms) the shared feePayer was locked (i.e. when the "Shared FeePayer Locked" notification fired). Used to time out stale normal-mode $1-$5 band buy gates. */
   lockedAt: number;
 }
 
@@ -2967,7 +2967,7 @@ export class InsiderBot extends EventEmitter {
       const lockAgeMs = Date.now() - state.lockedAt;
       if (lockAgeMs >= BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS) {
         this.log.warn(
-          "Skipping normal-mode $2-$5 band buy gate because too much time has passed since the shared feePayer was locked",
+          "Skipping normal-mode $1-$5 band buy gate because too much time has passed since the shared feePayer was locked",
           {
             mint: state.mint,
             funderWallet: state.funderWallet,
@@ -2979,13 +2979,13 @@ export class InsiderBot extends EventEmitter {
         );
         void this.sendTelegramSafe(
           [
-            `<b>⏭️ ${this.label} Normal $2-$5 Band Buy Skipped — Too Stale</b>`,
+            `<b>⏭️ ${this.label} Normal $1-$5 Band Buy Skipped — Too Stale</b>`,
             `Token: <code>${state.mint}</code>`,
             `FeePayer: <code>${state.funderWallet}</code>`,
             `Time since Shared FeePayer Locked: <b>${Math.round(lockAgeMs / 60_000)} min</b> (limit ${Math.round(BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS / 60_000)} min)`,
             "Skipping this token — resetting to watch for the next one.",
           ].join("\n"),
-          "normal tiny $2-5 band stale skip notification",
+          "normal tiny $1-5 band stale skip notification",
         );
         await this.resetForNewToken(true);
         // Signal the caller to stop processing this tx batch — `state` is now
@@ -3040,7 +3040,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${state.mint}</code>`,
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Group: <b>${selectedGroup.length}/${BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES}</b> same USD band within ${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s`,
-        `Band: <b>${tinyUsdBand === "2_5_to_5" ? "$2.00-$5.00" : ">$5.00-$10.00"}</b>`,
+        `Band: <b>${tinyUsdBand === "2_5_to_5" ? "$1.00-$5.00" : ">$5.00-$10.00"}</b>`,
         `Selected exit: <b>+${exitPercent}% MC</b>`,
         ...selectedGroup.map((entry, index) => `${index + 1}. <code>${entry.recipient}</code> — $${entry.amountUsd.toFixed(2)} — <code>${entry.signature}</code>`),
       ].join("\n"),
@@ -3696,7 +3696,7 @@ export class InsiderBot extends EventEmitter {
             `Bundler tiny transfers: <b>${bundlerGroup.length}</b>`,
             `Window: <b>${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s</b>`,
             "",
-            "Waiting for the next $2-$5 tiny transfer to a non-bundler wallet with prior activity in this token.",
+            "Waiting for the next $1-$5 tiny transfer to a non-bundler wallet with prior activity in this token.",
           ].join("\n"),
           "low-funding tiny bundler gate notification",
         );
@@ -3863,7 +3863,7 @@ export class InsiderBot extends EventEmitter {
           `<b>🟡 ${this.label} Low-Funding Tiny Candidate Pending</b>`,
           `Token: <code>${state.mint}</code>`,
           `Recipient: <code>${watch.wallet}</code>`,
-          `Band: <b>$2-$5</b>`,
+          `Band: <b>$1-$5</b>`,
           `Funding tx: <code>${tx.signature}</code>`,
           `Dev: <code>${this.devWallet ?? "unknown"}</code>`,
           "",

@@ -629,6 +629,62 @@ async function main(): Promise<void> {
     return false;
   }
 
+  /**
+   * Shared by the Telegram "Sell Position" button and the automatic
+   * Token Transfer sell-signal (return transfer-in worth >= the original
+   * transfer-out). Clears the active position and kicks off the normal
+   * sell pipeline; `chatId` is null for automatic triggers, which rely on
+   * the sell receipt's own broadcast rather than a direct reply.
+   */
+  function triggerTokenTransferSell(
+    mint: string,
+    reason: string,
+    chatId: string | null,
+  ): string {
+    const position = tokenTransferOrchestrator.getActivePosition();
+    if (!position || position.mint !== mint) {
+      return "No active Token Transfer position for that token.";
+    }
+    if (!config.tradingWalletAddress) {
+      return "No TRADING_WALLET_ADDRESS configured.";
+    }
+    if (hasPendingSellForMint(config.tradingWalletAddress, mint)) {
+      return "Sell already pending for this token.";
+    }
+
+    const event: FilterFailEvent = {
+      walletAddress: config.tradingWalletAddress,
+      mint,
+      sampleNumber: 0,
+      elapsedSec: 0,
+      reasons: [reason],
+      settings: db.getWalletSettings(config.tradingWalletAddress),
+      metrics: {
+        mint,
+        timestamp: new Date().toISOString(),
+        bundlersPercent: null,
+        bundlersCount: null,
+        initialBaseReserve: null,
+        topWallets: null,
+        top10HolderRate: null,
+        bundledAmountRate: null,
+      },
+      buySol: position.buySol,
+      matchingWallets: [],
+    };
+
+    const sellId = randomBytes(5).toString("hex");
+    pendingSells.set(sellId, {
+      event,
+      createdAt: Date.now(),
+      executing: true,
+    });
+    tokenTransferOrchestrator.clearActivePosition(reason);
+
+    void executeSellAndNotify(chatId, sellId, telegramBot);
+    return "Sell signal sent.";
+  }
+
   async function handleTelegramCommand(
     _chatId: string,
     text: string,
@@ -868,52 +924,11 @@ async function main(): Promise<void> {
         }
         if (data.startsWith("sell:tokentransfer:")) {
           const [, , mint] = parts;
-          const position = tokenTransferOrchestrator.getActivePosition();
-          if (!position || position.mint !== mint) {
-            return "No active Token Transfer position for that token.";
-          }
-          if (!config.tradingWalletAddress) {
-            return "No TRADING_WALLET_ADDRESS configured.";
-          }
-          if (
-            hasPendingSellForMint(config.tradingWalletAddress, mint)
-          ) {
-            return "Sell already pending for this token.";
-          }
-
-          const event: FilterFailEvent = {
-            walletAddress: config.tradingWalletAddress,
+          return triggerTokenTransferSell(
             mint,
-            sampleNumber: 0,
-            elapsedSec: 0,
-            reasons: ["Manual sell requested via Telegram button (Token Transfer mode)."],
-            settings: db.getWalletSettings(config.tradingWalletAddress),
-            metrics: {
-              mint,
-              timestamp: new Date().toISOString(),
-              bundlersPercent: null,
-              bundlersCount: null,
-              initialBaseReserve: null,
-              topWallets: null,
-              top10HolderRate: null,
-              bundledAmountRate: null,
-            },
-            buySol: position.buySol,
-            matchingWallets: [],
-          };
-
-          const sellId = randomBytes(5).toString("hex");
-          pendingSells.set(sellId, {
-            event,
-            createdAt: Date.now(),
-            executing: true,
-          });
-          tokenTransferOrchestrator.clearActivePosition(
-            "Manual sell requested via Telegram button",
+            "Manual sell requested via Telegram button (Token Transfer mode).",
+            chatId,
           );
-
-          void executeSellAndNotify(chatId, sellId, telegramBot);
-          return "Sell signal sent.";
         }
         if (data === "menu:wallets") return walletsReply(chatId, true);
         if (data === "menu:status") return statusReply(true);
@@ -1513,6 +1528,39 @@ async function main(): Promise<void> {
         tokenTransferBuyInProgress = false;
       }
     })();
+  });
+
+  tokenTransferOrchestrator.on("sellSignal", (signal) => {
+    // The dev wallet received the held token back, worth the same or more
+    // (in USD) than what it originally sent out — treat that as a sell
+    // signal and close the position through the normal sell pipeline.
+    log.warn("[TOKEN TRANSFER SELL SIGNAL]", signal);
+
+    void telegramBot
+      ?.sendDefault(
+        [
+          "<b>🚨 Token Transfer Sell Signal</b>",
+          `Token: <code>${html(signal.mint)}</code>`,
+          `Dev wallet received back <b>${signal.tokenAmount.toLocaleString()}</b> tokens from <code>${html(signal.from)}</code>`,
+          signal.incomingUsdValue !== null
+            ? `Incoming value: <b>$${signal.incomingUsdValue.toLocaleString()}</b>`
+            : "Incoming value: <b>Unknown (price unavailable)</b>",
+          signal.transferOutUsdValue !== null
+            ? `Original transfer-out value: <b>$${signal.transferOutUsdValue.toLocaleString()}</b>`
+            : `Original transfer-out amount: <b>${signal.transferOutTokenAmount.toLocaleString()}</b> tokens`,
+          "This matches or exceeds the original transfer-out — selling now.",
+        ].join("\n"),
+      )
+      .catch((err) =>
+        log.warn("Telegram Token Transfer sell-signal alert failed", err),
+      );
+
+    const result = triggerTokenTransferSell(
+      signal.mint,
+      "Dev wallet received a transfer-in worth the same or more (USD) than the original transfer-out.",
+      null,
+    );
+    log.info(`[TOKEN TRANSFER SELL SIGNAL] ${result}`, { mint: signal.mint });
   });
 
   insiderBots.forEach((bot, index) => {
@@ -2687,7 +2735,7 @@ async function main(): Promise<void> {
 
     let status = "Idle";
     if (activePosition)
-      status = `Holding token ${html(activePosition.mint.slice(0, 8))}...`;
+      status = `Holding ${html(activePosition.mint.slice(0, 8))}... — watching dev wallet for a return transfer-in as a sell signal`;
     else if (isRunning && watchedCandidates.length > 0)
       status = `Watching ${watchedCandidates.length} newly bought token(s) for a transfer-out...`;
     else if (isRunning) status = "Watching dev wallet for a new-token swap buy...";
@@ -2716,14 +2764,21 @@ async function main(): Promise<void> {
         activePosition?.entryMc
           ? `Entry MC: <b>$${html(activePosition.entryMc.toLocaleString())}</b>`
           : "",
+        activePosition
+          ? `Transfer-out was worth: <b>${
+              activePosition.transferOutUsdValue !== null
+                ? `$${html(activePosition.transferOutUsdValue.toLocaleString())}`
+                : `${html(activePosition.transferOutTokenAmount.toLocaleString())} tokens (pricing...)`
+            }</b>`
+          : "",
         "",
         "<b>Flow</b>",
         "1. Set the dev wallet address to watch.",
         "2. Click Start; the bot watches that wallet's transactions (Helius key 4) for a SWAP where it buys a new token.",
         "3. Once flagged, the bot watches specifically for that token being sent out (a plain transfer, not a sell) to another wallet.",
-        "4. The moment that transfer-out happens, the bot buys it immediately with your configured SOL amount.",
-        "5. There is no automatic sell — click \"Sell Position\" whenever you want to exit (MC is monitored via Helius key 4 for display only). The mode also auto-stops and clears the position if your trading wallet's balance for that token is ever seen at zero.",
-        "6. Either way, once the position closes the dev-wallet watch stays stopped until you press Start again.",
+        "4. The moment that transfer-out happens, the bot buys it immediately with your configured SOL amount — and keeps watching the dev wallet.",
+        "5. If the dev wallet later receives that same token back, worth the same or more (in USD) than what it sent out, the bot treats that as a sell signal and sells automatically. You can also click \"Sell Position\" any time to exit manually (MC is monitored via Helius key 4 for display only). The mode also auto-stops and clears the position if your trading wallet's balance for that token is ever seen at zero.",
+        "6. Either way, once the position closes the dev-wallet watch stops until you press Start again.",
       ]
         .filter(Boolean)
         .join("\n"),
@@ -2814,8 +2869,17 @@ async function main(): Promise<void> {
         `Running: ${tokenTransferOrchestrator.isRunning() ? "yes" : "no"}`,
         `Watching for transfer-out: ${watchedCandidates.length ? watchedCandidates.join(", ") : "none yet"}`,
         `Holding: ${activePosition ? activePosition.mint : "none"}`,
+        activePosition
+          ? `Watching dev wallet for a return transfer-in worth >= ${
+              activePosition.transferOutUsdValue !== null
+                ? `$${activePosition.transferOutUsdValue.toLocaleString()}`
+                : `${activePosition.transferOutTokenAmount.toLocaleString()} tokens (pricing...)`
+            } as a sell signal`
+          : "",
         `Buy: ${tokenTransferOrchestrator.getBuySol()} SOL`,
-      ].join("\n");
+      ]
+        .filter(Boolean)
+        .join("\n");
     }
 
     return {
