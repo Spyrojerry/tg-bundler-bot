@@ -39,6 +39,8 @@ const BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS = 10;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD = 1;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD = 5;
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD = 1;
+/** Floor for what counts as trackable "less than $1" dust (for the $1-$5 band's not-first-group check below) — the effective below-minimum band is $0.10-$0.99; anything under $0.10 is ignored entirely, not just below the buy minimum. */
+const BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD = 5;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
@@ -2922,11 +2924,23 @@ export class InsiderBot extends EventEmitter {
     ) {
       return false;
     }
+    if (transferOutUsd < BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD) {
+      this.log.debug("Skipping normal-mode feePayer transfer-out below the dust floor (too tiny to track at all)", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        signature: tx.signature,
+        recipient: transferOut.to,
+        amountSol: transferOut.amountSol,
+        amountUsd: transferOutUsd,
+        dustFloorUsd: BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD,
+      });
+      return false;
+    }
     const tinyUsdBand = this.getTinyUsdBand(transferOutUsd);
     // Record every qualifying feePayer transfer-out — including ones below
-    // the minimum buy USD ("lt2_5" band, i.e. sub-$1 dust) — purely so we can
-    // tell whether a later $1-$5 band group is genuinely the *first* tiny
-    // transfer-out activity seen for this token (see the "not the first
+    // the minimum buy USD ("lt2_5" band, i.e. $0.10-$0.99 dust) — purely so
+    // we can tell whether a later $1-$5 band group is genuinely the *first*
+    // tiny transfer-out activity seen for this token (see the "not the first
     // group" guard below), rather than a group that just happens to follow
     // some earlier, smaller transfer-out that was itself skipped as too tiny
     // to buy on.
@@ -2974,9 +2988,10 @@ export class InsiderBot extends EventEmitter {
     if (tinyUsdBand === "2_5_to_5") {
       // The $1-$5 band only qualifies as a buy signal if it's the very first
       // tiny transfer-out group observed for this token — i.e. no earlier
-      // feePayer transfer-out of any size (including sub-$1 dust, now
-      // tracked in `normalTinyTransferOuts` above precisely for this check)
-      // happened before this group's earliest member.
+      // feePayer transfer-out of any trackable size (including $0.10-$0.99
+      // dust, now tracked in `normalTinyTransferOuts` above precisely for
+      // this check; anything under $0.10 is ignored entirely) happened
+      // before this group's earliest member.
       const groupSignatures = new Set(sameBandGroup.map((entry) => entry.signature));
       const earliestGroupTimestamp = Math.min(...sameBandGroup.map((entry) => entry.timestamp));
       const earlierTransferOut = state.normalTinyTransferOuts.find(

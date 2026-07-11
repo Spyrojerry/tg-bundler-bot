@@ -2,6 +2,11 @@
 
 ## 2026-07-11
 
+### The "less than $1" dust band tracked for the not-first-group check is now $0.10-$0.99 (was anything under $1)
+
+- `insider-bot.ts`: added `BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1`. In `inspectBundlerFunderTransaction`, any feePayer transfer-out below this floor is now skipped outright (logged at debug level, not even recorded into `normalTinyTransferOuts`) before the dust-tracking/band-classification logic runs.
+- Practically this means the "less than $1" band used by the $1-$5 band's not-first-group check (added just above) now only considers transfer-outs in the **$0.10-$0.99** range as trackable dust that can disqualify a $1-$5 group from being "first." Amounts under $0.10 are treated as noise and ignored entirely — they neither count as dust nor affect group formation in any way.
+
 ### Normal mode's $1-$5 band buy gate now requires that group to be the *first* tiny transfer-out group for the token
 
 - `insider-bot.ts`: `inspectBundlerFunderTransaction` now records every qualifying feePayer transfer-out into `state.normalTinyTransferOuts` — including sub-$1 amounts that fall below `BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD` and were previously never tracked at all (they were dropped before the recording call even ran). Recording now happens before the minimum-USD check; the check itself still gates whether processing continues past that point.
