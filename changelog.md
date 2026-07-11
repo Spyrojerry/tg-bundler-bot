@@ -2,6 +2,14 @@
 
 ## 2026-07-11
 
+### Not-first-group disqualification for the $1-$5 band is now split by sub-band: $1-$2.5 still skips, $2.5-$5 buys anyway
+
+- `insider-bot.ts`: added `BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD = 2.5`, splitting the $1-$5 band in two for the not-first-group check added earlier. When a $1-$5 group is found to be preceded by an earlier transfer-out (one dust group, or several separate dust groups/rounds — the timestamp-based check already covers any number of them regardless of how they're clustered):
+  - If the group's amounts stay within **$1.00-$2.50** (`groupMaxUsd <= 2.5`), the token is still fully disqualified exactly as before: a `⏭️ ... Normal $1-$2.5 Sub-Band Buy Skipped — Preceded By Dust` notice is sent and `resetForNewToken(true)` runs.
+  - If the group reaches into the **>$2.50-$5.00** half instead (`groupMaxUsd > 2.5`), the disqualification is overridden — a `Normal-mode $2.5-$5 sub-band buy gate accepted despite earlier dust/transfer-outs` log line is written and execution falls through to the normal buy-gate flow, so the bot buys and follows the usual MC-based sell trigger through to exit/reset, same as any other successful buy.
+- The exit percent for this override case is unchanged (still the mid-band's `BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT`, i.e. +90% MC) — this only changes whether the group is trusted as a buy signal, not what happens after the buy.
+- Groups that genuinely have no earlier transfer-out at all (truly first) are unaffected by any of this — they proceed exactly as before regardless of amount within $1-$5.
+
 ### The "less than $1" dust band tracked for the not-first-group check is now $0.10-$0.99 (was anything under $1)
 
 - `insider-bot.ts`: added `BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1`. In `inspectBundlerFunderTransaction`, any feePayer transfer-out below this floor is now skipped outright (logged at debug level, not even recorded into `normalTinyTransferOuts`) before the dust-tracking/band-classification logic runs.

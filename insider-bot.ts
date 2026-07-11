@@ -42,6 +42,8 @@ const BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD = 1;
 /** Floor for what counts as trackable "less than $1" dust (for the $1-$5 band's not-first-group check below) — the effective below-minimum band is $0.10-$0.99; anything under $0.10 is ignored entirely, not just below the buy minimum. */
 const BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD = 5;
+/** Splits the $1-$5 band in two for the not-first-group override below: a group confined to $1.00-$2.50 that's preceded by dust/earlier transfer-outs is still disqualified, but one reaching into >$2.50-$5.00 is trusted anyway despite the earlier dust. */
+const BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD = 2.5;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
@@ -3000,34 +3002,65 @@ export class InsiderBot extends EventEmitter {
           entry.timestamp < earliestGroupTimestamp,
       );
       if (earlierTransferOut) {
+        // Dust (or any other earlier transfer-out) preceding this group means
+        // it isn't genuinely the token's first tiny transfer-out activity.
+        // We only fully disqualify the token for that when the group itself
+        // stays confined to the lower $1.00-$2.50 half of the band — dust
+        // noise followed by only a modest $1-$2.5 round isn't trusted. If the
+        // group reaches into the upper >$2.50-$5.00 half instead, it's still
+        // treated as a valid buy signal despite the earlier dust, and falls
+        // through to the normal buy/exit flow below.
+        const groupMaxUsd = Math.max(...sameBandGroup.map((entry) => entry.amountUsd));
+        if (groupMaxUsd <= BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD) {
+          this.log.warn(
+            "Skipping normal-mode $1-$2.5 sub-band buy gate because dust/earlier transfer-outs preceded this group",
+            {
+              mint: state.mint,
+              funderWallet: state.funderWallet,
+              signature: tx.signature,
+              tinyUsdBand,
+              groupMaxUsd,
+              earlierSignature: earlierTransferOut.signature,
+              earlierAmountUsd: earlierTransferOut.amountUsd,
+              earlierTimestamp: earlierTransferOut.timestamp,
+              groupEarliestTimestamp: earliestGroupTimestamp,
+            },
+          );
+          void this.sendTelegramSafe(
+            [
+              `<b>⏭️ ${this.label} Normal $1-$2.5 Sub-Band Buy Skipped — Preceded By Dust</b>`,
+              `Token: <code>${state.mint}</code>`,
+              `FeePayer: <code>${state.funderWallet}</code>`,
+              `An earlier feePayer transfer-out ($${earlierTransferOut.amountUsd.toFixed(2)}, <code>${earlierTransferOut.signature}</code>) happened before this group, and the group itself only reaches $${groupMaxUsd.toFixed(2)} — staying within $1.00-$2.50, so it isn't trusted.`,
+              "Skipping this token — resetting to watch for the next one.",
+            ].join("\n"),
+            "normal tiny $1-2.5 sub-band dust-preceded skip notification",
+          );
+          await this.resetForNewToken(true);
+          // Signal the caller to stop processing this tx batch — `state` is
+          // now detached from `this.bundlerFunderWatch` (reset/cleared
+          // above), so continuing to inspect further txs against it would be
+          // stale work.
+          return true;
+        }
+
         this.log.warn(
-          "Skipping normal-mode $1-$5 band buy gate because it is not the first tiny transfer-out group seen for this token",
+          "Normal-mode $2.5-$5 sub-band buy gate accepted despite earlier dust/transfer-outs (group reaches the upper half of the $1-$5 band)",
           {
             mint: state.mint,
             funderWallet: state.funderWallet,
             signature: tx.signature,
             tinyUsdBand,
+            groupMaxUsd,
             earlierSignature: earlierTransferOut.signature,
             earlierAmountUsd: earlierTransferOut.amountUsd,
             earlierTimestamp: earlierTransferOut.timestamp,
             groupEarliestTimestamp: earliestGroupTimestamp,
           },
         );
-        void this.sendTelegramSafe(
-          [
-            `<b>⏭️ ${this.label} Normal $1-$5 Band Buy Skipped — Not The First Group</b>`,
-            `Token: <code>${state.mint}</code>`,
-            `FeePayer: <code>${state.funderWallet}</code>`,
-            `An earlier feePayer transfer-out ($${earlierTransferOut.amountUsd.toFixed(2)}, <code>${earlierTransferOut.signature}</code>) happened before this $1-$5 group — it isn't the first tiny transfer-out group for this token.`,
-            "Skipping this token — resetting to watch for the next one.",
-          ].join("\n"),
-          "normal tiny $1-5 band not-first skip notification",
-        );
-        await this.resetForNewToken(true);
-        // Signal the caller to stop processing this tx batch — `state` is now
-        // detached from `this.bundlerFunderWatch` (reset/cleared above), so
-        // continuing to inspect further txs against it would be stale work.
-        return true;
+        // Deliberately not returning here — this group reaches into the
+        // >$2.50-$5.00 half of the band, so despite the earlier dust it's
+        // still trusted and proceeds through the normal buy-gate flow below.
       }
 
       const lockAgeMs = Date.now() - state.lockedAt;
