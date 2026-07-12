@@ -28,7 +28,9 @@ const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
 const BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_RETRY_DELAY_MS = 500;
-const BUNDLER_FUNDER_LOW_FUNDING_SOL = 15;
+const BUNDLER_FUNDER_LOW_FUNDING_SOL = 20;
+/** Kill switch for the whole low-funding-mode path. While false, any shared feePayer whose largest funding is below BUNDLER_FUNDER_LOW_FUNDING_SOL is skipped entirely (no watch is even created for it) instead of being handled via low-funding logic. */
+const BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED = false;
 const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
 const BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT = 50;
 const BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL = 3.5;
@@ -1555,10 +1557,33 @@ export class InsiderBot extends EventEmitter {
     );
     const largestFundingSol = Math.max(...records.map((record) => record.amountSol));
     const lowFundingMode = largestFundingSol < BUNDLER_FUNDER_LOW_FUNDING_SOL;
+    const funderWallet = records[0].fundingFeePayer;
+    if (lowFundingMode && !BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED) {
+      this.log.warn(
+        "Low-funding mode is disabled; skipping token because its shared feePayer's largest funding is below the normal-mode threshold",
+        {
+          mint,
+          funderWallet,
+          largestFundingSol,
+          normalFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏭️ ${this.label} Low-Funding Mode Disabled — Token Skipped</b>`,
+          `Token: <code>${mint}</code>`,
+          `FeePayer: <code>${funderWallet}</code>`,
+          `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b> (below the ${BUNDLER_FUNDER_LOW_FUNDING_SOL} SOL normal-mode threshold)`,
+          "Low-funding mode is currently disabled — resetting to watch for the next token.",
+        ].join("\n"),
+        "low-funding mode disabled skip notification",
+      );
+      await this.resetForNewToken(true);
+      return;
+    }
     const latestBundlerBuyTimestamp = Math.max(
       ...firstFour.map((buy) => buy.timestamp),
     );
-    const funderWallet = records[0].fundingFeePayer;
     this.bundlerFunderWatch = {
       mint,
       funderWallet,

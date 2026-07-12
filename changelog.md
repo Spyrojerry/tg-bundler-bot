@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-12
+
+### Normal-funding threshold raised to 20 SOL+; low-funding mode disabled for now
+
+- `insider-bot.ts`: `BUNDLER_FUNDER_LOW_FUNDING_SOL` changed from `15` to `20`. This is the sole threshold that decides which mode a shared feePayer falls into (`lowFundingMode = largestFundingSol < BUNDLER_FUNDER_LOW_FUNDING_SOL`), so normal-funding mode now requires the feePayer's largest bundler funding to be **≥20 SOL** (was ≥15 SOL); everything below that is the low-funding tier.
+- Added a kill switch, `BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED = false`. In `startBundlerFunderFlow`, right after computing `lowFundingMode` (and before any watch state is even created), if a feePayer would have qualified for low-funding mode but the switch is off, the token is skipped outright: a `⏭️ ... Low-Funding Mode Disabled — Token Skipped` Telegram notice is sent and `resetForNewToken(true)` runs, same as any other pre-watch rejection. No watch/state is created for these feePayers at all, so none of the existing low-funding-mode logic (tiny bands, dev-buy gate, large-transfer flow, etc.) runs for them — they're just skipped and the bot waits for the next token.
+- This is a single boolean flag specifically so low-funding mode can be re-enabled later by flipping `BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED` back to `true` — none of the underlying low-funding logic was removed.
+- Normal-funding mode (now ≥20 SOL) and its own tiny same-band logic (including the recent $1-$5 not-first-group rules) are completely unaffected by this change.
+
 ## 2026-07-11
 
 ### Not-first-group disqualification for the $1-$5 band is now split by sub-band: $1-$2.5 still skips, $2.5-$5 buys anyway
