@@ -316,6 +316,8 @@ interface BundlerFunderWatchState {
   recipientWatches: Map<string, FunderRecipientWatch>;
   queuedTransferOuts: FunderTransferOutCandidate[];
   normalTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
+  /** Sticky flag: set once a same-band group (≥2 recipients within 10s) of $0.10-$0.99 dust transfer-outs has been observed for this token. Once set, the next $1-$5/>$5-$10 band group is routed by sub-band instead of bought unconditionally — see inspectBundlerFunderTransaction. */
+  normalTinyDustGroupSeen: boolean;
   lowFundingFunderTxs: Array<{ signature: string; timestamp: number }>;
   lowFundingTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
   lowFundingTinyBundlerGateSeen: boolean;
@@ -1604,6 +1606,7 @@ export class InsiderBot extends EventEmitter {
       recipientWatches: new Map<string, FunderRecipientWatch>(),
       queuedTransferOuts: [],
       normalTinyTransferOuts: [],
+      normalTinyDustGroupSeen: false,
       lowFundingFunderTxs: [],
       lowFundingTinyTransferOuts: [],
       lowFundingTinyBundlerGateSeen: false,
@@ -2992,7 +2995,44 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    if (tinyUsdBand === "lt2_5") return false;
+    if (tinyUsdBand === "lt2_5") {
+      // A single dust transfer-out doesn't mean anything on its own — only a
+      // same-band *group* of them (≥2 recipients within the same 10s window,
+      // same as $1-$5/>$5-$10 grouping) counts as a genuine dust round. Once
+      // that's seen, stick a flag on the state so the next $1-$5/>$5-$10
+      // group gets routed by sub-band below instead of just checking raw
+      // timestamps (which is unreliable at Solana's 1-second timestamp
+      // resolution when dust and a real group land in the same second).
+      if (!state.normalTinyDustGroupSeen) {
+        const dustGroup = this.getNormalTinySameBandGroup(state, tx.timestamp, "lt2_5");
+        if (dustGroup.length >= 2) {
+          state.normalTinyDustGroupSeen = true;
+          this.log.warn(
+            "Normal-mode $0.10-$0.99 dust group observed; will route the next $1-$5/>$5-$10 group by sub-band instead of buying it unconditionally",
+            {
+              mint: state.mint,
+              funderWallet: state.funderWallet,
+              signature: tx.signature,
+              dustGroupCount: dustGroup.length,
+              dustGroupRecipients: dustGroup.map((entry) => entry.recipient),
+              groupWindowSeconds: BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS,
+            },
+          );
+          void this.sendTelegramSafe(
+            [
+              `<b>🟡 ${this.label} Normal Dust Group Observed</b>`,
+              `Token: <code>${state.mint}</code>`,
+              `FeePayer: <code>${state.funderWallet}</code>`,
+              `Dust transfer-outs: <b>${dustGroup.length}</b> (each $0.10-$0.99), same 10s window`,
+              "",
+              "Watching for what comes next: $1.00-$2.50 skips the token, >$2.50-$5.00 buys with +90% MC, >$5.00-$10.00 buys with +180% MC.",
+            ].join("\n"),
+            "normal tiny dust group observed notification",
+          );
+        }
+      }
+      return false;
+    }
     const sameBandGroup = this.getNormalTinySameBandGroup(
       state,
       tx.timestamp,
@@ -3012,82 +3052,70 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    if (tinyUsdBand === "2_5_to_5") {
-      // The $1-$5 band only qualifies as a buy signal if it's the very first
-      // tiny transfer-out group observed for this token — i.e. no earlier
-      // feePayer transfer-out of any trackable size (including $0.10-$0.99
-      // dust, now tracked in `normalTinyTransferOuts` above precisely for
-      // this check; anything under $0.10 is ignored entirely) happened
-      // before this group's earliest member.
-      const groupSignatures = new Set(sameBandGroup.map((entry) => entry.signature));
-      const earliestGroupTimestamp = Math.min(...sameBandGroup.map((entry) => entry.timestamp));
-      const earlierTransferOut = state.normalTinyTransferOuts.find(
-        (entry) =>
-          !groupSignatures.has(entry.signature) &&
-          entry.timestamp < earliestGroupTimestamp,
-      );
-      if (earlierTransferOut) {
-        // Dust (or any other earlier transfer-out) preceding this group means
-        // it isn't genuinely the token's first tiny transfer-out activity.
-        // We only fully disqualify the token for that when the group itself
-        // stays confined to the lower $1.00-$2.50 half of the band — dust
-        // noise followed by only a modest $1-$2.5 round isn't trusted. If the
-        // group reaches into the upper >$2.50-$5.00 half instead, it's still
-        // treated as a valid buy signal despite the earlier dust, and falls
-        // through to the normal buy/exit flow below.
-        const groupMaxUsd = Math.max(...sameBandGroup.map((entry) => entry.amountUsd));
-        if (groupMaxUsd <= BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD) {
-          this.log.warn(
-            "Skipping normal-mode $1-$2.5 sub-band buy gate because dust/earlier transfer-outs preceded this group",
-            {
-              mint: state.mint,
-              funderWallet: state.funderWallet,
-              signature: tx.signature,
-              tinyUsdBand,
-              groupMaxUsd,
-              earlierSignature: earlierTransferOut.signature,
-              earlierAmountUsd: earlierTransferOut.amountUsd,
-              earlierTimestamp: earlierTransferOut.timestamp,
-              groupEarliestTimestamp: earliestGroupTimestamp,
-            },
-          );
-          void this.sendTelegramSafe(
-            [
-              `<b>⏭️ ${this.label} Normal $1-$2.5 Sub-Band Buy Skipped — Preceded By Dust</b>`,
-              `Token: <code>${state.mint}</code>`,
-              `FeePayer: <code>${state.funderWallet}</code>`,
-              `An earlier feePayer transfer-out ($${earlierTransferOut.amountUsd.toFixed(2)}, <code>${earlierTransferOut.signature}</code>) happened before this group, and the group itself only reaches $${groupMaxUsd.toFixed(2)} — staying within $1.00-$2.50, so it isn't trusted.`,
-              "Skipping this token — resetting to watch for the next one.",
-            ].join("\n"),
-            "normal tiny $1-2.5 sub-band dust-preceded skip notification",
-          );
-          await this.resetForNewToken(true);
-          // Signal the caller to stop processing this tx batch — `state` is
-          // now detached from `this.bundlerFunderWatch` (reset/cleared
-          // above), so continuing to inspect further txs against it would be
-          // stale work.
-          return true;
-        }
-
+    if (tinyUsdBand === "2_5_to_5" && state.normalTinyDustGroupSeen) {
+      // A dust group was already seen for this token, so this is "what comes
+      // next" and gets routed by sub-band instead of bought unconditionally:
+      // a group confined to $1.00-$2.50 disqualifies the token outright,
+      // while one reaching into >$2.50-$5.00 is trusted and proceeds to the
+      // normal +90% MC buy/exit flow below.
+      const groupMaxUsd = Math.max(...sameBandGroup.map((entry) => entry.amountUsd));
+      if (groupMaxUsd <= BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD) {
         this.log.warn(
-          "Normal-mode $2.5-$5 sub-band buy gate accepted despite earlier dust/transfer-outs (group reaches the upper half of the $1-$5 band)",
+          "Skipping normal-mode $1-$2.5 sub-band buy gate because a dust group was already seen for this token",
           {
             mint: state.mint,
             funderWallet: state.funderWallet,
             signature: tx.signature,
             tinyUsdBand,
             groupMaxUsd,
-            earlierSignature: earlierTransferOut.signature,
-            earlierAmountUsd: earlierTransferOut.amountUsd,
-            earlierTimestamp: earlierTransferOut.timestamp,
-            groupEarliestTimestamp: earliestGroupTimestamp,
           },
         );
-        // Deliberately not returning here — this group reaches into the
-        // >$2.50-$5.00 half of the band, so despite the earlier dust it's
-        // still trusted and proceeds through the normal buy-gate flow below.
+        void this.sendTelegramSafe(
+          [
+            `<b>⏭️ ${this.label} Normal $1-$2.5 Sub-Band Buy Skipped — Preceded By Dust Group</b>`,
+            `Token: <code>${state.mint}</code>`,
+            `FeePayer: <code>${state.funderWallet}</code>`,
+            `A $0.10-$0.99 dust group was already seen for this token, and the group that followed it only reaches $${groupMaxUsd.toFixed(2)} — staying within $1.00-$2.50, so it isn't trusted.`,
+            "Skipping this token — resetting to watch for the next one.",
+          ].join("\n"),
+          "normal tiny $1-2.5 sub-band dust-group-preceded skip notification",
+        );
+        await this.resetForNewToken(true);
+        // Signal the caller to stop processing this tx batch — `state` is
+        // now detached from `this.bundlerFunderWatch` (reset/cleared
+        // above), so continuing to inspect further txs against it would be
+        // stale work.
+        return true;
       }
 
+      this.log.warn(
+        "Normal-mode $2.5-$5 sub-band buy gate accepted despite an earlier dust group (group reaches the upper half of the $1-$5 band)",
+        {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          signature: tx.signature,
+          tinyUsdBand,
+          groupMaxUsd,
+        },
+      );
+      // Deliberately not returning here — this group reaches into the
+      // >$2.50-$5.00 half of the band, so despite the earlier dust group it's
+      // still trusted and proceeds through the normal buy-gate flow below.
+    }
+
+    if (tinyUsdBand === "gt5" && state.normalTinyDustGroupSeen) {
+      this.log.info(
+        "Normal-mode >$5-$10 sub-band buy gate accepted despite an earlier dust group (this band always buys, with +180% MC exit)",
+        {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          signature: tx.signature,
+          tinyUsdBand,
+        },
+      );
+    }
+
+    if (tinyUsdBand === "2_5_to_5") {
       const lockAgeMs = Date.now() - state.lockedAt;
       if (lockAgeMs >= BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS) {
         this.log.warn(
@@ -3577,7 +3605,7 @@ export class InsiderBot extends EventEmitter {
   private getNormalTinySameBandGroup(
     state: BundlerFunderWatchState,
     timestamp: number,
-    band: "2_5_to_5" | "gt5",
+    band: "lt2_5" | "2_5_to_5" | "gt5",
   ): Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }> {
     const start = timestamp - BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS;
     const group = state.normalTinyTransferOuts.filter(

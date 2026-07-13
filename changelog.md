@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-07-13
+
+### Replaced the timestamp-based "not first group" check with an explicit dust-*group* flag (fixes a bug where dust preceding a $1-$2.5 group still bought)
+
+- **Bug**: production logs showed 15 dust transfer-outs (~$0.60 each, to 15 distinct recipients) all landing in the same second for a token, followed later by a $1-$2.5 group — which still triggered a buy. Root cause: the old check compared `entry.timestamp < earliestGroupTimestamp` using Solana's 1-second-resolution `blockTime`. When dust and a same-band group land in/near the same second, that strict "earlier than" comparison can simply never be true, so the disqualification silently never fired.
+- `insider-bot.ts`: removed that timestamp-scan entirely and replaced it with an explicit, sticky state flag: `normalTinyDustGroupSeen` (new field on `BundlerFunderWatchState`, defaults to `false`).
+- When a transfer-out lands in the dust band ($0.10-$0.99), the bot now runs the *same* same-band/10s/≥2-recipients grouping logic used for the $1-$5 and >$5-$10 bands (`getNormalTinySameBandGroup`, now widened to also accept the `"lt2_5"` band) to check for a genuine **dust group** — not just one dust tx, but ≥2 distinct recipients within 10s. Once such a group is seen, `normalTinyDustGroupSeen` is set permanently for this token and a `🟡 ... Normal Dust Group Observed` Telegram notice is sent.
+- From that point on, whichever qualifying group forms *next* is routed by sub-band instead of being bought unconditionally:
+  - **$1.00-$2.50** → token is skipped entirely (`resetForNewToken(true)`), same as before.
+  - **>$2.50-$5.00** → still buys, watches for the sell trigger, +90% MC exit.
+  - **>$5.00-$10.00** → unaffected either way — always buys with +180% MC exit (now just logged for visibility when a dust group preceded it).
+- If no dust group is ever observed for a token, behavior is unchanged from before — groups buy normally with no extra check.
+- This is a strictly more reliable version of the same rule requested earlier (`$1-$2.5 skips, $2.5-$5+ buys, when preceded by dust`) — same intended outcome, but keyed off an explicit grouped-dust-event flag instead of a same-second timestamp comparison that could silently fail to trigger.
+
 ## 2026-07-12
 
 ### Normal-funding threshold raised to 20 SOL+; low-funding mode disabled for now
