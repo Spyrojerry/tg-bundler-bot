@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-13 (3)
+
+### $1-$5/>$5-$10 buy-triggering bands now require a "round" bundler SOL amount (0.02/0.05/0.1 SOL)
+
+- Context: a $1-$5 band group bought on two ~0.03 SOL (~$2.14 each) transfer-outs — an amount that doesn't match the round SOL sizes bundlers actually use for gas-funding rounds, unlike a genuine group such as two ~0.1 SOL (~$7.67 each) transfer-outs in the >$5-$10 band, which should trigger a buy.
+- `insider-bot.ts`: added `BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS = [0.02, 0.05, 0.1]` and a slim tolerance `BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.001`, plus a new `isRoundBundlerTinySolAmount(amountSol)` helper.
+- `getNormalTinySameBandGroup` now additionally requires, for the `"2_5_to_5"` ($1-$5) and `"gt5"` (>$5-$10) bands only, that every member of the candidate group's `amountSol` be within that tolerance of one of `0.02`/`0.05`/`0.1` SOL — otherwise the whole candidate group is rejected (same "reject the batch" style already used for the same-band check). The `"lt2_5"` dust-band check (used only for the not-first-group/dust-group flag) is deliberately excluded from this filter, since dust transfers use much smaller, non-round amounts by nature.
+- Net effect: `0.100099385`/`0.099955288` SOL (both ≈0.1 SOL) still forms a valid >$5-$10 buy group; `0.030108614`/`0.030170117` SOL (≈0.03 SOL, not close to 0.02/0.05/0.1) no longer forms a valid $1-$5 buy group — it now falls through to the same "Normal tiny transfer waiting for same-band 10s group" log path (now also logging `isRoundBundlerSolAmount` for visibility) instead of triggering a buy.
+
 ## 2026-07-13 (2)
 
 ### New buy filter: buy MC must not be below the token's initial bundler-buy MC

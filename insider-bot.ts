@@ -51,6 +51,10 @@ const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
 /** Normal-mode $1-$5 band buy gates are skipped if this long has passed since the shared feePayer was locked. */
 const BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS = 30 * 60 * 1_000;
+/** Bundler recipient-funding transfers in the buy-triggering $1-$5/>$5-$10 bands are only trusted when their SOL amount is approximately one of these "round" funding sizes — real gas-funding rounds land on one of these, while incidental/coincidental transfers landing in the same USD band by chance (e.g. ~0.03 SOL) don't and are filtered out. Deliberately not applied to the $0.10-$0.99 dust band, which uses its own (much smaller, non-round) transfer sizes. */
+const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS = [0.02, 0.05, 0.1];
+/** Tolerance (in SOL) for matching a transfer-out amount against one of BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS — kept deliberately slim so it only absorbs tiny fee/rounding noise, not genuinely different amounts. */
+const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.001;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
@@ -3055,6 +3059,8 @@ export class InsiderBot extends EventEmitter {
         amountUsd: transferOutUsd,
         tinyUsdBand,
         groupWindowSeconds: BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS,
+        isRoundBundlerSolAmount: this.isRoundBundlerTinySolAmount(transferOut.amountSol),
+        roundBundlerSolAmounts: BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS,
       });
       return false;
     }
@@ -3624,10 +3630,25 @@ export class InsiderBot extends EventEmitter {
     );
     if (group.length < 2) return [];
     if (group.some((entry) => this.getTinyUsdBand(entry.amountUsd) !== band)) return [];
+    if (
+      band !== "lt2_5" &&
+      group.some((entry) => !this.isRoundBundlerTinySolAmount(entry.amountSol))
+    ) {
+      return [];
+    }
     const uniqueRecipients = new Set(group.map((entry) => entry.recipient));
     if (uniqueRecipients.size < 2) return [];
     return group;
   }
+
+  /** True if `amountSol` is approximately one of BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS (0.02/0.05/0.1 SOL), within a slim tolerance. Used to require the $1-$5/>$5-$10 buy-triggering bands to be genuine round-number bundler funding, not just any transfer-out that happens to land in the same USD band. */
+  private isRoundBundlerTinySolAmount(amountSol: number): boolean {
+    return BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS.some(
+      (target) =>
+        Math.abs(amountSol - target) <= BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL,
+    );
+  }
+
   private getLowFundingTinyUsdBand(amountUsd: number): "lt2_5" | "2_5_to_5" | "gt5" {
     if (amountUsd < BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD) return "lt2_5";
     if (amountUsd <= BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD) return "2_5_to_5";
