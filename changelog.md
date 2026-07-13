@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-13 (2)
+
+### New buy filter: buy MC must not be below the token's initial bundler-buy MC
+
+- `insider-bot.ts`: added `initialBundlerMarketCapUsd`, captured once per token in `handleFollowWalletBuy` from the same `followWalletBuyMc` fetch already used for the high-MC ceiling check (i.e. the market cap at the moment the followed/early-bundler wallet first bought this token). Stays `null` (no gate) if that fetch failed.
+- Added `isBelowInitialBundlerMarketCap(currentMc)` and wired it into all three buy-emit paths (`emitBundlerFunderBuy` for normal mode, `emitLowFundingRecipientBuy` and `emitLowFundingSharedFeePayerBuy` for low-funding mode), right alongside the existing rug-threshold check: if the market cap fetched at actual buy time is now **below** `initialBundlerMarketCapUsd`, the buy is skipped and the token is reset (`resetForNewToken(true)`) exactly like a rug-threshold hit.
+- Rationale: if MC has fallen back below where the earliest bundler bought by the time our own buy gate fires, the token's early momentum has already reversed — not worth buying into a declining chart.
+- `initialBundlerMarketCapUsd` is reset to `null` in both `completeFlowCycle` and `resetForNewToken`, alongside `highestObservedMarketCapUsd`, so each new token starts with a clean slate.
+
 ## 2026-07-13
 
 ### Replaced the timestamp-based "not first group" check with an explicit dust-*group* flag (fixes a bug where dust preceding a $1-$2.5 group still bought)

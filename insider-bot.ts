@@ -393,6 +393,8 @@ export class InsiderBot extends EventEmitter {
   private devCreateTimestamp: number | null = null;
   /** Highest market cap observed for the current token across all pre-buy MC fetches — used to skip normal-mode buys that would already be past their own exit target. */
   private highestObservedMarketCapUsd: number | null = null;
+  /** Market cap captured at the very start of the current token's flow (the follow-wallet/initial-bundler buy MC). A buy is only allowed if the market cap at buy time is still at or above this — i.e. the token hasn't round-tripped back below where the earliest bundler bought. Null if unknown (fetch failed at flow start), in which case the check is skipped entirely. */
+  private initialBundlerMarketCapUsd: number | null = null;
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private profitExitDisabled = false;
@@ -1013,6 +1015,11 @@ export class InsiderBot extends EventEmitter {
           },
         );
       }
+      // Record this as the token's "initial bundler MC" — the buy gate later
+      // requires the market cap at actual buy time to still be at or above
+      // this, so the bot never buys into a token that's already dropped back
+      // below where the earliest bundler bought.
+      this.initialBundlerMarketCapUsd = followWalletBuyMc;
 
       await this.startInsiderFlow(mint);
     } catch (err) {
@@ -4075,6 +4082,19 @@ export class InsiderBot extends EventEmitter {
         await this.resetForNewToken(true);
         return;
       }
+      if (this.isBelowInitialBundlerMarketCap(currentMc)) {
+        this.log.warn(
+          "Low-funding shared feePayer condition passed, but current market cap is below the token's initial bundler-buy MC; resetting instead of buying",
+          {
+            mint: state.mint,
+            sharedFeePayer: state.funderWallet,
+            currentMc,
+            initialBundlerMarketCapUsd: this.initialBundlerMarketCapUsd,
+          },
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
 
       this.setEntryMc(currentMc);
       this.setBuyExecuting(true);
@@ -4145,6 +4165,19 @@ export class InsiderBot extends EventEmitter {
             recipient: watch.wallet,
             currentMc,
             rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
+          },
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
+      if (this.isBelowInitialBundlerMarketCap(currentMc)) {
+        this.log.warn(
+          "Low-funding recipient bought token, but current market cap is below the token's initial bundler-buy MC; resetting instead of buying",
+          {
+            mint: state.mint,
+            recipient: watch.wallet,
+            currentMc,
+            initialBundlerMarketCapUsd: this.initialBundlerMarketCapUsd,
           },
         );
         await this.resetForNewToken(true);
@@ -4233,6 +4266,19 @@ export class InsiderBot extends EventEmitter {
             recipient: watch.wallet,
             currentMc,
             rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
+          },
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
+      if (this.isBelowInitialBundlerMarketCap(currentMc)) {
+        this.log.warn(
+          "Shared feePayer recipient bought token, but current market cap is below the token's initial bundler-buy MC; resetting instead of buying",
+          {
+            mint: state.mint,
+            recipient: watch.wallet,
+            currentMc,
+            initialBundlerMarketCapUsd: this.initialBundlerMarketCapUsd,
           },
         );
         await this.resetForNewToken(true);
@@ -5622,6 +5668,20 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  /**
+   * Buy filter: the market cap at actual buy time must not be below the
+   * market cap captured at the very start of this token's flow (the
+   * follow-wallet/initial-bundler buy MC) — i.e. don't buy into a token
+   * that's already round-tripped back below where the earliest bundler
+   * bought. Returns false (no gate) if the initial MC is unknown.
+   */
+  private isBelowInitialBundlerMarketCap(currentMc: number): boolean {
+    return (
+      this.initialBundlerMarketCapUsd !== null &&
+      currentMc < this.initialBundlerMarketCapUsd
+    );
+  }
+
   private parseBuyVolumeUsd(entry: Record<string, unknown>): number | null {
     const raw = entry.buy_volume_cur ?? entry.history_bought_cost;
     const n = typeof raw === "number" ? raw : Number(raw);
@@ -5755,6 +5815,7 @@ export class InsiderBot extends EventEmitter {
     this.devCreateSignature = null;
     this.devCreateTimestamp = null;
     this.highestObservedMarketCapUsd = null;
+    this.initialBundlerMarketCapUsd = null;
     this.preBuyStopped = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
@@ -5792,6 +5853,7 @@ export class InsiderBot extends EventEmitter {
     this.devCreateSignature = null;
     this.devCreateTimestamp = null;
     this.highestObservedMarketCapUsd = null;
+    this.initialBundlerMarketCapUsd = null;
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.profitExitDisabled = false;
