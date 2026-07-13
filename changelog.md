@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-13 (6)
+
+### Round-SOL-amount check is now band-specific: >$5-$10 (+180%) only accepts ~0.1 SOL, $1-$5 (+90%) only accepts ~0.02/0.05 SOL
+
+- Previously `isRoundBundlerTinySolAmount` checked a transfer-out's SOL amount against *all three* round targets (0.02/0.05/0.1 SOL) regardless of which USD band it was in — harmless in practice at typical SOL prices (0.02/0.05 SOL essentially can't reach the >$5 USD floor), but not strictly correct, and not what was asked: for the >$5-$10 band (+180% MC exit), the only valid round size should be **~0.1 SOL** (±0.004 SOL tolerance) — not 0.02 or 0.05.
+- `insider-bot.ts`: replaced the flat `BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS` list with a per-band map, `BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND`: `"2_5_to_5"` ($1-$5) → `[0.02, 0.05]`, `"gt5"` (>$5-$10) → `[0.1]`, `"lt2_5"` (dust) → `[]` (unused, dust never goes through this check).
+- `isRoundBundlerTinySolAmount(amountSol, band)` now takes the band and only matches against that band's own target(s). Both call sites (the group-formation filter in `getNormalTinySameBandGroup`, and the diagnostic log in `inspectBundlerFunderTransaction`) now pass the band through.
+- Net effect: a >$5-$10 group's members must each be within ±0.004 SOL of exactly **0.1 SOL** to be trusted as a genuine round bundler-funding size and trigger the +180% MC buy; the $1-$5 band remains gated on ~0.02 or ~0.05 SOL for the +90% MC buy, unchanged from before.
+
 ## 2026-07-13 (5)
 
 ### Round-SOL-amount tolerance widened from ±0.001 to ±0.004 SOL
