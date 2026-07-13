@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-07-13 (5)
+
+### Round-SOL-amount tolerance widened from ±0.001 to ±0.004 SOL
+
+- **Why**: production logs showed a real bundler funding round using ~0.018 SOL (~$1.37 each, 15 recipients) getting stuck at "Normal tiny transfer waiting for same-band 10s group" with `isRoundBundlerSolAmount: false` forever — 0.018 SOL is 0.002 SOL away from the 0.02 SOL target, just outside the old ±0.001 tolerance.
+- `insider-bot.ts`: `BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL` changed from `0.001` to `0.004`. At this tolerance the three target ranges are still non-overlapping (0.02 → [0.016, 0.024], 0.05 → [0.046, 0.054], 0.1 → [0.096, 0.104]), so there's no ambiguity between round sizes — just more headroom for real-world fee/slippage variance like the 0.018 SOL case above.
+
+## 2026-07-13 (4)
+
+### Dust-group-preceded $1-$5 sub-band split now keys off the group's round SOL size, not its USD amount
+
+- `insider-bot.ts`: the "dust group already seen, so route the next $1-$5 group by sub-band" check (added earlier the same day) previously split on USD amount — `groupMaxUsd <= $2.50` skipped, `> $2.50` bought. Replaced with a check on the group's round SOL size instead: **~0.02 SOL skips/resets**, **~0.05 SOL (or larger round) still buys** with the usual +90% MC exit.
+- Added `isNearBundlerTinySolAmount(amountSol, target)` (slim-tolerance match against a single target) and refactored `isRoundBundlerTinySolAmount` to reuse it against all of `BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS`.
+- Removed the now-unused `BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD` ($2.50) constant.
+- Every member of a $1-$5 group already has to match one of the round bundler sizes (0.02/0.05/0.1 SOL) to even form a group at all (see the "round SOL amount" filter above), so this check just reads which round size the group landed on rather than re-deriving anything from USD.
+
 ## 2026-07-13 (3)
 
 ### $1-$5/>$5-$10 buy-triggering bands now require a "round" bundler SOL amount (0.02/0.05/0.1 SOL)

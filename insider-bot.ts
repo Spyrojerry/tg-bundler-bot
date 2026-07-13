@@ -44,8 +44,6 @@ const BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD = 1;
 /** Floor for what counts as trackable "less than $1" dust (for the $1-$5 band's not-first-group check below) — the effective below-minimum band is $0.10-$0.99; anything under $0.10 is ignored entirely, not just below the buy minimum. */
 const BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD = 5;
-/** Splits the $1-$5 band in two for the not-first-group override below: a group confined to $1.00-$2.50 that's preceded by dust/earlier transfer-outs is still disqualified, but one reaching into >$2.50-$5.00 is trusted anyway despite the earlier dust. */
-const BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD = 2.5;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
@@ -53,8 +51,8 @@ const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS = 30 * 60 * 1_000;
 /** Bundler recipient-funding transfers in the buy-triggering $1-$5/>$5-$10 bands are only trusted when their SOL amount is approximately one of these "round" funding sizes — real gas-funding rounds land on one of these, while incidental/coincidental transfers landing in the same USD band by chance (e.g. ~0.03 SOL) don't and are filtered out. Deliberately not applied to the $0.10-$0.99 dust band, which uses its own (much smaller, non-round) transfer sizes. */
 const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS = [0.02, 0.05, 0.1];
-/** Tolerance (in SOL) for matching a transfer-out amount against one of BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS — kept deliberately slim so it only absorbs tiny fee/rounding noise, not genuinely different amounts. */
-const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.001;
+/** Tolerance (in SOL) for matching a transfer-out amount against one of BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS — kept deliberately slim so it only absorbs fee/rounding/slippage noise, not genuinely different amounts. Ranges stay non-overlapping between 0.02/0.05/0.1 at this tolerance. */
+const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.004;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
@@ -3067,31 +3065,33 @@ export class InsiderBot extends EventEmitter {
 
     if (tinyUsdBand === "2_5_to_5" && state.normalTinyDustGroupSeen) {
       // A dust group was already seen for this token, so this is "what comes
-      // next" and gets routed by sub-band instead of bought unconditionally:
-      // a group confined to $1.00-$2.50 disqualifies the token outright,
-      // while one reaching into >$2.50-$5.00 is trusted and proceeds to the
-      // normal +90% MC buy/exit flow below.
-      const groupMaxUsd = Math.max(...sameBandGroup.map((entry) => entry.amountUsd));
-      if (groupMaxUsd <= BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD) {
+      // next" and gets routed by the group's *round SOL size* instead of
+      // bought unconditionally: a ~0.02 SOL group disqualifies the token
+      // outright, while a ~0.05 SOL (or larger round) group is trusted and
+      // proceeds to the normal +90% MC buy/exit flow below. (Every member
+      // already matched one of the round bundler sizes back in
+      // getNormalTinySameBandGroup, so this just reads which one.)
+      const groupMaxSol = Math.max(...sameBandGroup.map((entry) => entry.amountSol));
+      if (this.isNearBundlerTinySolAmount(groupMaxSol, 0.02)) {
         this.log.warn(
-          "Skipping normal-mode $1-$2.5 sub-band buy gate because a dust group was already seen for this token",
+          "Skipping normal-mode ~0.02 SOL sub-band buy gate because a dust group was already seen for this token",
           {
             mint: state.mint,
             funderWallet: state.funderWallet,
             signature: tx.signature,
             tinyUsdBand,
-            groupMaxUsd,
+            groupMaxSol,
           },
         );
         void this.sendTelegramSafe(
           [
-            `<b>⏭️ ${this.label} Normal $1-$2.5 Sub-Band Buy Skipped — Preceded By Dust Group</b>`,
+            `<b>⏭️ ${this.label} Normal ~0.02 SOL Sub-Band Buy Skipped — Preceded By Dust Group</b>`,
             `Token: <code>${state.mint}</code>`,
             `FeePayer: <code>${state.funderWallet}</code>`,
-            `A $0.10-$0.99 dust group was already seen for this token, and the group that followed it only reaches $${groupMaxUsd.toFixed(2)} — staying within $1.00-$2.50, so it isn't trusted.`,
+            `A $0.10-$0.99 dust group was already seen for this token, and the group that followed it is only ~${groupMaxSol.toFixed(4)} SOL (≈0.02 SOL), so it isn't trusted.`,
             "Skipping this token — resetting to watch for the next one.",
           ].join("\n"),
-          "normal tiny $1-2.5 sub-band dust-group-preceded skip notification",
+          "normal tiny ~0.02 sol sub-band dust-group-preceded skip notification",
         );
         await this.resetForNewToken(true);
         // Signal the caller to stop processing this tx batch — `state` is
@@ -3102,18 +3102,19 @@ export class InsiderBot extends EventEmitter {
       }
 
       this.log.warn(
-        "Normal-mode $2.5-$5 sub-band buy gate accepted despite an earlier dust group (group reaches the upper half of the $1-$5 band)",
+        "Normal-mode ~0.05 SOL (or larger) sub-band buy gate accepted despite an earlier dust group",
         {
           mint: state.mint,
           funderWallet: state.funderWallet,
           signature: tx.signature,
           tinyUsdBand,
-          groupMaxUsd,
+          groupMaxSol,
         },
       );
-      // Deliberately not returning here — this group reaches into the
-      // >$2.50-$5.00 half of the band, so despite the earlier dust group it's
-      // still trusted and proceeds through the normal buy-gate flow below.
+      // Deliberately not returning here — this group is ~0.05 SOL or larger
+      // (not the disqualified ~0.02 SOL size), so despite the earlier dust
+      // group it's still trusted and proceeds through the normal buy-gate
+      // flow below.
     }
 
     if (tinyUsdBand === "gt5" && state.normalTinyDustGroupSeen) {
@@ -3641,11 +3642,15 @@ export class InsiderBot extends EventEmitter {
     return group;
   }
 
+  /** True if `amountSol` is within the slim round-amount tolerance of `target`. */
+  private isNearBundlerTinySolAmount(amountSol: number, target: number): boolean {
+    return Math.abs(amountSol - target) <= BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL;
+  }
+
   /** True if `amountSol` is approximately one of BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS (0.02/0.05/0.1 SOL), within a slim tolerance. Used to require the $1-$5/>$5-$10 buy-triggering bands to be genuine round-number bundler funding, not just any transfer-out that happens to land in the same USD band. */
   private isRoundBundlerTinySolAmount(amountSol: number): boolean {
-    return BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS.some(
-      (target) =>
-        Math.abs(amountSol - target) <= BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL,
+    return BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS.some((target) =>
+      this.isNearBundlerTinySolAmount(amountSol, target),
     );
   }
 
