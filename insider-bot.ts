@@ -43,7 +43,7 @@ const BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS = 10;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD = 1;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD = 5;
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD = 1;
-/** Floor for what counts as trackable "less than $1" dust (for the $1-$5 band's not-first-group check below) — the effective below-minimum band is $0.10-$0.99; anything under $0.10 is ignored entirely, not just below the buy minimum. */
+/** Absolute USD floor below which a feePayer transfer-out is ignored entirely (not even tracked as dust) — too tiny to be a meaningful gas-funding round of any kind, dust ("lt2_5", ~0.01 SOL, see BUNDLER_FUNDER_NORMAL_TINY_DUST_ROUND_SOL_AMOUNT) or otherwise. */
 const BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD = 5;
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
@@ -51,7 +51,7 @@ const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
 /** Normal-mode $1-$5 band buy gates are skipped if this long has passed since the shared feePayer was locked. */
 const BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS = 30 * 60 * 1_000;
-/** Bundler recipient-funding transfers in the buy-triggering $1-$5/>$5-$10 bands are only trusted when their SOL amount is approximately one of the "round" funding sizes valid for that specific band — real gas-funding rounds land on one of these, while incidental/coincidental transfers landing in the same USD band by chance (e.g. ~0.03 SOL) don't and are filtered out. The $1-$5 band ("2_5_to_5") maps to 0.02/0.05 SOL; the >$5-$10 band ("gt5") maps to 0.1 SOL only (0.02/0.05 SOL wouldn't realistically reach >$5 USD anyway, so restricting each band to its own realistic size(s) avoids any ambiguity). Deliberately not applied to the $0.10-$0.99 dust band ("lt2_5", empty here), which uses its own (much smaller, non-round) transfer sizes. */
+/** Bundler recipient-funding transfers in the buy-triggering $1-$5/>$5-$10 bands are only trusted when their SOL amount is approximately one of the "round" funding sizes valid for that specific band — real gas-funding rounds land on one of these, while incidental/coincidental transfers landing in the same USD band by chance (e.g. ~0.03 SOL) don't and are filtered out. The $1-$5 band ("2_5_to_5") maps to 0.02/0.05 SOL; the >$5-$10 band ("gt5") maps to 0.1 SOL only (0.02/0.05 SOL wouldn't realistically reach >$5 USD anyway, so restricting each band to its own realistic size(s) avoids any ambiguity). Deliberately not applied to the ~0.01 SOL dust band ("lt2_5", empty here), which has its own dedicated round-SOL target — see BUNDLER_FUNDER_NORMAL_TINY_DUST_ROUND_SOL_AMOUNT below. */
 const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
   "lt2_5" | "2_5_to_5" | "gt5",
   number[]
@@ -62,6 +62,8 @@ const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
 };
 /** Tolerance (in SOL) for matching a transfer-out amount against one of the per-band round SOL targets above — kept deliberately slim so it only absorbs fee/rounding/slippage noise, not genuinely different amounts. Ranges stay non-overlapping between 0.02/0.05/0.1 at this tolerance. */
 const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.004;
+/** The "lt2_5" dust band is defined purely by SOL amount, not USD: a transfer-out whose SOL amount is within BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL (±0.004 SOL, i.e. ~0.006-0.014 SOL) of this size is always dust, regardless of what it's worth in USD at the current SOL price (e.g. at a higher SOL price, ~0.01 SOL can be worth more than BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD's $1). This replaces the old "amountUsd < $1" USD-based dust definition — ~0.01 SOL is itself a recognizable small gas-funding round, so classifying it by its actual SOL size is more robust to SOL price movement than a USD cutoff that drifts underneath it. */
+const BUNDLER_FUNDER_NORMAL_TINY_DUST_ROUND_SOL_AMOUNT = 0.01;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 50;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
@@ -327,7 +329,7 @@ interface BundlerFunderWatchState {
   recipientWatches: Map<string, FunderRecipientWatch>;
   queuedTransferOuts: FunderTransferOutCandidate[];
   normalTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
-  /** Sticky flag: set once a same-band group (≥2 recipients within 10s) of $0.10-$0.99 dust transfer-outs has been observed for this token. Once set, the next $1-$5/>$5-$10 band group is routed by sub-band instead of bought unconditionally — see inspectBundlerFunderTransaction. */
+  /** Sticky flag: set once a same-band group (≥2 recipients within 10s) of ~0.01 SOL dust transfer-outs has been observed for this token. Once set, the next $1-$5/>$5-$10 band group is routed by sub-band instead of bought unconditionally — see inspectBundlerFunderTransaction. */
   normalTinyDustGroupSeen: boolean;
   lowFundingFunderTxs: Array<{ signature: string; timestamp: number }>;
   lowFundingTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
@@ -402,6 +404,8 @@ export class InsiderBot extends EventEmitter {
   private devWallet: string | null = null;
   private devCreateSignature: string | null = null;
   private devCreateTimestamp: number | null = null;
+  /** Set once a dev full-exit CLOSE_ACCOUNT tx has been acted on for the current token, so we don't re-trigger the reset/sell on the next poll tick. */
+  private devFullExitHandled = false;
   /** Highest market cap observed for the current token across all pre-buy MC fetches — used to skip normal-mode buys that would already be past their own exit target. */
   private highestObservedMarketCapUsd: number | null = null;
   /** Market cap captured at the very start of the current token's flow (the follow-wallet/initial-bundler buy MC). A buy is only allowed if the market cap at buy time is still at or above this — i.e. the token hasn't round-tripped back below where the earliest bundler bought. Null if unknown (fetch failed at flow start), in which case the check is skipped entirely. */
@@ -427,6 +431,10 @@ export class InsiderBot extends EventEmitter {
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
   private bundlerFunderLogsSubId: number | null = null;
   private lowFundingDevLogsSubId: number | null = null;
+  /** Websocket log subscription on the dev wallet, used to push-detect a full-exit CLOSE_ACCOUNT tx (see subscribeDevWalletFullExitWatch). */
+  private devFullExitLogsSubId: number | null = null;
+  /** Dedup set of dev-wallet signatures already checked for the full-exit pattern, so a duplicate log notification doesn't trigger a redundant getTransactionsBySignatures call. */
+  private devFullExitSeenSignatures = new Set<string>();
   private recipientLogsSubIds = new Map<string, number>();
   private recipientSolBalanceSubIds = new Map<string, number>();
   private isBundlerFunderSyncing = false;
@@ -1094,6 +1102,7 @@ export class InsiderBot extends EventEmitter {
         devCreateSignature: this.devCreateSignature,
         devCreateTimestamp: this.devCreateTimestamp,
       });
+      this.subscribeDevWalletFullExitWatch();
     }
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
@@ -2473,6 +2482,149 @@ export class InsiderBot extends EventEmitter {
     return sorted[0] ?? null;
   }
 
+  /**
+   * Detects the dev wallet fully cashing out: a CLOSE_ACCOUNT tx (source
+   * SOLANA_PROGRAM_LIBRARY) paid for by the dev wallet itself, closing a WSOL
+   * token account after unwrapping sell proceeds to native SOL. This is used
+   * as the token's rug/reset signal in place of a fixed MC floor — a dev
+   * closing out their WSOL account is a much sharper "fully sold" signal
+   * than market cap alone, which can lag or bounce around a threshold.
+   *
+   * Detection is push-based, not polled: a websocket log subscription on the
+   * dev wallet (subscribeDevWalletFullExitWatch) notifies us of each new
+   * signature, and only that specific signature is fetched/parsed via the
+   * getTransactionsBySignatures API — the same subscribe-then-getTx pattern
+   * used everywhere else in this file (queueSignature/processSignatureBatch,
+   * subscribeLowFundingDevWalletSubscription, subscribeFunderRecipient).
+   */
+  private isDevFullExitCloseAccountTx(tx: HeliusTransaction): boolean {
+    return (
+      tx.type === "CLOSE_ACCOUNT" &&
+      tx.source === "SOLANA_PROGRAM_LIBRARY" &&
+      !!this.devWallet &&
+      tx.feePayer === this.devWallet
+    );
+  }
+
+  private subscribeDevWalletFullExitWatch(): void {
+    if (!this.devWallet || this.devFullExitHandled) return;
+    if (this.devFullExitLogsSubId !== null) return;
+    this.devFullExitLogsSubId = this.connection.onLogs(
+      new PublicKey(this.devWallet),
+      (logInfo) => {
+        if (!logInfo.err) {
+          void this.checkDevWalletSignatureForFullExit(logInfo.signature);
+        }
+      },
+      "processed",
+    );
+    this.log.info("Subscribed to dev wallet for full-exit (CLOSE_ACCOUNT) detection", {
+      devWallet: this.devWallet,
+      devCreateSignature: this.devCreateSignature,
+      devCreateTimestamp: this.devCreateTimestamp,
+    });
+  }
+
+  private async stopDevWalletFullExitWatch(reason: string): Promise<void> {
+    if (this.devFullExitLogsSubId === null) return;
+    const subId = this.devFullExitLogsSubId;
+    this.devFullExitLogsSubId = null;
+    await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    this.log.info("Stopped dev wallet full-exit subscription", {
+      devWallet: this.devWallet,
+      reason,
+    });
+  }
+
+  private async checkDevWalletSignatureForFullExit(
+    signature: string,
+  ): Promise<void> {
+    if (!this.devWallet || this.devFullExitHandled) return;
+    if (this.devFullExitSeenSignatures.has(signature)) return;
+    this.devFullExitSeenSignatures.add(signature);
+
+    const mint = this.watchingMint ?? this.activePosition?.mint;
+    if (!mint) return;
+
+    try {
+      const txs = await this.withHeliusFallback((client) =>
+        client.getTransactionsBySignatures([signature]),
+      );
+      const tx = txs.find((t) => t.signature === signature);
+      if (!tx) return;
+      if (!this.isDevFullExitCloseAccountTx(tx)) return;
+      if (
+        this.devCreateTimestamp !== null &&
+        tx.timestamp <= this.devCreateTimestamp
+      ) {
+        return;
+      }
+      await this.handleDevWalletFullExit(mint, tx);
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Failed to check dev wallet signature for full exit", {
+        mint,
+        devWallet: this.devWallet,
+        signature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Acts on a confirmed full-exit CLOSE_ACCOUNT tx: either resets the pre-buy
+   * flow or triggers an immediate sell of the held position — replacing the
+   * old "MC below $5,000" rug check.
+   */
+  private async handleDevWalletFullExit(
+    mint: string,
+    exitTx: HeliusTransaction,
+  ): Promise<void> {
+    if (this.devFullExitHandled) return;
+    this.devFullExitHandled = true;
+    await this.stopDevWalletFullExitWatch("full exit detected");
+
+    this.log.warn(
+      "Dev wallet closed a WSOL token account (SOLANA_PROGRAM_LIBRARY CLOSE_ACCOUNT); treating as full dev exit",
+      {
+        mint,
+        devWallet: this.devWallet,
+        signature: exitTx.signature,
+        timestamp: exitTx.timestamp,
+        phase: this.phase,
+        hasActivePosition: !!this.activePosition,
+      },
+    );
+
+    if (this.activePosition) {
+      await this.triggerPositionSell(
+        mint,
+        `Dev wallet ${this.devWallet} closed its WSOL account (full exit detected)`,
+        [
+          "<b>🚨 Dev Full-Exit Detected — Selling ASAP</b>",
+          `Token: <code>${mint}</code>`,
+          `Dev wallet: <code>${this.devWallet}</code>`,
+          `Close-account tx: <code>${exitTx.signature}</code>`,
+          "Dev wallet closed its WSOL token account — treated as a full exit/rug signal.",
+        ],
+        exitTx.signature,
+      );
+    } else {
+      void this.sendTelegramSafe(
+        [
+          "<b>🧹 Dev Full-Exit Reset — Token Skipped</b>",
+          `Token: <code>${mint}</code>`,
+          `Dev wallet: <code>${this.devWallet}</code>`,
+          `Close-account tx: <code>${exitTx.signature}</code>`,
+          "Dev wallet closed its WSOL token account before we bought — treated as a full exit/rug signal.",
+          "Flow reset — waiting for the next token.",
+        ].join("\n"),
+        "dev full-exit reset notification",
+      );
+      await this.resetForNewToken(true);
+    }
+  }
+
   private async stopLowFundingDevWalletSubscription(reason: string): Promise<void> {
     if (this.lowFundingDevLogsSubId === null) return;
     const subId = this.lowFundingDevLogsSubId;
@@ -3015,11 +3167,11 @@ export class InsiderBot extends EventEmitter {
       });
       return false;
     }
-    const tinyUsdBand = this.getTinyUsdBand(transferOutUsd);
-    // Record every qualifying feePayer transfer-out — including ones below
-    // the minimum buy USD ("lt2_5" band, i.e. $0.10-$0.99 dust) — purely so
-    // we can tell whether a later $1-$5 band group is genuinely the *first*
-    // tiny transfer-out activity seen for this token (see the "not the first
+    const tinyUsdBand = this.getTinyUsdBand(transferOutUsd, transferOut.amountSol);
+    // Record every qualifying feePayer transfer-out — including dust
+    // ("lt2_5" band, i.e. ~0.01 SOL transfers) — purely so we can tell
+    // whether a later $1-$5 band group is genuinely the *first* tiny
+    // transfer-out activity seen for this token (see the "not the first
     // group" guard below), rather than a group that just happens to follow
     // some earlier, smaller transfer-out that was itself skipped as too tiny
     // to buy on.
@@ -3031,20 +3183,13 @@ export class InsiderBot extends EventEmitter {
       amountUsd: transferOutUsd,
     });
 
-    if (transferOutUsd < BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD) {
-      this.log.info("Skipping normal-mode feePayer tiny transfer below minimum buy USD", {
-        mint: state.mint,
-        funderWallet: state.funderWallet,
-        signature: tx.signature,
-        recipient: transferOut.to,
-        amountSol: transferOut.amountSol,
-        amountUsd: transferOutUsd,
-        minBuyUsd: BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD,
-      });
-      return false;
-    }
-
     if (tinyUsdBand === "lt2_5") {
+      // Dust is classified purely by SOL amount (~0.01 SOL, see
+      // BUNDLER_FUNDER_NORMAL_TINY_DUST_ROUND_SOL_AMOUNT) and handled here
+      // unconditionally — regardless of what it's worth in USD — so this
+      // must run before (and independently of) the minimum-buy-USD gate
+      // below, which only applies to the $1-$5/>$5-$10 buy-triggering bands.
+      //
       // A single dust transfer-out doesn't mean anything on its own — only a
       // same-band *group* of them (≥2 recipients within the same 10s window,
       // same as $1-$5/>$5-$10 grouping) counts as a genuine dust round. Once
@@ -3057,7 +3202,7 @@ export class InsiderBot extends EventEmitter {
         if (dustGroup.length >= 2) {
           state.normalTinyDustGroupSeen = true;
           this.log.warn(
-            "Normal-mode $0.10-$0.99 dust group observed; will route the next $1-$5/>$5-$10 group by sub-band instead of buying it unconditionally",
+            "Normal-mode ~0.01 SOL dust group observed; will route the next $1-$5/>$5-$10 group by sub-band instead of buying it unconditionally",
             {
               mint: state.mint,
               funderWallet: state.funderWallet,
@@ -3072,7 +3217,7 @@ export class InsiderBot extends EventEmitter {
               `<b>🟡 ${this.label} Normal Dust Group Observed</b>`,
               `Token: <code>${state.mint}</code>`,
               `FeePayer: <code>${state.funderWallet}</code>`,
-              `Dust transfer-outs: <b>${dustGroup.length}</b> (each $0.10-$0.99), same 10s window`,
+              `Dust transfer-outs: <b>${dustGroup.length}</b> (each ~0.01 SOL), same 10s window`,
               "",
               "Watching for what comes next: $1.00-$2.50 skips the token, >$2.50-$5.00 buys with +90% MC, >$5.00-$10.00 buys with +180% MC.",
             ].join("\n"),
@@ -3082,6 +3227,20 @@ export class InsiderBot extends EventEmitter {
       }
       return false;
     }
+
+    if (transferOutUsd < BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD) {
+      this.log.info("Skipping normal-mode feePayer tiny transfer below minimum buy USD", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        signature: tx.signature,
+        recipient: transferOut.to,
+        amountSol: transferOut.amountSol,
+        amountUsd: transferOutUsd,
+        minBuyUsd: BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD,
+      });
+      return false;
+    }
+
     const sameBandGroup = this.getNormalTinySameBandGroup(
       state,
       tx.timestamp,
@@ -3128,7 +3287,7 @@ export class InsiderBot extends EventEmitter {
             `<b>⏭️ ${this.label} Normal ~0.02 SOL Sub-Band Buy Skipped — Preceded By Dust Group</b>`,
             `Token: <code>${state.mint}</code>`,
             `FeePayer: <code>${state.funderWallet}</code>`,
-            `A $0.10-$0.99 dust group was already seen for this token, and the group that followed it is only ~${groupMaxSol.toFixed(4)} SOL (≈0.02 SOL), so it isn't trusted.`,
+            `A ~0.01 SOL dust group was already seen for this token, and the group that followed it is only ~${groupMaxSol.toFixed(4)} SOL (≈0.02 SOL), so it isn't trusted.`,
             "Skipping this token — resetting to watch for the next one.",
           ].join("\n"),
           "normal tiny ~0.02 sol sub-band dust-group-preceded skip notification",
@@ -3639,8 +3798,25 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private getTinyUsdBand(amountUsd: number): "lt2_5" | "2_5_to_5" | "gt5" {
-    if (amountUsd < BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD) return "lt2_5";
+  private getTinyUsdBand(
+    amountUsd: number,
+    amountSol: number,
+  ): "lt2_5" | "2_5_to_5" | "gt5" {
+    // Dust ("lt2_5") is defined purely by SOL amount — a ~0.01 SOL
+    // transfer-out is a recognizable small gas-funding round on its own,
+    // regardless of what it happens to be worth in USD at the current SOL
+    // price. This replaces the old "amountUsd < $1" USD-based dust
+    // definition, which drifted with SOL price and could misclassify a
+    // ~0.01 SOL dust transfer as a real $1-$5 buy-triggering group whenever
+    // SOL was expensive enough to push it just over $1.
+    if (
+      this.isNearBundlerTinySolAmount(
+        amountSol,
+        BUNDLER_FUNDER_NORMAL_TINY_DUST_ROUND_SOL_AMOUNT,
+      )
+    ) {
+      return "lt2_5";
+    }
     if (amountUsd <= BUNDLER_FUNDER_NORMAL_TINY_MID_MAX_USD) return "2_5_to_5";
     return "gt5";
   }
@@ -3670,7 +3846,7 @@ export class InsiderBot extends EventEmitter {
         !this.isKnownFunderCandidate(state, entry.signature),
     );
     if (group.length < 2) return [];
-    if (group.some((entry) => this.getTinyUsdBand(entry.amountUsd) !== band)) return [];
+    if (group.some((entry) => this.getTinyUsdBand(entry.amountUsd, entry.amountSol) !== band)) return [];
     if (
       band !== "lt2_5" &&
       group.some((entry) => !this.isRoundBundlerTinySolAmount(entry.amountSol, band))
@@ -5429,6 +5605,7 @@ export class InsiderBot extends EventEmitter {
     await this.stopInsiderMonitoring();
     await this.stopBundlerMonitoring();
     await this.stopBundlerFunderMonitoring();
+    await this.stopDevWalletFullExitWatch("flow monitoring stopped");
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
@@ -5873,6 +6050,7 @@ export class InsiderBot extends EventEmitter {
 
     await this.stopBundlerMonitoring();
     await this.stopBundlerFunderMonitoring();
+    await this.stopDevWalletFullExitWatch("flow cycle completed");
     this.watchingMint = null;
     this.monitoredWallet = null;
     this.insiderState = null;
@@ -5883,6 +6061,8 @@ export class InsiderBot extends EventEmitter {
     this.devWallet = null;
     this.devCreateSignature = null;
     this.devCreateTimestamp = null;
+    this.devFullExitHandled = false;
+    this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
     this.initialBundlerMarketCapUsd = null;
     this.preBuyStopped = false;
@@ -5921,6 +6101,8 @@ export class InsiderBot extends EventEmitter {
     this.devWallet = null;
     this.devCreateSignature = null;
     this.devCreateTimestamp = null;
+    this.devFullExitHandled = false;
+    this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
     this.initialBundlerMarketCapUsd = null;
     this.preBuyStopped = false;

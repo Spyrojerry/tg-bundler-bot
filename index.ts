@@ -42,7 +42,6 @@ import { randomBytes } from "crypto";
 const log = createLogger("MAIN");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
-const INSIDER_MIN_MARKET_CAP_USD = 5_000;
 const MCAP_CHECK_INTERVAL_MS = 2_000;
 const MCAP_FETCH_GRACE_MS = 1_000;
 const INSIDER_DAS_NO_PRICE_COOLDOWN_MS = 10_000;
@@ -1996,100 +1995,6 @@ async function main(): Promise<void> {
     });
   }
 
-  async function checkAndSellIfLowMcap(
-    mint: string,
-    context: "insider",
-    botIndex?: number,
-    preFetchedMc?: number | null,
-  ): Promise<void> {
-    if (!config.tradingWalletAddress) return;
-    if (hasPendingSellForMint(config.tradingWalletAddress, mint)) return;
-
-    try {
-      const client =
-        botIndex !== undefined ? gmgnClients[botIndex] : gmgnClients[0];
-      const currentMc =
-        preFetchedMc !== undefined
-          ? preFetchedMc
-          : await client.fetchTokenMarketCapUsd(mint);
-      if (currentMc !== null && currentMc < INSIDER_MIN_MARKET_CAP_USD) {
-        log.warn(
-          `[MCAP SELL TRIGGER] Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} for ${mint}`,
-          { context },
-        );
-
-        // Check Cache for balance first
-        const cached = activePositionCache.get(mint);
-        let balance: bigint | null = cached ? cached.balance : null;
-
-        if (balance === null && config.tradingWalletAddress) {
-          const owner = new PublicKey(config.tradingWalletAddress);
-          const mintPk = new PublicKey(mint);
-          balance = await getTokenRawBalance(owner, mintPk).catch(() => 0n);
-        }
-
-        if (balance !== null && balance <= 0n) {
-          log.info(`[MCAP SELL SKIP] No balance found for ${mint}`);
-          return;
-        }
-
-        const event: FilterFailEvent = {
-          walletAddress: config.tradingWalletAddress,
-          mint,
-          sampleNumber: 0,
-          elapsedSec: 0,
-          reasons: [
-            `Market cap $${currentMc.toLocaleString()} fell below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}.`,
-            `Context: ${context} position.`,
-            "Periodic market cap checker triggered automatic sell.",
-          ],
-          settings: db.getWalletSettings(config.tradingWalletAddress),
-          metrics: {
-            mint,
-            timestamp: new Date().toISOString(),
-            bundlersPercent: null,
-            bundlersCount: null,
-            initialBaseReserve: null,
-            topWallets: null,
-            top10HolderRate: null,
-            bundledAmountRate: null,
-          },
-          buySol: (
-            insiderBots.find((b) => b.getActivePosition()?.mint === mint) ||
-            insiderBots[0]
-          ).getBuySol(),
-          matchingWallets: [],
-        };
-
-        const sellId = randomBytes(5).toString("hex");
-        pendingSells.set(sellId, {
-          event,
-          createdAt: Date.now(),
-          executing: true,
-        });
-
-        // Keep the active position until the sell is confirmed. The pending
-        // sell map suppresses duplicate MC-triggered attempts meanwhile.
-
-        telegramBot
-          ?.sendDefault(
-            [
-              "<b>🚨 Market Cap Sell Triggered</b>",
-              `Token: <code>${html(mint)}</code>`,
-              `Market Cap: <b>$${currentMc.toLocaleString()}</b>`,
-              `Threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
-              `Action: submit sell for <b>${config.sellPercent}%</b>.`,
-            ].join("\n"),
-          )
-          .catch((err) => log.warn("Telegram mcap sell alert failed", err));
-
-        void executeSellAndNotify(config.telegramChatId, sellId, telegramBot);
-      }
-    } catch (err) {
-      log.error(`Failed to check market cap for ${mint}`, err);
-    }
-  }
-
   async function checkInsiderMcapFlow(
     index: number,
     preFetchedMc?: number | null,
@@ -2126,57 +2031,12 @@ async function main(): Promise<void> {
         `[INSIDER ${botNumber} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${fetched?.source ?? "Unknown"})`,
       );
 
-      if (currentMc < INSIDER_MIN_MARKET_CAP_USD) {
-        const reason = `Market cap $${currentMc.toLocaleString()} below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} (Rug)`;
-        if (
-          activePos &&
-          config.tradingWalletAddress &&
-          hasPendingSellForMint(config.tradingWalletAddress, mint)
-        ) {
-          log.info(
-            `[INSIDER ${botNumber} RUG] Sell already pending for ${mint}; MC monitoring remains active`,
-            { currentMc },
-          );
-          return;
-        }
-        log.warn(
-          `[INSIDER ${botNumber} RUG] ${reason} for ${mint}. ${activePos ? "Triggering sell." : "Resetting pre-buy state."}`,
-        );
-
-        const preBuyOnly = !!preBuyMint && !activePos;
-
-        if (activePos) {
-          bot.emit("sellTrigger", {
-            followedWallet: bot.getFollowedWallet()!,
-            positionMint: mint,
-            signature: "MC_TRIGGER",
-            reason: `Rug protection: ${reason}`,
-          });
-        }
-
-        if (preBuyOnly) {
-          telegramBot
-            ?.sendDefault(
-              [
-                "<b>🧹 Rug Reset — Token Skipped</b>",
-                `Bot: <b>${botNumber}</b>`,
-                `Token: <code>${html(mint)}</code>`,
-                `Market cap: <b>$${currentMc.toLocaleString()}</b>`,
-                `Rug threshold: <b>$${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()}</b>`,
-                "Token rugged during insider/bundler monitoring before buy.",
-                "Flow reset — waiting for next follow-wallet buy.",
-              ].join("\n"),
-            )
-            .catch((err) =>
-              log.warn("Telegram insider rug reset alert failed", err),
-            );
-        }
-
-        if (preBuyOnly) {
-          bot.clearPreBuyMint();
-        }
-        return;
-      }
+      // Note: the old "MC below $5,000 (Rug)" reset/sell check that used to
+      // live here has been replaced by dev-wallet full-exit detection inside
+      // InsiderBot itself (a CLOSE_ACCOUNT/SOLANA_PROGRAM_LIBRARY tx from the
+      // dev wallet — see checkDevWalletFullExit in insider-bot.ts), which runs
+      // continuously in the bot's own poll loop and triggers resetForNewToken
+      // (pre-buy) or a sellTrigger (post-buy) directly.
 
       if (activePos) {
         const exitMc = bot.getExitMc();
@@ -2318,12 +2178,6 @@ async function main(): Promise<void> {
                     i,
                     currentMc.marketCap,
                     currentMc.source,
-                  );
-                  await checkAndSellIfLowMcap(
-                    activePos.mint,
-                    "insider",
-                    i,
-                    currentMc.marketCap,
                   );
                 }
               })(),
@@ -2696,7 +2550,7 @@ async function main(): Promise<void> {
           "6. Mode-specific buy amounts are used for normal-funding and low-funding entries.",
           "7. Sell rules depend on the mode/band shown in the buy card; rug exits remain active.",
           "• API guard: Helius calls use a queued four-key pool, transient-only fallback, per-key backoff, and capped recipient batch sync.",
-          `• Rug: MC below $${INSIDER_MIN_MARKET_CAP_USD.toLocaleString()} resets before buy or sells after buy.`,
+          "• Rug: dev wallet closing a WSOL account (CLOSE_ACCOUNT, full exit) resets before buy or sells after buy.",
         ].join("\n"),
         replyMarkup: {
           inline_keyboard: [
