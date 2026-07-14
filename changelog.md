@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-07-14 (5)
+
+### Fixed followed-wallet buys being permanently dropped when Helius hadn't indexed the mint's early transactions yet
+
+- **Why**: `getEarlyInsiderSwaps` (fetched via `startInsiderFlow` right after a followed-wallet buy) requires at least one of the mint's first 5 transactions to already be classified `type === "SWAP"` by Helius. For a token that's only seconds old, Helius sometimes hasn't finished indexing/classifying those transactions yet, so this throws `"No SWAP transactions found for mint yet"` even though the buy is real. Two compounding issues made this worse than it should've been: (1) `withHeliusFallback`'s `isTransientHeliusError` didn't recognize this message, so it was treated as a **permanent** failure and immediately gave up instead of trying the other 3 Helius pool keys — the "Helius pool metrics" log showed only key index 0 was ever attempted (`requests: 1, permanentFailures: 1`) while keys 2-4 sat idle (`requests: 0`); (2) once `startInsiderFlow` threw, `handleFollowWalletBuy`'s catch block called `resetForNewToken(true)` and gave up on the mint for good — since the mint was already added to `boughtMints` before the flow started (and that set is only cleared when the followed wallet address itself changes), the bot would never retry that same followed-wallet buy again for the rest of the session, silently missing a real signal.
+- `insider-bot.ts`:
+  - `isTransientHeliusError` now also matches `"No transactions found for mint yet"` / `"No SWAP transactions found for mint yet"`, so `withHeliusFallback` cycles through the whole Helius pool for this error instead of bailing after the first key (each key still runs its own ~3-4s internal retry loop, so this alone extends the effective window from ~4s to ~15s across 4 keys).
+  - Added `startInsiderFlowWithIndexingLagRetry(mint)`, now called from `handleFollowWalletBuy` in place of a direct `startInsiderFlow(mint)` call: if `startInsiderFlow` still throws this same indexing-lag error after exhausting the whole Helius pool, it retries the whole flow up to 2 more times with real-world delays (4s, then 8s) before giving up and letting the existing catch block run `resetForNewToken(true)` as before. Any other error (e.g. `InsiderMinBuySolFilterError`) is rethrown immediately with no extra delay, unchanged from before.
+- Net effect: a followed-wallet buy on a brand-new mint now gets a much more generous window (up to ~10x longer) for Helius's indexing to catch up before the bot gives up on it, instead of failing permanently after a single ~4-second attempt against one API key.
+
 ## 2026-07-14 (4)
 
 ### Dust is now defined purely by ~0.01 SOL, not "$0.10-$0.99" USD — and fixed a dead-code bug where dust-group tracking never actually ran

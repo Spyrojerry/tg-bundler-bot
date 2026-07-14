@@ -1040,7 +1040,7 @@ export class InsiderBot extends EventEmitter {
       // below where the earliest bundler bought.
       this.initialBundlerMarketCapUsd = followWalletBuyMc;
 
-      await this.startInsiderFlow(mint);
+      await this.startInsiderFlowWithIndexingLagRetry(mint);
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
       this.releaseMint?.(mint);
@@ -1054,6 +1054,55 @@ export class InsiderBot extends EventEmitter {
         this.emit("error", err instanceof Error ? err : new Error(String(err)));
       }
       await this.resetForNewToken(true);
+    }
+  }
+
+  private isMintIndexingLagError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /No transactions found for mint yet|No SWAP transactions found for mint yet/i.test(
+      message,
+    );
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * A followed-wallet buy is a real, valuable signal — it shouldn't be
+   * permanently dropped just because Helius hasn't finished indexing/
+   * classifying the mint's very first transactions yet (common for tokens
+   * that are only seconds old). startInsiderFlow already fans its Helius
+   * request out across the whole key pool for this specific error (see
+   * isTransientHeliusError), but if every key still comes back empty, retry
+   * the whole flow a few more times with real-world delays in between
+   * before finally giving up and letting the caller reset for a new token.
+   */
+  private async startInsiderFlowWithIndexingLagRetry(
+    mint: string,
+    maxRetries = 2,
+  ): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await this.startInsiderFlow(mint);
+        return;
+      } catch (err) {
+        if (attempt >= maxRetries || !this.isMintIndexingLagError(err)) {
+          throw err;
+        }
+        const delayMs = (attempt + 1) * 4_000;
+        this.log.warn(
+          "Followed-wallet mint not indexed by Helius yet; retrying after delay",
+          {
+            mint,
+            attempt: attempt + 1,
+            maxRetries,
+            delayMs,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+        await this.delay(delayMs);
+      }
     }
   }
 
@@ -1439,6 +1488,15 @@ export class InsiderBot extends EventEmitter {
     if (/\b429\b|too many requests/i.test(message)) return true;
     if (/\b5\d\d\b/.test(message)) return true;
     if (/timeout|timed out|network|fetch failed|econnreset|etimedout|enotfound|socket|tls/i.test(message)) {
+      return true;
+    }
+    // A brand-new mint may not have any transactions indexed/classified by
+    // Helius yet — this is an indexing-lag issue, not a permanent failure of
+    // this particular API key, so it's worth cycling through the rest of the
+    // Helius pool (each key gets its own multi-attempt retry loop inside e.g.
+    // getEarlyInsiderSwaps/getEarlyBundlers) rather than giving up after just
+    // one key's ~3.7s retry budget.
+    if (/No transactions found for mint yet|No SWAP transactions found for mint yet/i.test(message)) {
       return true;
     }
     return false;
