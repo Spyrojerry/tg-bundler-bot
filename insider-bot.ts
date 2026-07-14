@@ -26,6 +26,8 @@ const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
 const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
+/** Of the BUNDLER_FUNDER_REQUIRED_COUNT (4) early bundler funding records, at least this many must share the exact same feePayer for the shared-feePayer watch to start. Relaxed from requiring all 4 to match, since a single outlier (e.g. one bundler additionally/separately funded from an unrelated wallet) shouldn't block an otherwise-clear shared-feePayer pattern. The majority feePayer's records are used for the watch; any non-matching outlier record is ignored (its bundler wallet is still tracked as an early buyer, just not as a funding source). */
+const BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_RETRY_DELAY_MS = 500;
 const BUNDLER_FUNDER_LOW_FUNDING_SOL = 20;
@@ -1551,15 +1553,46 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const records = fundingRecords as BundlerFundingRecord[];
-    const feePayers = new Set(records.map((record) => record.fundingFeePayer));
-    if (feePayers.size !== 1) {
-      this.log.warn("First four bundler funding tx feePayers did not match; resetting", {
-        mint,
-        fundingRecords: records,
-      });
+    const allRecords = fundingRecords as BundlerFundingRecord[];
+    const feePayerGroups = new Map<string, BundlerFundingRecord[]>();
+    for (const record of allRecords) {
+      const group = feePayerGroups.get(record.fundingFeePayer);
+      if (group) {
+        group.push(record);
+      } else {
+        feePayerGroups.set(record.fundingFeePayer, [record]);
+      }
+    }
+    const majorityGroup = [...feePayerGroups.values()].reduce((best, group) =>
+      group.length > best.length ? group : best,
+    );
+    if (majorityGroup.length < BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT) {
+      this.log.warn(
+        "Not enough bundler funding tx feePayers matched; resetting",
+        {
+          mint,
+          fundingRecords: allRecords,
+          matchingFeePayerCount: majorityGroup.length,
+          requiredMatchingFeePayerCount: BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT,
+          totalCount: allRecords.length,
+        },
+      );
       await this.resetForNewToken(true);
       return;
+    }
+    const records = majorityGroup;
+    if (records.length < allRecords.length) {
+      const outliers = allRecords.filter((record) => !records.includes(record));
+      this.log.warn(
+        "Majority of bundler funding tx feePayers matched; proceeding with the majority feePayer and ignoring the outlier(s)",
+        {
+          mint,
+          majorityFeePayer: records[0].fundingFeePayer,
+          matchingFeePayerCount: records.length,
+          totalCount: allRecords.length,
+          outliers,
+        },
+      );
     }
 
     const earliest = records.reduce((best, record) =>
@@ -1618,7 +1651,7 @@ export class InsiderBot extends EventEmitter {
       processedSignatures: new Set(records.map((record) => record.fundingSignature)),
       validOutSignatures: new Set<string>(),
       invalidOutSignatures: new Set<string>(),
-      bundlerWallets: new Set(records.map((record) => record.bundlerWallet)),
+      bundlerWallets: new Set(firstFour.map((buy) => buy.wallet)),
       recipientWatches: new Map<string, FunderRecipientWatch>(),
       queuedTransferOuts: [],
       normalTinyTransferOuts: [],

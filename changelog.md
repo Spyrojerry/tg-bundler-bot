@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-14
+
+### Relaxed the shared-feePayer validation: 3-of-4 matching feePayers now passes (was requiring all 4)
+
+- **Why**: a real token had 3 of the first 4 early bundlers funded by the same feePayer (`5TDYtdbM...`, ~30-33 SOL each), but the 4th bundler (`ALVy3Qw6...`) had its largest/selected funding transfer come from a different, unrelated feePayer (a ~59 SOL transfer, clearly a different funding source/pattern). The old all-or-nothing check (`feePayers.size !== 1`) reset on this single outlier even though the shared-feePayer signal from the other 3 was strong and unambiguous.
+- `insider-bot.ts`: added `BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT = 3`. After fetching the 4 funding records, they're grouped by `fundingFeePayer` and the largest group ("majority group") is taken. If the majority group has fewer than 3 matching records (e.g. a 2-2 split, or all 4 different), the bot still resets ("Not enough bundler funding tx feePayers matched"). Otherwise, the watch proceeds using **only the majority group's records** — the outlier record's feePayer/amount is ignored entirely and logged separately ("Majority of bundler funding tx feePayers matched; proceeding with the majority feePayer and ignoring the outlier(s)").
+- `earliestFundingTimestamp`, `cursorSignature`, `largestFundingSol`, `processedSignatures`, and the tracked `funderWallet` are now all derived from the majority group only, not the full 4. `bundlerWallets` (the set used to exclude the original early buyers from being mistaken for new recipients later) still comes from all 4 original bundler-buy wallets (`firstFour`), regardless of which ones matched the majority feePayer — the outlier bundler genuinely did buy early, it just isn't used to determine the shared feePayer itself.
+- Net effect: if 4-of-4 match, behavior is unchanged. If 3-of-4 match, the token now proceeds using the 3 matching records. If only 2-of-4 (or fewer) match, the bot still resets as before.
+
 ## 2026-07-13 (6)
 
 ### Round-SOL-amount check is now band-specific: >$5-$10 (+180%) only accepts ~0.1 SOL, $1-$5 (+90%) only accepts ~0.02/0.05 SOL
