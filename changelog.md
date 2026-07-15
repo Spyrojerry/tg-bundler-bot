@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-07-15 (13)
+
+### Remove REST backstops; cap forced ascending sync at 20 txs
+
+- Removed all periodic / WS-down REST backstop polling: funder-first feePayer interval sync, insider `runPollTick` REST/pollWallet loop, `scheduleBundlerFunderWsSync`, and onLogs→batch-sync recipient paths (push-only via Enhanced WSS when configured).
+- Forced ascending feePayer sync limits reduced **50 → 20** (`BUNDLER_FUNDER_SYNC_LIMIT`, `POTENTIAL_FEEPAYER_SYNC_LIMIT`). One-shot forced sync on flow events (funder receive, handoff, bundler-funder start/migration, sell rearm) is unchanged.
+
+## 2026-07-15 (12)
+
+### Funder-first: connect post-funder-receive pipeline with logging (REST backstop removed in `(13)`)
+
+- After funder SOL receive: explicit logs for WSS subscribe, pipeline armed, REST sync start/complete (fetched/processed counts), bundler funding events, and group evaluation.
+- Awaits the initial forced REST sync so immediate post-receive txs are not missed silently.
+- ~~Periodic REST backstop~~ — removed in `(13)`.
+- WSS potential-feePayer notifications drive detection; re-arm watch if subscription was dropped.
+
+## 2026-07-15 (11)
+
+### Funder-first: REST sync + pre-group half-drain handoff chain
+
+- Each potential feePayer now runs a REST backstop sync (`getAddressTransactionsAsc`, 50 tx limit, 1s min interval, single-flight queue) from the funder-receive signature onward — forced on first funder funding and after handoff.
+- **Before any bundler group:** half-drain (≤50% of post-funder-receive balance) inspects the drain tx; if SOL returns to the top-level funder, keep watching; otherwise stop the current feePayer and start fresh on the SOL recipient (chain can repeat).
+- **After a bundler group is active:** the feePayer itself is only dropped on native SOL → 0 (no more half-drain on the feePayer wallet).
+
+## 2026-07-15 (10)
+
+### Funder-first: skip 10s windows with 5+ tolerance matches
+
+- If 5 or more recipients in a 10s window have post-balances within 0.5 SOL of each other, that window is skipped entirely — no group is formed from it (previously the earliest 4 were kept).
+
+## 2026-07-15 (9)
+
+### Funder-first: tighten 3–4 bundler group selection
+
+- Cluster detection now finds the largest valid 3–4 recipient set whose post-balances span ≤0.5 SOL (balance-sorted sliding window), preferring 4 over 3 when both are valid.
+- If 5+ recipients meet the tolerance in one 10s window, that window is skipped (see `2026-07-15 (10)` — was briefly capped to earliest 4).
+- Concurrent groups no longer share recipients: once a wallet is in an active group, it is excluded from forming another overlapping group on the same feePayer.
+
 ## 2026-07-15 (8)
 
 ### Fix funder-first missing SOL transfer detection on Enhanced WSS

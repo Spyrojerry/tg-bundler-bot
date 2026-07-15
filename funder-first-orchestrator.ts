@@ -18,8 +18,9 @@
 //
 //  Group / recipient rules:
 //    • Multiple 10s bundler groups (normal or low) can be monitored concurrently.
-//    • A valid group is 3–4 unique recipients in 10s whose post-balances are all
-//      within 0.5 SOL of each other (and in the normal or low band).
+//    • A valid group is exactly 3–4 unique recipients in 10s whose post-balances
+//      are all within 0.5 SOL of each other (and in the normal or low band). If 5+
+//      recipients in the window meet the tolerance, the window is skipped entirely.
 //    • Keep watching the feePayer for new groups until a recipient buy overlaps
 //      the token's first-four bundlers.
 //    • Per recipient in the active group: stop watching if post-balance after the
@@ -28,9 +29,13 @@
 //      and look for the next 10s window.
 //
 //  Stop-watching rules for a potential feePayer wallet itself:
-//    • After receiving SOL from the funder, any outgoing transfer that leaves
-//      the wallet at ≤50% of the balance right after the funder receive.
-//    • Native SOL balance hits zero (account subscription).
+//    • Before any bundler group is found: half-drain (≤50% of post-funder-receive
+//      balance) triggers REST sync from the funder-receive tx; if the drain tx
+//      returns SOL to the top-level funder, keep watching; otherwise hand off to
+//      the SOL recipient and restart fresh for that wallet.
+//    • After at least one bundler group is active: only native SOL → zero drops
+//      the feePayer watch (no more half-drain on the feePayer itself).
+//    • Native SOL balance hits zero (account subscription) always stops the watch.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Connection, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
@@ -59,6 +64,8 @@ const LOW_MAX_POST_SOL = 19.99;
 const HALF_DRAIN_RATIO = 0.5;
 /** Recipients in a 3–4 bundler group must have post-balances within this spread (SOL). */
 const POST_BALANCE_TOLERANCE_SOL = 0.5;
+const POTENTIAL_FEEPAYER_SYNC_LIMIT = 20;
+const POTENTIAL_FEEPAYER_SYNC_MIN_INTERVAL_MS = 1_000;
 
 type PotentialFeePayerStatus =
   | 'watching'
@@ -95,6 +102,12 @@ interface PotentialFeePayerWatch {
   recipientProcessedSignatures: Map<string, Set<string>>;
   balanceAtFunderReceiveSol: number | null;
   balanceAtFunderReceiveSignature: string | null;
+  /** REST sync cursor — txs after funder-receive signature. */
+  cursorSignature: string | null;
+  isSyncing: boolean;
+  syncPending: boolean;
+  syncPendingForce: boolean;
+  lastSyncAt: number;
   bundlerFundingEvents: BundlerFundingEvent[];
   mode: 'normal' | 'low' | null;
   detectedMint: string | null;
@@ -256,7 +269,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       tx,
       funder,
     )) {
-      const existing = this.potentialFeePayers.get(recipient);
+      let existing = this.potentialFeePayers.get(recipient);
       if (
         existing &&
         (existing.status === 'active' || existing.status === 'cooldown')
@@ -269,19 +282,28 @@ export class FunderFirstOrchestrator extends EventEmitter {
         continue;
       }
 
-      if (!existing) {
-        this.ensurePotentialFeePayerWatch(recipient);
+      if (existing?.status === 'stopped') {
+        this.potentialFeePayers.delete(recipient);
+        existing = undefined;
       }
 
-      const watch = this.potentialFeePayers.get(recipient);
-      if (!watch || watch.status === 'stopped') continue;
-
       const postBalanceSol = this.getAccountPostBalanceSol(tx, recipient);
-      if (postBalanceSol === null) continue;
+      if (postBalanceSol === null) {
+        log.warn('Funder sent SOL but recipient post-balance unknown — skipping', {
+          recipient,
+          signature: tx.signature,
+        });
+        continue;
+      }
+
+      const watch = this.ensurePotentialFeePayerWatch(recipient);
+      if (!watch || watch.status === 'stopped') continue;
 
       const isTopUp = watch.balanceAtFunderReceiveSol !== null;
       watch.balanceAtFunderReceiveSol = postBalanceSol;
       watch.balanceAtFunderReceiveSignature = tx.signature;
+      watch.cursorSignature = tx.signature;
+      watch.processedSignatures.add(tx.signature);
 
       if (!isTopUp) {
         log.info('Potential feePayer received SOL from funder', {
@@ -289,14 +311,25 @@ export class FunderFirstOrchestrator extends EventEmitter {
           amountSol,
           postBalanceSol,
           signature: tx.signature,
+          enhancedWatchId: watch.enhancedWatchId,
         });
+        log.info(
+          'Potential feePayer pipeline armed — watching for 3–4 bundler sends in 10s (normal ≥20 SOL or low 5–19.99 post-balance, ≤0.5 SOL spread)',
+          {
+            potentialFeePayer: recipient,
+            postBalanceSol,
+          },
+        );
         void this.sendTelegram([
           '<b>👀 Funder-First: New Potential FeePayer</b>',
           `Funder: <code>${this.html(funder)}</code>`,
           `Recipient: <code>${this.html(recipient)}</code>`,
           `Received: <b>${amountSol.toFixed(4)} SOL</b>`,
           `Post-balance: <b>${postBalanceSol.toFixed(4)} SOL</b>`,
+          '',
+          'Watching for 3–4 bundler funding txs in 10s…',
         ]);
+        await this.syncPotentialFeePayerTransactions(recipient, true);
       } else {
         log.info('Potential feePayer topped up from funder — updated balance baseline', {
           potentialFeePayer: recipient,
@@ -305,48 +338,379 @@ export class FunderFirstOrchestrator extends EventEmitter {
           status: watch.status,
           signature: tx.signature,
         });
+        await this.syncPotentialFeePayerTransactions(recipient, true);
       }
     }
   }
 
-  private ensurePotentialFeePayerWatch(address: string): void {
-    if (this.potentialFeePayers.has(address)) return;
-    if (!this.enhancedWs) return;
-    const watch: PotentialFeePayerWatch = {
-      address,
-      status: 'watching',
-      enhancedWatchId: null,
-      solBalanceSubId: null,
-      subscribedRecipients: new Set(),
-      processedSignatures: new Set(),
-      recipientProcessedSignatures: new Map(),
-      balanceAtFunderReceiveSol: null,
-      balanceAtFunderReceiveSignature: null,
-      bundlerFundingEvents: [],
-      mode: null,
-      detectedMint: null,
-      detectedDevWallet: null,
-      cooldownDevWatchId: null,
-      activeGroups: new Map(),
-      exhaustedGroupAnchors: new Set(),
-      notifiedGroupAnchors: new Set(),
-      recipientBalanceAtReceive: new Map(),
-      recipientZeroBalanceSubIds: new Map(),
-    };
-    watch.enhancedWatchId = this.enhancedWs.watch(address, (tx) => {
-      void this.handlePotentialFeePayerTx(address, tx);
+  private ensurePotentialFeePayerWatch(address: string): PotentialFeePayerWatch | null {
+    if (!this.enhancedWs) return null;
+
+    let watch = this.potentialFeePayers.get(address);
+    if (watch?.status === 'stopped') {
+      this.potentialFeePayers.delete(address);
+      watch = undefined;
+    }
+
+    if (!watch) {
+      watch = {
+        address,
+        status: 'watching',
+        enhancedWatchId: null,
+        solBalanceSubId: null,
+        subscribedRecipients: new Set(),
+        processedSignatures: new Set(),
+        recipientProcessedSignatures: new Map(),
+        balanceAtFunderReceiveSol: null,
+        balanceAtFunderReceiveSignature: null,
+        cursorSignature: null,
+        isSyncing: false,
+        syncPending: false,
+        syncPendingForce: false,
+        lastSyncAt: 0,
+        bundlerFundingEvents: [],
+        mode: null,
+        detectedMint: null,
+        detectedDevWallet: null,
+        cooldownDevWatchId: null,
+        activeGroups: new Map(),
+        exhaustedGroupAnchors: new Set(),
+        notifiedGroupAnchors: new Set(),
+        recipientBalanceAtReceive: new Map(),
+        recipientZeroBalanceSubIds: new Map(),
+      };
+      this.potentialFeePayers.set(address, watch);
+    }
+
+    if (watch.enhancedWatchId === null) {
+      watch.enhancedWatchId = this.enhancedWs.watch(address, (tx) => {
+        void this.handlePotentialFeePayerTx(address, tx);
+      });
+      log.info('Subscribed to potential feePayer via Enhanced WSS', {
+        address,
+        enhancedWatchId: watch.enhancedWatchId,
+      });
+    }
+
+    if (watch.solBalanceSubId === null) {
+      watch.solBalanceSubId = this.connection.onAccountChange(
+        new PublicKey(address),
+        (info) => {
+          if (info.lamports === 0) {
+            this.stopPotentialFeePayerWatch(address, 'native SOL balance reached zero');
+          }
+        },
+        'processed',
+      );
+    }
+
+    if (watch.status === 'stopped') {
+      watch.status = 'watching';
+    }
+
+    return watch;
+  }
+
+  private async syncPotentialFeePayerTransactions(
+    address: string,
+    force = false,
+  ): Promise<void> {
+    const watch = this.potentialFeePayers.get(address);
+    if (!watch || !this.isEnabled) return;
+    if (
+      watch.status === 'stopped' ||
+      watch.status === 'active' ||
+      watch.status === 'cooldown'
+    ) {
+      return;
+    }
+
+    if (watch.isSyncing) {
+      watch.syncPending = true;
+      if (force) watch.syncPendingForce = true;
+      return;
+    }
+    if (
+      !force &&
+      Date.now() - watch.lastSyncAt < POTENTIAL_FEEPAYER_SYNC_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    watch.isSyncing = true;
+    watch.lastSyncAt = Date.now();
+    const syncingAddress = address;
+    const afterSignature =
+      watch.balanceAtFunderReceiveSignature ?? watch.cursorSignature ?? undefined;
+    let fetchedCount = 0;
+    let processedCount = 0;
+
+    log.info('Potential feePayer REST sync started', {
+      address: syncingAddress,
+      afterSignature: afterSignature ?? null,
+      force,
     });
-    watch.solBalanceSubId = this.connection.onAccountChange(
-      new PublicKey(address),
-      (info) => {
-        if (info.lamports === 0) {
-          this.stopPotentialFeePayerWatch(address, 'native SOL balance reached zero');
+
+    try {
+      const txs = await this.heliusClient.getAddressTransactionsAsc(
+        syncingAddress,
+        afterSignature,
+        POTENTIAL_FEEPAYER_SYNC_LIMIT,
+      );
+      fetchedCount = txs.length;
+      for (const tx of txs) {
+        if (!this.potentialFeePayers.has(syncingAddress)) break;
+        const current = this.potentialFeePayers.get(syncingAddress);
+        if (!current) break;
+        if (current.processedSignatures.has(tx.signature)) {
+          current.cursorSignature = tx.signature;
+          continue;
         }
-      },
-      'processed',
+        processedCount += 1;
+        const handoff = await this.processPotentialFeePayerTx(
+          syncingAddress,
+          tx,
+          'rest',
+        );
+        const after = this.potentialFeePayers.get(syncingAddress);
+        if (!after) break;
+        after.cursorSignature = tx.signature;
+        if (handoff) break;
+      }
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      log.warn('Potential feePayer REST sync failed', {
+        address: syncingAddress,
+        afterSignature: afterSignature ?? null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      const current = this.potentialFeePayers.get(syncingAddress);
+      if (current) {
+        current.isSyncing = false;
+        log.info('Potential feePayer REST sync completed', {
+          address: syncingAddress,
+          fetched: fetchedCount,
+          processed: processedCount,
+          fundingEvents: current.bundlerFundingEvents.length,
+          activeGroups: current.activeGroups.size,
+          status: current.status,
+        });
+        if (current.syncPending) {
+          current.syncPending = false;
+          const pendingForce = current.syncPendingForce;
+          current.syncPendingForce = false;
+          void this.syncPotentialFeePayerTransactions(syncingAddress, pendingForce);
+        }
+      }
+    }
+  }
+
+  private async handlePotentialFeePayerTx(
+    address: string,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    await this.processPotentialFeePayerTx(address, tx, 'wss');
+  }
+
+  /**
+   * Processes one potential feePayer tx from WSS or REST sync.
+   * Returns true when the watch was stopped or handed off (caller should stop iterating).
+   */
+  private async processPotentialFeePayerTx(
+    address: string,
+    tx: HeliusTransaction,
+    source: 'wss' | 'rest',
+  ): Promise<boolean> {
+    const watch = this.potentialFeePayers.get(address);
+    if (!watch || !this.isEnabled) return false;
+    if (watch.status === 'stopped' || watch.status === 'active') return true;
+    if (watch.processedSignatures.has(tx.signature)) return false;
+    watch.processedSignatures.add(tx.signature);
+
+    if (watch.status === 'cooldown') return false;
+
+    if (watch.activeGroups.size === 0) {
+      const handedOff = await this.handlePreGroupHalfDrain(watch, tx, source);
+      if (handedOff) return true;
+    }
+
+    for (const transfer of this.extractOutgoingSolTransfers(tx, address)) {
+      const recipientPostBalanceSol = this.getAccountPostBalanceSol(
+        tx,
+        transfer.to,
+      );
+      if (recipientPostBalanceSol === null) continue;
+
+      let band: 'normal' | 'low' | null = null;
+      if (recipientPostBalanceSol >= NORMAL_MIN_POST_SOL) {
+        band = 'normal';
+      } else if (
+        recipientPostBalanceSol >= LOW_MIN_POST_SOL &&
+        recipientPostBalanceSol <= LOW_MAX_POST_SOL
+      ) {
+        band = 'low';
+      }
+      if (!band) {
+        log.debug(
+          'Outgoing SOL ignored — recipient post-balance outside bundler bands (need ≥20 normal or 5–19.99 low)',
+          {
+            potentialFeePayer: address,
+            bundlerRecipient: transfer.to,
+            recipientPostBalanceSol,
+            signature: tx.signature,
+            source,
+          },
+        );
+        continue;
+      }
+
+      watch.bundlerFundingEvents.push({
+        recipient: transfer.to,
+        amountSol: transfer.amountSol,
+        recipientPostBalanceSol,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        band,
+      });
+      watch.recipientBalanceAtReceive.set(transfer.to, recipientPostBalanceSol);
+      log.info('Potential feePayer bundler funding event recorded', {
+        potentialFeePayer: address,
+        bundlerRecipient: transfer.to,
+        band,
+        amountSol: transfer.amountSol,
+        recipientPostBalanceSol,
+        signature: tx.signature,
+        source,
+        totalFundingEvents: watch.bundlerFundingEvents.length,
+      });
+    }
+
+    const groupsBefore = watch.activeGroups.size;
+    await this.evaluateBundlerGroups(watch);
+    if (watch.bundlerFundingEvents.length > 0) {
+      log.info('Potential feePayer group evaluation', {
+        potentialFeePayer: address,
+        status: watch.status,
+        fundingEvents: watch.bundlerFundingEvents.length,
+        activeGroups: watch.activeGroups.size,
+        newGroups: watch.activeGroups.size - groupsBefore,
+        source,
+      });
+    }
+    return false;
+  }
+
+  /**
+   * Before any bundler group exists: if an outgoing tx drops balance to ≤50% of the
+   * post-funder-receive baseline, check whether SOL went back to the top funder.
+   * If not, hand off to the primary SOL recipient and restart fresh there.
+   */
+  private async handlePreGroupHalfDrain(
+    watch: PotentialFeePayerWatch,
+    tx: HeliusTransaction,
+    source: 'wss' | 'rest',
+  ): Promise<boolean> {
+    if (watch.balanceAtFunderReceiveSol === null) return false;
+
+    const selfPostBalanceSol = this.getAccountPostBalanceSol(tx, watch.address);
+    if (selfPostBalanceSol === null) return false;
+    if (!this.hasOutgoingSolFrom(tx, watch.address)) return false;
+    if (selfPostBalanceSol > watch.balanceAtFunderReceiveSol * HALF_DRAIN_RATIO) {
+      return false;
+    }
+
+    const funder = this.funderAddress;
+    if (funder && this.transfersSolTo(watch.address, funder, tx)) {
+      log.info('Potential feePayer half-drain returned SOL to funder — keeping watch', {
+        potentialFeePayer: watch.address,
+        funder,
+        signature: tx.signature,
+        source,
+        balanceAtReceive: watch.balanceAtFunderReceiveSol,
+        balanceNow: selfPostBalanceSol,
+      });
+      return false;
+    }
+
+    const outgoing = this.extractOutgoingSolTransfers(tx, watch.address).filter(
+      (transfer) => transfer.to !== funder,
     );
-    this.potentialFeePayers.set(address, watch);
-    log.info('Started watching potential feePayer', { address });
+    const handoff = [...outgoing].sort((a, b) => b.amountSol - a.amountSol)[0];
+    if (!handoff) {
+      void this.sendTelegram([
+        '<b>⏹️ Funder-First: FeePayer Watch Stopped</b>',
+        `FeePayer: <code>${this.html(watch.address)}</code>`,
+        `Reason: <b>half-drain with no handoff recipient</b>`,
+        `Tx: <code>${this.html(tx.signature)}</code>`,
+      ]);
+      this.stopPotentialFeePayerWatch(
+        watch.address,
+        'half drain with no identifiable handoff recipient',
+      );
+      return true;
+    }
+
+    const handoffPostBalanceSol = this.getAccountPostBalanceSol(tx, handoff.to);
+    if (handoffPostBalanceSol === null) {
+      log.warn('Half-drain handoff skipped — recipient post-balance unknown', {
+        potentialFeePayer: watch.address,
+        handoffRecipient: handoff.to,
+        signature: tx.signature,
+      });
+      return false;
+    }
+
+    void this.sendTelegram([
+      '<b>🔀 Funder-First: FeePayer Handoff</b>',
+      `Stopped: <code>${this.html(watch.address)}</code>`,
+      `New potential feePayer: <code>${this.html(handoff.to)}</code>`,
+      `Reason: <b>half-drain did not return SOL to funder</b>`,
+      `Balance at receive: <b>${watch.balanceAtFunderReceiveSol.toFixed(4)} SOL</b>`,
+      `Balance after drain: <b>${selfPostBalanceSol.toFixed(4)} SOL</b>`,
+      `Handoff amount: <b>${handoff.amountSol.toFixed(4)} SOL</b>`,
+      `Handoff post-balance: <b>${handoffPostBalanceSol.toFixed(4)} SOL</b>`,
+      `Tx: <code>${this.html(tx.signature)}</code>`,
+    ]);
+
+    const oldAddress = watch.address;
+    this.stopPotentialFeePayerWatch(
+      oldAddress,
+      `half-drain handoff to ${handoff.to}`,
+    );
+    this.startFreshPotentialFeePayerWatch(
+      handoff.to,
+      tx.signature,
+      handoffPostBalanceSol,
+    );
+    return true;
+  }
+
+  private startFreshPotentialFeePayerWatch(
+    address: string,
+    receiveSignature: string,
+    postBalanceSol: number,
+  ): void {
+    if (this.potentialFeePayers.has(address)) {
+      this.stopPotentialFeePayerWatch(address, 'reset for fresh handoff');
+    }
+    const watch = this.ensurePotentialFeePayerWatch(address);
+    if (!watch) return;
+    watch.balanceAtFunderReceiveSol = postBalanceSol;
+    watch.balanceAtFunderReceiveSignature = receiveSignature;
+    watch.cursorSignature = receiveSignature;
+    watch.processedSignatures.add(receiveSignature);
+    log.info('Started fresh potential feePayer watch after handoff', {
+      address,
+      receiveSignature,
+      postBalanceSol,
+      enhancedWatchId: watch.enhancedWatchId,
+    });
+    log.info(
+      'Potential feePayer pipeline armed — watching for 3–4 bundler sends in 10s (normal ≥20 SOL or low 5–19.99 post-balance, ≤0.5 SOL spread)',
+      { potentialFeePayer: address, postBalanceSol },
+    );
+    void this.syncPotentialFeePayerTransactions(address, true);
   }
 
   private stopPotentialFeePayerWatch(address: string, reason: string): void {
@@ -374,72 +738,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
     }
     this.potentialFeePayers.delete(address);
     log.info('Stopped watching potential feePayer', { address, reason });
-  }
-
-  private async handlePotentialFeePayerTx(
-    address: string,
-    tx: HeliusTransaction,
-  ): Promise<void> {
-    const watch = this.potentialFeePayers.get(address);
-    if (!watch || !this.isEnabled) return;
-    if (watch.status === 'stopped' || watch.status === 'active') return;
-    if (watch.processedSignatures.has(tx.signature)) return;
-    watch.processedSignatures.add(tx.signature);
-
-    if (watch.status === 'cooldown') return;
-
-    const selfPostBalanceSol = this.getAccountPostBalanceSol(tx, address);
-    if (
-      watch.balanceAtFunderReceiveSol !== null &&
-      selfPostBalanceSol !== null &&
-      this.hasOutgoingSolFrom(tx, address)
-    ) {
-      if (selfPostBalanceSol <= watch.balanceAtFunderReceiveSol * HALF_DRAIN_RATIO) {
-        void this.sendTelegram([
-          '<b>⏹️ Funder-First: FeePayer Watch Stopped</b>',
-          `FeePayer: <code>${this.html(address)}</code>`,
-          `Reason: <b>balance drained to ≤50% after funder receive</b>`,
-          `Balance at receive: <b>${watch.balanceAtFunderReceiveSol.toFixed(4)} SOL</b>`,
-          `Balance now: <b>${selfPostBalanceSol.toFixed(4)} SOL</b>`,
-        ]);
-        this.stopPotentialFeePayerWatch(
-          address,
-          'balance drained to half or less after funder receive',
-        );
-        return;
-      }
-    }
-
-    for (const transfer of this.extractOutgoingSolTransfers(tx, address)) {
-      const recipientPostBalanceSol = this.getAccountPostBalanceSol(
-        tx,
-        transfer.to,
-      );
-      if (recipientPostBalanceSol === null) continue;
-
-      let band: 'normal' | 'low' | null = null;
-      if (recipientPostBalanceSol >= NORMAL_MIN_POST_SOL) {
-        band = 'normal';
-      } else if (
-        recipientPostBalanceSol >= LOW_MIN_POST_SOL &&
-        recipientPostBalanceSol <= LOW_MAX_POST_SOL
-      ) {
-        band = 'low';
-      }
-      if (!band) continue;
-
-      watch.bundlerFundingEvents.push({
-        recipient: transfer.to,
-        amountSol: transfer.amountSol,
-        recipientPostBalanceSol,
-        signature: tx.signature,
-        timestamp: tx.timestamp,
-        band,
-      });
-      watch.recipientBalanceAtReceive.set(transfer.to, recipientPostBalanceSol);
-    }
-
-    await this.evaluateBundlerGroups(watch);
   }
 
   private getGroupAnchorKey(
@@ -516,35 +814,48 @@ export class FunderFirstOrchestrator extends EventEmitter {
 
   private findClusteredGroupInWindow(
     window: BundlerFundingEvent[],
+    excludeRecipients: ReadonlySet<string> = new Set(),
   ): BundlerFundingEvent[] | null {
     const unique = new Map<string, BundlerFundingEvent>();
     for (const e of window) {
+      if (excludeRecipients.has(e.recipient)) continue;
       if (!unique.has(e.recipient)) unique.set(e.recipient, e);
     }
-    const events = [...unique.values()].sort((a, b) => a.timestamp - b.timestamp);
-    if (events.length < MIN_BUNDLER_GROUP) return null;
+    if (unique.size < MIN_BUNDLER_GROUP) return null;
 
-    for (const anchor of events) {
-      const clustered = events
-        .filter(
-          (e) =>
-            Math.abs(e.recipientPostBalanceSol - anchor.recipientPostBalanceSol) <=
-            POST_BALANCE_TOLERANCE_SOL,
-        )
-        .sort((a, b) => a.timestamp - b.timestamp);
-      if (clustered.length < MIN_BUNDLER_GROUP) continue;
-      const group =
-        clustered.length <= MAX_BUNDLER_GROUP
-          ? clustered
-          : clustered.slice(0, MAX_BUNDLER_GROUP);
-      if (
-        group.length >= MIN_BUNDLER_GROUP &&
-        this.postBalancesClustered(group)
-      ) {
-        return group;
+    const byBalance = [...unique.values()].sort(
+      (a, b) => a.recipientPostBalanceSol - b.recipientPostBalanceSol,
+    );
+
+    let best: BundlerFundingEvent[] | null = null;
+    let maxClusterSize = 0;
+
+    for (let left = 0; left < byBalance.length; left += 1) {
+      for (let right = left; right < byBalance.length; right += 1) {
+        const spread =
+          byBalance[right]!.recipientPostBalanceSol -
+          byBalance[left]!.recipientPostBalanceSol;
+        if (spread > POST_BALANCE_TOLERANCE_SOL) break;
+
+        const count = right - left + 1;
+        maxClusterSize = Math.max(maxClusterSize, count);
+        if (count < MIN_BUNDLER_GROUP || count > MAX_BUNDLER_GROUP) continue;
+
+        const selected = byBalance.slice(left, right + 1);
+        if (!this.postBalancesClustered(selected)) continue;
+
+        const ordered = [...selected].sort((a, b) => a.timestamp - b.timestamp);
+        const isBetter =
+          !best ||
+          ordered.length > best.length ||
+          (ordered.length === best.length &&
+            ordered[0]!.timestamp < best[0]!.timestamp);
+        if (isBetter) best = ordered;
       }
     }
-    return null;
+
+    if (maxClusterSize > MAX_BUNDLER_GROUP) return null;
+    return best;
   }
 
   private findAllBundlerGroups(
@@ -556,9 +867,18 @@ export class FunderFirstOrchestrator extends EventEmitter {
       .sort((a, b) => a.timestamp - b.timestamp);
     const found: BundlerFundingEvent[][] = [];
     const claimedAnchorKeys = new Set<string>();
+    const claimedRecipients = new Set<string>();
+    for (const group of watch.activeGroups.values()) {
+      if (group.band !== band) continue;
+      for (const recipient of group.recipients) {
+        if (!group.stoppedRecipients.has(recipient)) {
+          claimedRecipients.add(recipient);
+        }
+      }
+    }
 
     for (let i = 0; i < events.length; i += 1) {
-      const anchor = events[i];
+      const anchor = events[i]!;
       const anchorKey = this.getGroupAnchorKey(anchor, band);
       if (watch.exhaustedGroupAnchors.has(anchorKey)) continue;
       if (watch.activeGroups.has(anchorKey)) continue;
@@ -569,7 +889,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
           e.timestamp >= anchor.timestamp &&
           e.timestamp <= anchor.timestamp + GROUP_WINDOW_SEC,
       );
-      const group = this.findClusteredGroupInWindow(window);
+      const group = this.findClusteredGroupInWindow(window, claimedRecipients);
       if (!group) continue;
 
       const groupAnchor = group[0]!;
@@ -583,6 +903,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       }
 
       claimedAnchorKeys.add(groupAnchorKey);
+      for (const event of group) claimedRecipients.add(event.recipient);
       found.push(group);
     }
     return found;
@@ -1026,23 +1347,14 @@ export class FunderFirstOrchestrator extends EventEmitter {
   }
 
   private resubscribePotentialFeePayer(watch: PotentialFeePayerWatch): void {
-    if (!this.enhancedWs || watch.enhancedWatchId !== null) return;
-    watch.enhancedWatchId = this.enhancedWs.watch(watch.address, (tx) => {
-      void this.handlePotentialFeePayerTx(watch.address, tx);
+    const refreshed = this.ensurePotentialFeePayerWatch(watch.address);
+    if (!refreshed) return;
+    log.info('Resumed potential feePayer watch after cooldown', {
+      address: watch.address,
+      enhancedWatchId: refreshed.enhancedWatchId,
     });
-    if (watch.solBalanceSubId === null) {
-      watch.solBalanceSubId = this.connection.onAccountChange(
-        new PublicKey(watch.address),
-        (info) => {
-          if (info.lamports === 0) {
-            this.stopPotentialFeePayerWatch(
-              watch.address,
-              'native SOL balance reached zero',
-            );
-          }
-        },
-        'processed',
-      );
+    if (refreshed.balanceAtFunderReceiveSignature) {
+      void this.syncPotentialFeePayerTransactions(refreshed.address, true);
     }
   }
 
@@ -1139,6 +1451,16 @@ export class FunderFirstOrchestrator extends EventEmitter {
   private hasOutgoingSolFrom(tx: HeliusTransaction, from: string): boolean {
     return (tx.nativeTransfers ?? []).some(
       (t) => t.fromUserAccount === from && t.amount > 0,
+    );
+  }
+
+  private transfersSolTo(
+    from: string,
+    to: string,
+    tx: HeliusTransaction,
+  ): boolean {
+    return this.extractOutgoingSolTransfers(tx, from).some(
+      (transfer) => transfer.to === to,
     );
   }
 

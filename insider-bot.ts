@@ -66,9 +66,8 @@ const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.004;
 /** The "lt2_5" dust band is defined purely by SOL amount, not USD: a transfer-out whose SOL amount is within BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL (±0.004 SOL, i.e. ~0.006-0.014 SOL) of this size is always dust, regardless of what it's worth in USD at the current SOL price (e.g. at a higher SOL price, ~0.01 SOL can be worth more than BUNDLER_FUNDER_NORMAL_TINY_MIN_BUY_USD's $1). This replaces the old "amountUsd < $1" USD-based dust definition — ~0.01 SOL is itself a recognizable small gas-funding round, so classifying it by its actual SOL size is more robust to SOL price movement than a USD cutoff that drifts underneath it. */
 const BUNDLER_FUNDER_NORMAL_TINY_DUST_ROUND_SOL_AMOUNT = 0.01;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
-const BUNDLER_FUNDER_SYNC_LIMIT = 50;
+const BUNDLER_FUNDER_SYNC_LIMIT = 20;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
-const BUNDLER_FUNDER_WS_SYNC_DELAY_MS = 50;
 const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 2;
 const BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW = 3;
 const BUNDLER_FUNDER_RECIPIENT_SWAP_HISTORY_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1_000;
@@ -470,7 +469,6 @@ export class InsiderBot extends EventEmitter {
   private isBundlerFunderSyncing = false;
   private bundlerFunderSyncPending = false;
   private bundlerFunderSyncPendingForce = false;
-  private bundlerFunderWsSyncTimer: ReturnType<typeof setTimeout> | null = null;
   private lastBundlerFunderSyncAt = 0;
   private dirtyFunderRecipients = new Set<string>();
   private dirtyFunderRecipientSignatures = new Map<string, Set<string>>();
@@ -494,7 +492,6 @@ export class InsiderBot extends EventEmitter {
   private buySubmitted = false;
   private isBuyExecuting = false;
   private isBuyGateEvaluating = false;
-  private isProcessing = false;
   private cachedSolPriceUsd: number | null = null;
   private cachedSolPriceAt = 0;
 
@@ -632,8 +629,8 @@ export class InsiderBot extends EventEmitter {
     this.positionSellTriggered = false;
     this.phase = "holding";
     this.startPollLoop();
-    void this.syncBundlerFunderTransactions();
-    void this.syncFunderRecipientBatch();
+    void this.syncBundlerFunderTransactions(true);
+    void this.syncFunderRecipientBatch(true);
     this.log.warn(
       "Sell failed; active position retained and shared feePayer monitoring rearmed",
       {
@@ -1077,7 +1074,7 @@ export class InsiderBot extends EventEmitter {
     this.profitExitDisabled = this.disableProfitExitAfterBuy;
     this.disableProfitExitAfterBuy = false;
 
-    void this.syncBundlerFunderTransactions();
+    void this.syncBundlerFunderTransactions(true);
     void this.syncFunderRecipientBatch(true);
     void this.auditFunderRecipientsAfterBuy();
   }
@@ -2489,86 +2486,13 @@ export class InsiderBot extends EventEmitter {
   }
 
   private startPollLoop(): void {
-    this.stopPollLoop();
-    this.pollTimer = setInterval(() => {
-      void this.runPollTick().catch((err) => {
-        void this.heliusClient.handlePossibleRateLimitError(err);
-        this.log.warn("Insider poll tick failed", {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }, this.config.monitorInterval);
+    // Push-only: Enhanced WSS handles tx detection; no REST poll/backstop loop.
   }
 
   private stopPollLoop(): void {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
-    }
-  }
-
-  private async runPollTick(): Promise<void> {
-    if (this.isProcessing) return;
-    this.isProcessing = true;
-    try {
-      const mint = this.watchingMint ?? this.activePosition?.mint;
-      if (!mint) return;
-
-      // Enhanced WSS `transactionSubscribe` (this.enhancedWs) is now the
-      // primary detection path for every site below — each subscribe*/
-      // start*Monitoring call already routes to it when available. These
-      // REST-based sync/poll calls are now purely a safety net for a
-      // disconnected/unconfigured WS connection: forcing them (or running
-      // them at all, for pollWallet) only when !wsHealthy reproduces the old
-      // always-on-polling behavior exactly, so a WS outage never regresses
-      // detection — it just goes back to costing what it always used to.
-      const wsHealthy = this.enhancedWs?.isConnected ?? false;
-
-      if (this.phase === "pre_buy" && !this.preBuyStopped) {
-        if (this.bundlerFunderWatch) {
-          await this.syncBundlerFunderTransactions(!wsHealthy);
-          await this.syncFunderRecipientBatch(!wsHealthy);
-        } else if (this.monitoredWallet && !this.insiderSellsReady) {
-          if (!wsHealthy || this.insiderEnhancedWatchId === null) {
-            await this.pollWallet(this.monitoredWallet, mint, "insider");
-          }
-        }
-      }
-
-      if (this.phase === "holding") {
-        await this.syncBundlerFunderTransactions(!wsHealthy);
-        await this.syncFunderRecipientBatch(!wsHealthy);
-        if (!wsHealthy && this.bundlerWatch) {
-          for (const wallet of this.bundlerWatch.wallets) {
-            await this.pollWallet(wallet, mint, "bundler");
-          }
-        }
-      }
-    } finally {
-      this.isProcessing = false;
-    }
-  }
-
-  private async pollWallet(
-    wallet: string,
-    mint: string,
-    context: "insider" | "bundler",
-  ): Promise<void> {
-    const txs = await this.withHeliusFallback((client) =>
-      client.getWalletTransactionsDesc(wallet, INSIDER_HISTORY_LIMIT),
-    );
-    const relevant = txs
-      .filter((tx) => this.isRelevantMintTx(tx, mint))
-      .reverse();
-
-    for (const tx of relevant) {
-      if (this.processedSignatures.has(tx.signature)) continue;
-      this.processedSignatures.add(tx.signature);
-      if (context === "insider") {
-        await this.handleInsiderTransaction(tx, mint);
-      } else {
-        await this.handleBundlerTransaction(tx, mint, wallet);
-      }
     }
   }
 
@@ -2698,15 +2622,17 @@ export class InsiderBot extends EventEmitter {
       new PublicKey(address),
       (logInfo) => {
         if (!logInfo.err) {
-          this.scheduleBundlerFunderWsSync(logInfo.signature);
+          this.log.debug(
+            "Shared feePayer logs notification ignored — Enhanced WSS required for push detection",
+            { signature: logInfo.signature },
+          );
         }
       },
       "processed",
     );
-    this.log.info("Subscribed to shared bundler funder transactions", {
+    this.log.info("Subscribed to shared bundler funder transactions (logs only — Enhanced WSS recommended)", {
       address,
       syncLimit: BUNDLER_FUNDER_SYNC_LIMIT,
-      wsSyncDelayMs: BUNDLER_FUNDER_WS_SYNC_DELAY_MS,
     });
   }
 
@@ -2788,22 +2714,6 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "shared feePayer migration notification",
     );
-  }
-
-  private scheduleBundlerFunderWsSync(signature: string): void {
-    if (this.bundlerFunderWsSyncTimer) {
-      this.bundlerFunderSyncPending = true;
-      this.bundlerFunderSyncPendingForce = true;
-      return;
-    }
-    this.bundlerFunderWsSyncTimer = setTimeout(() => {
-      this.bundlerFunderWsSyncTimer = null;
-      void this.syncBundlerFunderTransactions(true);
-    }, BUNDLER_FUNDER_WS_SYNC_DELAY_MS);
-    this.log.debug("Scheduled shared feePayer websocket sync", {
-      signature,
-      delayMs: BUNDLER_FUNDER_WS_SYNC_DELAY_MS,
-    });
   }
 
   private subscribeLowFundingDevWallet(state: BundlerFunderWatchState): void {
@@ -3106,8 +3016,10 @@ export class InsiderBot extends EventEmitter {
         new PublicKey(wallet),
         (logInfo) => {
           if (!logInfo.err) {
-            this.markFunderRecipientDirty(wallet, logInfo.signature);
-            void this.syncFunderRecipientBatch();
+            this.log.debug(
+              "Funder recipient logs notification ignored — Enhanced WSS required for push detection",
+              { wallet, signature: logInfo.signature },
+            );
           }
         },
         "processed",
@@ -3248,10 +3160,6 @@ export class InsiderBot extends EventEmitter {
   private async stopBundlerFunderMonitoring(): Promise<void> {
     await this.stopLowFundingDevWalletSubscription("bundler funder monitoring stopped");
     await this.unsubscribeBundlerFunder();
-    if (this.bundlerFunderWsSyncTimer) {
-      clearTimeout(this.bundlerFunderWsSyncTimer);
-      this.bundlerFunderWsSyncTimer = null;
-    }
     for (const [wallet, subId] of this.recipientLogsSubIds) {
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
       this.recipientLogsSubIds.delete(wallet);
@@ -3549,10 +3457,6 @@ export class InsiderBot extends EventEmitter {
     state.discoveryStopped = true;
     await this.stopLowFundingDevWalletSubscription("bundler funder monitoring stopped");
     await this.unsubscribeBundlerFunder();
-    if (this.bundlerFunderWsSyncTimer) {
-      clearTimeout(this.bundlerFunderWsSyncTimer);
-      this.bundlerFunderWsSyncTimer = null;
-    }
     this.isBundlerFunderSyncing = false;
     this.bundlerFunderSyncPending = false;
     this.bundlerFunderSyncPendingForce = false;
