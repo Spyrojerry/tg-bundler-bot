@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-15 (8)
+
+### Fix funder-first missing SOL transfer detection on Enhanced WSS
+
+- `extractOutgoingSolTransfers` now handles delta-reconstructed `nativeTransfers` from Enhanced WSS (`from=funder, to=__pool__` paired with `from=__pool__, to=recipient`). Previously every funder send was silently skipped because the recipient was always `__pool__` on the outgoing leg.
+- `handleFunderTx` uses the fixed helper so new potential feePayer watches and Telegram alerts fire again.
+
 ## 2026-07-15 (7)
 
 ### Remove Token Transfer mode; drop all idle token-account RPC polling

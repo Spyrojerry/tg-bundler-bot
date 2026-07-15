@@ -250,13 +250,12 @@ export class FunderFirstOrchestrator extends EventEmitter {
     funder: string,
   ): Promise<void> {
     if (!this.isEnabled || this.funderAddress !== funder) return;
-    for (const transfer of tx.nativeTransfers ?? []) {
-      if (transfer.fromUserAccount !== funder) continue;
-      const recipient = transfer.toUserAccount;
-      if (!recipient || recipient === UNKNOWN_COUNTERPARTY) continue;
-      const amountSol = transfer.amount / LAMPORTS_PER_SOL;
-      if (amountSol <= 0) continue;
+    if (!this.hasOutgoingSolFrom(tx, funder)) return;
 
+    for (const { to: recipient, amountSol } of this.extractOutgoingSolTransfers(
+      tx,
+      funder,
+    )) {
       const existing = this.potentialFeePayers.get(recipient);
       if (
         existing &&
@@ -1152,6 +1151,20 @@ export class FunderFirstOrchestrator extends EventEmitter {
       if (transfer.fromUserAccount !== from) continue;
       const to = transfer.toUserAccount;
       if (!to || to === UNKNOWN_COUNTERPARTY) continue;
+      const amountSol = transfer.amount / LAMPORTS_PER_SOL;
+      if (amountSol <= 0) continue;
+      out.push({ to, amountSol });
+    }
+    if (out.length > 0) return out;
+
+    // Enhanced WSS delta reconstruction emits outgoing legs as
+    // from=<wallet>, to=__pool__ and recipients as from=__pool__, to=<wallet>.
+    if (!this.hasOutgoingSolFrom(tx, from)) return [];
+
+    for (const transfer of tx.nativeTransfers ?? []) {
+      if (transfer.fromUserAccount !== UNKNOWN_COUNTERPARTY) continue;
+      const to = transfer.toUserAccount;
+      if (!to || to === from || to === UNKNOWN_COUNTERPARTY) continue;
       const amountSol = transfer.amount / LAMPORTS_PER_SOL;
       if (amountSol <= 0) continue;
       out.push({ to, amountSol });
