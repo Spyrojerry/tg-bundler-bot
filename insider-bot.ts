@@ -16,6 +16,7 @@ import type { ServiceConfig } from "./types";
 import { TelegramBot } from "./telegram-bot";
 import { WalletMonitor } from "./wallet-monitor";
 import { HeliusEnhancedWsClient } from "./helius-enhanced-ws";
+import { isDevRugCloseAccountTx } from "./tx-normalizer";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const NATIVE_SOL_BALANCE_MINT =
@@ -2927,15 +2928,6 @@ export class InsiderBot extends EventEmitter {
    * used everywhere else in this file (queueSignature/processSignatureBatch,
    * subscribeLowFundingDevWalletSubscription, subscribeFunderRecipient).
    */
-  private isDevFullExitCloseAccountTx(tx: HeliusTransaction): boolean {
-    return (
-      tx.type === "CLOSE_ACCOUNT" &&
-      tx.source === "SOLANA_PROGRAM_LIBRARY" &&
-      !!this.devWallet &&
-      tx.feePayer === this.devWallet
-    );
-  }
-
   private subscribeDevWalletFullExitWatch(): void {
     if (!this.devWallet || this.devFullExitHandled) return;
     if (this.devFullExitLogsSubId !== null || this.devFullExitEnhancedWatchId !== null) return;
@@ -2997,7 +2989,7 @@ export class InsiderBot extends EventEmitter {
     if (!this.devWallet || this.devFullExitHandled) return;
     const mint = this.watchingMint ?? this.activePosition?.mint;
     if (!mint) return;
-    if (!this.isDevFullExitCloseAccountTx(tx)) return;
+    if (!isDevRugCloseAccountTx(tx, this.devWallet)) return;
     if (
       this.devCreateTimestamp !== null &&
       tx.timestamp <= this.devCreateTimestamp
@@ -3023,7 +3015,7 @@ export class InsiderBot extends EventEmitter {
       );
       const tx = txs.find((t) => t.signature === signature);
       if (!tx) return;
-      if (!this.isDevFullExitCloseAccountTx(tx)) return;
+      if (!isDevRugCloseAccountTx(tx, this.devWallet)) return;
       if (
         this.devCreateTimestamp !== null &&
         tx.timestamp <= this.devCreateTimestamp

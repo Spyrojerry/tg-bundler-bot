@@ -43,7 +43,7 @@ import {
 } from './insider-bot';
 import type { ServiceConfig } from './types';
 import { TelegramBot } from './telegram-bot';
-import { UNKNOWN_COUNTERPARTY } from './tx-normalizer';
+import { isDevRugCloseAccountTx, UNKNOWN_COUNTERPARTY } from './tx-normalizer';
 import { findWalletSwapBuyMint } from './wallet-swap-detector';
 
 const log = createLogger('FUNDER-FIRST');
@@ -1358,7 +1358,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
     devWallet: string,
     tx: HeliusTransaction,
   ): Promise<void> {
-    if (!this.isDevFullExitCloseAccountTx(tx, devWallet)) return;
+    if (!isDevRugCloseAccountTx(tx, devWallet)) return;
     const watch = this.potentialFeePayers.get(feePayerAddress);
     if (!watch || watch.status !== 'cooldown') return;
 
@@ -1466,17 +1466,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
       out.push({ to, amountSol });
     }
     return out;
-  }
-
-  private isDevFullExitCloseAccountTx(
-    tx: HeliusTransaction,
-    devWallet: string,
-  ): boolean {
-    return (
-      tx.type === 'CLOSE_ACCOUNT' &&
-      tx.source === 'SOLANA_PROGRAM_LIBRARY' &&
-      tx.feePayer === devWallet
-    );
   }
 
   private async sendTelegram(lines: string[]): Promise<void> {

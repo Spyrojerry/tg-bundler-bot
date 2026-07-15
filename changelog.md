@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-15 (19)
+
+### Dev rug: CLOSE_ACCOUNT only, not sell-all SWAP
+
+- WSS tx normalizer now classifies SWAP before inner `closeAccount` instructions, so Pump AMM sell-all txs (which close token/WSOL accounts) stay `SWAP` instead of mislabeled `CLOSE_ACCOUNT`.
+- Shared `isDevRugCloseAccountTx` rejects `SWAP` txs and any tx involving known DEX programs. Funder-first cooldown resume and Insider dev full-exit reset only fire on standalone dev `CLOSE_ACCOUNT` txs.
+
 ## 2026-07-15 (18)
 
 ### Funder-first: ≥20 SOL only, zero-balance follow, no low-funding spam

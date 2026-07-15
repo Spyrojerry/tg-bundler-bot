@@ -46,6 +46,7 @@ import { createLogger } from './logger';
 import { HeliusTransaction } from './helius-client';
 import {
   collectWalletsWithBalanceChanges,
+  SWAP_PROGRAM_IDS,
   transactionInvolvesWalletSwap,
 } from './wallet-swap-detector';
 
@@ -113,18 +114,20 @@ function classifyType(
   accountKeys: string[],
   instructions: ParsedInstructionLike[],
 ): { type: string; source?: string } {
+  const wallets = collectWalletsWithBalanceChanges(raw, accountKeys);
+  if (accountKeys[0]) wallets.add(accountKeys[0]);
+  // Swap before closeAccount: sell-all DEX txs often close token/WSOL accounts in
+  // inner instructions — those must stay SWAP, not rug CLOSE_ACCOUNT.
+  if (transactionInvolvesWalletSwap(raw, wallets)) {
+    return { type: 'SWAP' };
+  }
+
   for (const ix of instructions) {
     const isTokenProgram =
       ix.programId === TOKEN_PROGRAM_ID || ix.programId === TOKEN_2022_PROGRAM_ID;
     if (isTokenProgram && ix.parsed?.type === 'closeAccount') {
       return { type: 'CLOSE_ACCOUNT', source: 'SOLANA_PROGRAM_LIBRARY' };
     }
-  }
-
-  const wallets = collectWalletsWithBalanceChanges(raw, accountKeys);
-  if (accountKeys[0]) wallets.add(accountKeys[0]);
-  if (transactionInvolvesWalletSwap(raw, wallets)) {
-    return { type: 'SWAP' };
   }
 
   return { type: 'TRANSFER' };
@@ -289,3 +292,26 @@ export function normalizeEnhancedWsTransaction(
 }
 
 export { SOL_MINT as TX_NORMALIZER_SOL_MINT, UNKNOWN_COUNTERPARTY };
+
+/**
+ * Rug/reset signal: standalone dev CLOSE_ACCOUNT (typically closing WSOL after
+ * fully exiting). Rejects SWAP txs and DEX bundles that close accounts as part
+ * of a sell-all.
+ */
+export function isDevRugCloseAccountTx(
+  tx: HeliusTransaction,
+  devWallet: string,
+): boolean {
+  if (tx.type === 'SWAP') return false;
+  if (tx.type !== 'CLOSE_ACCOUNT') return false;
+  if (tx.source !== 'SOLANA_PROGRAM_LIBRARY') return false;
+  if (tx.feePayer !== devWallet) return false;
+  if (
+    (tx.instructions ?? []).some(
+      (ix) => ix.programId && SWAP_PROGRAM_IDS.has(ix.programId),
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
