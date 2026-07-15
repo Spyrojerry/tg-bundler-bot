@@ -156,6 +156,9 @@ export function loadConfig(): ServiceConfig {
   const insiderFollowWallet2 = optionalNullable('INSIDER_FOLLOW_WALLET_2');
   const insiderFollowWallet3 = optionalNullable('INSIDER_FOLLOW_WALLET_3');
   const insiderFollowWallet4 = optionalNullable('INSIDER_FOLLOW_WALLET_4');
+  const insiderFeePayerFunderAddress = optionalNullable(
+    'INSIDER_FEEPAYER_FUNDER_ADDRESS',
+  );
   const defaultBotMode = optional('DEFAULT_BOT_MODE', 'insider').toLowerCase();
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
@@ -271,6 +274,7 @@ export function loadConfig(): ServiceConfig {
     insiderFollowWallet2,
     insiderFollowWallet3,
     insiderFollowWallet4,
+    insiderFeePayerFunderAddress,
     defaultBotMode,
     logLevel: rawLogLevel,
     telegramBotToken,

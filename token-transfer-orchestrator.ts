@@ -34,6 +34,7 @@ import { PublicKey } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { createLogger } from './logger';
 import { HeliusClient, HeliusTransaction } from './helius-client';
+import { HeliusEnhancedWsClient } from './helius-enhanced-ws';
 import { PumpReserveMarketCapClient } from './pump-reserve-market-cap';
 import type { ServiceConfig } from './types';
 import { TelegramBot } from './telegram-bot';
@@ -41,7 +42,10 @@ import { TelegramBot } from './telegram-bot';
 const log = createLogger('TOKEN TRANSFER');
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+/** Cadence used only while the Enhanced WSS push connection is down — same value as the original always-on poll, so a WS outage degrades to exactly the old behavior. */
 const DEV_WALLET_POLL_INTERVAL_MS = 4_000;
+/** Cadence used while the Enhanced WSS push connection is healthy — this is now purely a rare safety net for a missed/silently-dropped notification, not the primary detection path. */
+const DEV_WALLET_BACKSTOP_POLL_INTERVAL_MS = 45_000;
 const MC_MONITOR_INTERVAL_MS = 5_000;
 const DEV_WALLET_TX_FETCH_LIMIT = 25;
 
@@ -89,6 +93,9 @@ export interface TokenTransferOrchestrator {
 export class TokenTransferOrchestrator extends EventEmitter {
   private readonly heliusClient: HeliusClient;
   private readonly marketCapClient: PumpReserveMarketCapClient;
+  /** Enhanced WSS (transactionSubscribe) client — always keyed to the Developer-plan key (config.insiderHeliusApiKey), NOT key 4, since transactionSubscribe requires a Developer+ plan and key 4 isn't guaranteed to be on one. Null (and this mode falls back to pure REST polling) if that key isn't configured. */
+  private readonly enhancedWs: HeliusEnhancedWsClient | null;
+  private enhancedWatchId: number | null = null;
 
   private devAddress: string | null = null;
   private buySol: number;
@@ -108,6 +115,7 @@ export class TokenTransferOrchestrator extends EventEmitter {
   constructor(
     private readonly config: ServiceConfig,
     private readonly telegramBot: TelegramBot | null = null,
+    enhancedWs: HeliusEnhancedWsClient | null = null,
   ) {
     super();
     this.buySol = config.insiderBuySol;
@@ -127,6 +135,19 @@ export class TokenTransferOrchestrator extends EventEmitter {
       config.insiderSolanaWsUrl4 || config.solanaWsUrl,
       heliusKey,
     );
+
+    const enhancedWsApiKey = config.insiderHeliusApiKey || config.heliusApiKey;
+    this.enhancedWs =
+      enhancedWs ??
+      (enhancedWsApiKey
+        ? new HeliusEnhancedWsClient(enhancedWsApiKey, 'Token Transfer Enhanced WS')
+        : null);
+    if (!this.enhancedWs) {
+      log.warn(
+        'No Developer-plan Helius key configured (INSIDER_HELIUS_API_KEY); Token Transfer mode is falling back to REST polling of the dev wallet every ' +
+          `${DEV_WALLET_POLL_INTERVAL_MS}ms.`,
+      );
+    }
   }
 
   setDevAddress(address: string): string {
@@ -226,8 +247,17 @@ export class TokenTransferOrchestrator extends EventEmitter {
       buySol: this.buySol,
       baselineSignature: this.cursorSignature,
       alreadyWatchedCandidates: [...this.candidateMints],
+      pushDriven: Boolean(this.enhancedWs),
     });
-    this.schedulePoll(0);
+    if (this.enhancedWs) {
+      this.subscribeEnhancedWs(this.devAddress);
+      // Rare safety net only — the Enhanced WSS push above is the primary
+      // detection path now. If the push connection drops, isConnected will
+      // report false and the tick below falls back to the tight interval.
+      this.schedulePoll(DEV_WALLET_BACKSTOP_POLL_INTERVAL_MS);
+    } else {
+      this.schedulePoll(0);
+    }
   }
 
   stop(reason = 'Stopped from Telegram'): void {
@@ -237,12 +267,37 @@ export class TokenTransferOrchestrator extends EventEmitter {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
+    void this.unsubscribeEnhancedWs();
     if (wasRunning) {
       log.info('Token Transfer dev-wallet watch stopped', {
         reason,
         devAddress: this.devAddress,
       });
     }
+  }
+
+  /** Subscribes to the dev wallet via Helius Enhanced WSS `transactionSubscribe` — the primary, near-free detection path. Each notification already carries the fully parsed transaction, so no follow-up REST fetch is needed. */
+  private subscribeEnhancedWs(devAddress: string): void {
+    if (!this.enhancedWs || this.enhancedWatchId !== null) return;
+    this.enhancedWatchId = this.enhancedWs.watch(devAddress, (tx) => {
+      void this.processDevWalletTx(tx, devAddress).catch((err) => {
+        log.warn('Failed to process Enhanced WSS dev-wallet notification', {
+          devAddress,
+          signature: tx.signature,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    });
+    log.info('Subscribed to dev wallet via Helius Enhanced WSS (transactionSubscribe)', {
+      devAddress,
+    });
+  }
+
+  private async unsubscribeEnhancedWs(): Promise<void> {
+    if (this.enhancedWatchId === null || !this.enhancedWs) return;
+    const id = this.enhancedWatchId;
+    this.enhancedWatchId = null;
+    await this.enhancedWs.unwatch(id).catch(() => undefined);
   }
 
   /**
@@ -282,6 +337,14 @@ export class TokenTransferOrchestrator extends EventEmitter {
     }, delayMs);
   }
 
+  /**
+   * REST-based backstop poll. While the Enhanced WSS push connection is
+   * healthy this only runs every DEV_WALLET_BACKSTOP_POLL_INTERVAL_MS (a
+   * rare safety net for a missed notification); if the push connection is
+   * down (or was never configured), it runs at the original tight interval
+   * and becomes the primary detection path again, exactly like before this
+   * migration.
+   */
   private async pollDevWallet(): Promise<void> {
     if (!this.isEnabled || this.isShuttingDown || !this.devAddress) return;
     if (this.isPolling) {
@@ -298,37 +361,7 @@ export class TokenTransferOrchestrator extends EventEmitter {
       );
       for (const tx of txs) {
         if (!this.isEnabled || this.devAddress !== watchedAddress) break;
-        if (this.processedSignatures.has(tx.signature)) continue;
-        this.processedSignatures.add(tx.signature);
-        this.cursorSignature = tx.signature;
-
-        // While holding a position, the only thing we watch for is a
-        // transfer-in of that same mint back to the dev wallet — the
-        // new-token-candidate / transfer-out detection below is irrelevant
-        // until the current position closes.
-        if (this.activePosition) {
-          const incoming = this.findMatchingTransferIn(tx, watchedAddress, this.activePosition.mint);
-          if (incoming) {
-            await this.evaluateSellSignal(tx, incoming);
-          }
-          continue;
-        }
-
-        const newCandidateMint = this.findNewTokenSwapBuy(tx, watchedAddress);
-        if (newCandidateMint && !this.candidateMints.has(newCandidateMint)) {
-          this.candidateMints.add(newCandidateMint);
-          log.info('Dev wallet swap-bought a new token; now watching it for a transfer-out', {
-            devAddress: watchedAddress,
-            mint: newCandidateMint,
-            signature: tx.signature,
-            totalWatchedCandidates: this.candidateMints.size,
-          });
-        }
-
-        const found = this.findTokenTransferOut(tx, watchedAddress);
-        if (found) {
-          await this.handleTransferOutDetected(tx, found);
-        }
+        await this.processDevWalletTx(tx, watchedAddress);
       }
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
@@ -339,7 +372,49 @@ export class TokenTransferOrchestrator extends EventEmitter {
     } finally {
       this.isPolling = false;
     }
-    this.schedulePoll(DEV_WALLET_POLL_INTERVAL_MS);
+    const wsHealthy = this.enhancedWs?.isConnected ?? false;
+    this.schedulePoll(wsHealthy ? DEV_WALLET_BACKSTOP_POLL_INTERVAL_MS : DEV_WALLET_POLL_INTERVAL_MS);
+  }
+
+  /**
+   * Shared per-transaction processing, fed either by a fresh Enhanced WSS
+   * `transactionSubscribe` notification (already fully parsed, no REST call)
+   * or by the REST backstop poll above. Identical logic either way — only
+   * the data source differs.
+   */
+  private async processDevWalletTx(tx: HeliusTransaction, watchedAddress: string): Promise<void> {
+    if (!this.isEnabled || this.devAddress !== watchedAddress) return;
+    if (this.processedSignatures.has(tx.signature)) return;
+    this.processedSignatures.add(tx.signature);
+    this.cursorSignature = tx.signature;
+
+    // While holding a position, the only thing we watch for is a
+    // transfer-in of that same mint back to the dev wallet — the
+    // new-token-candidate / transfer-out detection below is irrelevant
+    // until the current position closes.
+    if (this.activePosition) {
+      const incoming = this.findMatchingTransferIn(tx, watchedAddress, this.activePosition.mint);
+      if (incoming) {
+        await this.evaluateSellSignal(tx, incoming);
+      }
+      return;
+    }
+
+    const newCandidateMint = this.findNewTokenSwapBuy(tx, watchedAddress);
+    if (newCandidateMint && !this.candidateMints.has(newCandidateMint)) {
+      this.candidateMints.add(newCandidateMint);
+      log.info('Dev wallet swap-bought a new token; now watching it for a transfer-out', {
+        devAddress: watchedAddress,
+        mint: newCandidateMint,
+        signature: tx.signature,
+        totalWatchedCandidates: this.candidateMints.size,
+      });
+    }
+
+    const found = this.findTokenTransferOut(tx, watchedAddress);
+    if (found) {
+      await this.handleTransferOutDetected(tx, found);
+    }
   }
 
   /**

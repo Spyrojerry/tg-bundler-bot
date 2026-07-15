@@ -15,6 +15,7 @@ import { GmgnClient } from "./gmgn-client";
 import type { ServiceConfig } from "./types";
 import { TelegramBot } from "./telegram-bot";
 import { WalletMonitor } from "./wallet-monitor";
+import { HeliusEnhancedWsClient } from "./helius-enhanced-ws";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const NATIVE_SOL_BALANCE_MINT =
@@ -186,6 +187,14 @@ export interface InsiderSellTrigger {
   reason: string;
 }
 
+export interface InsiderTokenFlowEndedEvent {
+  mint: string | null;
+  feePayer: string | null;
+  source: "follow" | "funder-first" | null;
+  hadPosition: boolean;
+  reason: "reset" | "cycle_complete";
+}
+
 export interface InsiderBot {
   on(event: "buyTrigger", listener: (trigger: InsiderBuyTrigger) => void): this;
   on(
@@ -193,6 +202,10 @@ export interface InsiderBot {
     listener: (trigger: InsiderSellTrigger) => void,
   ): this;
   on(event: "mintSeen", listener: (mint: string) => void): this;
+  on(
+    event: "tokenFlowEnded",
+    listener: (event: InsiderTokenFlowEndedEvent) => void,
+  ): this;
   on(
     event: "heliusCreditsExhausted",
     listener: (info: HeliusCreditExhaustionInfo) => void,
@@ -261,6 +274,9 @@ interface EarlyInsiderBuy {
   feePayer: string | null;
   timestamp: number;
 }
+
+/** Bundler first-buy record used when entering a token flow (follow-wallet or funder-first). */
+export type FunderFirstEarlyBuy = EarlyInsiderBuy;
 
 interface BundlerFundingRecord {
   bundlerWallet: string;
@@ -362,6 +378,8 @@ export class InsiderBot extends EventEmitter {
   private readonly heliusClient: HeliusClient;
   private readonly heliusClients: HeliusClient[] = [];
   private readonly heliusPool: HeliusPoolEntry[] = [];
+  /** Enhanced WSS (transactionSubscribe) client — always keyed to the Developer-plan key (config.insiderHeliusApiKey), never a fallback pool entry, since transactionSubscribe requires a Developer+ plan Helius key and only that one is confirmed to be on it. Null (falls back to the pre-existing onLogs + REST fetch pattern everywhere) if that key isn't configured. */
+  private readonly enhancedWs: HeliusEnhancedWsClient | null;
   private readonly heliusRequestQueue = new AsyncRequestQueue(
     HELIUS_POOL_MAX_CONCURRENT,
     HELIUS_POOL_MIN_TIME_MS,
@@ -374,6 +392,10 @@ export class InsiderBot extends EventEmitter {
   private readonly label: string;
 
   private followedWallet: string | null = null;
+  /** Whether the current/previous token flow was started from follow-wallet backtrack or funder-first discovery. */
+  private flowSource: "follow" | "funder-first" | null = null;
+  /** FeePayer locked for the active funder-first flow — emitted on tokenFlowEnded so the orchestrator can cooldown/resume. */
+  private funderFirstFeePayer: string | null = null;
   private buySol: number;
   private normalFundingBuySol: number;
   private lowFundingBuySol: number;
@@ -422,6 +444,14 @@ export class InsiderBot extends EventEmitter {
 
   private insiderLogsSubId: number | null = null;
   private bundlerLogsSubIds = new Map<string, number>();
+  /** Enhanced WSS watch handles, parallel to the *LogsSubId/*LogsSubIds fields above — used instead of the onLogs+REST pattern whenever this.enhancedWs is available. */
+  private insiderEnhancedWatchId: number | null = null;
+  private bundlerEnhancedWatchIds = new Map<string, number>();
+  private bundlerFunderEnhancedWatchId: number | null = null;
+  private devFullExitEnhancedWatchId: number | null = null;
+  private recipientEnhancedWatchIds = new Map<string, number>();
+  /** Per-recipient dedup for Enhanced WSS notifications — a reconnect can resubscribe and redeliver a signature already applied, and unlike the REST batch path (which consumes/clears dirty signatures as it goes) this push path has no other natural at-most-once guarantee. */
+  private recipientEnhancedWatchSeenSignatures = new Map<string, Set<string>>();
 
   private processedSignatures = new Set<string>();
   private queuedSignatures = new Set<string>();
@@ -479,6 +509,7 @@ export class InsiderBot extends EventEmitter {
     claimMint: InsiderMintClaimFn | null = null,
     releaseMint: InsiderMintReleaseFn | null = null,
     label: string = "Insider",
+    enhancedWs: HeliusEnhancedWsClient | null = null,
   ) {
     super();
     this.config = config;
@@ -493,6 +524,17 @@ export class InsiderBot extends EventEmitter {
         this.emit("heliusCreditsExhausted", info);
       },
     });
+    const enhancedWsApiKey = config.insiderHeliusApiKey || config.heliusApiKey;
+    this.enhancedWs =
+      enhancedWs ??
+      (enhancedWsApiKey
+        ? new HeliusEnhancedWsClient(enhancedWsApiKey, `${label} Enhanced WS`)
+        : null);
+    if (!this.enhancedWs) {
+      createLogger(label.toUpperCase()).warn(
+        "No Developer-plan Helius key configured (INSIDER_HELIUS_API_KEY); Enhanced WSS push disabled, falling back to onLogs + REST fetch everywhere",
+      );
+    }
     const apiKeys = [
       heliusApiKey,
       config.insiderHeliusApiKey || config.heliusApiKey,
@@ -558,6 +600,11 @@ export class InsiderBot extends EventEmitter {
       commitment: "processed",
       wsEndpoint: wsUrl,
     });
+  }
+
+  /** No-op when using the process-wide shared Enhanced WSS client. */
+  closeEnhancedWs(): void {
+    // Shared client is closed once in index.ts shutdown.
   }
 
   seedSeenMints(mints: Set<string>): void {
@@ -758,6 +805,104 @@ export class InsiderBot extends EventEmitter {
     return this.followedWallet;
   }
 
+  getFlowSource() {
+    return this.flowSource;
+  }
+
+  /** True when the bot is not mid-flow on a token and can accept a funder-first handoff. */
+  isIdleForFunderFirst(): boolean {
+    return (
+      !this.watchingMint &&
+      !this.activePosition &&
+      !this.isBuyExecuting &&
+      !this.buySubmitted
+    );
+  }
+
+  /**
+   * Enters a token flow from funder-first discovery (feePayer already known).
+   * Skips follow-wallet backtrack and locks the provided feePayer directly.
+   */
+  async startFromFunderFirst(
+    mint: string,
+    feePayer: string,
+    earlyBuys: FunderFirstEarlyBuy[],
+  ): Promise<boolean> {
+    if (!this.isIdleForFunderFirst()) {
+      this.log.warn("Funder-first handoff rejected because Insider bot is busy", {
+        mint,
+        feePayer,
+        watchingMint: this.watchingMint,
+        activePosition: this.activePosition?.mint ?? null,
+      });
+      return false;
+    }
+    if (this.claimMint && !this.claimMint(mint)) {
+      this.log.warn("Funder-first handoff rejected because mint is claimed by another bot", {
+        mint,
+        feePayer,
+      });
+      return false;
+    }
+    if (this.boughtMints.has(mint)) {
+      this.log.info("Funder-first handoff skipped because mint was already bought this session", {
+        mint,
+        feePayer,
+      });
+      return false;
+    }
+
+    this.flowSource = "funder-first";
+    this.funderFirstFeePayer = feePayer;
+    this.watchingMint = mint;
+    this.claimedMint = mint;
+    this.boughtMints.add(mint);
+    this.emit("mintSeen", mint);
+
+    this.resetHeliusPoolMetricsForMint(mint);
+    this.resetTokenTxCounts();
+    this.insiderSellsReady = false;
+    this.bundlerMatchesReady = false;
+    this.highestObservedMarketCapUsd = null;
+    this.clearBundlerAccumulation();
+
+    const earlyBundlerWallets = this.extractEarlyInsiderWallets(earlyBuys);
+    this.initialInsiderWallets.clear();
+    for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
+
+    const createTx = await this.withHeliusFallback((client) =>
+      client.getMintCreateTransaction(mint),
+    );
+    this.devWallet = createTx?.feePayer ?? null;
+    this.devCreateSignature = createTx?.signature ?? null;
+    this.devCreateTimestamp = createTx?.timestamp ?? null;
+    if (this.devWallet) {
+      this.subscribeDevWalletFullExitWatch();
+    }
+
+    this.preBuyStopped = false;
+    this.positionSellTriggered = false;
+    this.monitoredWallet = null;
+    this.insiderState = null;
+    this.phase = "pre_buy";
+
+    void this.sendTelegramSafe(
+      [
+        `<b>🔍 ${this.label} Funder-First Flow Started</b>`,
+        `Token: <code>${mint}</code>`,
+        `FeePayer: <code>${feePayer}</code>`,
+        `Matched bundlers: <b>${earlyBundlerWallets.length}</b>`,
+        "",
+        "FeePayer was discovered upstream; watching its transfer-outs for normal-mode buy signals.",
+      ].join("\n"),
+      "funder-first flow-start notification",
+    );
+
+    this.startPollLoop();
+    await this.startKnownFeePayerBundlerFlow(mint, feePayer, earlyBuys);
+    return true;
+  }
+
   setBuyExecuting(executing: boolean): void {
     this.isBuyExecuting = executing;
   }
@@ -783,9 +928,13 @@ export class InsiderBot extends EventEmitter {
     return (
       this.followMonitor !== null ||
       this.insiderLogsSubId !== null ||
+      this.insiderEnhancedWatchId !== null ||
       this.bundlerLogsSubIds.size > 0 ||
+      this.bundlerEnhancedWatchIds.size > 0 ||
       this.bundlerFunderLogsSubId !== null ||
+      this.bundlerFunderEnhancedWatchId !== null ||
       this.recipientLogsSubIds.size > 0 ||
+      this.recipientEnhancedWatchIds.size > 0 ||
       this.pollTimer !== null
     );
   }
@@ -1107,6 +1256,8 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async startInsiderFlow(mint: string): Promise<void> {
+    this.flowSource = "follow";
+    this.funderFirstFeePayer = null;
     this.resetHeliusPoolMetricsForMint(mint);
     this.resetTokenTxCounts();
     this.insiderSellsReady = false;
@@ -1823,6 +1974,106 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  /**
+   * Locks a feePayer discovered by funder-first upstream logic — skips the
+   * four-bundler funding-record backtrack since the feePayer is already known.
+   */
+  private async startKnownFeePayerBundlerFlow(
+    mint: string,
+    feePayer: string,
+    earlyBuys: EarlyInsiderBuy[],
+  ): Promise<void> {
+    const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
+    if (firstFour.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
+      this.log.warn("Funder-first token has fewer than four early bundler buys; resetting", {
+        mint,
+        feePayer,
+        earlyBuyCount: firstFour.length,
+      });
+      await this.resetForNewToken(true);
+      return;
+    }
+
+    const largestFundingSol = BUNDLER_FUNDER_LOW_FUNDING_SOL;
+    const latestBundlerBuy = firstFour.reduce((best, buy) =>
+      buy.timestamp > best.timestamp ? buy : best,
+    );
+
+    this.bundlerFunderWatch = {
+      mint,
+      funderWallet: feePayer,
+      originalFunderWallet: feePayer,
+      migrationCount: 0,
+      lowFundingMode: false,
+      earliestFundingTimestamp: latestBundlerBuy.timestamp,
+      earliestFundingSignature: latestBundlerBuy.signature,
+      largestFundingSol,
+      minTransferOutSol: largestFundingSol,
+      cursorSignature: latestBundlerBuy.signature,
+      processedSignatures: new Set<string>(),
+      validOutSignatures: new Set<string>(),
+      invalidOutSignatures: new Set<string>(),
+      bundlerWallets: new Set(firstFour.map((buy) => buy.wallet)),
+      recipientWatches: new Map<string, FunderRecipientWatch>(),
+      queuedTransferOuts: [],
+      normalTinyTransferOuts: [],
+      normalTinyDustGroupSeen: false,
+      lowFundingFunderTxs: [],
+      lowFundingTinyTransferOuts: [],
+      lowFundingTinyBundlerGateSeen: false,
+      lowFundingTinyEntryTimestamp: null,
+      lowFundingTinyCandidateWallets: new Set<string>(),
+      lowFundingTinySellGroupSignatures: new Set<string>(),
+      lowFundingTinyBoughtUsdBands: new Set<"2_5_to_5" | "gt5">(),
+      lowFundingTinySoldUsdBands: new Set<"2_5_to_5" | "gt5">(),
+      lowFundingPendingTinyBuyWallets: new Set<string>(),
+      lowFundingDevBuySignatures: new Set<string>(),
+      lowFundingDevBuyAfterCreateSignature: null,
+      lowFundingDevBuyAfterCreateTimestamp: null,
+      lowFundingTinyMcExitPending: false,
+      lowFundingTinyMcExitReachedMc: null,
+      lowFundingTinyDevExitSwapSignature: null,
+      lowFundingTinyDevExitBaselineSignature: null,
+      lowFundingTinyDevExitBaselineTimestamp: null,
+      lowFundingLargeTransferBuyUsed: false,
+      discoveryStopped: false,
+      lockedAt: Date.now(),
+    };
+
+    this.subscribeBundlerFunder(feePayer);
+    if (!this.buySubmitted) {
+      await this.syncBundlerFunderTransactions(true);
+    }
+
+    const activeFunderWatch = this.bundlerFunderWatch;
+    if (
+      !activeFunderWatch ||
+      activeFunderWatch.mint !== mint ||
+      this.watchingMint !== mint ||
+      this.phase !== "pre_buy"
+    ) {
+      return;
+    }
+
+    this.log.warn("Funder-first feePayer locked; shared feePayer watch started", {
+      mint,
+      sharedFeePayer: feePayer,
+      largestFundingSol,
+      bundlerWallets: [...activeFunderWatch.bundlerWallets],
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>✅ ${this.label} Funder-First FeePayer Locked</b>`,
+        `Token: <code>${mint}</code>`,
+        `FeePayer: <code>${feePayer}</code>`,
+        `Mode: <b>Normal (funder-first)</b>`,
+        "",
+        "Watching feePayer tiny transfer-outs for normal-mode buy signals.",
+      ].join("\n"),
+      "funder-first feePayer locked notification",
+    );
+  }
+
   private async evaluateLowFundingSharedFeePayerBuy(args: {
     state: BundlerFunderWatchState;
     syncStart: {
@@ -2262,18 +2513,35 @@ export class InsiderBot extends EventEmitter {
       const mint = this.watchingMint ?? this.activePosition?.mint;
       if (!mint) return;
 
+      // Enhanced WSS `transactionSubscribe` (this.enhancedWs) is now the
+      // primary detection path for every site below — each subscribe*/
+      // start*Monitoring call already routes to it when available. These
+      // REST-based sync/poll calls are now purely a safety net for a
+      // disconnected/unconfigured WS connection: forcing them (or running
+      // them at all, for pollWallet) only when !wsHealthy reproduces the old
+      // always-on-polling behavior exactly, so a WS outage never regresses
+      // detection — it just goes back to costing what it always used to.
+      const wsHealthy = this.enhancedWs?.isConnected ?? false;
+
       if (this.phase === "pre_buy" && !this.preBuyStopped) {
         if (this.bundlerFunderWatch) {
-          await this.syncBundlerFunderTransactions();
-          await this.syncFunderRecipientBatch();
+          await this.syncBundlerFunderTransactions(!wsHealthy);
+          await this.syncFunderRecipientBatch(!wsHealthy);
         } else if (this.monitoredWallet && !this.insiderSellsReady) {
-          await this.pollWallet(this.monitoredWallet, mint, "insider");
+          if (!wsHealthy || this.insiderEnhancedWatchId === null) {
+            await this.pollWallet(this.monitoredWallet, mint, "insider");
+          }
         }
       }
 
       if (this.phase === "holding") {
-        await this.syncBundlerFunderTransactions();
-        await this.syncFunderRecipientBatch();
+        await this.syncBundlerFunderTransactions(!wsHealthy);
+        await this.syncFunderRecipientBatch(!wsHealthy);
+        if (!wsHealthy && this.bundlerWatch) {
+          for (const wallet of this.bundlerWatch.wallets) {
+            await this.pollWallet(wallet, mint, "bundler");
+          }
+        }
       }
     } finally {
       this.isProcessing = false;
@@ -2303,9 +2571,35 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  /** Fed by a fresh Enhanced WSS `transactionSubscribe` notification for the monitored insider wallet or a post-buy bundler wallet — already fully parsed, no REST fetch/batching needed. Mirrors the net effect of queueSignature -> processSignatureBatch for the push path. */
+  private handleEnhancedWsMintTx(
+    tx: HeliusTransaction,
+    context: "insider" | "bundler",
+    bundlerWallet?: string,
+  ): void {
+    if (this.processedSignatures.has(tx.signature)) return;
+    const mint = this.watchingMint ?? this.activePosition?.mint;
+    if (!mint || !this.isRelevantMintTx(tx, mint)) return;
+    this.processedSignatures.add(tx.signature);
+    if (context === "insider") {
+      void this.handleInsiderTransaction(tx, mint);
+    } else if (context === "bundler" && bundlerWallet) {
+      void this.handleBundlerTransaction(tx, mint, bundlerWallet);
+    }
+  }
+
   private startInsiderMonitoring(): void {
     if (!this.monitoredWallet) return;
     this.stopInsiderMonitoring();
+    if (this.enhancedWs) {
+      this.insiderEnhancedWatchId = this.enhancedWs.watch(this.monitoredWallet, (tx) => {
+        this.handleEnhancedWsMintTx(tx, "insider");
+      });
+      this.log.info("Started pre-buy insider wallet monitoring via Enhanced WSS", {
+        wallet: this.monitoredWallet,
+      });
+      return;
+    }
     const pubkey = new PublicKey(this.monitoredWallet);
     this.insiderLogsSubId = this.connection.onLogs(
       pubkey,
@@ -2317,6 +2611,11 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async stopInsiderMonitoring(): Promise<void> {
+    if (this.insiderEnhancedWatchId !== null) {
+      const id = this.insiderEnhancedWatchId;
+      this.insiderEnhancedWatchId = null;
+      await this.enhancedWs?.unwatch(id).catch(() => undefined);
+    }
     if (this.insiderLogsSubId !== null) {
       const id = this.insiderLogsSubId;
       this.insiderLogsSubId = null;
@@ -2335,6 +2634,13 @@ export class InsiderBot extends EventEmitter {
     };
 
     for (const wallet of wallets) {
+      if (this.enhancedWs) {
+        const watchId = this.enhancedWs.watch(wallet, (tx) => {
+          this.handleEnhancedWsMintTx(tx, "bundler", wallet);
+        });
+        this.bundlerEnhancedWatchIds.set(wallet, watchId);
+        continue;
+      }
       const pubkey = new PublicKey(wallet);
       const subId = this.connection.onLogs(
         pubkey,
@@ -2357,7 +2663,11 @@ export class InsiderBot extends EventEmitter {
       );
     }
 
-    this.log.info("Started post-buy bundler monitoring", { mint, wallets });
+    this.log.info("Started post-buy bundler monitoring", {
+      mint,
+      wallets,
+      pushDriven: this.bundlerEnhancedWatchIds.size > 0,
+    });
   }
 
   private async stopBundlerMonitoring(): Promise<void> {
@@ -2365,11 +2675,24 @@ export class InsiderBot extends EventEmitter {
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
       this.bundlerLogsSubIds.delete(wallet);
     }
+    for (const [wallet, watchId] of this.bundlerEnhancedWatchIds) {
+      await this.enhancedWs?.unwatch(watchId).catch(() => undefined);
+      this.bundlerEnhancedWatchIds.delete(wallet);
+    }
     this.bundlerWatch = null;
   }
 
   private subscribeBundlerFunder(address: string): void {
-    if (this.bundlerFunderLogsSubId !== null) return;
+    if (this.bundlerFunderLogsSubId !== null || this.bundlerFunderEnhancedWatchId !== null) return;
+    if (this.enhancedWs) {
+      this.bundlerFunderEnhancedWatchId = this.enhancedWs.watch(address, (tx) => {
+        void this.applyBundlerFunderNotificationTx(tx);
+      });
+      this.log.info("Subscribed to shared bundler funder transactions via Enhanced WSS", {
+        address,
+      });
+      return;
+    }
     this.bundlerFunderLogsSubId = this.connection.onLogs(
       new PublicKey(address),
       (logInfo) => {
@@ -2386,6 +2709,46 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  /** Fed by a fresh Enhanced WSS `transactionSubscribe` notification for the watched feePayer — already fully parsed, no REST fetch needed. Mirrors the per-tx body of syncBundlerFunderTransactions' loop. */
+  private async applyBundlerFunderNotificationTx(tx: HeliusTransaction): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    if (!state || this.positionSellTriggered) return;
+    if (state.discoveryStopped) return;
+    if (state.processedSignatures.has(tx.signature)) return;
+    // Enhanced WSS accountInclude also matches txs where the watched address
+    // is merely referenced (not necessarily the fee payer) — harmless here,
+    // since inspectBundlerFunderTransaction only acts on outgoing transfers
+    // *from* state.funderWallet and no-ops otherwise.
+    state.processedSignatures.add(tx.signature);
+    state.cursorSignature = tx.signature;
+    try {
+      const migrated = await this.inspectBundlerFunderTransaction(state, tx);
+      if (!migrated) {
+        await this.maybeTriggerLowFundingPendingTinyBuys(state, "shared feePayer Enhanced WSS notification");
+      }
+    } catch (err) {
+      this.log.warn("Failed to apply shared feePayer Enhanced WSS notification", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        signature: tx.signature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async unsubscribeBundlerFunder(): Promise<void> {
+    if (this.bundlerFunderEnhancedWatchId !== null) {
+      const id = this.bundlerFunderEnhancedWatchId;
+      this.bundlerFunderEnhancedWatchId = null;
+      await this.enhancedWs?.unwatch(id).catch(() => undefined);
+    }
+    if (this.bundlerFunderLogsSubId !== null) {
+      const subId = this.bundlerFunderLogsSubId;
+      this.bundlerFunderLogsSubId = null;
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+  }
+
   private async switchBundlerFunderWatchAddress(
     state: BundlerFunderWatchState,
     nextWallet: string,
@@ -2393,11 +2756,7 @@ export class InsiderBot extends EventEmitter {
     reason: string,
   ): Promise<void> {
     if (nextWallet === state.funderWallet) return;
-    if (this.bundlerFunderLogsSubId !== null) {
-      const subId = this.bundlerFunderLogsSubId;
-      this.bundlerFunderLogsSubId = null;
-      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
-    }
+    await this.unsubscribeBundlerFunder();
     const previousWallet = state.funderWallet;
     state.funderWallet = nextWallet;
     state.migrationCount += 1;
@@ -2566,7 +2925,20 @@ export class InsiderBot extends EventEmitter {
 
   private subscribeDevWalletFullExitWatch(): void {
     if (!this.devWallet || this.devFullExitHandled) return;
-    if (this.devFullExitLogsSubId !== null) return;
+    if (this.devFullExitLogsSubId !== null || this.devFullExitEnhancedWatchId !== null) return;
+    if (this.enhancedWs) {
+      this.devFullExitEnhancedWatchId = this.enhancedWs.watch(this.devWallet, (tx) => {
+        if (this.devFullExitSeenSignatures.has(tx.signature)) return;
+        this.devFullExitSeenSignatures.add(tx.signature);
+        void this.evaluateDevWalletFullExitTx(tx);
+      });
+      this.log.info("Subscribed to dev wallet for full-exit (CLOSE_ACCOUNT) detection via Enhanced WSS", {
+        devWallet: this.devWallet,
+        devCreateSignature: this.devCreateSignature,
+        devCreateTimestamp: this.devCreateTimestamp,
+      });
+      return;
+    }
     this.devFullExitLogsSubId = this.connection.onLogs(
       new PublicKey(this.devWallet),
       (logInfo) => {
@@ -2584,6 +2956,15 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async stopDevWalletFullExitWatch(reason: string): Promise<void> {
+    if (this.devFullExitEnhancedWatchId !== null) {
+      const id = this.devFullExitEnhancedWatchId;
+      this.devFullExitEnhancedWatchId = null;
+      await this.enhancedWs?.unwatch(id).catch(() => undefined);
+      this.log.info("Stopped dev wallet full-exit subscription", {
+        devWallet: this.devWallet,
+        reason,
+      });
+    }
     if (this.devFullExitLogsSubId === null) return;
     const subId = this.devFullExitLogsSubId;
     this.devFullExitLogsSubId = null;
@@ -2592,6 +2973,25 @@ export class InsiderBot extends EventEmitter {
       devWallet: this.devWallet,
       reason,
     });
+  }
+
+  /**
+   * Acts on an already-fetched/normalized dev-wallet transaction, whether it
+   * arrived as a fresh Enhanced WSS notification (no REST call at all) or
+   * from the REST fallback fetch in checkDevWalletSignatureForFullExit.
+   */
+  private async evaluateDevWalletFullExitTx(tx: HeliusTransaction): Promise<void> {
+    if (!this.devWallet || this.devFullExitHandled) return;
+    const mint = this.watchingMint ?? this.activePosition?.mint;
+    if (!mint) return;
+    if (!this.isDevFullExitCloseAccountTx(tx)) return;
+    if (
+      this.devCreateTimestamp !== null &&
+      tx.timestamp <= this.devCreateTimestamp
+    ) {
+      return;
+    }
+    await this.handleDevWalletFullExit(mint, tx);
   }
 
   private async checkDevWalletSignatureForFullExit(
@@ -2694,18 +3094,25 @@ export class InsiderBot extends EventEmitter {
     });
   }
   private subscribeFunderRecipient(wallet: string): void {
-    if (this.recipientLogsSubIds.has(wallet)) return;
-    const subId = this.connection.onLogs(
-      new PublicKey(wallet),
-      (logInfo) => {
-        if (!logInfo.err) {
-          this.markFunderRecipientDirty(wallet, logInfo.signature);
-          void this.syncFunderRecipientBatch();
-        }
-      },
-      "processed",
-    );
-    this.recipientLogsSubIds.set(wallet, subId);
+    if (this.recipientLogsSubIds.has(wallet) || this.recipientEnhancedWatchIds.has(wallet)) return;
+    if (this.enhancedWs) {
+      const watchId = this.enhancedWs.watch(wallet, (tx) => {
+        void this.applyFunderRecipientNotificationTx(wallet, tx);
+      });
+      this.recipientEnhancedWatchIds.set(wallet, watchId);
+    } else {
+      const subId = this.connection.onLogs(
+        new PublicKey(wallet),
+        (logInfo) => {
+          if (!logInfo.err) {
+            this.markFunderRecipientDirty(wallet, logInfo.signature);
+            void this.syncFunderRecipientBatch();
+          }
+        },
+        "processed",
+      );
+      this.recipientLogsSubIds.set(wallet, subId);
+    }
     if (!this.recipientSolBalanceSubIds.has(wallet)) {
       const balanceSubId = this.connection.onAccountChange(
         new PublicKey(wallet),
@@ -2721,9 +3128,40 @@ export class InsiderBot extends EventEmitter {
     }
     this.log.info("Subscribed to valid funder transfer-out recipient", {
       wallet,
+      pushDriven: this.recipientEnhancedWatchIds.has(wallet),
       solBalanceSubscription: this.recipientSolBalanceSubIds.has(wallet),
     });
   }
+
+  /** Fed by a fresh Enhanced WSS `transactionSubscribe` notification for a watched recipient — already fully parsed, no REST fetch needed. Mirrors the per-tx filtering + body of syncFunderRecipientTransactions' loop. */
+  private async applyFunderRecipientNotificationTx(
+    wallet: string,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    const watch = state?.recipientWatches.get(wallet);
+    if (!state || !watch || this.positionSellTriggered) return;
+    let seen = this.recipientEnhancedWatchSeenSignatures.get(wallet);
+    if (!seen) {
+      seen = new Set<string>();
+      this.recipientEnhancedWatchSeenSignatures.set(wallet, seen);
+    }
+    if (seen.has(tx.signature)) return;
+    seen.add(tx.signature);
+    if (tx.signature === watch.fundingSignature) return;
+    if (!watch.normalTinyTransferMode && tx.timestamp < watch.fundingTimestamp) return;
+    try {
+      await this.applyFunderRecipientTransaction(state, watch, tx, "notification");
+    } catch (err) {
+      this.log.warn("Failed to apply funder recipient Enhanced WSS notification", {
+        mint: state.mint,
+        wallet,
+        signature: tx.signature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private isNormalTinyWalletExitDisabled(
     state: BundlerFunderWatchState,
     watch: FunderRecipientWatch,
@@ -2783,10 +3221,16 @@ export class InsiderBot extends EventEmitter {
     state?.recipientWatches.delete(wallet);
     this.dirtyFunderRecipients.delete(wallet);
     this.dirtyFunderRecipientSignatures.delete(wallet);
+    this.recipientEnhancedWatchSeenSignatures.delete(wallet);
     const subId = this.recipientLogsSubIds.get(wallet);
     if (subId !== undefined) {
       this.recipientLogsSubIds.delete(wallet);
       void this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+    const watchId = this.recipientEnhancedWatchIds.get(wallet);
+    if (watchId !== undefined) {
+      this.recipientEnhancedWatchIds.delete(wallet);
+      void this.enhancedWs?.unwatch(watchId).catch(() => undefined);
     }
     const balanceSubId = this.recipientSolBalanceSubIds.get(wallet);
     if (balanceSubId !== undefined) {
@@ -2802,11 +3246,7 @@ export class InsiderBot extends EventEmitter {
 
   private async stopBundlerFunderMonitoring(): Promise<void> {
     await this.stopLowFundingDevWalletSubscription("bundler funder monitoring stopped");
-    if (this.bundlerFunderLogsSubId !== null) {
-      const subId = this.bundlerFunderLogsSubId;
-      this.bundlerFunderLogsSubId = null;
-      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
-    }
+    await this.unsubscribeBundlerFunder();
     if (this.bundlerFunderWsSyncTimer) {
       clearTimeout(this.bundlerFunderWsSyncTimer);
       this.bundlerFunderWsSyncTimer = null;
@@ -2815,6 +3255,11 @@ export class InsiderBot extends EventEmitter {
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
       this.recipientLogsSubIds.delete(wallet);
     }
+    for (const [wallet, watchId] of this.recipientEnhancedWatchIds) {
+      await this.enhancedWs?.unwatch(watchId).catch(() => undefined);
+      this.recipientEnhancedWatchIds.delete(wallet);
+    }
+    this.recipientEnhancedWatchSeenSignatures.clear();
     for (const [wallet, subId] of this.recipientSolBalanceSubIds) {
       await this.connection.removeAccountChangeListener(subId).catch(() => undefined);
       this.recipientSolBalanceSubIds.delete(wallet);
@@ -3102,11 +3547,7 @@ export class InsiderBot extends EventEmitter {
     if (state.discoveryStopped) return;
     state.discoveryStopped = true;
     await this.stopLowFundingDevWalletSubscription("bundler funder monitoring stopped");
-    if (this.bundlerFunderLogsSubId !== null) {
-      const subId = this.bundlerFunderLogsSubId;
-      this.bundlerFunderLogsSubId = null;
-      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
-    }
+    await this.unsubscribeBundlerFunder();
     if (this.bundlerFunderWsSyncTimer) {
       clearTimeout(this.bundlerFunderWsSyncTimer);
       this.bundlerFunderWsSyncTimer = null;
@@ -6101,6 +6542,12 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async completeFlowCycle(): Promise<void> {
+    const endedMint = this.watchingMint ?? this.activePosition?.mint ?? null;
+    const endedFeePayer =
+      this.funderFirstFeePayer ?? this.bundlerFunderWatch?.funderWallet ?? null;
+    const endedSource = this.flowSource;
+    const hadPosition = !!this.activePosition;
+
     if (this.claimedMint) {
       this.releaseMint?.(this.claimedMint);
       this.claimedMint = null;
@@ -6133,12 +6580,28 @@ export class InsiderBot extends EventEmitter {
       this.resetTokenTxCounts();
     }
 
+    this.emit("tokenFlowEnded", {
+      mint: endedMint,
+      feePayer: endedFeePayer,
+      source: endedSource,
+      hadPosition,
+      reason: "cycle_complete",
+    });
+    this.flowSource = null;
+    this.funderFirstFeePayer = null;
+
     if (this.followedWallet && !this.followMonitor) {
       await this.followWallet(this.followedWallet);
     }
   }
 
   private async resetForNewToken(clearPosition: boolean): Promise<void> {
+    const endedMint = this.watchingMint ?? this.activePosition?.mint ?? null;
+    const endedFeePayer =
+      this.funderFirstFeePayer ?? this.bundlerFunderWatch?.funderWallet ?? null;
+    const endedSource = this.flowSource;
+    const hadPosition = clearPosition && !!this.activePosition;
+
     if (this.claimedMint) {
       this.releaseMint?.(this.claimedMint);
       this.claimedMint = null;
@@ -6177,6 +6640,16 @@ export class InsiderBot extends EventEmitter {
     this.heliusPoolMetricsStartedAt = 0;
     this.lastHeliusPoolMetricsAt = 0;
     this.resetTokenTxCounts();
+
+    this.emit("tokenFlowEnded", {
+      mint: endedMint,
+      feePayer: endedFeePayer,
+      source: endedSource,
+      hadPosition,
+      reason: "reset",
+    });
+    this.flowSource = null;
+    this.funderFirstFeePayer = null;
 
     this.log.info("InsiderBot reset; resuming followed wallet monitoring");
     if (this.followedWallet && !this.followMonitor) {

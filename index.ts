@@ -30,11 +30,13 @@ import {
   SellQuote,
 } from "./types";
 import { TokenTransferOrchestrator } from "./token-transfer-orchestrator";
+import { FunderFirstOrchestrator } from "./funder-first-orchestrator";
 import { InsiderBot } from "./insider-bot";
 import type { InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
 import { PumpReserveMarketCapClient } from "./pump-reserve-market-cap";
 import { HeliusClient } from "./helius-client";
+import { HeliusEnhancedWsClient } from "./helius-enhanced-ws";
 import type { HeliusCreditExhaustionInfo, HeliusProjectUsage } from "./helius-client";
 import { PublicKey } from "@solana/web3.js";
 import { randomBytes } from "crypto";
@@ -201,12 +203,22 @@ async function main(): Promise<void> {
       config.heliusApiKey,
   );
 
+  const sharedEnhancedWsApiKey =
+    config.insiderHeliusApiKey || config.heliusApiKey;
+  const sharedEnhancedWs = sharedEnhancedWsApiKey
+    ? new HeliusEnhancedWsClient(
+        sharedEnhancedWsApiKey,
+        "Shared Helius Enhanced WS",
+      )
+    : null;
+
   let telegramBot: TelegramBot | null = null;
   const insiderBots: InsiderBot[] = [];
   let activeInsiderIndex = 0; // Insider UI is pinned to bot 1; keys 2-4 provide API capacity.
 
   // ── 4. Token Transfer Orchestrator ────────────────────────────────────────
   let tokenTransferOrchestrator: TokenTransferOrchestrator;
+  let funderFirstOrchestrator: FunderFirstOrchestrator;
   let botMode: "insider" | "tokentransfer" = config.defaultBotMode;
   let tokenTransferBuyInProgress = false;
 
@@ -227,7 +239,8 @@ async function main(): Promise<void> {
           | "insiderBundlerMaxUsd";
         index: number;
       }
-    | { type: "tokenTransferDevAddress" | "tokenTransferBuySol" };
+    | { type: "tokenTransferDevAddress" | "tokenTransferBuySol" }
+    | { type: "funderFirstFunderAddress" };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
 
   const pendingSells = new Map<
@@ -986,6 +999,29 @@ async function main(): Promise<void> {
             editCurrent: true,
           };
         }
+        if (data === "funderfirst:funder") {
+          pendingTelegramActions.set(chatId, { type: "funderFirstFunderAddress" });
+          return {
+            text: "Send the top-level feePayer <b>funder</b> wallet address to watch for SOL transfer-outs.",
+            trackPrompt: true,
+            editCurrent: true,
+          };
+        }
+        if (data === "funderfirst:start") {
+          try {
+            await funderFirstOrchestrator.start();
+          } catch (err) {
+            return {
+              text: html(err instanceof Error ? err.message : String(err)),
+              editCurrent: true,
+            };
+          }
+          return homeReply(true);
+        }
+        if (data === "funderfirst:stop") {
+          funderFirstOrchestrator.stop("Stopped from Telegram");
+          return homeReply(true);
+        }
         if (data === "insider:buysol") {
           activeInsiderIndex = 0;
           pendingTelegramActions.set(chatId, {
@@ -1303,6 +1339,17 @@ async function main(): Promise<void> {
             tokenTransferOrchestrator.setBuySol(value);
             return homeReply();
           }
+          if (pendingAction.type === "funderFirstFunderAddress") {
+            try {
+              funderFirstOrchestrator.setFunderAddress(text.trim());
+              log.info(
+                `[SETTINGS] Funder-first funder address set to ${funderFirstOrchestrator.getFunderAddress()}`,
+              );
+            } catch (err) {
+              return html(err instanceof Error ? err.message : String(err));
+            }
+            return homeReply();
+          }
         }
         if (botMode === "insider") {
           const started = await followInsiderWalletWithUsageGuard(
@@ -1354,6 +1401,7 @@ async function main(): Promise<void> {
       makeClaimFn(index),
       () => undefined,
       `Insider ${definition.botNumber}`,
+      sharedEnhancedWs,
     );
     bot.on("heliusCreditsExhausted", (info) => {
       void (async () => {
@@ -1442,6 +1490,14 @@ async function main(): Promise<void> {
   tokenTransferOrchestrator = new TokenTransferOrchestrator(
     config,
     telegramBot,
+    sharedEnhancedWs,
+  );
+
+  funderFirstOrchestrator = new FunderFirstOrchestrator(
+    config,
+    insiderBots[0]!,
+    telegramBot,
+    sharedEnhancedWs,
   );
 
   tokenTransferOrchestrator.on("buyTrigger", (trigger) => {
@@ -2358,6 +2414,20 @@ async function main(): Promise<void> {
     });
   }
 
+  async function startFunderFirstModeServices(): Promise<void> {
+    if (!funderFirstOrchestrator.getFunderAddress()) return;
+    try {
+      await funderFirstOrchestrator.start();
+      log.info("Funder-first mode auto-started from configured funder address", {
+        funderAddress: funderFirstOrchestrator.getFunderAddress(),
+      });
+    } catch (err) {
+      log.warn("Funder-first mode failed to auto-start", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   function updateMinSol(walletAddress: string, rawValue: string): string {
     const normalized = new PublicKey(walletAddress).toBase58();
     const isTrading = normalized === config.tradingWalletAddress;
@@ -2524,6 +2594,20 @@ async function main(): Promise<void> {
       };
 
       const monitoredWallet = bot.getMonitoredWallet();
+      const funderAddress = funderFirstOrchestrator.getFunderAddress();
+      const funderFirstRunning = funderFirstOrchestrator.isRunning();
+      const watchedPotential = funderFirstOrchestrator.getWatchedPotentialFeePayers();
+      const potentialLines =
+        watchedPotential.length > 0
+          ? watchedPotential.map(
+              (w) =>
+                `  • <code>${html(w.address.slice(0, 8))}…</code> — <b>${w.status}</b>${w.mint ? ` (${html(w.mint.slice(0, 8))}…)` : ""}`,
+            )
+          : ["  • <i>none yet</i>"];
+
+      const funderFirstStartStop = funderFirstRunning
+        ? { text: "Stop Funder-First", callback_data: "funderfirst:stop" }
+        : { text: "Start Funder-First", callback_data: "funderfirst:start" };
 
       return {
         text: [
@@ -2535,22 +2619,32 @@ async function main(): Promise<void> {
           monitoredWallet
             ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
             : "",
+          `FeePayer funder: ${funderAddress ? `<code>${html(funderAddress)}</code>` : "<b>Not set</b>"}`,
+          `Funder-first: <b>${funderFirstRunning ? "Running" : "Stopped"}</b>`,
+          "<b>Watched potential feePayers:</b>",
+          ...potentialLines,
           `Default Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
           `Normal Funding Buy SOL: <b>${html(String(bot.getNormalFundingBuySol()))}</b>`,
           `Low-Funding Buy SOL: <b>${html(String(bot.getLowFundingBuySol()))}</b>`,
           `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% Current MC from Entry</b>`,
           `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
           "",
-          "<b>Flow</b>",
-          "1. Bot 1 follows one wallet; Insider API keys 1-4 are used as the Helius fallback/key pool.",
-          "2. Skip if the follow-wallet buy MC is above $60,000.",
-          "3. First four unique bundler-wallet buy txs are checked; the follow wallet must be one of those first-buy wallets.",
-          "4. Each bundler must have a zero-balance funding window; all four selected funding txs must share one feePayer.",
-          "5. Low-funding mode uses tiny same-band feePayer transfer groups only; normal mode uses normal tiny same-band groups.",
-          "6. Mode-specific buy amounts are used for normal-funding and low-funding entries.",
-          "7. Sell rules depend on the mode/band shown in the buy card; rug exits remain active.",
-          "• API guard: Helius calls use a queued four-key pool, transient-only fallback, per-key backoff, and capped recipient batch sync.",
-          "• Rug: dev wallet closing a WSOL account (CLOSE_ACCOUNT, full exit) resets before buy or sells after buy.",
+          "<b>Flows (run in parallel)</b>",
+          "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
+          "<b>B) Funder-first</b> — watch a feePayer funder; detect potential feePayers funding bundlers.",
+          "",
+          "<b>Follow-wallet steps</b>",
+          "1. Bot 1 follows one wallet; Helius keys 1-4 are the fallback pool.",
+          "2. Skip if follow-wallet buy MC is above $80,000.",
+          "3. First four bundler buys must include the follow wallet.",
+          "4. Shared feePayer locked → normal-mode tiny transfer-out buy signals.",
+          "",
+          "<b>Funder-first steps</b>",
+          "1. Funder sends SOL → potential feePayer watches open.",
+          "2. ≥20 SOL post-balance to 3-4 wallets in 10s → normal candidate → buy.",
+          "3. 5-19.99 SOL post-balance in 10s → skipped; wait for dev rug.",
+          "4. Half-drain or zero balance → stop watching that feePayer.",
+          "• Rug: dev CLOSE_ACCOUNT resumes feePayer watch after a trade.",
         ].join("\n"),
         replyMarkup: {
           inline_keyboard: [
@@ -2560,16 +2654,18 @@ async function main(): Promise<void> {
             ],
             [
               { text: "Follow wallet", callback_data: "insider:follow" },
+              { text: "FeePayer funder", callback_data: "funderfirst:funder" },
+            ],
+            [funderFirstStartStop],
+            [
               { text: "Default Buy SOL", callback_data: "insider:buysol" },
-            ],
-            [
               { text: "Normal Buy SOL", callback_data: "insider:normalbuysol" },
-              { text: "Low-Funding Buy SOL", callback_data: "insider:lowfundingbuysol" },
             ],
             [
+              { text: "Low-Funding Buy SOL", callback_data: "insider:lowfundingbuysol" },
               { text: "Set Exit %", callback_data: "insider:exitpercent" },
-              disableBuyButton,
             ],
+            [disableBuyButton],
             [
               { text: "Status", callback_data: "menu:status" },
               { text: "Refresh", callback_data: "menu:refresh" },
@@ -2939,6 +3035,7 @@ async function main(): Promise<void> {
   // Insider and Token Transfer are independent and both come up active at
   // startup; `botMode` only picks which card /start shows first.
   await startTokenTransferModeServices();
+  await startFunderFirstModeServices();
   await resumePrimaryInsiderBot();
 
   // Only now, with every orchestrator/bot fully wired up, do we start
@@ -2950,7 +3047,7 @@ async function main(): Promise<void> {
   startMarketCapChecker();
 
   log.info(
-    `Service fully started — mode=${botMode}, token transfer running=${tokenTransferOrchestrator.isRunning()}`,
+    `Service fully started — mode=${botMode}, token transfer running=${tokenTransferOrchestrator.isRunning()}, funder-first running=${funderFirstOrchestrator.isRunning()}`,
   );
 
   // Send a one-off Telegram summary so it's obvious the process actually
@@ -2970,6 +3067,11 @@ async function main(): Promise<void> {
         `Dev address: ${tokenTransferOrchestrator.getDevAddress() ? `<code>${html(tokenTransferOrchestrator.getDevAddress()!)}</code>` : "not set"}`,
         `Buy SOL: <b>${tokenTransferOrchestrator.getBuySol()}</b>`,
         `Watching dev wallet: <b>${tokenTransferOrchestrator.isRunning() ? "yes" : "no"}</b>`,
+        "",
+        "<b>Funder-First</b>",
+        `Funder address: ${funderFirstOrchestrator.getFunderAddress() ? `<code>${html(funderFirstOrchestrator.getFunderAddress()!)}</code>` : "not set"}`,
+        `Running: <b>${funderFirstOrchestrator.isRunning() ? "yes" : "no"}</b>`,
+        `Watched potential feePayers: <b>${funderFirstOrchestrator.getWatchedPotentialFeePayers().length}</b>`,
         "",
         `Trading wallet: ${config.tradingWalletAddress ? `<code>${html(config.tradingWalletAddress)}</code>` : "not set"}`,
         `Watched wallets: <b>${walletMonitors.size}</b>`,
@@ -2999,6 +3101,8 @@ async function main(): Promise<void> {
     healthServer.close();
 
     await tokenTransferOrchestrator.shutdown();
+    await funderFirstOrchestrator.shutdown();
+    sharedEnhancedWs?.close();
 
     await Promise.all(
       [...gmgnLimiters, gmgnFallbackLimiter].map((limiter, index) =>

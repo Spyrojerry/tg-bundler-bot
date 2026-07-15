@@ -186,6 +186,8 @@ export interface ServiceConfig {
   insiderFollowWallet2: string | null;
   insiderFollowWallet3: string | null;
   insiderFollowWallet4: string | null;
+  /** Top-level feePayer funder wallet for the parallel funder-first discovery flow. */
+  insiderFeePayerFunderAddress: string | null;
   defaultBotMode: 'insider' | 'tokentransfer';
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;

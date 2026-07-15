@@ -32,6 +32,8 @@ export interface HeliusTransaction {
   }>;
   accountData?: Array<{
     account: string;
+    /** Absolute native lamport balance after the transaction (from meta.postBalances). */
+    nativePostBalance?: number;
     nativeBalanceChange?: number;
     tokenBalanceChanges?: Array<{
       userAccount?: string;
