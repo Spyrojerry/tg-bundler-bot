@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-15 (20)
+
+### Funder-first: stop on zero balance, no handoff
+
+- When a potential feePayer's native SOL hits zero, monitoring stops and unsubscribes. No follow/handoff to the drain recipient wallet.
+
 ## 2026-07-15 (19)
 
 ### Dev rug: CLOSE_ACCOUNT only, not sell-all SWAP

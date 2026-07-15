@@ -26,9 +26,7 @@
 //
 //  Stop-watching rules for a potential feePayer wallet itself:
 //    • Keep monitoring until native SOL balance hits zero.
-//    • On zero: follow the wallet that received the final drain; if that wallet
-//      is the top-level funder, stop and unsubscribe; otherwise restart fresh
-//      on the recipient.
+//    • On zero: stop and unsubscribe (no handoff to drain recipient).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Connection, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
@@ -91,7 +89,7 @@ interface PotentialFeePayerWatch {
   recipientProcessedSignatures: Map<string, Set<string>>;
   balanceAtFunderReceiveSol: number | null;
   balanceAtFunderReceiveSignature: string | null;
-  /** Unix seconds when this feePayer was armed (funder receive or handoff). */
+  /** Unix seconds when this feePayer was armed (funder receive). */
   balanceAtFunderReceiveTimestamp: number | null;
   /** REST sync cursor — txs after funder-receive signature. */
   cursorSignature: string | null;
@@ -409,7 +407,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
     return /too old or does not exist/i.test(message);
   }
 
-  /** Fallback when Helius rejects after-signature (common after zero-balance handoff). */
+  /** Fallback when Helius rejects after-signature on REST sync cursor. */
   private async fetchPotentialFeePayerTxsAfterTimestamp(
     address: string,
     afterTimestamp: number,
@@ -621,70 +619,20 @@ export class FunderFirstOrchestrator extends EventEmitter {
     return balanceSol !== null && balanceSol <= ZERO_BALANCE_EPSILON_SOL;
   }
 
-  /**
-   * Fee payer hit zero — follow the primary drain recipient, unless it is the
-   * top-level funder (then stop and unsubscribe).
-   */
+  /** Fee payer hit zero — stop monitoring (no handoff). */
   private finalizeFeePayerZeroBalance(
     watch: PotentialFeePayerWatch,
     tx: HeliusTransaction,
     source: 'wss' | 'rest',
   ): boolean {
-    const funder = this.funderAddress;
-    const outgoing = this.extractOutgoingSolTransfers(tx, watch.address).filter(
-      (transfer) => transfer.to !== funder,
-    );
-    const drain =
-      [...outgoing].sort((a, b) => b.amountSol - a.amountSol)[0] ?? null;
-
-    if (!drain || (funder && drain.to === funder)) {
-      log.info('Potential feePayer reached zero — drain returned to funder; stopping watch', {
-        potentialFeePayer: watch.address,
-        funder,
-        signature: tx.signature,
-        source,
-      });
-      this.stopPotentialFeePayerWatch(
-        watch.address,
-        'native SOL balance reached zero (returned to funder)',
-      );
-      return true;
-    }
-
-    const nextPostBalanceSol = this.getAccountPostBalanceSol(tx, drain.to);
-    if (nextPostBalanceSol === null) {
-      log.warn('Potential feePayer zero-balance follow skipped — recipient post-balance unknown', {
-        potentialFeePayer: watch.address,
-        nextPotentialFeePayer: drain.to,
-        signature: tx.signature,
-        source,
-      });
-      this.stopPotentialFeePayerWatch(
-        watch.address,
-        'native SOL balance reached zero (follow recipient post-balance unknown)',
-      );
-      return true;
-    }
-
-    log.info('Potential feePayer reached zero — following drain recipient', {
-      stoppedFeePayer: watch.address,
-      nextPotentialFeePayer: drain.to,
-      drainAmountSol: drain.amountSol,
-      nextPostBalanceSol,
+    log.info('Potential feePayer reached zero — stopping watch', {
+      potentialFeePayer: watch.address,
       signature: tx.signature,
       source,
     });
-
-    const oldAddress = watch.address;
     this.stopPotentialFeePayerWatch(
-      oldAddress,
-      `zero-balance follow to ${drain.to}`,
-    );
-    this.startFreshPotentialFeePayerWatch(
-      drain.to,
-      tx.signature,
-      tx.timestamp,
-      nextPostBalanceSol,
+      watch.address,
+      'native SOL balance reached zero',
     );
     return true;
   }
@@ -700,53 +648,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       return;
     }
 
-    try {
-      const recent = await this.heliusClient.getWalletTransactionsDesc(address, 5);
-      for (const tx of recent) {
-        if (watch.processedSignatures.has(tx.signature)) continue;
-        if (!this.hasOutgoingSolFrom(tx, address)) continue;
-        const selfPost = this.getAccountPostBalanceSol(tx, address);
-        if (!this.isFeePayerBalanceZero(selfPost)) continue;
-        watch.processedSignatures.add(tx.signature);
-        if (this.finalizeFeePayerZeroBalance(watch, tx, 'rest')) return;
-      }
-    } catch (err) {
-      log.warn('Failed to resolve zero-balance feePayer drain tx', {
-        address,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
     this.stopPotentialFeePayerWatch(address, 'native SOL balance reached zero');
-  }
-
-  private startFreshPotentialFeePayerWatch(
-    address: string,
-    receiveSignature: string,
-    receiveTimestamp: number,
-    postBalanceSol: number,
-  ): void {
-    if (this.potentialFeePayers.has(address)) {
-      this.stopPotentialFeePayerWatch(address, 'reset for fresh handoff');
-    }
-    const watch = this.ensurePotentialFeePayerWatch(address);
-    if (!watch) return;
-    watch.balanceAtFunderReceiveSol = postBalanceSol;
-    watch.balanceAtFunderReceiveSignature = receiveSignature;
-    watch.balanceAtFunderReceiveTimestamp = receiveTimestamp;
-    watch.cursorSignature = receiveSignature;
-    watch.processedSignatures.add(receiveSignature);
-    log.info('Started fresh potential feePayer watch after handoff', {
-      address,
-      receiveSignature,
-      postBalanceSol,
-      enhancedWatchId: watch.enhancedWatchId,
-    });
-    log.info(
-      'Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (≥20 SOL post-balance, ≤0.5 SOL spread)',
-      { potentialFeePayer: address, postBalanceSol },
-    );
-    void this.syncPotentialFeePayerTransactions(address, true);
   }
 
   private stopPotentialFeePayerWatch(address: string, reason: string): void {

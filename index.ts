@@ -2296,7 +2296,7 @@ async function main(): Promise<void> {
         "1. Funder sends SOL → potential feePayer watches open.",
         "2. ≥20 SOL post-balance to 4 wallets in 10s → normal candidate → buy.",
         "3. Sub-20 SOL bundler sends are ignored (no alerts).",
-        "4. FeePayer watch continues until SOL → zero; follow drain recipient (skip if funder).",
+        "4. FeePayer watch continues until SOL → zero, then stops (no handoff).",
         "• Rug: dev CLOSE_ACCOUNT resumes feePayer watch after a trade.",
       ].join("\n"),
       replyMarkup: {
