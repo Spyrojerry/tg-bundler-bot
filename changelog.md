@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-07-15 (15)
+
+### Funder-first: require exactly 4 bundler funding txs (remove 5s grace)
+
+- Valid group is now **exactly 4** unique recipients in 10s (not 3–4). Group activates immediately once the 4th matching funding tx is recorded.
+- Removed `GROUP_ACTIVATION_GRACE_SEC` and deferred 3-wallet activation timers from `(14)`.
+- 5+ recipients in the same tolerance window is still skipped entirely.
+
+## 2026-07-15 (14)
+
+### Funder-first: 5s grace before locking 3-bundler groups + asset-based swap detection
+
+- **Group activation:** a 3-wallet cluster is not activated (Telegram / recipient subscribe) until **5 seconds** after the anchor funding tx, giving a 4th recipient time to land in the same 10s window. A cluster of **4** still activates immediately.
+- **`wallet-swap-detector.ts`:** new per-wallet swap classifier — requires tx success, known DEX program participation, and a wallet-level asset exchange (SOL/WSOL ↔ token or token ↔ token). Used for funder-first bundler buy detection and for WSS `type: "SWAP"` normalization (no longer program-ID-only).
+- Added Meteora DLMM and Orca Whirlpool to the known swap program set.
+
 ## 2026-07-15 (13)
 
 ### Remove REST backstops; cap forced ascending sync at 20 txs

@@ -2294,7 +2294,7 @@ async function main(): Promise<void> {
         "",
         "<b>Funder-first steps</b>",
         "1. Funder sends SOL → potential feePayer watches open.",
-        "2. ≥20 SOL post-balance to 3-4 wallets in 10s → normal candidate → buy.",
+        "2. ≥20 SOL post-balance to 4 wallets in 10s → normal candidate → buy.",
         "3. 5-19.99 SOL post-balance in 10s → skipped; wait for dev rug.",
         "4. Half-drain or zero balance → stop watching that feePayer.",
         "• Rug: dev CLOSE_ACCOUNT resumes feePayer watch after a trade.",

@@ -24,9 +24,9 @@
 //     wallet — never the identity of the other side — so this is a safe,
 //     robust simplification that also sidesteps having to correctly pair up
 //     multi-hop swap instructions (Jupiter routes, PumpSwap pool legs, etc).
-//   - `type` (SWAP / TRANSFER / CLOSE_ACCOUNT / UNKNOWN) is inferred from
-//     which program IDs appear anywhere in the instruction tree (top-level +
-//     inner instructions).
+//   - `type` (SWAP / TRANSFER / CLOSE_ACCOUNT / UNKNOWN): SWAP requires a known
+//     DEX program plus a wallet-level asset exchange (SOL/token in/out), not
+//     program IDs alone — see wallet-swap-detector.ts.
 //   - `source` is only populated for CLOSE_ACCOUNT (SOLANA_PROGRAM_LIBRARY),
 //     which is currently the only place the rest of the code reads it.
 //
@@ -44,6 +44,10 @@
 
 import { createLogger } from './logger';
 import { HeliusTransaction } from './helius-client';
+import {
+  collectWalletsWithBalanceChanges,
+  transactionInvolvesWalletSwap,
+} from './wallet-swap-detector';
 
 const log = createLogger('TX-NORMALIZER');
 
@@ -51,20 +55,11 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const TOKEN_2022_PROGRAM_ID = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 
-/** Program IDs whose presence anywhere in the instruction tree marks a tx as a SWAP (pump.fun bonding curve, PumpSwap AMM, plus the major Solana DEX/router programs a migrated/graduated token could route through). */
-const SWAP_PROGRAM_IDS = new Set([
-  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump.fun bonding curve
-  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', // PumpSwap AMM
-  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM v4
-  'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', // Raydium CLMM
-  'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', // Raydium CPMM
-  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter Aggregator v6
-]);
-
 const UNKNOWN_COUNTERPARTY = '__pool__';
 
 interface ParsedInstructionLike {
   programId?: string;
+  programIdIndex?: number;
   program?: string;
   parsed?: { type?: string; info?: Record<string, unknown> };
 }
@@ -76,31 +71,9 @@ interface RawParsedTokenBalance {
   uiTokenAmount?: { uiAmount?: number | null; amount?: string; decimals?: number };
 }
 
-/** Shape of the `result` field of a Helius/Solana `transactionNotification` push, defensively typed since it is not runtime-verified here. */
-export interface RawEnhancedWsTransactionResult {
-  slot?: number;
-  transaction?: {
-    transaction?: {
-      signatures?: string[];
-      message?: {
-        accountKeys?: Array<string | { pubkey: string }>;
-        instructions?: ParsedInstructionLike[];
-      };
-    };
-    meta?: {
-      err?: unknown;
-      fee?: number;
-      preBalances?: number[];
-      postBalances?: number[];
-      preTokenBalances?: RawParsedTokenBalance[];
-      postTokenBalances?: RawParsedTokenBalance[];
-      innerInstructions?: Array<{ index: number; instructions?: ParsedInstructionLike[] }>;
-      loadedAddresses?: { writable?: string[]; readonly?: string[] };
-    };
-  };
-  signature?: string;
-  blockTime?: number | null;
-}
+/** Re-exported for `helius-enhanced-ws.ts` and other consumers. */
+export type { RawEnhancedWsTransactionResult } from './wallet-swap-detector';
+import type { RawEnhancedWsTransactionResult } from './wallet-swap-detector';
 
 function accountKeyToString(key: string | { pubkey: string } | undefined): string | null {
   if (!key) return null;
@@ -136,13 +109,10 @@ function collectAllInstructions(
 }
 
 function classifyType(
+  raw: RawEnhancedWsTransactionResult,
+  accountKeys: string[],
   instructions: ParsedInstructionLike[],
 ): { type: string; source?: string } {
-  for (const ix of instructions) {
-    if (ix.programId && SWAP_PROGRAM_IDS.has(ix.programId)) {
-      return { type: 'SWAP' };
-    }
-  }
   for (const ix of instructions) {
     const isTokenProgram =
       ix.programId === TOKEN_PROGRAM_ID || ix.programId === TOKEN_2022_PROGRAM_ID;
@@ -150,6 +120,13 @@ function classifyType(
       return { type: 'CLOSE_ACCOUNT', source: 'SOLANA_PROGRAM_LIBRARY' };
     }
   }
+
+  const wallets = collectWalletsWithBalanceChanges(raw, accountKeys);
+  if (accountKeys[0]) wallets.add(accountKeys[0]);
+  if (transactionInvolvesWalletSwap(raw, wallets)) {
+    return { type: 'SWAP' };
+  }
+
   return { type: 'TRANSFER' };
 }
 
@@ -278,7 +255,7 @@ export function normalizeEnhancedWsTransaction(
     }
     const accountKeys = buildFullAccountKeys(raw);
     const instructions = collectAllInstructions(raw);
-    const { type, source } = classifyType(instructions);
+    const { type, source } = classifyType(raw, accountKeys, instructions);
     const nativeTransfers = reconstructNativeTransfers(raw, accountKeys);
     const tokenTransfers = reconstructTokenTransfers(raw);
     const accountData = reconstructAccountData(raw, accountKeys);
