@@ -1123,10 +1123,9 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    if (this.followMonitor) {
-      this.followMonitor.stop();
-      this.followMonitor = null;
-    }
+    // Keep the follow-wallet Enhanced WSS subscription alive — watchingMint /
+    // boughtMints guards prevent duplicate flow starts; avoids unsubscribe +
+    // resubscribe churn (and extra transactionSubscribe RPCs) on every reset.
 
     this.boughtMints.add(mint);
     this.watchingMint = mint;
@@ -1287,21 +1286,12 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const createTx = await this.withHeliusFallback((client) =>
-      client.getMintCreateTransaction(mint),
-    );
-    this.devWallet = createTx?.feePayer ?? null;
-    this.devCreateSignature = createTx?.signature ?? null;
-    this.devCreateTimestamp = createTx?.timestamp ?? null;
-    if (this.devWallet) {
-      this.log.info("Dev wallet identified for trader-scan exclusions", {
-        mint,
-        devWallet: this.devWallet,
-        devCreateSignature: this.devCreateSignature,
-        devCreateTimestamp: this.devCreateTimestamp,
-      });
-      this.subscribeDevWalletFullExitWatch();
+    if (
+      await this.trySkipLowFundingDisabledFromEarlyBuys(mint, earlyInsiderBuys)
+    ) {
+      return;
     }
+
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.monitoredWallet = null;
@@ -1466,10 +1456,104 @@ export class InsiderBot extends EventEmitter {
     tx: HeliusTransaction,
     buyWallet: string,
   ): number | null {
-    return (
-      this.estimateWalletSolSpent(tx, buyWallet) ??
-      (tx.feePayer ? this.estimateWalletSolSpent(tx, tx.feePayer) : null)
+    const fromTransfers = this.estimateWalletSolSpent(tx, buyWallet);
+    if (fromTransfers !== null) return fromTransfers;
+
+    const accountEntry = tx.accountData?.find((a) => a.account === buyWallet);
+    if (
+      accountEntry?.nativeBalanceChange !== undefined &&
+      accountEntry.nativeBalanceChange < 0
+    ) {
+      return parseFloat(
+        (
+          -accountEntry.nativeBalanceChange / LAMPORTS_PER_SOL
+        ).toFixed(6),
+      );
+    }
+
+    return tx.feePayer ? this.estimateWalletSolSpent(tx, tx.feePayer) : null;
+  }
+
+  /**
+   * When low-funding mode is off, skip tokens whose first-four bundler buys
+   * clearly spent less than the normal-mode threshold — avoids ~40+ Helius
+   * balance-at / funding-history calls that would reject the token anyway.
+   */
+  private async trySkipLowFundingDisabledFromEarlyBuys(
+    mint: string,
+    buys: EarlyInsiderBuy[],
+  ): Promise<boolean> {
+    if (BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED) return false;
+    if (buys.length < BUNDLER_FUNDER_REQUIRED_COUNT) return false;
+
+    const buySols = buys.map((buy) => buy.buySol);
+    if (buySols.some((sol) => sol === null)) return false;
+
+    const maxBuySol = Math.max(...(buySols as number[]));
+    if (maxBuySol >= BUNDLER_FUNDER_LOW_FUNDING_SOL) return false;
+
+    this.log.warn(
+      "Low-funding mode disabled; skipping token from early bundler buy SOL (before funding REST)",
+      {
+        mint,
+        maxBuySol,
+        normalFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
+        bundlerBuySols: buys.map((buy) => ({
+          wallet: buy.wallet,
+          buySol: buy.buySol,
+          signature: buy.signature,
+        })),
+      },
     );
+    await this.skipLowFundingDisabledToken(mint, null, maxBuySol);
+    return true;
+  }
+
+  private async skipLowFundingDisabledToken(
+    mint: string,
+    funderWallet: string | null,
+    largestFundingSol: number,
+  ): Promise<void> {
+    void this.sendTelegramSafe(
+      [
+        `<b>⏭️ ${this.label} Low-Funding Mode Disabled — Token Skipped</b>`,
+        `Token: <code>${mint}</code>`,
+        funderWallet ? `FeePayer: <code>${funderWallet}</code>` : "",
+        `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b> (below the ${BUNDLER_FUNDER_LOW_FUNDING_SOL} SOL normal-mode threshold)`,
+        "Low-funding mode is currently disabled — resetting to watch for the next token.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "low-funding mode disabled skip notification",
+    );
+    await this.resetForNewToken(true);
+  }
+
+  private async ensureDevWalletLoaded(mint: string): Promise<void> {
+    if (this.devWallet) return;
+    const createTx = await this.withHeliusFallback((client) =>
+      client.getMintCreateTransaction(mint),
+    );
+    this.devWallet = createTx?.feePayer ?? null;
+    this.devCreateSignature = createTx?.signature ?? null;
+    this.devCreateTimestamp = createTx?.timestamp ?? null;
+    if (!this.devWallet) return;
+    this.log.info("Dev wallet identified for trader-scan exclusions", {
+      mint,
+      devWallet: this.devWallet,
+      devCreateSignature: this.devCreateSignature,
+      devCreateTimestamp: this.devCreateTimestamp,
+    });
+    this.subscribeDevWalletFullExitWatch();
+  }
+
+  private getNativePostBalanceSol(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): number | null {
+    const entry = tx.accountData?.find((a) => a.account === wallet);
+    if (entry?.nativePostBalance === undefined) return null;
+    return entry.nativePostBalance / LAMPORTS_PER_SOL;
   }
 
   private findLowestInsiderWallet(buys: EarlyInsiderBuy[]) {
@@ -1726,11 +1810,14 @@ export class InsiderBot extends EventEmitter {
       attempt <= BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS;
       attempt += 1
     ) {
-      fundingRecords = await Promise.all(
-        firstFour.map((buy, index) =>
-          this.findValidBundlerFundingRecord(mint, buy, index),
-        ),
+      const resolved = await this.resolveBundlerFundingRecordsSequential(
+        mint,
+        firstFour,
       );
+      if (resolved === null) {
+        return;
+      }
+      fundingRecords = resolved;
 
       const missingCount = fundingRecords.filter((record) => !record).length;
       if (missingCount === 0) {
@@ -1835,19 +1922,12 @@ export class InsiderBot extends EventEmitter {
           normalFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
         },
       );
-      void this.sendTelegramSafe(
-        [
-          `<b>⏭️ ${this.label} Low-Funding Mode Disabled — Token Skipped</b>`,
-          `Token: <code>${mint}</code>`,
-          `FeePayer: <code>${funderWallet}</code>`,
-          `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b> (below the ${BUNDLER_FUNDER_LOW_FUNDING_SOL} SOL normal-mode threshold)`,
-          "Low-funding mode is currently disabled — resetting to watch for the next token.",
-        ].join("\n"),
-        "low-funding mode disabled skip notification",
-      );
-      await this.resetForNewToken(true);
+      await this.skipLowFundingDisabledToken(mint, funderWallet, largestFundingSol);
       return;
     }
+
+    await this.ensureDevWalletLoaded(mint);
+
     const latestBundlerBuyTimestamp = Math.max(
       ...firstFour.map((buy) => buy.timestamp),
     );
@@ -2185,6 +2265,42 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private async resolveBundlerFundingRecordsSequential(
+    mint: string,
+    firstFour: EarlyInsiderBuy[],
+  ): Promise<Array<BundlerFundingRecord | null> | null> {
+    const records: Array<BundlerFundingRecord | null> = [];
+    for (let index = 0; index < firstFour.length; index += 1) {
+      const buy = firstFour[index]!;
+      const record = await this.findValidBundlerFundingRecord(mint, buy, index);
+      records.push(record);
+      if (!record) continue;
+      if (
+        !BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED &&
+        record.amountSol < BUNDLER_FUNDER_LOW_FUNDING_SOL
+      ) {
+        this.log.warn(
+          "Low-funding mode disabled; aborting remaining bundler funding lookups after first sub-threshold record",
+          {
+            mint,
+            bundlerWallet: buy.wallet,
+            fundingSol: record.amountSol,
+            resolvedCount: records.filter(Boolean).length,
+            remaining: firstFour.length - index - 1,
+            normalFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
+          },
+        );
+        await this.skipLowFundingDisabledToken(
+          mint,
+          record.fundingFeePayer,
+          record.amountSol,
+        );
+        return null;
+      }
+    }
+    return records;
+  }
+
   private async findValidBundlerFundingRecord(
     mint: string,
     buy: EarlyInsiderBuy,
@@ -2215,11 +2331,13 @@ export class InsiderBot extends EventEmitter {
 
     for (let index = 0; index < txs.length; index += 1) {
       const tx = txs[index];
-      const currentBalance = await this.fetchSolBalanceAt(
-        buy.wallet,
-        tx.timestamp,
-        preferredClientIndex,
-      );
+      const currentBalance =
+        this.getNativePostBalanceSol(tx, buy.wallet) ??
+        (await this.fetchSolBalanceAt(
+          buy.wallet,
+          tx.timestamp,
+          preferredClientIndex,
+        ));
       if (currentBalance < 0) {
         this.log.info("Bundler funding candidate rejected: balance-at timestamp is negative", {
           mint,
@@ -2387,26 +2505,10 @@ export class InsiderBot extends EventEmitter {
     timestamp: number,
     preferredClientIndex = 0,
   ): Promise<HeliusBalanceAtResponse> {
-    const first = await this.withHeliusFallback(
+    return this.withHeliusFallback(
       (client) => client.getWalletBalanceAt(wallet, mint, timestamp),
       preferredClientIndex,
     );
-    const confirmed = await this.withHeliusFallback(
-      (client) => client.getWalletBalanceAt(wallet, mint, timestamp),
-      preferredClientIndex,
-    );
-    this.log.debug("Confirmed Helius balance-at with second request", {
-      wallet,
-      mint,
-      timestamp,
-      firstBalance: first.balance,
-      firstBalanceRaw: first.balanceRaw,
-      confirmedBalance: confirmed.balance,
-      confirmedBalanceRaw: confirmed.balanceRaw,
-      firstAsOf: first.asOf,
-      confirmedAsOf: confirmed.asOf,
-    });
-    return confirmed;
   }
 
   private async getConfirmedWalletSwapHistory(

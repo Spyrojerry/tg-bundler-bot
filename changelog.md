@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-07-15 (18)
+
+### Funder-first: ≥20 SOL only, zero-balance follow, no low-funding spam
+
+- Removed the 5–19.99 SOL low-funding band entirely from funder-first. Sub-20 SOL bundler sends are silently ignored — no Telegram or backend info logs.
+- Potential feePayer watches no longer stop on half-drain (50% balance drop). Monitoring continues until native SOL hits zero.
+- On zero balance: follow the primary drain recipient as the next potential feePayer; if the drain returned to the top-level funder, stop and unsubscribe.
+- Telegram/UI help text updated to match.
+
+## 2026-07-15 (17)
+
+### Funder-first: handoff REST sync fallback when after-signature rejected
+
+- Helius often rejects `after-signature` on half-drain handoff (signature from the old feePayer's drain tx is not a valid cursor on the new wallet). On that 400, REST sync now falls back to recent desc fetch + timestamp filter instead of failing with a warn.
+- Watches store `balanceAtFunderReceiveTimestamp` for the fallback path.
+
+## 2026-07-15 (16)
+
+### Follow-wallet flow: cut Helius REST before low-funding skips
+
+- **Early skip:** when low-funding mode is disabled, reject tokens after `getEarlyInsiderSwaps` if all four bundler buy SOL amounts are known and below 20 SOL — skips ~40+ funding/balance-at REST calls.
+- **Sequential funding resolve:** if early skip can't run, stop after the first sub-threshold funding record instead of fetching all four.
+- **Defer dev lookup:** `getMintCreateTransaction` + dev WSS watch only run after funding gate passes.
+- **Follow wallet WSS:** no longer unsubscribes on buy; guards prevent duplicate flows — avoids extra `transactionSubscribe` on every reset.
+- **Balance-at:** use `accountData.nativePostBalance` from funding TRANSFER txs when present; removed duplicate identical `getWalletBalanceAt` call.
+
 ## 2026-07-15 (15)
 
 ### Funder-first: require exactly 4 bundler funding txs (remove 5s grace)
