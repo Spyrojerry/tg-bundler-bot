@@ -21,8 +21,9 @@
 //    • Sub-20 SOL bundler sends are ignored (no Telegram, no backend info logs).
 //    • Keep watching the feePayer for new groups until a recipient buy overlaps
 //      the token's first-four bundlers.
-//    • Per recipient in the active group: stop watching if post-balance after the
-//      feePayer send drops to ≤50% of that receive baseline, or native SOL → zero.
+//    • Per recipient in the active group: stop watching when native SOL → zero
+//      (unless a token buy was already seen — then keep monitoring for buy logic).
+//    • Follow wallet merged with a bundler recipient uses one Enhanced WSS watch.
 //
 //  Stop-watching rules for a potential feePayer wallet itself:
 //    • Keep monitoring until native SOL balance hits zero.
@@ -50,7 +51,6 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const GROUP_WINDOW_SEC = 10;
 const BUNDLER_GROUP_SIZE = 4;
 const NORMAL_MIN_POST_SOL = 20;
-const HALF_DRAIN_RATIO = 0.5;
 const ZERO_BALANCE_EPSILON_SOL = 1e-6;
 /** Recipients in a 4-bundler group must have post-balances within this spread (SOL). */
 const POST_BALANCE_TOLERANCE_SOL = 0.5;
@@ -109,6 +109,8 @@ interface PotentialFeePayerWatch {
   /** Post-balance when the feePayer sent SOL to each recipient. */
   recipientBalanceAtReceive: Map<string, number>;
   recipientZeroBalanceSubIds: Map<string, number>;
+  /** Recipients that emitted a token buy — skip drain-based unsubscribe. */
+  recipientsWithBuySeen: Set<string>;
 }
 
 export class FunderFirstOrchestrator extends EventEmitter {
@@ -191,6 +193,31 @@ export class FunderFirstOrchestrator extends EventEmitter {
 
   isRunning(): boolean {
     return this.isEnabled;
+  }
+
+  /**
+   * Follow-wallet Enhanced WSS txs forwarded here when the follow wallet is an
+   * active bundler recipient — avoids a duplicate recipient-batch subscription.
+   */
+  handleMergedFollowWalletTx(tx: HeliusTransaction): void {
+    const followWallet = this.insiderBot.getFollowedWallet();
+    if (!followWallet || !this.isEnabled) return;
+
+    for (const [feePayer, watch] of this.potentialFeePayers) {
+      if (watch.status === 'stopped' || watch.status === 'active') continue;
+      const inActiveGroup = [...watch.activeGroups.values()].some(
+        (group) =>
+          group.recipients.has(followWallet) &&
+          !group.stoppedRecipients.has(followWallet),
+      );
+      if (!inActiveGroup) continue;
+      void this.handleRecipientTx(feePayer, followWallet, tx);
+    }
+  }
+
+  private isMergedFollowWalletRecipient(recipient: string): boolean {
+    const followWallet = this.insiderBot.getFollowedWallet();
+    return !!followWallet && recipient === followWallet;
   }
 
   async start(): Promise<void> {
@@ -369,6 +396,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
         notifiedGroupAnchors: new Set(),
         recipientBalanceAtReceive: new Map(),
         recipientZeroBalanceSubIds: new Map(),
+        recipientsWithBuySeen: new Set(),
       };
       this.potentialFeePayers.set(address, watch);
     }
@@ -911,6 +939,19 @@ export class FunderFirstOrchestrator extends EventEmitter {
         if (!group.stoppedRecipients.has(recipient)) toSubscribe.add(recipient);
       }
     }
+    const merged = [...toSubscribe].filter((r) =>
+      this.isMergedFollowWalletRecipient(r),
+    );
+    for (const recipient of merged) {
+      toSubscribe.delete(recipient);
+      log.info(
+        'Bundler recipient merged with follow wallet — using follow-wallet Enhanced WSS only',
+        {
+          feePayer: watch.address,
+          recipient,
+        },
+      );
+    }
     this.subscribeRecipients(watch, [...toSubscribe]);
     for (const recipient of toSubscribe) {
       this.ensureRecipientZeroBalanceSub(watch, recipient);
@@ -921,6 +962,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch: PotentialFeePayerWatch,
     recipient: string,
   ): void {
+    if (this.isMergedFollowWalletRecipient(recipient)) return;
     if (watch.recipientZeroBalanceSubIds.has(recipient)) return;
     const subId = this.connection.onAccountChange(
       new PublicKey(recipient),
@@ -1002,6 +1044,8 @@ export class FunderFirstOrchestrator extends EventEmitter {
     recipient: string,
     tx: HeliusTransaction,
   ): boolean {
+    if (watch.recipientsWithBuySeen.has(recipient)) return false;
+
     const inAnyGroup = [...watch.activeGroups.values()].some((g) =>
       g.recipients.has(recipient),
     );
@@ -1014,20 +1058,17 @@ export class FunderFirstOrchestrator extends EventEmitter {
       return false;
     }
 
-    const baseline = watch.recipientBalanceAtReceive.get(recipient);
-    if (baseline === undefined) return false;
-
     const postBalanceSol = this.getAccountPostBalanceSol(tx, recipient);
     if (postBalanceSol === null) return false;
 
     if (
       this.hasOutgoingSolFrom(tx, recipient) &&
-      postBalanceSol <= baseline * HALF_DRAIN_RATIO
+      postBalanceSol <= ZERO_BALANCE_EPSILON_SOL
     ) {
       this.markRecipientStoppedInGroup(
         watch.address,
         recipient,
-        'balance drained to ≤50% after feePayer receive',
+        'native SOL balance reached zero after feePayer receive',
       );
       return true;
     }
@@ -1105,12 +1146,14 @@ export class FunderFirstOrchestrator extends EventEmitter {
     if (seen.has(tx.signature)) return;
     seen.add(tx.signature);
 
-    if (this.checkRecipientDrain(watch, recipient, tx)) return;
-
     const mint = findWalletSwapBuyMint(tx, recipient);
-    if (!mint || mint === SOL_MINT) return;
+    if (mint && mint !== SOL_MINT) {
+      watch.recipientsWithBuySeen.add(recipient);
+      await this.tryConfirmToken(watch, mint, recipient);
+      return;
+    }
 
-    await this.tryConfirmToken(watch, mint, recipient);
+    if (this.checkRecipientDrain(watch, recipient, tx)) return;
   }
 
   private async tryConfirmToken(

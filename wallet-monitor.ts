@@ -176,6 +176,8 @@ export class WalletMonitor extends EventEmitter {
     this.enhancedSeenSignatures.add(tx.signature);
 
     const wallet = this.walletPubkey.toBase58();
+    this.emit('transaction', { walletAddress: wallet, tx });
+
     const boughtMints = this.detectBoughtMintsFromHeliusTx(tx, wallet);
     if (boughtMints.length === 0) return;
 
