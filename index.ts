@@ -2255,7 +2255,7 @@ async function main(): Promise<void> {
       watchedPotential.length > 0
         ? watchedPotential.map(
             (w) =>
-              `  • <code>${html(w.address.slice(0, 8))}…</code> — <b>${w.status}</b>${w.mint ? ` (${html(w.mint.slice(0, 8))}…)` : ""}`,
+              `  • <code>${html(w.address)}</code> — <b>${w.status}</b>${w.mint ? ` (<code>${html(w.mint)}</code>)` : ""}`,
           )
         : ["  • <i>none yet</i>"];
 
