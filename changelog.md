@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-07-15 (5)
+
+### Funder-first: concurrent groups + 0.5 SOL post-balance clustering
+
+- Multiple 3–4 bundler groups per feePayer can be monitored **concurrently** (each keyed by anchor); abandoning one group does not stop others.
+- Group detection now requires 3–4 unique recipients in 10s whose post-balances are within **0.5 SOL** of each other (still in normal ≥20 or low 5–19.99 band).
+- Per-recipient drain/zero only unsubscribes when no remaining active group needs that wallet.
+- Token confirm uses the band of the group that contained the buying wallet.
+
+## 2026-07-15 (4)
+
+### Follow-wallet Enhanced WSS + funder-first multi-group recipient rules
+
+- **Follow-wallet**: `WalletMonitor` accepts optional `enhancedWs`; Insider bot passes the shared client so follow-wallet resume uses `transactionSubscribe` (token buy detection from normalized SWAP payloads) with poll backstop when WS is down.
+- **Funder-first groups**: feePayer keeps watching for new 10s bundler windows (normal or low) until a recipient buy overlaps the token's first-four bundlers. Exhausted groups are abandoned and the next window is evaluated.
+- **Per-recipient rules**: each bundler in the active group is unsubscribed if post-balance drops to ≤50% after the feePayer send or native SOL hits zero (`onAccountChange`). When all recipients in a 3–4 group stop, that group is abandoned.
+- FeePayer zero-balance `onAccountChange` unchanged.
+
 ## 2026-07-15 (3)
 
 ### Shared Enhanced WSS + batched recipient subscriptions (API optimization)

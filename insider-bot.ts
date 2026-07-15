@@ -965,6 +965,7 @@ export class InsiderBot extends EventEmitter {
       rpcUrl: this.rpcUrl,
       wsUrl: this.wsUrl,
       logLabel: `WALLET ${this.label.toUpperCase()}`,
+      enhancedWs: this.enhancedWs,
     });
     this.followMonitor = monitor;
     monitor.on("newToken", (event) => {

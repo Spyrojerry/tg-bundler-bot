@@ -17,9 +17,12 @@ import {
 } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { createLogger, Logger } from './logger';
+import { HeliusTransaction } from './helius-client';
+import { HeliusEnhancedWsClient } from './helius-enhanced-ws';
 import { NewTokenEvent, ServiceConfig, TokenExitEvent, TokenHolding } from './types';
 
 const WALLET_COMMITMENT = 'processed';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 const TOKEN_PROGRAM_IDS = [
   new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
@@ -44,8 +47,12 @@ export class WalletMonitor extends EventEmitter {
   /** Mints currently held with positive balance. */
   private heldMints: Set<string> = new Set();
 
-  /** Websocket logs subscription id returned by Connection.onLogs. */
+  /** Websocket logs subscription id returned by Connection.onLogs (fallback path). */
   private logsSubscriptionId: number | null = null;
+  /** Enhanced WSS watch handle when `options.enhancedWs` is provided. */
+  private enhancedWatchId: number | null = null;
+  private readonly enhancedWs: HeliusEnhancedWsClient | null;
+  private readonly enhancedSeenSignatures = new Set<string>();
 
   /** Signatures currently being parsed from websocket notifications. */
   private pendingSignatures: Set<string> = new Set();
@@ -65,6 +72,8 @@ export class WalletMonitor extends EventEmitter {
       rpcUrl?: string;
       wsUrl?: string;
       logLabel?: string;
+      /** When set, uses Helius `transactionSubscribe` instead of `onLogs` + RPC fetch. */
+      enhancedWs?: HeliusEnhancedWsClient | null;
     } = {}
   ) {
     super();
@@ -95,6 +104,7 @@ export class WalletMonitor extends EventEmitter {
       this.minBuySol = options.enforceMinBuySol === false ? 0 : config.minBuySol;
     }
     this.wsEndpoint = wsUrl;
+    this.enhancedWs = options.enhancedWs ?? null;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -105,7 +115,11 @@ export class WalletMonitor extends EventEmitter {
 
     this.log.info(`Starting wallet monitor for ${this.walletPubkey.toBase58()}`);
     this.log.info(`Poll interval: ${this.pollInterval}ms`);
-    this.log.info(`Websocket endpoint: ${this.wsEndpoint}`);
+    this.log.info(
+      this.enhancedWs
+        ? 'Push path: Helius Enhanced WSS transactionSubscribe'
+        : `Websocket endpoint: ${this.wsEndpoint}`,
+    );
 
     // Snapshot existing holdings — these are NOT monitored
     const initial = await this.fetchHoldings();
@@ -121,7 +135,11 @@ export class WalletMonitor extends EventEmitter {
       { mints: [...this.existingTokens] }
     );
 
-    this.startLogsSubscription();
+    if (this.enhancedWs) {
+      this.startEnhancedWsSubscription();
+    } else {
+      this.startLogsSubscription();
+    }
     this.schedulePoll();
   }
 
@@ -130,6 +148,13 @@ export class WalletMonitor extends EventEmitter {
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
+    }
+    if (this.enhancedWatchId !== null && this.enhancedWs) {
+      const id = this.enhancedWatchId;
+      this.enhancedWatchId = null;
+      void this.enhancedWs.unwatch(id).catch((err) =>
+        this.log.warn('Failed to remove Enhanced WSS watch', err),
+      );
     }
     if (this.logsSubscriptionId !== null) {
       const subscriptionId = this.logsSubscriptionId;
@@ -151,9 +176,94 @@ export class WalletMonitor extends EventEmitter {
 
   private schedulePoll(): void {
     if (!this.running) return;
+    const wsHealthy = this.enhancedWs?.isConnected ?? false;
+    const delay =
+      this.enhancedWs && wsHealthy
+        ? this.pollInterval
+        : this.enhancedWs
+          ? Math.min(this.pollInterval, 4_000)
+          : this.pollInterval;
     this.pollTimer = setTimeout(() => {
       this.poll().catch((err) => this.log.error('Poll error', err));
-    }, this.pollInterval);
+    }, delay);
+  }
+
+  private startEnhancedWsSubscription(): void {
+    if (!this.enhancedWs) return;
+    const wallet = this.walletPubkey.toBase58();
+    this.log.info(`Enhanced WSS subscribing to wallet ${wallet}`);
+    this.enhancedWatchId = this.enhancedWs.watch(wallet, (tx) => {
+      this.handleEnhancedWsTx(tx).catch((err) =>
+        this.log.error(`Failed to process Enhanced WSS tx for ${wallet}`, err),
+      );
+    });
+  }
+
+  private async handleEnhancedWsTx(tx: HeliusTransaction): Promise<void> {
+    if (!this.running || this.enhancedSeenSignatures.has(tx.signature)) return;
+    this.enhancedSeenSignatures.add(tx.signature);
+
+    const wallet = this.walletPubkey.toBase58();
+    const boughtMints = this.detectBoughtMintsFromHeliusTx(tx, wallet);
+    if (boughtMints.length === 0) return;
+
+    for (const buy of boughtMints) {
+      if (this.knownMints.has(buy.mint)) {
+        this.heldMints.add(buy.mint);
+        continue;
+      }
+      this.log.info(`[ENHANCED WS BUY] ${tx.signature} -> ${buy.mint}`, {
+        buySol: buy.buySol,
+      });
+      this.emit('buyDetected', {
+        walletAddress: wallet,
+        mint: buy.mint,
+        detectedAt: Date.now(),
+        buySol: buy.buySol,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+      });
+      this.emitNewToken(
+        buy.mint,
+        Date.now(),
+        'tx-detected',
+        'enhancedWs',
+        buy.buySol,
+        tx.signature,
+        tx.timestamp,
+      );
+    }
+  }
+
+  private detectBoughtMintsFromHeliusTx(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): Array<{ mint: string; buySol: number | null }> {
+    const buys: Array<{ mint: string; buySol: number | null }> = [];
+    const seenMints = new Set<string>();
+    for (const transfer of tx.tokenTransfers ?? []) {
+      if (transfer.mint === SOL_MINT) continue;
+      if (transfer.toUserAccount !== wallet) continue;
+      if (seenMints.has(transfer.mint)) continue;
+      seenMints.add(transfer.mint);
+      buys.push({
+        mint: transfer.mint,
+        buySol: this.estimateSolSpentFromHeliusTx(tx, wallet),
+      });
+    }
+    return buys;
+  }
+
+  private estimateSolSpentFromHeliusTx(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): number | null {
+    const entry = tx.accountData?.find((a) => a.account === wallet);
+    if (!entry?.nativeBalanceChange) return null;
+    const spentLamports = -entry.nativeBalanceChange;
+    return spentLamports > 0
+      ? parseFloat((spentLamports / LAMPORTS_PER_SOL).toFixed(6))
+      : 0;
   }
 
   private startLogsSubscription(): void {

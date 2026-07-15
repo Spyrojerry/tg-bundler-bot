@@ -16,7 +16,18 @@
 //       in cooldown until the token's dev wallet CLOSE_ACCOUNTs (rug), then
 //       resumes watching that feePayer for the next opportunity.
 //
-//  Stop-watching rules for a potential feePayer:
+//  Group / recipient rules:
+//    • Multiple 10s bundler groups (normal or low) can be monitored concurrently.
+//    • A valid group is 3–4 unique recipients in 10s whose post-balances are all
+//      within 0.5 SOL of each other (and in the normal or low band).
+//    • Keep watching the feePayer for new groups until a recipient buy overlaps
+//      the token's first-four bundlers.
+//    • Per recipient in the active group: stop watching if post-balance after the
+//      feePayer send drops to ≤50% of that receive baseline, or native SOL → zero.
+//    • If every recipient in the active 3–4 group drains/stops, abandon that group
+//      and look for the next 10s window.
+//
+//  Stop-watching rules for a potential feePayer wallet itself:
 //    • After receiving SOL from the funder, any outgoing transfer that leaves
 //      the wallet at ≤50% of the balance right after the funder receive.
 //    • Native SOL balance hits zero (account subscription).
@@ -46,6 +57,8 @@ const NORMAL_MIN_POST_SOL = 20;
 const LOW_MIN_POST_SOL = 5;
 const LOW_MAX_POST_SOL = 19.99;
 const HALF_DRAIN_RATIO = 0.5;
+/** Recipients in a 3–4 bundler group must have post-balances within this spread (SOL). */
+const POST_BALANCE_TOLERANCE_SOL = 0.5;
 
 type PotentialFeePayerStatus =
   | 'watching'
@@ -64,6 +77,13 @@ interface BundlerFundingEvent {
   band: 'normal' | 'low';
 }
 
+interface ActiveBundlerGroup {
+  anchorKey: string;
+  band: 'normal' | 'low';
+  recipients: Set<string>;
+  stoppedRecipients: Set<string>;
+}
+
 interface PotentialFeePayerWatch {
   address: string;
   status: PotentialFeePayerStatus;
@@ -80,8 +100,13 @@ interface PotentialFeePayerWatch {
   detectedMint: string | null;
   detectedDevWallet: string | null;
   cooldownDevWatchId: number | null;
-  lowNoteSent: boolean;
-  normalNoteSent: boolean;
+  /** Concurrent active 3–4 bundler groups keyed by anchor. */
+  activeGroups: Map<string, ActiveBundlerGroup>;
+  exhaustedGroupAnchors: Set<string>;
+  notifiedGroupAnchors: Set<string>;
+  /** Post-balance when the feePayer sent SOL to each recipient. */
+  recipientBalanceAtReceive: Map<string, number>;
+  recipientZeroBalanceSubIds: Map<string, number>;
 }
 
 export class FunderFirstOrchestrator extends EventEmitter {
@@ -303,8 +328,11 @@ export class FunderFirstOrchestrator extends EventEmitter {
       detectedMint: null,
       detectedDevWallet: null,
       cooldownDevWatchId: null,
-      lowNoteSent: false,
-      normalNoteSent: false,
+      activeGroups: new Map(),
+      exhaustedGroupAnchors: new Set(),
+      notifiedGroupAnchors: new Set(),
+      recipientBalanceAtReceive: new Map(),
+      recipientZeroBalanceSubIds: new Map(),
     };
     watch.enhancedWatchId = this.enhancedWs.watch(address, (tx) => {
       void this.handlePotentialFeePayerTx(address, tx);
@@ -337,6 +365,10 @@ export class FunderFirstOrchestrator extends EventEmitter {
       watch.solBalanceSubId = null;
     }
     this.unsubscribeRecipientsForWatch(watch);
+    for (const [, subId] of watch.recipientZeroBalanceSubIds) {
+      void this.connection.removeAccountChangeListener(subId).catch(() => undefined);
+    }
+    watch.recipientZeroBalanceSubIds.clear();
     if (watch.cooldownDevWatchId !== null) {
       void this.enhancedWs?.unwatch(watch.cooldownDevWatchId).catch(() => undefined);
       watch.cooldownDevWatchId = null;
@@ -405,84 +437,386 @@ export class FunderFirstOrchestrator extends EventEmitter {
         timestamp: tx.timestamp,
         band,
       });
+      watch.recipientBalanceAtReceive.set(transfer.to, recipientPostBalanceSol);
     }
 
     await this.evaluateBundlerGroups(watch);
   }
 
+  private getGroupAnchorKey(
+    anchor: BundlerFundingEvent,
+    band: 'normal' | 'low',
+  ): string {
+    return `${band}:${anchor.timestamp}:${anchor.signature}`;
+  }
+
   private async evaluateBundlerGroups(watch: PotentialFeePayerWatch): Promise<void> {
-    if (watch.status !== 'watching' && watch.status !== 'normal_candidate' && watch.status !== 'low_candidate') {
+    if (
+      watch.status !== 'watching' &&
+      watch.status !== 'normal_candidate' &&
+      watch.status !== 'low_candidate'
+    ) {
       return;
     }
 
-    const normalGroup = this.findBundlerGroup(watch, 'normal');
-    if (normalGroup) {
+    for (const [anchorKey, group] of [...watch.activeGroups]) {
+      if (group.stoppedRecipients.size >= group.recipients.size) {
+        this.abandonActiveGroup(
+          watch,
+          anchorKey,
+          'all recipients in group drained or zero',
+          false,
+        );
+      }
+    }
+
+    for (const group of this.findAllBundlerGroups(watch, 'normal')) {
+      this.activateGroup(watch, group, 'normal');
+    }
+    for (const group of this.findAllBundlerGroups(watch, 'low')) {
+      this.activateGroup(watch, group, 'low');
+    }
+
+    this.updateWatchCandidateStatus(watch);
+  }
+
+  private updateWatchCandidateStatus(watch: PotentialFeePayerWatch): void {
+    const groups = [...watch.activeGroups.values()];
+    if (groups.some((g) => g.band === 'normal')) {
       watch.status = 'normal_candidate';
       watch.mode = 'normal';
-      if (!watch.normalNoteSent) {
-        watch.normalNoteSent = true;
+    } else if (groups.length > 0) {
+      watch.status = 'low_candidate';
+      watch.mode = 'low';
+    } else if (watch.subscribedRecipients.size === 0) {
+      watch.status = 'watching';
+      watch.mode = null;
+    }
+  }
+
+  private recipientStillNeeded(
+    watch: PotentialFeePayerWatch,
+    recipient: string,
+  ): boolean {
+    for (const group of watch.activeGroups.values()) {
+      if (group.recipients.has(recipient) && !group.stoppedRecipients.has(recipient)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private postBalancesClustered(
+    events: BundlerFundingEvent[],
+    toleranceSol = POST_BALANCE_TOLERANCE_SOL,
+  ): boolean {
+    if (events.length === 0) return false;
+    const balances = events.map((e) => e.recipientPostBalanceSol);
+    return Math.max(...balances) - Math.min(...balances) <= toleranceSol;
+  }
+
+  private findClusteredGroupInWindow(
+    window: BundlerFundingEvent[],
+  ): BundlerFundingEvent[] | null {
+    const unique = new Map<string, BundlerFundingEvent>();
+    for (const e of window) {
+      if (!unique.has(e.recipient)) unique.set(e.recipient, e);
+    }
+    const events = [...unique.values()].sort((a, b) => a.timestamp - b.timestamp);
+    if (events.length < MIN_BUNDLER_GROUP) return null;
+
+    for (const anchor of events) {
+      const clustered = events
+        .filter(
+          (e) =>
+            Math.abs(e.recipientPostBalanceSol - anchor.recipientPostBalanceSol) <=
+            POST_BALANCE_TOLERANCE_SOL,
+        )
+        .sort((a, b) => a.timestamp - b.timestamp);
+      if (clustered.length < MIN_BUNDLER_GROUP) continue;
+      const group =
+        clustered.length <= MAX_BUNDLER_GROUP
+          ? clustered
+          : clustered.slice(0, MAX_BUNDLER_GROUP);
+      if (
+        group.length >= MIN_BUNDLER_GROUP &&
+        this.postBalancesClustered(group)
+      ) {
+        return group;
+      }
+    }
+    return null;
+  }
+
+  private findAllBundlerGroups(
+    watch: PotentialFeePayerWatch,
+    band: 'normal' | 'low',
+  ): BundlerFundingEvent[][] {
+    const events = watch.bundlerFundingEvents
+      .filter((e) => e.band === band)
+      .sort((a, b) => a.timestamp - b.timestamp);
+    const found: BundlerFundingEvent[][] = [];
+    const claimedAnchorKeys = new Set<string>();
+
+    for (let i = 0; i < events.length; i += 1) {
+      const anchor = events[i];
+      const anchorKey = this.getGroupAnchorKey(anchor, band);
+      if (watch.exhaustedGroupAnchors.has(anchorKey)) continue;
+      if (watch.activeGroups.has(anchorKey)) continue;
+      if (claimedAnchorKeys.has(anchorKey)) continue;
+
+      const window = events.filter(
+        (e) =>
+          e.timestamp >= anchor.timestamp &&
+          e.timestamp <= anchor.timestamp + GROUP_WINDOW_SEC,
+      );
+      const group = this.findClusteredGroupInWindow(window);
+      if (!group) continue;
+
+      const groupAnchor = group[0]!;
+      const groupAnchorKey = this.getGroupAnchorKey(groupAnchor, band);
+      if (
+        watch.exhaustedGroupAnchors.has(groupAnchorKey) ||
+        watch.activeGroups.has(groupAnchorKey) ||
+        claimedAnchorKeys.has(groupAnchorKey)
+      ) {
+        continue;
+      }
+
+      claimedAnchorKeys.add(groupAnchorKey);
+      found.push(group);
+    }
+    return found;
+  }
+
+  private activateGroup(
+    watch: PotentialFeePayerWatch,
+    group: BundlerFundingEvent[],
+    band: 'normal' | 'low',
+  ): void {
+    const anchor = group[0]!;
+    const anchorKey = this.getGroupAnchorKey(anchor, band);
+    if (watch.exhaustedGroupAnchors.has(anchorKey)) return;
+
+    if (watch.activeGroups.has(anchorKey)) {
+      this.syncAllActiveGroupSubscriptions(watch);
+      return;
+    }
+
+    watch.activeGroups.set(anchorKey, {
+      anchorKey,
+      band,
+      recipients: new Set(group.map((e) => e.recipient)),
+      stoppedRecipients: new Set(),
+    });
+
+    for (const event of group) {
+      watch.recipientBalanceAtReceive.set(
+        event.recipient,
+        event.recipientPostBalanceSol,
+      );
+    }
+
+    if (!watch.notifiedGroupAnchors.has(anchorKey)) {
+      watch.notifiedGroupAnchors.add(anchorKey);
+      const spread =
+        Math.max(...group.map((e) => e.recipientPostBalanceSol)) -
+        Math.min(...group.map((e) => e.recipientPostBalanceSol));
+      if (band === 'normal') {
         void this.sendTelegram([
           '<b>✅ Funder-First: Normal Mode Candidate (≥20 SOL post-balance)</b>',
           `Potential FeePayer: <code>${this.html(watch.address)}</code>`,
-          `Bundlers (${normalGroup.length} in 10s):`,
-          ...normalGroup.map(
+          `Bundlers (${group.length} in 10s, post-balance spread ≤0.5 SOL):`,
+          ...group.map(
             (e) =>
               `• <code>${this.html(e.recipient)}</code> — post <b>${e.recipientPostBalanceSol.toFixed(2)} SOL</b>`,
           ),
+          `Spread: <b>${spread.toFixed(2)} SOL</b>`,
           '',
           'Waiting for a SWAP buy from one of these wallets…',
         ]);
-      }
-      this.subscribeRecipients(watch, normalGroup.map((e) => e.recipient));
-      return;
-    }
-
-    const lowGroup = this.findBundlerGroup(watch, 'low');
-    if (lowGroup) {
-      watch.status = 'low_candidate';
-      watch.mode = 'low';
-      if (!watch.lowNoteSent) {
-        watch.lowNoteSent = true;
+      } else {
         void this.sendTelegram([
           '<b>⏭️ Funder-First: Low-Funding Pattern (5–19.99 SOL) — <u>Skipped</u></b>',
           `Potential FeePayer: <code>${this.html(watch.address)}</code>`,
-          `Bundlers (${lowGroup.length} in 10s):`,
-          ...lowGroup.map(
+          `Bundlers (${group.length} in 10s, post-balance spread ≤0.5 SOL):`,
+          ...group.map(
             (e) =>
               `• <code>${this.html(e.recipient)}</code> — post <b>${e.recipientPostBalanceSol.toFixed(2)} SOL</b>`,
           ),
+          `Spread: <b>${spread.toFixed(2)} SOL</b>`,
           '',
           'No buy — watching for a token buy to note the dev wallet, then waiting for rug before resuming this feePayer.',
         ]);
       }
-      this.subscribeRecipients(watch, lowGroup.map((e) => e.recipient));
     }
+
+    this.syncAllActiveGroupSubscriptions(watch);
+    this.updateWatchCandidateStatus(watch);
+  }
+
+  private abandonActiveGroup(
+    watch: PotentialFeePayerWatch,
+    anchorKey: string,
+    reason: string,
+    reevaluate = true,
+  ): void {
+    const group = watch.activeGroups.get(anchorKey);
+    if (!group) return;
+    watch.exhaustedGroupAnchors.add(anchorKey);
+    watch.activeGroups.delete(anchorKey);
+    log.info('Abandoning bundler group; other active groups continue', {
+      feePayer: watch.address,
+      anchorKey,
+      reason,
+      recipients: [...group.recipients],
+      remainingGroups: watch.activeGroups.size,
+    });
+    for (const recipient of group.recipients) {
+      if (!this.recipientStillNeeded(watch, recipient)) {
+        this.unsubscribeSingleRecipient(watch, recipient);
+      }
+    }
+    this.updateWatchCandidateStatus(watch);
+    if (reevaluate) void this.evaluateBundlerGroups(watch);
+  }
+
+  private syncAllActiveGroupSubscriptions(watch: PotentialFeePayerWatch): void {
+    if (!this.enhancedWs) return;
+    const toSubscribe = new Set<string>();
+    for (const group of watch.activeGroups.values()) {
+      for (const recipient of group.recipients) {
+        if (!group.stoppedRecipients.has(recipient)) toSubscribe.add(recipient);
+      }
+    }
+    this.subscribeRecipients(watch, [...toSubscribe]);
+    for (const recipient of toSubscribe) {
+      this.ensureRecipientZeroBalanceSub(watch, recipient);
+    }
+  }
+
+  private ensureRecipientZeroBalanceSub(
+    watch: PotentialFeePayerWatch,
+    recipient: string,
+  ): void {
+    if (watch.recipientZeroBalanceSubIds.has(recipient)) return;
+    const subId = this.connection.onAccountChange(
+      new PublicKey(recipient),
+      (info) => {
+        if (info.lamports === 0) {
+          this.markRecipientStoppedInGroup(
+            watch.address,
+            recipient,
+            'native SOL balance reached zero',
+          );
+        }
+      },
+      'processed',
+    );
+    watch.recipientZeroBalanceSubIds.set(recipient, subId);
+  }
+
+  private unsubscribeSingleRecipient(
+    watch: PotentialFeePayerWatch,
+    recipient: string,
+  ): void {
+    if (watch.subscribedRecipients.has(recipient)) {
+      watch.subscribedRecipients.delete(recipient);
+      const owner = this.recipientToFeePayer.get(recipient);
+      if (owner === watch.address) {
+        this.recipientToFeePayer.delete(recipient);
+      }
+      void this.syncRecipientBatch();
+    }
+    const subId = watch.recipientZeroBalanceSubIds.get(recipient);
+    if (subId !== undefined) {
+      void this.connection.removeAccountChangeListener(subId).catch(() => undefined);
+      watch.recipientZeroBalanceSubIds.delete(recipient);
+    }
+  }
+
+  private markRecipientStoppedInGroup(
+    feePayerAddress: string,
+    recipient: string,
+    reason: string,
+  ): void {
+    const watch = this.potentialFeePayers.get(feePayerAddress);
+    if (!watch || watch.activeGroups.size === 0) return;
+
+    let touched = false;
+    for (const [anchorKey, group] of watch.activeGroups) {
+      if (!group.recipients.has(recipient)) continue;
+      if (group.stoppedRecipients.has(recipient)) continue;
+      touched = true;
+      group.stoppedRecipients.add(recipient);
+      log.info('Stopped watching bundler recipient in active group', {
+        feePayer: feePayerAddress,
+        anchorKey,
+        recipient,
+        reason,
+        stopped: group.stoppedRecipients.size,
+        total: group.recipients.size,
+      });
+      if (group.stoppedRecipients.size >= group.recipients.size) {
+        this.abandonActiveGroup(
+          watch,
+          anchorKey,
+          'all recipients in group drained or zero',
+          false,
+        );
+      }
+    }
+    if (!touched) return;
+
+    if (!this.recipientStillNeeded(watch, recipient)) {
+      this.unsubscribeSingleRecipient(watch, recipient);
+    }
+    this.updateWatchCandidateStatus(watch);
+    void this.evaluateBundlerGroups(watch);
+  }
+
+  private checkRecipientDrain(
+    watch: PotentialFeePayerWatch,
+    recipient: string,
+    tx: HeliusTransaction,
+  ): boolean {
+    const inAnyGroup = [...watch.activeGroups.values()].some((g) =>
+      g.recipients.has(recipient),
+    );
+    if (!inAnyGroup) return false;
+    if (
+      [...watch.activeGroups.values()].every(
+        (g) => !g.recipients.has(recipient) || g.stoppedRecipients.has(recipient),
+      )
+    ) {
+      return false;
+    }
+
+    const baseline = watch.recipientBalanceAtReceive.get(recipient);
+    if (baseline === undefined) return false;
+
+    const postBalanceSol = this.getAccountPostBalanceSol(tx, recipient);
+    if (postBalanceSol === null) return false;
+
+    if (
+      this.hasOutgoingSolFrom(tx, recipient) &&
+      postBalanceSol <= baseline * HALF_DRAIN_RATIO
+    ) {
+      this.markRecipientStoppedInGroup(
+        watch.address,
+        recipient,
+        'balance drained to ≤50% after feePayer receive',
+      );
+      return true;
+    }
+    return false;
   }
 
   private findBundlerGroup(
     watch: PotentialFeePayerWatch,
     band: 'normal' | 'low',
   ): BundlerFundingEvent[] | null {
-    const events = watch.bundlerFundingEvents
-      .filter((e) => e.band === band)
-      .sort((a, b) => a.timestamp - b.timestamp);
-    for (let i = 0; i < events.length; i += 1) {
-      const anchor = events[i];
-      const window = events.filter(
-        (e) =>
-          e.timestamp >= anchor.timestamp &&
-          e.timestamp <= anchor.timestamp + GROUP_WINDOW_SEC,
-      );
-      const uniqueRecipients = new Map<string, BundlerFundingEvent>();
-      for (const e of window) {
-        if (!uniqueRecipients.has(e.recipient)) uniqueRecipients.set(e.recipient, e);
-      }
-      const group = [...uniqueRecipients.values()];
-      if (group.length >= MIN_BUNDLER_GROUP && group.length <= MAX_BUNDLER_GROUP) {
-        return group;
-      }
-    }
-    return null;
+    return this.findAllBundlerGroups(watch, band)[0] ?? null;
   }
 
   private subscribeRecipients(watch: PotentialFeePayerWatch, recipients: string[]): void {
@@ -503,6 +837,11 @@ export class FunderFirstOrchestrator extends EventEmitter {
       const owner = this.recipientToFeePayer.get(recipient);
       if (owner === watch.address) {
         this.recipientToFeePayer.delete(recipient);
+      }
+      const subId = watch.recipientZeroBalanceSubIds.get(recipient);
+      if (subId !== undefined) {
+        void this.connection.removeAccountChangeListener(subId).catch(() => undefined);
+        watch.recipientZeroBalanceSubIds.delete(recipient);
       }
     }
     watch.subscribedRecipients.clear();
@@ -550,6 +889,8 @@ export class FunderFirstOrchestrator extends EventEmitter {
     }
     if (seen.has(tx.signature)) return;
     seen.add(tx.signature);
+
+    if (this.checkRecipientDrain(watch, recipient, tx)) return;
 
     const mint = this.findSwapBuyMint(tx, recipient);
     if (!mint || mint === SOL_MINT) return;
@@ -610,7 +951,12 @@ export class FunderFirstOrchestrator extends EventEmitter {
       watch.detectedMint = mint;
       watch.detectedDevWallet = devWallet;
 
-      if (watch.mode === 'low') {
+      const buyWalletGroup = [...watch.activeGroups.values()].find((g) =>
+        g.recipients.has(buyWallet),
+      );
+      const confirmBand = buyWalletGroup?.band ?? watch.mode;
+
+      if (confirmBand === 'low') {
         void this.sendTelegram([
           '<b>📋 Funder-First: Low-Funding Token Noted (no buy)</b>',
           `Token: <code>${this.html(mint)}</code>`,
@@ -633,6 +979,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       }
 
       watch.status = 'active';
+      watch.activeGroups.clear();
       this.unsubscribePotentialFeePayerOnly(watch);
 
       const started = await this.insiderBot.startFromFunderFirst(
@@ -643,8 +990,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       if (!started) {
         watch.status = 'normal_candidate';
         this.resubscribePotentialFeePayer(watch);
-        const group = this.findBundlerGroup(watch, 'normal');
-        if (group) this.subscribeRecipients(watch, group.map((e) => e.recipient));
+        void this.evaluateBundlerGroups(watch);
         return;
       }
 
@@ -707,6 +1053,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
     devWallet: string | null,
   ): void {
     watch.status = 'cooldown';
+    watch.activeGroups.clear();
     this.unsubscribePotentialFeePayerOnly(watch);
     if (!devWallet || !this.enhancedWs) return;
     this.cooldownsByDev.set(devWallet, watch.address);
@@ -747,8 +1094,10 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.detectedMint = null;
     watch.detectedDevWallet = null;
     watch.mode = null;
-    watch.normalNoteSent = false;
-    watch.lowNoteSent = false;
+    watch.activeGroups.clear();
+    watch.exhaustedGroupAnchors.clear();
+    watch.notifiedGroupAnchors.clear();
+    watch.recipientBalanceAtReceive.clear();
     watch.bundlerFundingEvents = [];
     this.resubscribePotentialFeePayer(watch);
   }
