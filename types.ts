@@ -130,7 +130,6 @@ export interface ServiceConfig {
   tradingWalletAddress: string | null;
   solanaRpcUrl: string;
   solanaWsUrl: string;
-  walletPollInterval: number;
   minBuySol: number;
   gmgnApiKey: string;
   gmgnApiKey2: string;
@@ -188,7 +187,6 @@ export interface ServiceConfig {
   insiderFollowWallet4: string | null;
   /** Top-level feePayer funder wallet for the parallel funder-first discovery flow. */
   insiderFeePayerFunderAddress: string | null;
-  defaultBotMode: 'insider' | 'tokentransfer';
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;
@@ -209,13 +207,6 @@ export interface NewTokenEvent {
   signature?: string;
   timestamp?: number;
   matchingWallets?: string[];
-}
-
-export interface TokenExitEvent {
-  walletAddress: string;
-  mint: string;
-  detectedAt: number;
-  source: string;
 }
 
 export interface MonitorSampleEvent {

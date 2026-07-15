@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-15 (7)
+
+### Remove Token Transfer mode; drop all idle token-account RPC polling
+
+- Deleted `token-transfer-orchestrator.ts` and removed every Token Transfer code path from `index.ts` (orchestrator, callbacks, startup/shutdown, Telegram UI).
+- `WalletMonitor` no longer runs any recurring `getParsedTokenAccountsByOwner` poll — only a one-time startup snapshot; buy detection is push-driven (Enhanced WSS primary, `onLogs` + `getParsedTransaction` fallback).
+- Removed dead config: `DEFAULT_BOT_MODE`, `WALLET_POLL_INTERVAL`, `defaultBotMode`, `walletPollInterval`, and unused `TokenExitEvent` type.
+
 ## 2026-07-15 (6)
 
 ### Follow-wallet: drop idle token-account RPC poll when Enhanced WSS is up

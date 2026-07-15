@@ -4,8 +4,7 @@
 //  On start:
 //    1. Fetch all current token accounts → existingTokens set (NOT monitored)
 //    2. Push-driven buy detection (Enhanced WSS when available, else onLogs + RPC)
-//    3. Token-account RPC poll only when Enhanced WSS is unavailable (backstop)
-//    4. Any mint not in existingTokens and not yet tracked → emit 'newToken'
+//    3. Any mint not in existingTokens and not yet tracked → emit 'newToken'
 // ─────────────────────────────────────────────────────────────────────────────
 
 import {
@@ -19,7 +18,7 @@ import { EventEmitter } from 'events';
 import { createLogger, Logger } from './logger';
 import { HeliusTransaction } from './helius-client';
 import { HeliusEnhancedWsClient } from './helius-enhanced-ws';
-import { NewTokenEvent, ServiceConfig, TokenExitEvent, TokenHolding } from './types';
+import { NewTokenEvent, ServiceConfig, TokenHolding } from './types';
 
 const WALLET_COMMITMENT = 'processed';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -29,16 +28,12 @@ const TOKEN_PROGRAM_IDS = [
   new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'),
 ];
 
-/** How often to re-check Enhanced WSS health without issuing RPC polls. */
-const ENHANCED_WS_HEALTH_CHECK_MS = 15_000;
-
 // ── WalletMonitor ─────────────────────────────────────────────────────────────
 
 export class WalletMonitor extends EventEmitter {
   private readonly log: Logger;
   private readonly connection: Connection;
   private readonly walletPubkey: PublicKey;
-  private readonly pollInterval: number;
   private readonly minBuySol: number;
   private readonly wsEndpoint: string;
 
@@ -58,10 +53,9 @@ export class WalletMonitor extends EventEmitter {
   private readonly enhancedSeenSignatures = new Set<string>();
 
   /** Signatures currently being parsed from websocket notifications. */
-  private pendingSignatures: Set<string> = new Set();
-  private minBuyUnknownLogged: Set<string> = new Set();
+  private pendingSignatures = new Set<string>();
+  private minBuyUnknownLogged = new Set<string>();
 
-  private pollTimer: NodeJS.Timeout | null = null;
   private running = false;
   private activeProcessingCount = 0;
   private readonly MAX_CONCURRENT_PROCESSING = 3;
@@ -100,7 +94,6 @@ export class WalletMonitor extends EventEmitter {
       throw new Error(`Invalid wallet address: ${walletAddress}`);
     }
 
-    this.pollInterval = config.walletPollInterval;
     if (options.minBuySol !== undefined) {
       this.minBuySol = options.minBuySol;
     } else {
@@ -118,13 +111,12 @@ export class WalletMonitor extends EventEmitter {
 
     this.log.info(`Starting wallet monitor for ${this.walletPubkey.toBase58()}`);
     if (this.enhancedWs) {
-      this.log.info('Push path: Helius Enhanced WSS transactionSubscribe (no token-account RPC poll while connected)');
+      this.log.info('Push path: Helius Enhanced WSS transactionSubscribe');
     } else {
-      this.log.info(`Poll interval: ${this.pollInterval}ms`);
       this.log.info(`Websocket endpoint: ${this.wsEndpoint}`);
     }
 
-    // Snapshot existing holdings — these are NOT monitored
+    // One-time snapshot so pre-existing holdings are not treated as new buys.
     const initial = await this.fetchHoldings();
     for (const h of initial) {
       if (!this.hasPositiveBalance(h)) continue;
@@ -135,7 +127,7 @@ export class WalletMonitor extends EventEmitter {
 
     this.log.info(
       `Snapshot taken: ${this.existingTokens.size} existing token(s) — these will NOT be monitored`,
-      { mints: [...this.existingTokens] }
+      { mints: [...this.existingTokens] },
     );
 
     if (this.enhancedWs) {
@@ -143,15 +135,10 @@ export class WalletMonitor extends EventEmitter {
     } else {
       this.startLogsSubscription();
     }
-    this.schedulePollBackstop();
   }
 
   stop(): void {
     this.running = false;
-    if (this.pollTimer) {
-      clearTimeout(this.pollTimer);
-      this.pollTimer = null;
-    }
     if (this.enhancedWatchId !== null && this.enhancedWs) {
       const id = this.enhancedWatchId;
       this.enhancedWatchId = null;
@@ -169,29 +156,8 @@ export class WalletMonitor extends EventEmitter {
     this.log.info('Wallet monitor stopped');
   }
 
-  // ── Snapshot accessor (for DB pre-population) ─────────────────────────────
-
   get existingMints(): ReadonlySet<string> {
     return this.existingTokens;
-  }
-
-  // ── Polling ───────────────────────────────────────────────────────────────
-
-  private schedulePollBackstop(): void {
-    if (!this.running) return;
-    const wsHealthy = this.enhancedWs?.isConnected ?? false;
-    if (this.enhancedWs && wsHealthy) {
-      this.pollTimer = setTimeout(() => {
-        this.schedulePollBackstop();
-      }, ENHANCED_WS_HEALTH_CHECK_MS);
-      return;
-    }
-    const delay = this.enhancedWs
-      ? Math.min(this.pollInterval, 4_000)
-      : this.pollInterval;
-    this.pollTimer = setTimeout(() => {
-      this.poll().catch((err) => this.log.error('Poll error', err));
-    }, delay);
   }
 
   private startEnhancedWsSubscription(): void {
@@ -283,17 +249,14 @@ export class WalletMonitor extends EventEmitter {
           return;
         }
 
-        // --- PRE-FILTER LOGS ---
-        // Only process transactions that look like token swaps or transfers.
-        // This drastically reduces RPC calls for highly active wallets.
         const logs = logInfo.logs || [];
-        const isLikelyTokenTx = logs.some(l => 
-          l.includes('Transfer') || 
-          l.includes('Swap') || 
-          l.includes('Buy') || 
-          l.includes('Sell') || 
+        const isLikelyTokenTx = logs.some((l) =>
+          l.includes('Transfer') ||
+          l.includes('Swap') ||
+          l.includes('Buy') ||
+          l.includes('Sell') ||
           l.includes('Route') ||
-          l.includes('Token')
+          l.includes('Token'),
         );
 
         if (!isLikelyTokenTx) {
@@ -303,41 +266,14 @@ export class WalletMonitor extends EventEmitter {
 
         this.log.info(`[WS TX] ${logInfo.signature}`);
         this.processSignature(logInfo.signature, 'logsSubscribe').catch((err) =>
-          this.log.error(`Failed to process logs signature ${logInfo.signature}`, err)
+          this.log.error(`Failed to process logs signature ${logInfo.signature}`, err),
         );
       },
-      WALLET_COMMITMENT
+      WALLET_COMMITMENT,
     );
 
     this.log.info(`WS logsSubscribe active (id=${this.logsSubscriptionId})`);
   }
-
-  private async poll(): Promise<void> {
-    try {
-      const holdings = await this.fetchHoldings();
-      const now = Date.now();
-      const currentlyHeld = new Set<string>();
-
-      this.log.debug(`Poll complete: ${holdings.length} holding(s)`);
-
-      for (const holding of holdings) {
-        if (!this.hasPositiveBalance(holding)) {
-          this.log.debug(`Skipping zero-balance mint ${holding.mint}; will keep watching`);
-          continue;
-        }
-        currentlyHeld.add(holding.mint);
-
-        this.emitNewToken(holding.mint, now, holding.uiAmount ?? holding.amount, 'account-poll', null);
-      }
-      this.detectExitedTokens(currentlyHeld, now, 'account-poll');
-    } catch (err) {
-      this.log.error('Failed to poll wallet holdings', err);
-    } finally {
-      this.schedulePollBackstop();
-    }
-  }
-
-  // ── RPC: fetch SPL token accounts ─────────────────────────────────────────
 
   private async fetchHoldings(): Promise<TokenHolding[]> {
     const holdings: TokenHolding[] = [];
@@ -346,7 +282,7 @@ export class WalletMonitor extends EventEmitter {
       const resp = await this.connection.getParsedTokenAccountsByOwner(
         this.walletPubkey,
         { programId },
-        WALLET_COMMITMENT
+        WALLET_COMMITMENT,
       );
 
       for (const { account } of resp.value) {
@@ -373,9 +309,8 @@ export class WalletMonitor extends EventEmitter {
   private async processSignature(signature: string, source: string): Promise<void> {
     if (!this.running || this.pendingSignatures.has(signature)) return;
 
-    // Concurrency limit to avoid hitting RPC rate limits (429)
     while (this.activeProcessingCount >= this.MAX_CONCURRENT_PROCESSING) {
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, 100));
       if (!this.running) return;
     }
 
@@ -386,21 +321,14 @@ export class WalletMonitor extends EventEmitter {
       const boughtMints = await this.fetchBoughtMintsFromSignature(signature);
       if (!boughtMints) return;
 
-      if (boughtMints.length === 0) {
-        this.log.debug(`[WS TX] ${signature} parsed: no wallet token balance increase`);
-      }
-
       for (const buy of boughtMints) {
         if (this.knownMints.has(buy.mint)) {
-          // Update held status but don't emit as new
           this.heldMints.add(buy.mint);
           continue;
         }
 
-        // New token detected!
         this.log.info(`[WS BUY] ${signature} -> ${buy.mint}`, { buySol: buy.buySol });
-        
-        // Emit general buy event for any detected balance increase
+
         this.emit('buyDetected', {
           walletAddress: this.walletPubkey.toBase58(),
           mint: buy.mint,
@@ -410,7 +338,15 @@ export class WalletMonitor extends EventEmitter {
           timestamp: buy.timestamp,
         });
 
-        this.emitNewToken(buy.mint, Date.now(), 'tx-detected', source, buy.buySol, signature, buy.timestamp);
+        this.emitNewToken(
+          buy.mint,
+          Date.now(),
+          'tx-detected',
+          source,
+          buy.buySol,
+          signature,
+          buy.timestamp,
+        );
       }
     } finally {
       this.pendingSignatures.delete(signature);
@@ -419,7 +355,7 @@ export class WalletMonitor extends EventEmitter {
   }
 
   private async fetchBoughtMintsFromSignature(
-    signature: string
+    signature: string,
   ): Promise<Array<{ mint: string; buySol: number | null; timestamp?: number }> | null> {
     let tx = null;
     for (let attempt = 1; attempt <= 5; attempt++) {
@@ -441,15 +377,19 @@ export class WalletMonitor extends EventEmitter {
     const postBalances = tx.meta?.postTokenBalances ?? [];
     const accountKeys = tx.transaction.message.accountKeys;
     const walletIndex = accountKeys.findIndex((key) =>
-      key.pubkey.equals(this.walletPubkey)
+      key.pubkey.equals(this.walletPubkey),
     );
-    const buySol = this.estimateSolSpent(tx.meta?.preBalances, tx.meta?.postBalances, walletIndex);
+    const buySol = this.estimateSolSpent(
+      tx.meta?.preBalances,
+      tx.meta?.postBalances,
+      walletIndex,
+    );
 
     for (const post of postBalances) {
       if (post.owner !== this.walletPubkey.toBase58()) continue;
 
       const before = preBalances.find(
-        (pre) => pre.accountIndex === post.accountIndex && pre.mint === post.mint
+        (pre) => pre.accountIndex === post.accountIndex && pre.mint === post.mint,
       );
       const preAmount = BigInt(before?.uiTokenAmount.amount ?? '0');
       const postAmount = BigInt(post.uiTokenAmount.amount);
@@ -459,13 +399,17 @@ export class WalletMonitor extends EventEmitter {
       }
     }
 
-    return [...boughtMints].map((mint) => ({ mint, buySol, timestamp: tx.blockTime ?? undefined }));
+    return [...boughtMints].map((mint) => ({
+      mint,
+      buySol,
+      timestamp: tx.blockTime ?? undefined,
+    }));
   }
 
   private estimateSolSpent(
     preBalances: number[] | undefined,
     postBalances: number[] | undefined,
-    walletIndex: number
+    walletIndex: number,
   ): number | null {
     if (!preBalances || !postBalances || walletIndex < 0) return null;
     const pre = preBalances[walletIndex];
@@ -477,24 +421,6 @@ export class WalletMonitor extends EventEmitter {
       : 0;
   }
 
-  private detectExitedTokens(currentlyHeld: Set<string>, detectedAt: number, source: string): void {
-    for (const mint of this.heldMints) {
-      if (currentlyHeld.has(mint)) continue;
-      this.knownMints.delete(mint);
-      this.existingTokens.delete(mint);
-      this.minBuyUnknownLogged.delete(mint);
-      this.log.info(`[TOKEN EXITED] Mint: ${mint}  Source: ${source}`);
-      const event: TokenExitEvent = {
-        walletAddress: this.walletPubkey.toBase58(),
-        mint,
-        detectedAt,
-        source,
-      };
-      this.emit('tokenExited', event);
-    }
-    this.heldMints = currentlyHeld;
-  }
-
   private emitNewToken(
     mint: string,
     detectedAt: number,
@@ -502,7 +428,7 @@ export class WalletMonitor extends EventEmitter {
     source: string,
     buySol: number | null,
     signature?: string,
-    timestamp?: number
+    timestamp?: number,
   ): void {
     if (this.knownMints.has(mint)) return;
 
@@ -511,7 +437,7 @@ export class WalletMonitor extends EventEmitter {
         if (!this.minBuyUnknownLogged.has(mint)) {
           this.log.info(
             `[WAIT TOKEN] Mint: ${mint}  Source: ${source}  ` +
-            `Reason: buy SOL unknown, waiting for tx parse to check min ${this.minBuySol} SOL`
+              `Reason: buy SOL unknown, waiting for tx parse to check min ${this.minBuySol} SOL`,
           );
           this.minBuyUnknownLogged.add(mint);
         }
@@ -520,7 +446,7 @@ export class WalletMonitor extends EventEmitter {
       if (buySol < this.minBuySol) {
         this.log.info(
           `[SKIP TOKEN] Mint: ${mint}  Buy: ${buySol} SOL  ` +
-          `Min: ${this.minBuySol} SOL  Source: ${source}`
+            `Min: ${this.minBuySol} SOL  Source: ${source}`,
         );
         this.knownMints.add(mint);
         return;
@@ -528,7 +454,9 @@ export class WalletMonitor extends EventEmitter {
     }
 
     this.knownMints.add(mint);
-    this.log.info(`[NEW TOKEN] Mint: ${mint}  Amount: ${amount}  Source: ${source}  BuySOL: ${buySol ?? 'unknown'}`);
+    this.log.info(
+      `[NEW TOKEN] Mint: ${mint}  Amount: ${amount}  Source: ${source}  BuySOL: ${buySol ?? 'unknown'}`,
+    );
 
     const event: NewTokenEvent = {
       walletAddress: this.walletPubkey.toBase58(),

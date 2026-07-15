@@ -71,10 +71,6 @@ function isValidGmgnFetchMode(s: string): s is ServiceConfig['gmgnFetchMode'] {
   return ['auto', 'direct', 'cli'].includes(s);
 }
 
-function isValidDefaultBotMode(s: string): s is ServiceConfig['defaultBotMode'] {
-  return ['insider', 'tokentransfer'].includes(s);
-}
-
 export function loadConfig(): ServiceConfig {
   const walletAddress    = optionalNullable('WALLET_ADDRESS');
   const tradingWalletAddress = optionalNullable('TRADING_WALLET_ADDRESS');
@@ -159,14 +155,12 @@ export function loadConfig(): ServiceConfig {
   const insiderFeePayerFunderAddress = optionalNullable(
     'INSIDER_FEEPAYER_FUNDER_ADDRESS',
   );
-  const defaultBotMode = optional('DEFAULT_BOT_MODE', 'insider').toLowerCase();
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
   const sellAutoSlippage = optionalBoolean('SELL_AUTO_SLIPPAGE', false);
   const sellAntiMev      = optionalBoolean('SELL_ANTI_MEV', true);
 
-  const walletPollInterval     = optionalInt('WALLET_POLL_INTERVAL', 5_000);
   const minBuySol              = optionalNumber('MIN_BUY_SOL', 8);
   const monitorInterval        = optionalInt('MONITOR_INTERVAL', 2_000);
   const monitoringWindowMs     = optionalInt('MONITOR_WINDOW_MS', 60_000);
@@ -193,9 +187,6 @@ export function loadConfig(): ServiceConfig {
   if (!isValidGmgnFetchMode(gmgnFetchMode)) {
     throw new Error(`GMGN_FETCH_MODE must be one of auto|direct|cli, got: ${gmgnFetchMode}`);
   }
-  if (!isValidDefaultBotMode(defaultBotMode)) {
-    throw new Error(`DEFAULT_BOT_MODE must be one of insider|tokentransfer, got: ${defaultBotMode}`);
-  }
 
   // Sanity checks
   if (monitorInterval < 1_000) {
@@ -218,7 +209,6 @@ export function loadConfig(): ServiceConfig {
     tradingWalletAddress,
     solanaRpcUrl,
     solanaWsUrl,
-    walletPollInterval,
     minBuySol,
     gmgnApiKey,
     gmgnApiKey2,
@@ -275,7 +265,6 @@ export function loadConfig(): ServiceConfig {
     insiderFollowWallet3,
     insiderFollowWallet4,
     insiderFeePayerFunderAddress,
-    defaultBotMode,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,

@@ -5,7 +5,7 @@
 //    1. Load + validate environment config
 //    2. Open SQLite database
 //    3. Initialise RateLimiter + GmgnClient
-//    4. Initialise TokenTransferOrchestrator
+//    4. Initialise FunderFirstOrchestrator + insider bot listeners
 //    5. Initialise TelegramBot
 //    6. Register SIGINT/SIGTERM for graceful shutdown
 // ─────────────────────────────────────────────────────────────────────────────
@@ -29,7 +29,6 @@ import {
   SellResult,
   SellQuote,
 } from "./types";
-import { TokenTransferOrchestrator } from "./token-transfer-orchestrator";
 import { FunderFirstOrchestrator } from "./funder-first-orchestrator";
 import { InsiderBot } from "./insider-bot";
 import type { InsiderMintClaimFn } from "./insider-bot";
@@ -216,11 +215,8 @@ async function main(): Promise<void> {
   const insiderBots: InsiderBot[] = [];
   let activeInsiderIndex = 0; // Insider UI is pinned to bot 1; keys 2-4 provide API capacity.
 
-  // ── 4. Token Transfer Orchestrator ────────────────────────────────────────
-  let tokenTransferOrchestrator: TokenTransferOrchestrator;
+  // ── 4. Orchestrators ──────────────────────────────────────────────────────
   let funderFirstOrchestrator: FunderFirstOrchestrator;
-  let botMode: "insider" | "tokentransfer" = config.defaultBotMode;
-  let tokenTransferBuyInProgress = false;
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
@@ -239,7 +235,6 @@ async function main(): Promise<void> {
           | "insiderBundlerMaxUsd";
         index: number;
       }
-    | { type: "tokenTransferDevAddress" | "tokenTransferBuySol" }
     | { type: "funderFirstFunderAddress" };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
 
@@ -641,62 +636,6 @@ async function main(): Promise<void> {
     return false;
   }
 
-  /**
-   * Shared by the Telegram "Sell Position" button and the automatic
-   * Token Transfer sell-signal (return transfer-in worth >= the original
-   * transfer-out). Clears the active position and kicks off the normal
-   * sell pipeline; `chatId` is null for automatic triggers, which rely on
-   * the sell receipt's own broadcast rather than a direct reply.
-   */
-  function triggerTokenTransferSell(
-    mint: string,
-    reason: string,
-    chatId: string | null,
-  ): string {
-    const position = tokenTransferOrchestrator.getActivePosition();
-    if (!position || position.mint !== mint) {
-      return "No active Token Transfer position for that token.";
-    }
-    if (!config.tradingWalletAddress) {
-      return "No TRADING_WALLET_ADDRESS configured.";
-    }
-    if (hasPendingSellForMint(config.tradingWalletAddress, mint)) {
-      return "Sell already pending for this token.";
-    }
-
-    const event: FilterFailEvent = {
-      walletAddress: config.tradingWalletAddress,
-      mint,
-      sampleNumber: 0,
-      elapsedSec: 0,
-      reasons: [reason],
-      settings: db.getWalletSettings(config.tradingWalletAddress),
-      metrics: {
-        mint,
-        timestamp: new Date().toISOString(),
-        bundlersPercent: null,
-        bundlersCount: null,
-        initialBaseReserve: null,
-        topWallets: null,
-        top10HolderRate: null,
-        bundledAmountRate: null,
-      },
-      buySol: position.buySol,
-      matchingWallets: [],
-    };
-
-    const sellId = randomBytes(5).toString("hex");
-    pendingSells.set(sellId, {
-      event,
-      createdAt: Date.now(),
-      executing: true,
-    });
-    tokenTransferOrchestrator.clearActivePosition(reason);
-
-    void executeSellAndNotify(chatId, sellId, telegramBot);
-    return "Sell signal sent.";
-  }
-
   async function handleTelegramCommand(
     _chatId: string,
     text: string,
@@ -729,13 +668,9 @@ async function main(): Promise<void> {
         if (data === "menu:refresh") return homeReply(true);
         if (data.startsWith("r:m:")) {
           const [, , mint, contextCode] = parts;
-          let context: "insider" | "tokentransfer" = "tokentransfer";
           let resolvedBotIndex: number | null = null;
 
-          if (contextCode === "t") {
-            context = "tokentransfer";
-          } else if (contextCode === "i" || contextCode?.startsWith("i")) {
-            context = "insider";
+          if (contextCode === "i" || contextCode?.startsWith("i")) {
             if (contextCode && contextCode.length > 1) {
               const parsed = parseInt(contextCode.slice(1), 10);
               if (Number.isFinite(parsed)) resolvedBotIndex = parsed;
@@ -752,12 +687,8 @@ async function main(): Promise<void> {
           const botIndex =
             resolvedBotIndex ??
             insiderBots.findIndex((b) => b.getActivePosition()?.mint === mint);
-          const effectiveBotIndex =
-            context === "insider" && botIndex !== -1 ? botIndex : 0;
-          const client =
-            context === "insider"
-              ? gmgnClients[effectiveBotIndex]
-              : gmgnClients[0];
+          const effectiveBotIndex = botIndex !== -1 ? botIndex : 0;
+          const client = gmgnClients[effectiveBotIndex];
 
           try {
             const cached = activePositionCache.get(mint);
@@ -802,9 +733,7 @@ async function main(): Promise<void> {
             [currentMarketCapUsd, athMarketCapUsd, currentPrice] =
               await Promise.all([
                 client.fetchTokenMarketCapUsd(mint),
-                context === "insider"
-                  ? client.fetchTokenAthMarketCapUsd(mint)
-                  : Promise.resolve(null),
+                client.fetchTokenAthMarketCapUsd(mint),
                 quotePromise,
               ]);
             await balancePromise;
@@ -821,26 +750,11 @@ async function main(): Promise<void> {
             quoteError = err instanceof Error ? err.message : String(err);
           }
 
-          let buySol = 0;
-          let entryMc: number | null = null;
-          let exitMc: number | null = null;
-          let insiderProfitExitDisabled = false;
-
-          if (context === "insider") {
-            const bot =
-              botIndex !== -1 ? insiderBots[botIndex] : insiderBots[0];
-            buySol = bot.getBuySol();
-            entryMc = bot.getEntryMc();
-            exitMc = bot.getExitMc();
-            insiderProfitExitDisabled = bot.isProfitExitDisabled();
-          } else if (context === "tokentransfer") {
-            const position = tokenTransferOrchestrator.getActivePosition();
-            buySol = position?.buySol ?? tokenTransferOrchestrator.getBuySol();
-            entryMc = position?.entryMc ?? null;
-            // Token Transfer mode has no automatic MC exit target — the
-            // position is only ever closed via the manual Sell Position button.
-            exitMc = null;
-          }
+          const bot =
+            botIndex !== -1 ? insiderBots[botIndex] : insiderBots[0];
+          const entryMc = bot.getEntryMc();
+          const exitMc = bot.getExitMc();
+          const insiderProfitExitDisabled = bot.isProfitExitDisabled();
 
           const marketCapPnlPct =
             entryMc !== null && entryMc > 0 && currentMarketCapUsd !== null
@@ -856,25 +770,22 @@ async function main(): Promise<void> {
               ? `Token Balance: <code>${html(tokenBalance.toString())}</code>`
               : null;
 
-          const refreshContextCode =
-            context === "insider" ? `i${effectiveBotIndex}` : "t";
+          const refreshContextCode = `i${effectiveBotIndex}`;
 
           const lines = [
-            context === "insider"
-              ? `<b>Insider ${getInsiderBotNumber(effectiveBotIndex)} Position Update</b>`
-              : "<b>Token Transfer Position Update</b>",
+            `<b>Insider ${getInsiderBotNumber(effectiveBotIndex)} Position Update</b>`,
             `Token: <code>${html(mint)}</code>`,
             entryMc !== null
               ? `Entry MC: <b>$${entryMc.toLocaleString()}</b>`
               : null,
             `Market Cap: <b>$${currentMarketCapUsd?.toLocaleString() ?? "Unknown"}</b>`,
-            context === "insider" && athMarketCapUsd !== null
+            athMarketCapUsd !== null
               ? `ATH MC: <b>$${athMarketCapUsd.toLocaleString()}</b>`
               : null,
-            context === "insider" && exitMc !== null
+            exitMc !== null
               ? `Exit MC: <b>$${exitMc.toLocaleString()}</b>`
               : null,
-            context === "insider" && insiderProfitExitDisabled
+            insiderProfitExitDisabled
               ? "Exit MC status: <b>Disabled — waiting for recipient sell-all/zero-SOL exit</b>"
               : null,
             profitDisplay,
@@ -885,13 +796,10 @@ async function main(): Promise<void> {
 
           const buttons = [];
 
-          if ((context === "insider" || context === "tokentransfer") && !balanceIsZero) {
+          if (!balanceIsZero) {
             buttons.push({
               text: "🔴 Sell Position",
-              callback_data:
-                context === "insider"
-                  ? `sell:insider:${mint}:${effectiveBotIndex}`
-                  : `sell:tokentransfer:${mint}`,
+              callback_data: `sell:insider:${mint}:${effectiveBotIndex}`,
             });
             buttons.push({
               text: "🔄 Refresh",
@@ -934,55 +842,8 @@ async function main(): Promise<void> {
 
           return "Sell signal sent.";
         }
-        if (data.startsWith("sell:tokentransfer:")) {
-          const [, , mint] = parts;
-          return triggerTokenTransferSell(
-            mint,
-            "Manual sell requested via Telegram button (Token Transfer mode).",
-            chatId,
-          );
-        }
         if (data === "menu:wallets") return walletsReply(chatId, true);
         if (data === "menu:status") return statusReply(true);
-        if (data === "mode:insider") {
-          // Insider and Token Transfer run independently of each other and
-          // stay active in the background regardless of which one is on
-          // screen — this button only changes which card is shown/edited.
-          log.info("[MODE SWITCH] Displaying Insider card");
-          botMode = "insider";
-          await resumePrimaryInsiderBot();
-          return homeReply(true);
-        }
-        if (data === "mode:tokentransfer") {
-          log.info("[MODE SWITCH] Displaying Token Transfer card");
-          botMode = "tokentransfer";
-          await startTokenTransferModeServices();
-          return homeReply(true);
-        }
-        if (data === "tokentransfer:setdev") {
-          pendingTelegramActions.set(chatId, { type: "tokenTransferDevAddress" });
-          return {
-            text: "Send the dev wallet address for Token Transfer mode to watch.",
-            trackPrompt: true,
-            editCurrent: true,
-          };
-        }
-        if (data === "tokentransfer:buysol") {
-          pendingTelegramActions.set(chatId, { type: "tokenTransferBuySol" });
-          return {
-            text: "Send the SOL amount Token Transfer mode should buy with.",
-            trackPrompt: true,
-            editCurrent: true,
-          };
-        }
-        if (data === "tokentransfer:start") {
-          await tokenTransferOrchestrator.start();
-          return homeReply(true);
-        }
-        if (data === "tokentransfer:stop") {
-          tokenTransferOrchestrator.stop("Stopped from Telegram");
-          return homeReply(true);
-        }
         if (data.startsWith("insider:select:")) {
           activeInsiderIndex = 0;
           return homeReply(true);
@@ -1328,17 +1189,6 @@ async function main(): Promise<void> {
             );
             return homeReply();
           }
-          if (pendingAction.type === "tokenTransferDevAddress") {
-            tokenTransferOrchestrator.setDevAddress(text.trim());
-            return homeReply();
-          }
-          if (pendingAction.type === "tokenTransferBuySol") {
-            const value = Number(text.trim());
-            if (!Number.isFinite(value) || value <= 0)
-              return "Send a SOL amount greater than 0.";
-            tokenTransferOrchestrator.setBuySol(value);
-            return homeReply();
-          }
           if (pendingAction.type === "funderFirstFunderAddress") {
             try {
               funderFirstOrchestrator.setFunderAddress(text.trim());
@@ -1351,18 +1201,15 @@ async function main(): Promise<void> {
             return homeReply();
           }
         }
-        if (botMode === "insider") {
-          const started = await followInsiderWalletWithUsageGuard(
-            activeInsiderIndex,
-            text,
-            "telegram follow-wallet setup",
-          );
-          if (!started) {
-            return "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
-          }
-          return homeReply();
+        const started = await followInsiderWalletWithUsageGuard(
+          activeInsiderIndex,
+          text,
+          "telegram follow-wallet setup",
+        );
+        if (!started) {
+          return "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
         }
-        return walletSummaryReply(text);
+        return homeReply();
       }
 
       return "Unknown command. Send /help.";
@@ -1484,14 +1331,8 @@ async function main(): Promise<void> {
   // Telegram polling is intentionally NOT started yet — it's started further
   // down, once every orchestrator/bot event listener is wired up. Otherwise
   // an incoming /start (or a queued update from before a restart) could be
-  // handled while `tokenTransferOrchestrator` or the insider buyTrigger/
-  // sellTrigger listeners don't exist yet, silently dropping that update.
-
-  tokenTransferOrchestrator = new TokenTransferOrchestrator(
-    config,
-    telegramBot,
-    sharedEnhancedWs,
-  );
+  // handled while insider buyTrigger/sellTrigger listeners don't exist yet,
+  // silently dropping that update.
 
   funderFirstOrchestrator = new FunderFirstOrchestrator(
     config,
@@ -1499,124 +1340,6 @@ async function main(): Promise<void> {
     telegramBot,
     sharedEnhancedWs,
   );
-
-  tokenTransferOrchestrator.on("buyTrigger", (trigger) => {
-    // Token Transfer's dev-wallet watch is started/stopped explicitly via its
-    // own Start/Stop buttons, independent of which card is currently shown —
-    // so a buy trigger here is always honored, even while Insider mode's
-    // card is on screen. (Insider mode's buys are likewise never gated on
-    // which card is shown.) Both can run and buy/sell concurrently.
-    if (!config.tradingWalletAddress) {
-      log.warn("[TOKEN TRANSFER BUY SKIP] No trading wallet configured", trigger);
-      tokenTransferOrchestrator.clearActivePosition("No trading wallet configured");
-      return;
-    }
-
-    if (tokenTransferBuyInProgress) {
-      log.info(
-        "[TOKEN TRANSFER BUY SKIP] A buy is already in progress",
-        trigger,
-      );
-      return;
-    }
-
-    void (async () => {
-      tokenTransferBuyInProgress = true;
-      try {
-        const result = await gmgnClients[0].buyTokenWithSol(
-          config.tradingWalletAddress!,
-          trigger.mint,
-          {
-            solAmount: tokenTransferOrchestrator.getBuySol(),
-            slippage: config.sellSlippage,
-            autoSlippage: config.sellAutoSlippage,
-            priorityFeeSol: config.sellPriorityFeeSol,
-          },
-        );
-
-        const entryMc = await gmgnClients[0]
-          .fetchTokenMarketCapUsd(trigger.mint)
-          .catch(() => null);
-        tokenTransferOrchestrator.markPositionBought(entryMc);
-
-        await telegramBot?.sendDefault(
-          [
-            "<b>✅ Token Transfer Buy Completed</b>",
-            `Token: <code>${html(trigger.mint)}</code>`,
-            `Dev wallet: <code>${html(trigger.devAddress)}</code>`,
-            `Sent to: <code>${html(trigger.recipient)}</code>`,
-            `Entry MC: <b>$${html(entryMc?.toLocaleString() ?? "Unknown")}</b>`,
-            `Status: <b>${html(result.status)}</b>`,
-            result.hash ? `Tx: https://solscan.io/tx/${html(result.hash)}` : "",
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          {
-            pin: true,
-            replyMarkup: {
-              inline_keyboard: [
-                [
-                  {
-                    text: "🔴 Sell Position",
-                    callback_data: `sell:tokentransfer:${trigger.mint}`,
-                  },
-                  {
-                    text: "🔄 Refresh P/L & MC",
-                    callback_data: `r:m:${trigger.mint}:t`,
-                  },
-                ],
-              ],
-            },
-          },
-        );
-      } catch (err) {
-        log.error("Token Transfer buy failed", err);
-        tokenTransferOrchestrator.clearActivePosition("Buy execution failed");
-        await telegramBot?.sendDefault(
-          [
-            "<b>❌ Token Transfer Buy Failed</b>",
-            `Token: <code>${html(trigger.mint)}</code>`,
-            `Error: ${html(err instanceof Error ? err.message : String(err))}`,
-          ].join("\n"),
-        );
-      } finally {
-        tokenTransferBuyInProgress = false;
-      }
-    })();
-  });
-
-  tokenTransferOrchestrator.on("sellSignal", (signal) => {
-    // The dev wallet received the held token back, worth the same or more
-    // (in USD) than what it originally sent out — treat that as a sell
-    // signal and close the position through the normal sell pipeline.
-    log.warn("[TOKEN TRANSFER SELL SIGNAL]", signal);
-
-    void telegramBot
-      ?.sendDefault(
-        [
-          "<b>🚨 Token Transfer Sell Signal</b>",
-          `Token: <code>${html(signal.mint)}</code>`,
-          `Dev wallet received back <b>${signal.tokenAmount.toLocaleString()}</b> tokens from <code>${html(signal.from)}</code>`,
-          signal.incomingUsdValue !== null
-            ? `Incoming value: <b>$${signal.incomingUsdValue.toLocaleString()}</b>`
-            : "Incoming value: <b>Unknown (price unavailable)</b>",
-          signal.transferOutUsdValue !== null
-            ? `Original transfer-out value: <b>$${signal.transferOutUsdValue.toLocaleString()}</b>`
-            : `Original transfer-out amount: <b>${signal.transferOutTokenAmount.toLocaleString()}</b> tokens`,
-          "This matches or exceeds the original transfer-out — selling now.",
-        ].join("\n"),
-      )
-      .catch((err) =>
-        log.warn("Telegram Token Transfer sell-signal alert failed", err),
-      );
-
-    const result = triggerTokenTransferSell(
-      signal.mint,
-      "Dev wallet received a transfer-in worth the same or more (USD) than the original transfer-out.",
-      null,
-    );
-    log.info(`[TOKEN TRANSFER SELL SIGNAL] ${result}`, { mint: signal.mint });
-  });
 
   insiderBots.forEach((bot, index) => {
     const client = gmgnClients[index];
@@ -2032,7 +1755,6 @@ async function main(): Promise<void> {
 
   function wireWatchedWalletMonitor(walletMonitor: WalletMonitor): void {
     walletMonitor.on("newToken", (event: NewTokenEvent) => {
-      if (botMode !== "tokentransfer") return;
       log.info(
         `[WATCHED BUY] Wallet: ${event.walletAddress} Mint: ${event.mint}`,
       );
@@ -2251,63 +1973,6 @@ async function main(): Promise<void> {
         }
       }, MCAP_CHECK_INTERVAL_MS);
     });
-
-    // 2. Token Transfer balance-zero watch. Token Transfer mode has no
-    // automatic MC-based sell — its own dedicated Helius-4-backed MC monitor
-    // runs inside TokenTransferOrchestrator purely for display purposes.
-    // This loop only exists to notice when the trading wallet's balance for
-    // the held token reaches zero (sold manually via the "Sell Position"
-    // button already clears it immediately, but this also covers a sell
-    // made outside the bot entirely) so the mode is explicitly marked idle
-    // rather than silently still "holding" a position that's already gone.
-    let isTokenTransferBalanceChecking = false;
-    setInterval(async () => {
-      if (isTokenTransferBalanceChecking) return;
-      const activePosition = tokenTransferOrchestrator.getActivePosition();
-      if (!activePosition || !config.tradingWalletAddress) return;
-      if (hasPendingSellForMint(config.tradingWalletAddress, activePosition.mint)) return;
-
-      isTokenTransferBalanceChecking = true;
-      try {
-        const cached = activePositionCache.get(activePosition.mint);
-        let balance: bigint | null = cached ? cached.balance : null;
-        if (!cached || Date.now() - cached.timestamp > 30_000) {
-          const owner = new PublicKey(config.tradingWalletAddress);
-          const mintPk = new PublicKey(activePosition.mint);
-          balance = await getTokenRawBalance(owner, mintPk).catch(() => balance);
-          activePositionCache.set(activePosition.mint, {
-            balance: balance ?? 0n,
-            quote: cached?.quote ?? null,
-            timestamp: Date.now(),
-          });
-        }
-
-        if (balance !== null && balance <= 0n) {
-          log.warn(
-            `[TOKEN TRANSFER AUTO-STOP] Trading wallet balance for ${activePosition.mint} is zero; treating position as sold`,
-          );
-          tokenTransferOrchestrator.clearActivePosition(
-            "Trading wallet balance reached zero (sold outside the Sell Position button)",
-          );
-          await telegramBot
-            ?.sendDefault(
-              [
-                "<b>🔴 Token Transfer Position Closed</b>",
-                `Token: <code>${html(activePosition.mint)}</code>`,
-                "Detected that the trading wallet's balance for this token is now zero.",
-                "Token Transfer mode is now idle — press Start to watch a dev wallet again.",
-              ].join("\n"),
-            )
-            .catch((err) =>
-              log.warn("Telegram token-transfer auto-stop alert failed", err),
-            );
-        }
-      } catch (err) {
-        log.error("Error in Token Transfer balance-zero check", err);
-      } finally {
-        isTokenTransferBalanceChecking = false;
-      }
-    }, MCAP_CHECK_INTERVAL_MS);
   }
 
   function startWatchedWalletSummary(event: NewTokenEvent): void {
@@ -2402,16 +2067,6 @@ async function main(): Promise<void> {
     await monitor.start();
     log.info(`[WALLET RESUME] Resumed monitoring ${normalized}`);
     return `Continued monitoring <code>${normalized}</code>`;
-  }
-
-  async function startTokenTransferModeServices(): Promise<void> {
-    // Token Transfer mode never auto-starts the dev-wallet watch — the user
-    // must set a dev address and press Start explicitly.
-    log.info("Token Transfer mode services started", {
-      devAddress: tokenTransferOrchestrator.getDevAddress(),
-      buySol: tokenTransferOrchestrator.getBuySol(),
-      running: tokenTransferOrchestrator.isRunning(),
-    });
   }
 
   async function startFunderFirstModeServices(): Promise<void> {
@@ -2563,190 +2218,108 @@ async function main(): Promise<void> {
   }
 
   function homeReply(editCurrent = false): TelegramReply {
-    if (botMode === "insider") {
-      activeInsiderIndex = 0;
-      const bot = insiderBots[0];
-      const followedWallet = bot.getFollowedWallet();
-      const insiderRunning = bot.isRunning();
-      const preBuyMint = bot.getPreBuyMint();
-      const activePos = bot.getActivePosition();
-
-      let status = "Idle";
-      if (insiderRunning) {
-        if (activePos)
-          status = `Holding token ${html(activePos.mint.slice(0, 8))}...`;
-        else if (preBuyMint)
-          status = `Watching token ${html(preBuyMint.slice(0, 8))}...`;
-        else status = "Running";
-      } else if (followedWallet) {
-        status = "Paused";
-      }
-
-      const stopResumeButton =
-        followedWallet && !insiderRunning
-          ? { text: "Resume", callback_data: "insider:resume" }
-          : { text: "Stop", callback_data: "insider:stop" };
-
-      const buyDisabled = bot.isBuyDisabled();
-      const disableBuyButton = {
-        text: buyDisabled ? "✅ Enable Buy" : "❌ Disable Buy",
-        callback_data: "insider:togglebuy",
-      };
-
-      const monitoredWallet = bot.getMonitoredWallet();
-      const funderAddress = funderFirstOrchestrator.getFunderAddress();
-      const funderFirstRunning = funderFirstOrchestrator.isRunning();
-      const watchedPotential = funderFirstOrchestrator.getWatchedPotentialFeePayers();
-      const potentialLines =
-        watchedPotential.length > 0
-          ? watchedPotential.map(
-              (w) =>
-                `  • <code>${html(w.address.slice(0, 8))}…</code> — <b>${w.status}</b>${w.mint ? ` (${html(w.mint.slice(0, 8))}…)` : ""}`,
-            )
-          : ["  • <i>none yet</i>"];
-
-      const funderFirstStartStop = funderFirstRunning
-        ? { text: "Stop Funder-First", callback_data: "funderfirst:stop" }
-        : { text: "Start Funder-First", callback_data: "funderfirst:start" };
-
-      return {
-        text: [
-          "<b>Insider Bot</b>",
-          "",
-          `Mode: <b>Insider</b>`,
-          `Status: <b>${status}</b>`,
-          `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : "<b>Not set</b>"}`,
-          monitoredWallet
-            ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
-            : "",
-          `FeePayer funder: ${funderAddress ? `<code>${html(funderAddress)}</code>` : "<b>Not set</b>"}`,
-          `Funder-first: <b>${funderFirstRunning ? "Running" : "Stopped"}</b>`,
-          "<b>Watched potential feePayers:</b>",
-          ...potentialLines,
-          `Default Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
-          `Normal Funding Buy SOL: <b>${html(String(bot.getNormalFundingBuySol()))}</b>`,
-          `Low-Funding Buy SOL: <b>${html(String(bot.getLowFundingBuySol()))}</b>`,
-          `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% Current MC from Entry</b>`,
-          `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
-          "",
-          "<b>Flows (run in parallel)</b>",
-          "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
-          "<b>B) Funder-first</b> — watch a feePayer funder; detect potential feePayers funding bundlers.",
-          "",
-          "<b>Follow-wallet steps</b>",
-          "1. Bot 1 follows one wallet; Helius keys 1-4 are the fallback pool.",
-          "2. Skip if follow-wallet buy MC is above $80,000.",
-          "3. First four bundler buys must include the follow wallet.",
-          "4. Shared feePayer locked → normal-mode tiny transfer-out buy signals.",
-          "",
-          "<b>Funder-first steps</b>",
-          "1. Funder sends SOL → potential feePayer watches open.",
-          "2. ≥20 SOL post-balance to 3-4 wallets in 10s → normal candidate → buy.",
-          "3. 5-19.99 SOL post-balance in 10s → skipped; wait for dev rug.",
-          "4. Half-drain or zero balance → stop watching that feePayer.",
-          "• Rug: dev CLOSE_ACCOUNT resumes feePayer watch after a trade.",
-        ].join("\n"),
-        replyMarkup: {
-          inline_keyboard: [
-            [
-              { text: "Insider", callback_data: "mode:insider" },
-              { text: "Token Transfer", callback_data: "mode:tokentransfer" },
-            ],
-            [
-              { text: "Follow wallet", callback_data: "insider:follow" },
-              { text: "FeePayer funder", callback_data: "funderfirst:funder" },
-            ],
-            [funderFirstStartStop],
-            [
-              { text: "Default Buy SOL", callback_data: "insider:buysol" },
-              { text: "Normal Buy SOL", callback_data: "insider:normalbuysol" },
-            ],
-            [
-              { text: "Low-Funding Buy SOL", callback_data: "insider:lowfundingbuysol" },
-              { text: "Set Exit %", callback_data: "insider:exitpercent" },
-            ],
-            [disableBuyButton],
-            [
-              { text: "Status", callback_data: "menu:status" },
-              { text: "Refresh", callback_data: "menu:refresh" },
-            ],
-            [stopResumeButton],
-          ],
-        },
-        editCurrent,
-      };
-    }
-
-    const devAddress = tokenTransferOrchestrator.getDevAddress();
-    const buySol = tokenTransferOrchestrator.getBuySol();
-    const isRunning = tokenTransferOrchestrator.isRunning();
-    const activePosition = tokenTransferOrchestrator.getActivePosition();
-    const watchedCandidates = tokenTransferOrchestrator.getWatchedCandidateMints();
+    activeInsiderIndex = 0;
+    const bot = insiderBots[0];
+    const followedWallet = bot.getFollowedWallet();
+    const insiderRunning = bot.isRunning();
+    const preBuyMint = bot.getPreBuyMint();
+    const activePos = bot.getActivePosition();
 
     let status = "Idle";
-    if (activePosition)
-      status = `Holding ${html(activePosition.mint.slice(0, 8))}... — watching dev wallet for a return transfer-in as a sell signal`;
-    else if (isRunning && watchedCandidates.length > 0)
-      status = `Watching ${watchedCandidates.length} newly bought token(s) for a transfer-out...`;
-    else if (isRunning) status = "Watching dev wallet for a new-token swap buy...";
-    else if (devAddress) status = "Stopped";
+    if (insiderRunning) {
+      if (activePos)
+        status = `Holding token ${html(activePos.mint.slice(0, 8))}...`;
+      else if (preBuyMint)
+        status = `Watching token ${html(preBuyMint.slice(0, 8))}...`;
+      else status = "Running";
+    } else if (followedWallet) {
+      status = "Paused";
+    }
 
-    const startStopButton = activePosition
-      ? {
-          text: "🔴 Sell Position",
-          callback_data: `sell:tokentransfer:${activePosition.mint}`,
-        }
-      : isRunning
-        ? { text: "Stop", callback_data: "tokentransfer:stop" }
-        : { text: "Start", callback_data: "tokentransfer:start" };
+    const stopResumeButton =
+      followedWallet && !insiderRunning
+        ? { text: "Resume", callback_data: "insider:resume" }
+        : { text: "Stop", callback_data: "insider:stop" };
+
+    const buyDisabled = bot.isBuyDisabled();
+    const disableBuyButton = {
+      text: buyDisabled ? "✅ Enable Buy" : "❌ Disable Buy",
+      callback_data: "insider:togglebuy",
+    };
+
+    const monitoredWallet = bot.getMonitoredWallet();
+    const funderAddress = funderFirstOrchestrator.getFunderAddress();
+    const funderFirstRunning = funderFirstOrchestrator.isRunning();
+    const watchedPotential = funderFirstOrchestrator.getWatchedPotentialFeePayers();
+    const potentialLines =
+      watchedPotential.length > 0
+        ? watchedPotential.map(
+            (w) =>
+              `  • <code>${html(w.address.slice(0, 8))}…</code> — <b>${w.status}</b>${w.mint ? ` (${html(w.mint.slice(0, 8))}…)` : ""}`,
+          )
+        : ["  • <i>none yet</i>"];
+
+    const funderFirstStartStop = funderFirstRunning
+      ? { text: "Stop Funder-First", callback_data: "funderfirst:stop" }
+      : { text: "Start Funder-First", callback_data: "funderfirst:start" };
 
     return {
       text: [
-        "<b>Token Transfer Bot</b>",
+        "<b>Insider Bot</b>",
         "",
-        `Mode: <b>Token Transfer</b>`,
         `Status: <b>${status}</b>`,
-        `Dev address: ${devAddress ? `<code>${html(devAddress)}</code>` : "<b>Not set</b>"}`,
-        `Buy SOL: <b>${html(String(buySol))}</b>`,
-        activePosition
-          ? `Recipient: <code>${html(activePosition.recipient)}</code>`
+        `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : "<b>Not set</b>"}`,
+        monitoredWallet
+          ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
           : "",
-        activePosition?.entryMc
-          ? `Entry MC: <b>$${html(activePosition.entryMc.toLocaleString())}</b>`
-          : "",
-        activePosition
-          ? `Transfer-out was worth: <b>${
-              activePosition.transferOutUsdValue !== null
-                ? `$${html(activePosition.transferOutUsdValue.toLocaleString())}`
-                : `${html(activePosition.transferOutTokenAmount.toLocaleString())} tokens (pricing...)`
-            }</b>`
-          : "",
+        `FeePayer funder: ${funderAddress ? `<code>${html(funderAddress)}</code>` : "<b>Not set</b>"}`,
+        `Funder-first: <b>${funderFirstRunning ? "Running" : "Stopped"}</b>`,
+        "<b>Watched potential feePayers:</b>",
+        ...potentialLines,
+        `Default Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
+        `Normal Funding Buy SOL: <b>${html(String(bot.getNormalFundingBuySol()))}</b>`,
+        `Low-Funding Buy SOL: <b>${html(String(bot.getLowFundingBuySol()))}</b>`,
+        `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% Current MC from Entry</b>`,
+        `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
         "",
-        "<b>Flow</b>",
-        "1. Set the dev wallet address to watch.",
-        "2. Click Start; the bot watches that wallet's transactions (Helius key 4) for a SWAP where it buys a new token.",
-        "3. Once flagged, the bot watches specifically for that token being sent out (a plain transfer, not a sell) to another wallet.",
-        "4. The moment that transfer-out happens, the bot buys it immediately with your configured SOL amount — and keeps watching the dev wallet.",
-        "5. If the dev wallet later receives that same token back, worth the same or more (in USD) than what it sent out, the bot treats that as a sell signal and sells automatically. You can also click \"Sell Position\" any time to exit manually (MC is monitored via Helius key 4 for display only). The mode also auto-stops and clears the position if your trading wallet's balance for that token is ever seen at zero.",
-        "6. Either way, once the position closes the dev-wallet watch stops until you press Start again.",
-      ]
-        .filter(Boolean)
-        .join("\n"),
+        "<b>Flows (run in parallel)</b>",
+        "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
+        "<b>B) Funder-first</b> — watch a feePayer funder; detect potential feePayers funding bundlers.",
+        "",
+        "<b>Follow-wallet steps</b>",
+        "1. Bot 1 follows one wallet; Helius keys 1-4 are the fallback pool.",
+        "2. Skip if follow-wallet buy MC is above $80,000.",
+        "3. First four bundler buys must include the follow wallet.",
+        "4. Shared feePayer locked → normal-mode tiny transfer-out buy signals.",
+        "",
+        "<b>Funder-first steps</b>",
+        "1. Funder sends SOL → potential feePayer watches open.",
+        "2. ≥20 SOL post-balance to 3-4 wallets in 10s → normal candidate → buy.",
+        "3. 5-19.99 SOL post-balance in 10s → skipped; wait for dev rug.",
+        "4. Half-drain or zero balance → stop watching that feePayer.",
+        "• Rug: dev CLOSE_ACCOUNT resumes feePayer watch after a trade.",
+      ].join("\n"),
       replyMarkup: {
         inline_keyboard: [
           [
-            { text: "Insider", callback_data: "mode:insider" },
-            { text: "Token Transfer", callback_data: "mode:tokentransfer" },
+            { text: "Follow wallet", callback_data: "insider:follow" },
+            { text: "FeePayer funder", callback_data: "funderfirst:funder" },
+          ],
+          [funderFirstStartStop],
+          [
+            { text: "Default Buy SOL", callback_data: "insider:buysol" },
+            { text: "Normal Buy SOL", callback_data: "insider:normalbuysol" },
           ],
           [
-            { text: "Set Dev Address", callback_data: "tokentransfer:setdev" },
-            { text: "Buy SOL", callback_data: "tokentransfer:buysol" },
+            { text: "Low-Funding Buy SOL", callback_data: "insider:lowfundingbuysol" },
+            { text: "Set Exit %", callback_data: "insider:exitpercent" },
           ],
+          [disableBuyButton],
           [
             { text: "Status", callback_data: "menu:status" },
             { text: "Refresh", callback_data: "menu:refresh" },
           ],
-          [startStopButton],
+          [stopResumeButton],
         ],
       },
       editCurrent,
@@ -2781,56 +2354,31 @@ async function main(): Promise<void> {
   }
 
   function statusReply(editCurrent = false): TelegramReply {
-    let text = "";
-    if (botMode === "insider") {
-      const bot = insiderBots[0];
-      const followed = bot?.getFollowedWallet();
-      const status = bot?.isRunning()
-        ? "Running"
-        : followed
-          ? "Paused"
-          : "Idle";
-      const primaryInfo = [
-        "<b>Primary Insider Bot</b>",
-        `Status: ${status}`,
-        `Follow: ${followed ?? "not set"}`,
-        `Default Buy: ${bot?.getBuySol() ?? config.insiderBuySol} SOL`,
-        `Normal Buy: ${bot?.getNormalFundingBuySol() ?? config.insiderNormalBuySol} SOL`,
-        `Low-Funding Buy: ${bot?.getLowFundingBuySol() ?? config.insiderLowFundingBuySol} SOL`,
-        `Helius key pool: ${insiderBots.length} key${insiderBots.length === 1 ? "" : "s"}`,
-      ].join("\n");
+    const bot = insiderBots[0];
+    const followed = bot?.getFollowedWallet();
+    const status = bot?.isRunning()
+      ? "Running"
+      : followed
+        ? "Paused"
+        : "Idle";
+    const primaryInfo = [
+      "<b>Primary Insider Bot</b>",
+      `Status: ${status}`,
+      `Follow: ${followed ?? "not set"}`,
+      `Default Buy: ${bot?.getBuySol() ?? config.insiderBuySol} SOL`,
+      `Normal Buy: ${bot?.getNormalFundingBuySol() ?? config.insiderNormalBuySol} SOL`,
+      `Low-Funding Buy: ${bot?.getLowFundingBuySol() ?? config.insiderLowFundingBuySol} SOL`,
+      `Helius key pool: ${insiderBots.length} key${insiderBots.length === 1 ? "" : "s"}`,
+    ].join("\n");
 
-      text = [
-        "<b>Bot Status</b>",
-        "Mode: Insider",
-        "Flow: one follow wallet, four-key Helius pool, shared bundler-funder confirmation.",
-        "Candidate rule: transfer-out confirms only when the immediate next funder tx is not a SOL transfer-in.",
-        "API guard: queued Helius pool, transient-only fallback, per-key backoff, capped recipient batch sync.",
-        "",
-        primaryInfo,
-      ].join("\n");
-    } else {
-      const activePosition = tokenTransferOrchestrator.getActivePosition();
-      const watchedCandidates = tokenTransferOrchestrator.getWatchedCandidateMints();
-      text = [
-        "<b>Bot Status</b>",
-        "Mode: Token Transfer",
-        `Dev address: ${tokenTransferOrchestrator.getDevAddress() ?? "not set"}`,
-        `Running: ${tokenTransferOrchestrator.isRunning() ? "yes" : "no"}`,
-        `Watching for transfer-out: ${watchedCandidates.length ? watchedCandidates.join(", ") : "none yet"}`,
-        `Holding: ${activePosition ? activePosition.mint : "none"}`,
-        activePosition
-          ? `Watching dev wallet for a return transfer-in worth >= ${
-              activePosition.transferOutUsdValue !== null
-                ? `$${activePosition.transferOutUsdValue.toLocaleString()}`
-                : `${activePosition.transferOutTokenAmount.toLocaleString()} tokens (pricing...)`
-            } as a sell signal`
-          : "",
-        `Buy: ${tokenTransferOrchestrator.getBuySol()} SOL`,
-      ]
-        .filter(Boolean)
-        .join("\n");
-    }
+    const text = [
+      "<b>Bot Status</b>",
+      "Flow: one follow wallet, four-key Helius pool, shared bundler-funder confirmation.",
+      "Candidate rule: transfer-out confirms only when the immediate next funder tx is not a SOL transfer-in.",
+      "API guard: queued Helius pool, transient-only fallback, per-key backoff, capped recipient batch sync.",
+      "",
+      primaryInfo,
+    ].join("\n");
 
     return {
       text,
@@ -3031,23 +2579,21 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── 6. Start active mode ──────────────────────────────────────────────────
-  // Insider and Token Transfer are independent and both come up active at
-  // startup; `botMode` only picks which card /start shows first.
-  await startTokenTransferModeServices();
+  // ── 6. Start active services ─────────────────────────────────────────────
   await startFunderFirstModeServices();
   await resumePrimaryInsiderBot();
 
   // Only now, with every orchestrator/bot fully wired up, do we start
-  // draining Telegram's update queue — see the note above `tokenTransferOrchestrator`'s
-  // construction for why this was moved down from right after `new TelegramBot(...)`.
+  // draining Telegram's update queue — see the note above
+  // `funderFirstOrchestrator`'s construction for why this was moved down
+  // from right after `new TelegramBot(...)`.
   if (telegramBot) {
     telegramBot.start();
   }
   startMarketCapChecker();
 
   log.info(
-    `Service fully started — mode=${botMode}, token transfer running=${tokenTransferOrchestrator.isRunning()}, funder-first running=${funderFirstOrchestrator.isRunning()}`,
+    `Service fully started — insider bots=${insiderBots.length}, funder-first running=${funderFirstOrchestrator.isRunning()}`,
   );
 
   // Send a one-off Telegram summary so it's obvious the process actually
@@ -3056,17 +2602,11 @@ async function main(): Promise<void> {
     ?.sendDefault(
       [
         "<b>🟢 Bot Started</b>",
-        `Displayed mode: <b>${botMode === "insider" ? "Insider" : "Token Transfer"}</b>`,
         "",
         "<b>Insider</b>",
         `Enabled bots: <b>${insiderBots.length}</b> (Helius key pool)`,
         `Bot 1 follow wallet: ${insiderBots[0]?.getFollowedWallet() ? `<code>${html(insiderBots[0]!.getFollowedWallet()!)}</code>` : "not set"}`,
         `Bot 1 running: <b>${insiderBots[0]?.isRunning() ? "yes" : "no"}</b>`,
-        "",
-        "<b>Token Transfer</b>",
-        `Dev address: ${tokenTransferOrchestrator.getDevAddress() ? `<code>${html(tokenTransferOrchestrator.getDevAddress()!)}</code>` : "not set"}`,
-        `Buy SOL: <b>${tokenTransferOrchestrator.getBuySol()}</b>`,
-        `Watching dev wallet: <b>${tokenTransferOrchestrator.isRunning() ? "yes" : "no"}</b>`,
         "",
         "<b>Funder-First</b>",
         `Funder address: ${funderFirstOrchestrator.getFunderAddress() ? `<code>${html(funderFirstOrchestrator.getFunderAddress()!)}</code>` : "not set"}`,
@@ -3100,7 +2640,6 @@ async function main(): Promise<void> {
     telegramBot?.stop();
     healthServer.close();
 
-    await tokenTransferOrchestrator.shutdown();
     await funderFirstOrchestrator.shutdown();
     sharedEnhancedWs?.close();
 

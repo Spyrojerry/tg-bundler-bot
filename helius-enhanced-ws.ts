@@ -17,8 +17,8 @@
 //  happens to use.
 //
 //  Design:
-//   - One WebSocket connection per process (shared across Insider, funder-first,
-//     and Token Transfer orchestrators) watching addresses via
+//   - One WebSocket connection per process (shared across Insider and
+//     funder-first) watching addresses via
 //     `transactionSubscribe`.
 //   - Single-address `watch()` and multi-address `watchMulti()` both supported;
 //     the latter batches `accountInclude: [addr1, addr2, …]` into one server
