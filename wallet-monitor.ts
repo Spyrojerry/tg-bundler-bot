@@ -3,8 +3,8 @@
 //
 //  On start:
 //    1. Fetch all current token accounts → existingTokens set (NOT monitored)
-//    2. Subscribe to wallet logs over websocket for immediate buy detection
-//    3. Poll token-account state as a fallback/backfill
+//    2. Push-driven buy detection (Enhanced WSS when available, else onLogs + RPC)
+//    3. Token-account RPC poll only when Enhanced WSS is unavailable (backstop)
 //    4. Any mint not in existingTokens and not yet tracked → emit 'newToken'
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -28,6 +28,9 @@ const TOKEN_PROGRAM_IDS = [
   new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
   new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'),
 ];
+
+/** How often to re-check Enhanced WSS health without issuing RPC polls. */
+const ENHANCED_WS_HEALTH_CHECK_MS = 15_000;
 
 // ── WalletMonitor ─────────────────────────────────────────────────────────────
 
@@ -114,12 +117,12 @@ export class WalletMonitor extends EventEmitter {
     this.running = true;
 
     this.log.info(`Starting wallet monitor for ${this.walletPubkey.toBase58()}`);
-    this.log.info(`Poll interval: ${this.pollInterval}ms`);
-    this.log.info(
-      this.enhancedWs
-        ? 'Push path: Helius Enhanced WSS transactionSubscribe'
-        : `Websocket endpoint: ${this.wsEndpoint}`,
-    );
+    if (this.enhancedWs) {
+      this.log.info('Push path: Helius Enhanced WSS transactionSubscribe (no token-account RPC poll while connected)');
+    } else {
+      this.log.info(`Poll interval: ${this.pollInterval}ms`);
+      this.log.info(`Websocket endpoint: ${this.wsEndpoint}`);
+    }
 
     // Snapshot existing holdings — these are NOT monitored
     const initial = await this.fetchHoldings();
@@ -140,7 +143,7 @@ export class WalletMonitor extends EventEmitter {
     } else {
       this.startLogsSubscription();
     }
-    this.schedulePoll();
+    this.schedulePollBackstop();
   }
 
   stop(): void {
@@ -174,15 +177,18 @@ export class WalletMonitor extends EventEmitter {
 
   // ── Polling ───────────────────────────────────────────────────────────────
 
-  private schedulePoll(): void {
+  private schedulePollBackstop(): void {
     if (!this.running) return;
     const wsHealthy = this.enhancedWs?.isConnected ?? false;
-    const delay =
-      this.enhancedWs && wsHealthy
-        ? this.pollInterval
-        : this.enhancedWs
-          ? Math.min(this.pollInterval, 4_000)
-          : this.pollInterval;
+    if (this.enhancedWs && wsHealthy) {
+      this.pollTimer = setTimeout(() => {
+        this.schedulePollBackstop();
+      }, ENHANCED_WS_HEALTH_CHECK_MS);
+      return;
+    }
+    const delay = this.enhancedWs
+      ? Math.min(this.pollInterval, 4_000)
+      : this.pollInterval;
     this.pollTimer = setTimeout(() => {
       this.poll().catch((err) => this.log.error('Poll error', err));
     }, delay);
@@ -327,7 +333,7 @@ export class WalletMonitor extends EventEmitter {
     } catch (err) {
       this.log.error('Failed to poll wallet holdings', err);
     } finally {
-      this.schedulePoll();
+      this.schedulePollBackstop();
     }
   }
 

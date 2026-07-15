@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-15 (6)
+
+### Follow-wallet: drop idle token-account RPC poll when Enhanced WSS is up
+
+- `WalletMonitor` no longer runs recurring `getParsedTokenAccountsByOwner` polls while Enhanced WSS is connected — only a one-time startup snapshot plus a 15s WS health check. RPC poll resumes as backstop if Enhanced WSS drops.
+
 ## 2026-07-15 (5)
 
 ### Funder-first: concurrent groups + 0.5 SOL post-balance clustering
