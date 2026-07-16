@@ -12,6 +12,8 @@
 //    6. Normal → hands off to InsiderBot.startFromFunderFirst for buy/sell.
 //    7. After a normal trade completes, the feePayer stays in cooldown until the
 //       token's dev wallet CLOSE_ACCOUNTs (rug), then resumes watching.
+//       On cooldown entry, recent dev txs are REST-synced so a rug is not missed
+//       if it landed before the dev Enhanced WSS subscription was armed.
 //
 //  Group / recipient rules:
 //    • Multiple 10s bundler groups (≥20 SOL only) can be monitored concurrently.
@@ -59,6 +61,8 @@ const ZERO_BALANCE_EPSILON_SOL = 1e-6;
 const POST_BALANCE_TOLERANCE_SOL = 0.5;
 const POTENTIAL_FEEPAYER_SYNC_LIMIT = 20;
 const POTENTIAL_FEEPAYER_SYNC_MIN_INTERVAL_MS = 1_000;
+const COOLDOWN_DEV_SYNC_LIMIT = 30;
+const COOLDOWN_DEV_SYNC_MIN_INTERVAL_MS = 1_000;
 /** Outgoing transfers up to this fraction of initial funder-receive balance trigger exchange-identity checks. */
 const EXCHANGE_DRAIN_CHECK_MAX_FRACTION = 0.5;
 
@@ -107,6 +111,14 @@ interface PotentialFeePayerWatch {
   detectedMint: string | null;
   detectedDevWallet: string | null;
   cooldownDevWatchId: number | null;
+  /** Mint tied to the active cooldown — used for rug sync/resume. */
+  cooldownMint: string | null;
+  /** Dev create tx timestamp — ignore CLOSE_ACCOUNT txs at or before this. */
+  cooldownDevCreateTimestamp: number | null;
+  cooldownDevProcessedSignatures: Set<string>;
+  cooldownDevSyncing: boolean;
+  cooldownDevSyncPending: boolean;
+  cooldownDevLastSyncAt: number;
   /** Concurrent active 4-bundler groups keyed by anchor. */
   activeGroups: Map<string, ActiveBundlerGroup>;
   exhaustedGroupAnchors: Set<string>;
@@ -398,6 +410,12 @@ export class FunderFirstOrchestrator extends EventEmitter {
         detectedMint: null,
         detectedDevWallet: null,
         cooldownDevWatchId: null,
+        cooldownMint: null,
+        cooldownDevCreateTimestamp: null,
+        cooldownDevProcessedSignatures: new Set(),
+        cooldownDevSyncing: false,
+        cooldownDevSyncPending: false,
+        cooldownDevLastSyncAt: 0,
         activeGroups: new Map(),
         exhaustedGroupAnchors: new Set(),
         notifiedGroupAnchors: new Set(),
@@ -797,6 +815,9 @@ export class FunderFirstOrchestrator extends EventEmitter {
     if (watch.cooldownDevWatchId !== null) {
       void this.enhancedWs?.unwatch(watch.cooldownDevWatchId).catch(() => undefined);
       watch.cooldownDevWatchId = null;
+    }
+    if (watch.detectedDevWallet) {
+      this.cooldownsByDev.delete(watch.detectedDevWallet);
     }
     this.potentialFeePayers.delete(address);
     log.info('Stopped watching potential feePayer', { address, reason });
@@ -1304,6 +1325,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       const devWallet = createTx?.feePayer ?? null;
       watch.detectedMint = mint;
       watch.detectedDevWallet = devWallet;
+      watch.cooldownDevCreateTimestamp = createTx?.timestamp ?? null;
 
       if (!this.insiderBot.isIdleForFunderFirst()) {
         log.warn('Normal-mode funder-first handoff delayed — Insider bot busy', {
@@ -1381,16 +1403,160 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.status = 'cooldown';
     watch.activeGroups.clear();
     this.unsubscribePotentialFeePayerOnly(watch);
-    if (!devWallet || !this.enhancedWs) return;
+    watch.cooldownMint = mint;
+    watch.cooldownDevProcessedSignatures.clear();
+    if (!devWallet || !this.enhancedWs) {
+      void this.syncCooldownDevTransactions(watch.address, true);
+      return;
+    }
     this.cooldownsByDev.set(devWallet, watch.address);
     watch.cooldownDevWatchId = this.enhancedWs.watch(devWallet, (tx) => {
-      void this.handleDevTx(watch.address, mint, devWallet, tx);
+      void this.processCooldownDevTx(watch.address, mint, devWallet, tx, 'wss');
     });
     log.info('FeePayer entered cooldown; watching dev for rug', {
       feePayer: watch.address,
       mint,
       devWallet,
     });
+    void this.syncCooldownDevTransactions(watch.address, true);
+  }
+
+  private async ensureCooldownDevCreateTimestamp(
+    watch: PotentialFeePayerWatch,
+    mint: string,
+  ): Promise<void> {
+    if (watch.cooldownDevCreateTimestamp !== null) return;
+    try {
+      const createTx = await this.heliusClient.getMintCreateTransaction(mint);
+      watch.cooldownDevCreateTimestamp = createTx?.timestamp ?? null;
+    } catch (err) {
+      log.warn('Failed to fetch mint create tx for cooldown dev sync baseline', {
+        mint,
+        feePayer: watch.address,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * REST backfill for dev CLOSE_ACCOUNT while in cooldown — catches rugs that
+   * landed before the Enhanced WSS subscription was armed.
+   */
+  private async syncCooldownDevTransactions(
+    feePayerAddress: string,
+    force = false,
+  ): Promise<void> {
+    const watch = this.potentialFeePayers.get(feePayerAddress);
+    if (!watch || !this.isEnabled || watch.status !== 'cooldown') return;
+
+    const devWallet = watch.detectedDevWallet;
+    const mint = watch.cooldownMint ?? watch.detectedMint;
+    if (!devWallet || !mint) return;
+
+    if (watch.cooldownDevSyncing) {
+      watch.cooldownDevSyncPending = true;
+      return;
+    }
+    if (
+      !force &&
+      Date.now() - watch.cooldownDevLastSyncAt < COOLDOWN_DEV_SYNC_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    watch.cooldownDevSyncing = true;
+    watch.cooldownDevLastSyncAt = Date.now();
+
+    log.info('Cooldown dev REST sync started', {
+      feePayer: feePayerAddress,
+      mint,
+      devWallet,
+      force,
+    });
+
+    try {
+      await this.ensureCooldownDevCreateTimestamp(watch, mint);
+      const txs = await this.heliusClient.getWalletTransactionsDesc(
+        devWallet,
+        COOLDOWN_DEV_SYNC_LIMIT,
+      );
+      const sorted = [...txs].sort(
+        (a, b) => a.timestamp - b.timestamp || a.slot - b.slot,
+      );
+      for (const tx of sorted) {
+        const stopped = await this.processCooldownDevTx(
+          feePayerAddress,
+          mint,
+          devWallet,
+          tx,
+          'rest',
+        );
+        if (stopped) return;
+      }
+      log.info('Cooldown dev REST sync completed — no rug found', {
+        feePayer: feePayerAddress,
+        mint,
+        devWallet,
+        scanned: sorted.length,
+      });
+    } catch (err) {
+      log.warn('Cooldown dev REST sync failed', {
+        feePayer: feePayerAddress,
+        mint,
+        devWallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      watch.cooldownDevSyncing = false;
+      if (watch.cooldownDevSyncPending) {
+        watch.cooldownDevSyncPending = false;
+        void this.syncCooldownDevTransactions(feePayerAddress, true);
+      }
+    }
+  }
+
+  /**
+   * Processes one dev tx from WSS or REST sync during cooldown.
+   * Returns true when cooldown ended (rug detected and feePayer resumed).
+   */
+  private async processCooldownDevTx(
+    feePayerAddress: string,
+    mint: string,
+    devWallet: string,
+    tx: HeliusTransaction,
+    source: 'wss' | 'rest',
+  ): Promise<boolean> {
+    const watch = this.potentialFeePayers.get(feePayerAddress);
+    if (!watch || watch.status !== 'cooldown') return false;
+    if (watch.cooldownDevProcessedSignatures.has(tx.signature)) return false;
+    watch.cooldownDevProcessedSignatures.add(tx.signature);
+
+    if (!isDevRugCloseAccountTx(tx, devWallet)) return false;
+    if (
+      watch.cooldownDevCreateTimestamp !== null &&
+      tx.timestamp <= watch.cooldownDevCreateTimestamp
+    ) {
+      log.debug('Ignoring dev CLOSE_ACCOUNT at or before mint create during cooldown sync', {
+        feePayer: feePayerAddress,
+        mint,
+        devWallet,
+        signature: tx.signature,
+        txTimestamp: tx.timestamp,
+        devCreateTimestamp: watch.cooldownDevCreateTimestamp,
+        source,
+      });
+      return false;
+    }
+
+    log.info('Dev rug CLOSE_ACCOUNT detected during cooldown', {
+      feePayer: feePayerAddress,
+      mint,
+      devWallet,
+      signature: tx.signature,
+      source,
+    });
+    await this.handleDevTx(feePayerAddress, mint, devWallet, tx);
+    return watch.status !== 'cooldown';
   }
 
   private async handleDevTx(
@@ -1399,7 +1565,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
     devWallet: string,
     tx: HeliusTransaction,
   ): Promise<void> {
-    if (!isDevRugCloseAccountTx(tx, devWallet)) return;
     const watch = this.potentialFeePayers.get(feePayerAddress);
     if (!watch || watch.status !== 'cooldown') return;
 
@@ -1419,6 +1584,11 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.status = 'watching';
     watch.detectedMint = null;
     watch.detectedDevWallet = null;
+    watch.cooldownMint = null;
+    watch.cooldownDevCreateTimestamp = null;
+    watch.cooldownDevProcessedSignatures.clear();
+    watch.cooldownDevSyncing = false;
+    watch.cooldownDevSyncPending = false;
     watch.mode = null;
     watch.activeGroups.clear();
     watch.exhaustedGroupAnchors.clear();

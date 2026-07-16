@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-07-16 (27)
+
+### Normal mode: restore >20 micro-dust counter + ~0.02–~0.1 first group
+
+- **Micro-dust** is strictly below **~0.006 SOL** (0.01 − 0.004 tolerance). Up to **20** allowed before the first buy group; **>20** skips the token.
+- **~0.01 SOL** and other amounts between micro-dust and ~0.02 SOL are allowed as preamble (no immediate skip).
+- **Buy** still requires the **first group**: ≥2 recipients in 10s with each transfer in **~0.02–~0.1 SOL** (any amount in range, not just exact round sizes).
+- Only transfers **above ~0.1 SOL** before the first group still skip immediately.
+
+## 2026-07-16 (26)
+
+### Funder-first: REST sync dev wallet on cooldown entry
+
+- When a feePayer enters post-trade cooldown and starts watching the dev for `CLOSE_ACCOUNT`, the bot now immediately REST-syncs recent dev-wallet transactions.
+- Catches dev rugs that occurred before the Enhanced WSS subscription was armed; processed signatures are deduped between REST and WSS.
+
 ## 2026-07-16 (25)
 
 ### Normal mode: unified ~0.02–~0.1 SOL first-round buy gate

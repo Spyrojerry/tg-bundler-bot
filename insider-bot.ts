@@ -56,8 +56,13 @@ const BUNDLER_FUNDER_NORMAL_TINY_MID_BAND_MAX_LOCK_AGE_MS = 30 * 60 * 1_000;
 /** Inclusive first-group buy range (~0.02 SOL through ~0.1 SOL, with tolerance). */
 const BUNDLER_FUNDER_NORMAL_TINY_FIRST_GROUP_MIN_SOL = 0.02;
 const BUNDLER_FUNDER_NORMAL_TINY_FIRST_GROUP_MAX_SOL = 0.1;
-/** Transfers below ~0.02 SOL are dust — skip the token if seen before the first group. */
-const BUNDLER_FUNDER_NORMAL_TINY_DUST_MAX_SOL = 0.02;
+/** Tolerance (in SOL) for matching a transfer-out against a valid round size — ranges stay non-overlapping at 0.004. */
+const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.004;
+/** Preamble micro-dust: strictly below ~0.01 SOL minus round tolerance (< 0.006 SOL). */
+const BUNDLER_FUNDER_NORMAL_TINY_MICRO_DUST_MAX_SOL =
+  0.01 - BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL;
+/** Skip token when more than this many micro-dust outs land before the first ~0.02–~0.1 SOL group. */
+const BUNDLER_FUNDER_NORMAL_MAX_DUST_BEFORE_ROUND_GROUP = 20;
 /** Low-funding mode still requires discrete round sizes per USD band. */
 const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
   "lt2_5" | "2_5_to_5" | "gt5",
@@ -67,8 +72,6 @@ const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
   "2_5_to_5": [0.02, 0.05],
   gt5: [0.1],
 };
-/** Tolerance (in SOL) for matching a transfer-out against a valid round size — ranges stay non-overlapping at 0.004. */
-const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.004;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 20;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
@@ -350,7 +353,7 @@ interface BundlerFunderWatchState {
   recipientWatches: Map<string, FunderRecipientWatch>;
   queuedTransferOuts: FunderTransferOutCandidate[];
   normalTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
-  /** True once a qualifying 0.02/0.05/0.1 SOL same-band group (≥2) is found. */
+  /** True once a qualifying ~0.02–~0.1 SOL first group (≥2 in 10s) is found. */
   normalTinyRoundGroupFound: boolean;
   lowFundingFunderTxs: Array<{ signature: string; timestamp: number }>;
   lowFundingTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
@@ -3720,8 +3723,32 @@ export class InsiderBot extends EventEmitter {
     });
 
     if (!state.normalTinyRoundGroupFound) {
-      if (this.isNormalTinyDustSolAmount(transferOut.amountSol)) {
-        await this.skipTokenDustBeforeFirstRoundGroup(
+      if (this.isNormalTinyMicroDustSolAmount(transferOut.amountSol)) {
+        const microDustCount = this.countNormalTinyMicroDustTransferOuts(state);
+        if (microDustCount > BUNDLER_FUNDER_NORMAL_MAX_DUST_BEFORE_ROUND_GROUP) {
+          await this.skipTokenExcessiveMicroDustBeforeRoundGroup(
+            state,
+            microDustCount,
+            tx,
+          );
+          return true;
+        }
+        this.log.debug("Normal-mode micro-dust transfer-out before first group (within limit)", {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          signature: tx.signature,
+          amountSol: transferOut.amountSol,
+          microDustCount,
+          microDustLimit: BUNDLER_FUNDER_NORMAL_MAX_DUST_BEFORE_ROUND_GROUP,
+        });
+        return false;
+      }
+      if (
+        !this.isNormalTinyFirstGroupSolAmount(transferOut.amountSol) &&
+        transferOut.amountSol >
+          this.getNormalTinyFirstGroupSolBounds().maxSol
+      ) {
+        await this.skipTokenOutOfRangeBeforeFirstRoundGroup(
           state,
           tx,
           transferOut.amountSol,
@@ -3730,13 +3757,14 @@ export class InsiderBot extends EventEmitter {
         return true;
       }
       if (!this.isNormalTinyFirstGroupSolAmount(transferOut.amountSol)) {
-        await this.skipTokenOutOfRangeBeforeFirstRoundGroup(
-          state,
-          tx,
-          transferOut.amountSol,
-          transferOutUsd,
-        );
-        return true;
+        this.log.debug("Normal-mode preamble transfer-out below first-group range — waiting", {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          signature: tx.signature,
+          amountSol: transferOut.amountSol,
+          firstGroupMinSol: this.getNormalTinyFirstGroupSolBounds().minSol,
+        });
+        return false;
       }
     }
 
@@ -4246,10 +4274,47 @@ export class InsiderBot extends EventEmitter {
     return BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT;
   }
 
-  /** True when transfer is below ~0.02 SOL. */
-  private isNormalTinyDustSolAmount(amountSol: number): boolean {
-    const { minSol } = this.getNormalTinyFirstGroupSolBounds();
-    return amountSol < minSol;
+  /** True when transfer is micro-dust: strictly below ~0.01 SOL minus tolerance (< 0.006 SOL). */
+  private isNormalTinyMicroDustSolAmount(amountSol: number): boolean {
+    return amountSol < BUNDLER_FUNDER_NORMAL_TINY_MICRO_DUST_MAX_SOL;
+  }
+
+  private countNormalTinyMicroDustTransferOuts(state: BundlerFunderWatchState): number {
+    return state.normalTinyTransferOuts.filter((entry) =>
+      this.isNormalTinyMicroDustSolAmount(entry.amountSol),
+    ).length;
+  }
+
+  private async skipTokenExcessiveMicroDustBeforeRoundGroup(
+    state: BundlerFunderWatchState,
+    microDustCount: number,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    this.log.warn(
+      "Skipping token — too many micro-dust transfer-outs before first ~0.02–~0.1 SOL group",
+      {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        microDustCount,
+        maxMicroDust: BUNDLER_FUNDER_NORMAL_MAX_DUST_BEFORE_ROUND_GROUP,
+        microDustMaxSol: BUNDLER_FUNDER_NORMAL_TINY_MICRO_DUST_MAX_SOL,
+        signature: tx.signature,
+      },
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏭️ ${this.label} Token Skipped — Excessive Micro-Dust Before First Group</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `FeePayer: <code>${state.funderWallet}</code>`,
+        `Micro-dust outs (&lt; ${BUNDLER_FUNDER_NORMAL_TINY_MICRO_DUST_MAX_SOL.toFixed(3)} SOL): <b>${microDustCount}</b>`,
+        `Limit before ~0.02–~0.1 SOL group: <b>${BUNDLER_FUNDER_NORMAL_MAX_DUST_BEFORE_ROUND_GROUP}</b>`,
+        `Trigger tx: <code>${tx.signature}</code>`,
+        "",
+        "Skipping this token — waiting for the next one.",
+      ].join("\n"),
+      "excessive micro-dust before first round group skip notification",
+    );
+    await this.resetForNewToken(true);
   }
 
   private recordNormalTinyTransferOut(
@@ -4261,38 +4326,6 @@ export class InsiderBot extends EventEmitter {
     state.normalTinyTransferOuts = state.normalTinyTransferOuts
       .filter((existing) => entry.timestamp - existing.timestamp <= 180)
       .sort((a, b) => a.timestamp - b.timestamp);
-  }
-
-  private async skipTokenDustBeforeFirstRoundGroup(
-    state: BundlerFunderWatchState,
-    tx: HeliusTransaction,
-    amountSol: number,
-    amountUsd: number,
-  ): Promise<void> {
-    this.log.warn(
-      "Skipping token — dust feePayer transfer-out below ~0.02 SOL before first round group",
-      {
-        mint: state.mint,
-        funderWallet: state.funderWallet,
-        amountSol,
-        amountUsd,
-        signature: tx.signature,
-        dustMaxSol: BUNDLER_FUNDER_NORMAL_TINY_DUST_MAX_SOL,
-      },
-    );
-    void this.sendTelegramSafe(
-      [
-        `<b>⏭️ ${this.label} Token Skipped — Dust Before First Group</b>`,
-        `Token: <code>${state.mint}</code>`,
-        `FeePayer: <code>${state.funderWallet}</code>`,
-        `Transfer-out: <b>${amountSol.toFixed(4)} SOL</b> (~$${amountUsd.toFixed(2)})`,
-        `Trigger tx: <code>${tx.signature}</code>`,
-        "",
-        "First feePayer activity must be a ~0.02–~0.1 SOL group (≥2 in 10s). Transfers below ~0.02 SOL skip the token.",
-      ].join("\n"),
-      "dust before first round group skip notification",
-    );
-    await this.resetForNewToken(true);
   }
 
   private async skipTokenOutOfRangeBeforeFirstRoundGroup(
@@ -4322,7 +4355,7 @@ export class InsiderBot extends EventEmitter {
         `Transfer-out: <b>${amountSol.toFixed(4)} SOL</b> (~$${amountUsd.toFixed(2)})`,
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
-        "First feePayer activity must be a ~0.02–~0.1 SOL group (≥2 in 10s). Amounts outside that range skip the token.",
+        "First feePayer activity must be a ~0.02–~0.1 SOL group (≥2 in 10s). Amounts above ~0.1 SOL skip the token.",
       ].join("\n"),
       "out-of-range before first round group skip notification",
     );
