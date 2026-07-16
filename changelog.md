@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-16 (25)
+
+### Normal mode: unified ~0.02–~0.1 SOL first-round buy gate
+
+- Dust is anything **below ~0.02 SOL** seen before the first group — skips the token.
+- Buy triggers on **any transfer-out from ~0.02 to ~0.1 SOL** (not just exact 0.02/0.05/0.1), **≥2 unique recipients within 10s**, and only when that group is the **first** feePayer transfer-out activity (not a dust preamble).
+- Removed same-USD-band grouping — a valid first group can mix any amounts in the ~0.02–~0.1 SOL range within the same 10s window.
+- Exit: **+90% MC** for triggers below ~0.1 SOL, **+180% MC** when the triggering transfer is ~0.1 SOL.
+
+## 2026-07-16 (24)
+
+### Funder-first: stop potential feePayer on exchange send
+
+- When a potential feePayer sends SOL to a recipient (transfer ≤50% of its initial funder-receive balance), the bot resolves the recipient via Helius `wallet/identity`.
+- If the recipient `type` is **exchange** (e.g. Bybit hot wallet), the potential feePayer watch is unsubscribed immediately and a Telegram alert is sent.
+- Identity results are cached per wallet address to limit API calls.
+
 ## 2026-07-15 (23)
 
 ### Normal mode: first feePayer activity must be a round SOL group

@@ -26,6 +26,9 @@
 //    • Follow wallet merged with a bundler recipient uses one Enhanced WSS watch.
 //
 //  Stop-watching rules for a potential feePayer wallet itself:
+//    • On any outgoing SOL transfer ≤50% of the initial funder-receive balance,
+//      resolve the recipient via Helius wallet identity; if type is "exchange",
+//      stop and unsubscribe immediately.
 //    • Keep monitoring until native SOL balance hits zero.
 //    • On zero: stop and unsubscribe (no handoff to drain recipient).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33,7 +36,7 @@
 import { Connection, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { createLogger } from './logger';
-import { HeliusClient, HeliusTransaction } from './helius-client';
+import { HeliusClient, HeliusTransaction, HeliusWalletIdentity } from './helius-client';
 import { HeliusEnhancedWsClient } from './helius-enhanced-ws';
 import {
   FunderFirstEarlyBuy,
@@ -56,6 +59,8 @@ const ZERO_BALANCE_EPSILON_SOL = 1e-6;
 const POST_BALANCE_TOLERANCE_SOL = 0.5;
 const POTENTIAL_FEEPAYER_SYNC_LIMIT = 20;
 const POTENTIAL_FEEPAYER_SYNC_MIN_INTERVAL_MS = 1_000;
+/** Outgoing transfers up to this fraction of initial funder-receive balance trigger exchange-identity checks. */
+const EXCHANGE_DRAIN_CHECK_MAX_FRACTION = 0.5;
 
 type PotentialFeePayerStatus =
   | 'watching'
@@ -129,6 +134,8 @@ export class FunderFirstOrchestrator extends EventEmitter {
   private readonly recipientToFeePayer = new Map<string, string>();
   private readonly potentialFeePayers = new Map<string, PotentialFeePayerWatch>();
   private readonly cooldownsByDev = new Map<string, string>();
+  /** Cached Helius wallet identity: address → true when type is public exchange. */
+  private readonly walletExchangeIdentityCache = new Map<string, boolean>();
 
   constructor(
     private readonly config: ServiceConfig,
@@ -593,6 +600,17 @@ export class FunderFirstOrchestrator extends EventEmitter {
     if (watch.status === 'cooldown') return false;
 
     for (const transfer of this.extractOutgoingSolTransfers(tx, address)) {
+      if (
+        await this.maybeStopPotentialFeePayerForExchangeRecipient(
+          watch,
+          transfer,
+          tx,
+          source,
+        )
+      ) {
+        return true;
+      }
+
       const recipientPostBalanceSol = this.getAccountPostBalanceSol(
         tx,
         transfer.to,
@@ -645,6 +663,84 @@ export class FunderFirstOrchestrator extends EventEmitter {
 
   private isFeePayerBalanceZero(balanceSol: number | null): boolean {
     return balanceSol !== null && balanceSol <= ZERO_BALANCE_EPSILON_SOL;
+  }
+
+  private isExchangeDrainCheckTransfer(
+    watch: PotentialFeePayerWatch,
+    amountSol: number,
+  ): boolean {
+    const baselineSol = watch.balanceAtFunderReceiveSol;
+    if (baselineSol === null || baselineSol <= 0) return false;
+    return amountSol <= baselineSol * EXCHANGE_DRAIN_CHECK_MAX_FRACTION;
+  }
+
+  private isPublicExchangeIdentity(identity: HeliusWalletIdentity): boolean {
+    return identity.type?.trim().toLowerCase() === 'exchange';
+  }
+
+  private async resolveIsPublicExchangeWallet(wallet: string): Promise<boolean> {
+    const cached = this.walletExchangeIdentityCache.get(wallet);
+    if (cached !== undefined) return cached;
+
+    try {
+      const identity = await this.heliusClient.getWalletIdentity(wallet);
+      const isExchange =
+        identity !== null && this.isPublicExchangeIdentity(identity);
+      this.walletExchangeIdentityCache.set(wallet, isExchange);
+      if (isExchange) {
+        log.info('Helius wallet identity resolved as public exchange', {
+          wallet,
+          name: identity?.name ?? null,
+          category: identity?.category ?? null,
+        });
+      }
+      return isExchange;
+    } catch (err) {
+      log.warn('Helius wallet identity lookup failed — continuing watch', {
+        wallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  private async maybeStopPotentialFeePayerForExchangeRecipient(
+    watch: PotentialFeePayerWatch,
+    transfer: { to: string; amountSol: number },
+    tx: HeliusTransaction,
+    source: 'wss' | 'rest',
+  ): Promise<boolean> {
+    if (!this.isExchangeDrainCheckTransfer(watch, transfer.amountSol)) {
+      return false;
+    }
+
+    const isExchange = await this.resolveIsPublicExchangeWallet(transfer.to);
+    if (!isExchange) return false;
+
+    log.warn('Potential feePayer sent SOL to public exchange — stopping watch', {
+      potentialFeePayer: watch.address,
+      exchangeRecipient: transfer.to,
+      amountSol: transfer.amountSol,
+      initialReceiveSol: watch.balanceAtFunderReceiveSol,
+      signature: tx.signature,
+      source,
+    });
+
+    void this.sendTelegram([
+      '<b>⏹️ Funder-First: Potential FeePayer Stopped — Exchange Send</b>',
+      `FeePayer: <code>${this.html(watch.address)}</code>`,
+      `Exchange recipient: <code>${this.html(transfer.to)}</code>`,
+      `Sent: <b>${transfer.amountSol.toFixed(4)} SOL</b>`,
+      `Initial receive baseline: <b>${(watch.balanceAtFunderReceiveSol ?? 0).toFixed(4)} SOL</b>`,
+      '',
+      'Unsubscribed — not a bundler-funding feePayer pattern.',
+    ]);
+
+    this.stopPotentialFeePayerWatch(
+      watch.address,
+      'outgoing SOL transfer to public exchange wallet',
+    );
+    return true;
   }
 
   /** Fee payer hit zero — stop monitoring (no handoff). */

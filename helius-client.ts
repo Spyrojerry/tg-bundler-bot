@@ -106,6 +106,16 @@ export interface HeliusCreditExhaustionInfo {
   usage: HeliusProjectUsage;
 }
 
+export interface HeliusWalletIdentity {
+  address: string;
+  type?: string;
+  name?: string;
+  category?: string;
+  tags?: string[];
+  icon?: string;
+  website?: string;
+}
+
 interface HeliusClientOptions {
   projectId?: string;
   label?: string;
@@ -541,6 +551,24 @@ export class HeliusClient {
       throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
     }
     return await response.json() as HeliusTransaction[];
+  }
+
+  /**
+   * Resolves a wallet's public identity (exchange, validator, etc.) via Helius.
+   * Returns null when Helius has no identity record (404).
+   */
+  async getWalletIdentity(wallet: string): Promise<HeliusWalletIdentity | null> {
+    const url = `https://api.helius.xyz/v1/wallet/${wallet}/identity?api-key=${this.apiKey}`;
+
+    const response = await this.fetchWithCreditCheck(url);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `Helius wallet identity API error: ${response.status} ${response.statusText} - ${text}`,
+      );
+    }
+    return (await response.json()) as HeliusWalletIdentity;
   }
 
   async getWalletBalanceAt(
