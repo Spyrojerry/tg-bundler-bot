@@ -60,13 +60,13 @@ const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
   "lt2_5" | "2_5_to_5" | "gt5",
   number[]
 > = {
-  lt2_5: [0.01],
+  lt2_5: [],
   "2_5_to_5": [0.02, 0.05],
   gt5: [0.1],
 };
-/** Tolerance (in SOL) for matching a transfer-out amount against one of the per-band round SOL targets above — kept deliberately slim so it only absorbs fee/rounding/slippage noise, not genuinely different amounts. Ranges stay non-overlapping between 0.01/0.02/0.05/0.1 at this tolerance. */
+/** Tolerance (in SOL) for matching a transfer-out amount against one of the per-band round SOL targets above — kept deliberately slim so it only absorbs fee/rounding/slippage noise, not genuinely different amounts. Ranges stay non-overlapping between 0.02/0.05/0.1 at this tolerance. */
 const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.004;
-/** ~0.01 SOL round target — same value as lt2_5 band entry above. */
+/** ~0.01 SOL — classified as lt2_5 preamble dust, not a buy-triggering round size. */
 const BUNDLER_FUNDER_NORMAL_TINY_DUST_ROUND_SOL_AMOUNT = 0.01;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 20;
@@ -349,7 +349,7 @@ interface BundlerFunderWatchState {
   recipientWatches: Map<string, FunderRecipientWatch>;
   queuedTransferOuts: FunderTransferOutCandidate[];
   normalTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
-  /** True once a qualifying 0.01/0.02/0.05/0.1 SOL same-band group (≥2) is found. */
+  /** True once a qualifying 0.02/0.05/0.1 SOL same-band group (≥2) is found. */
   normalTinyRoundGroupFound: boolean;
   lowFundingFunderTxs: Array<{ signature: string; timestamp: number }>;
   lowFundingTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
@@ -3848,7 +3848,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${state.mint}</code>`,
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Group: <b>${selectedGroup.length}/${BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES}</b> same USD band within ${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s`,
-        `Band: <b>${tinyUsdBand === "gt5" ? ">$5.00-$10.00" : tinyUsdBand === "2_5_to_5" ? "$1.00-$5.00" : "~0.01 SOL"}</b>`,
+        `Band: <b>${tinyUsdBand === "gt5" ? ">$5.00-$10.00" : "$1.00-$5.00"}</b>`,
         `Selected exit: <b>+${exitPercent}% MC</b>`,
         ...selectedGroup.map((entry, index) => `${index + 1}. <code>${entry.recipient}</code> — $${entry.amountUsd.toFixed(2)} — <code>${entry.signature}</code>`),
       ].join("\n"),
@@ -4277,7 +4277,6 @@ export class InsiderBot extends EventEmitter {
 
   private isValidFirstRoundSolAmount(amountSol: number): boolean {
     const targets = [
-      ...BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND.lt2_5,
       ...BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND["2_5_to_5"],
       ...BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND.gt5,
     ];
@@ -4291,7 +4290,7 @@ export class InsiderBot extends EventEmitter {
     amountUsd: number,
   ): Promise<void> {
     this.log.warn(
-      "Skipping token — non-round feePayer transfer-out before first 0.01/0.02/0.1 SOL group",
+      "Skipping token — non-round feePayer transfer-out before first 0.02/0.05/0.1 SOL group",
       {
         mint: state.mint,
         funderWallet: state.funderWallet,
@@ -4299,7 +4298,6 @@ export class InsiderBot extends EventEmitter {
         amountUsd,
         signature: tx.signature,
         validRoundTargets: [
-          ...BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND.lt2_5,
           ...BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND["2_5_to_5"],
           ...BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND.gt5,
         ],
@@ -4314,7 +4312,7 @@ export class InsiderBot extends EventEmitter {
         `Transfer-out: <b>${amountSol.toFixed(4)} SOL</b> (~$${amountUsd.toFixed(2)})`,
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
-        "First feePayer activity must be a 0.01 / 0.02 / 0.1 SOL round group (≥2 in 10s). Skipping — waiting for the next token.",
+        "First feePayer activity must be a 0.02 / 0.05 / 0.1 SOL round group (≥2 in 10s). ~0.01 SOL preamble skips the token. Waiting for the next one.",
       ].join("\n"),
       "non-round before first round group skip notification",
     );
@@ -4336,7 +4334,10 @@ export class InsiderBot extends EventEmitter {
     );
     if (group.length < 2) return [];
     if (group.some((entry) => this.getTinyUsdBand(entry.amountUsd, entry.amountSol) !== band)) return [];
-    if (group.some((entry) => !this.isRoundBundlerTinySolAmount(entry.amountSol, band))) {
+    if (
+      band !== "lt2_5" &&
+      group.some((entry) => !this.isRoundBundlerTinySolAmount(entry.amountSol, band))
+    ) {
       return [];
     }
     const uniqueRecipients = new Set(group.map((entry) => entry.recipient));
