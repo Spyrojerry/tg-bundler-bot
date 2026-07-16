@@ -2,9 +2,11 @@
 
 ## 2026-07-15 (23)
 
-### Normal mode: skip tokens with >20 dust outs before round SOL group
+### Normal mode: first feePayer activity must be a round SOL group
 
-- If more than **20** ~0.01 SOL dust feePayer transfer-outs are recorded before a qualifying **0.02 / 0.05 / 0.1 SOL** same-band group (≥2 recipients in 10s), the token is skipped and the bot resets to watch for the next one.
+- Removed the “>20 dust outs” counter. Any **non-round** feePayer transfer-out (not ~0.01 / 0.02 / 0.05 / 0.1 SOL within tolerance) that appears **before** the first qualifying same-band group now skips the token immediately.
+- Transfers below **$0.10 USD** are still ignored entirely (not tracked).
+- The **first** buy-triggering group must be ≥2 recipients in 10s at a round size: **~0.01**, **~0.02/0.05**, or **~0.1 SOL** — including ~0.01 SOL groups, which now proceed through the normal buy gate (+90% MC exit).
 
 ## 2026-07-15 (22)
 
