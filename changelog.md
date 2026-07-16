@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-07-16 (31)
+
+### Normal mode: first sol group + buy at ≥20 round txs
+
+- **First qualifying group** = first 10s window with **≥2 txs of the same sol type** (dust, or one of ~0.02 / ~0.05 / ~0.1 SOL).
+- If that first group is **dust** → skip token.
+- **Buy** only when a **~0.02 / ~0.05 / ~0.1 SOL** group has **≥20 txs** in 10s and is the first qualifying sol group (2–19 txs waits, no buy).
+- Removed the >20 round-group skip cap.
+
+## 2026-07-16 (30)
+
+### Normal mode: first 10s group uses tx counts (2–20), not dust-group tally
+
+- **First qualifying group** = first 10s window with **≥2 transfer-out txs**.
+- If that first group is **dust** (not ~0.02 / ~0.05 / ~0.1 SOL) → skip token.
+- If first group is **~0.02 / ~0.05 / ~0.1 SOL** (same round size) with **2–20 txs** in 10s → buy.
+- **>20 txs** in a valid round 10s window → skip.
+- **>20 individual dust txs** total before the first qualifying group → skip.
+- Removed counting separate “dust groups” over time.
+
+## 2026-07-16 (29)
+
+### Normal mode: dust skip uses groups, not individual outs
+
+- Dust skip threshold is now **>20 dust groups** (≥2 non-round transfer-outs in 10s), not >20 individual dust outs.
+- Up to **20 dust groups** may precede the first valid ~0.02 / ~0.05 / ~0.1 SOL round group; the 21st dust group skips the token.
+- Removed immediate skip on any single dust group before a valid round group.
+
+## 2026-07-16 (28)
+
+### Normal mode: exact ~0.02 / ~0.05 / ~0.1 SOL round groups only
+
+- Replaced the ~0.02–~0.1 SOL range logic with **three discrete round sizes** only (±0.004 SOL each).
+- Buy requires **≥2 recipients at the same round size within 10s**, and that group must be the **first valid SOL group** (no prior dust group of ≥2 in 10s).
+- **Dust** = any transfer not matching ~0.02 / ~0.05 / ~0.1 SOL. **>20 dust groups** (≥2 in 10s) before the first valid round group skips the token.
+- Removed range-based buys, micro-dust threshold, out-of-range immediate skip, preamble wait, and stale $1–$5 lock timeout.
+
 ## 2026-07-16 (27)
 
 ### Normal mode: restore >20 micro-dust counter + ~0.02–~0.1 first group
