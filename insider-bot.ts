@@ -37,6 +37,8 @@ const BUNDLER_FUNDER_FUNDING_RECORD_RETRY_DELAY_MS = 500;
 const BUNDLER_FUNDER_LOW_FUNDING_SOL = 20;
 /** Kill switch for the whole low-funding-mode path. While false, any shared feePayer whose largest funding is below BUNDLER_FUNDER_LOW_FUNDING_SOL is skipped entirely (no watch is even created for it) instead of being handled via low-funding logic. */
 const BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED = false;
+/** Max follow wallets monitored concurrently on one insider bot. */
+const MAX_FOLLOW_WALLETS = 2;
 const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
 const BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT = 50;
 const BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL = 3.5;
@@ -238,11 +240,13 @@ export interface InsiderBot {
   setBundlerBuyMaxUsd(value: number): void;
   getRequiredInsiderSells(): number;
   getFollowedWallet(): string | null;
+  getFollowedWallets(): string[];
   getMonitoredWallet(): string | null;
   getBuySol(): number;
   isBuyDisabled(): boolean;
   setBuyDisabled(value: boolean): void;
   configureFollowWallet(address: string): void;
+  removeFollowWallet(address: string): Promise<void>;
   pause(): void;
   stopForHeliusCredits(): Promise<void>;
   isStoppedForHeliusCredits(): boolean;
@@ -252,6 +256,9 @@ export interface InsiderBot {
   resetBuyAttempt(): void;
   seedSeenMints(mints: Set<string>): void;
   followWallet(address: string): Promise<void>;
+  addFollowWallet(
+    address: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }>;
   stop(): Promise<void>;
 }
 
@@ -399,11 +406,15 @@ export class InsiderBot extends EventEmitter {
   private readonly wsUrl: string;
   private readonly label: string;
 
-  private followedWallet: string | null = null;
-  /** Follow wallet that started the current follow-sourced flow (may differ from `followedWallet` when delegated to another bot). */
+  private followedWallets: string[] = [];
+  /** Follow wallet that started the current follow-sourced flow (may differ when delegated to another bot). */
   private flowFollowWallet: string | null = null;
   private followWalletFlowDelegate:
-    | ((mint: string, signature: string) => Promise<boolean>)
+    | ((
+        mint: string,
+        signature: string,
+        followedWallet: string,
+      ) => Promise<boolean>)
     | null = null;
   /** Whether the current/previous token flow was started from follow-wallet backtrack or funder-first discovery. */
   private flowSource: "follow" | "funder-first" | null = null;
@@ -420,7 +431,7 @@ export class InsiderBot extends EventEmitter {
   private requiredInsiderSells: number;
   private buyDisabled = false;
 
-  private followMonitor: WalletMonitor | null = null;
+  private followMonitors = new Map<string, WalletMonitor>();
   private followWalletTxNotifier: ((tx: HeliusTransaction) => void) | null = null;
   private watchingMint: string | null = null;
   private phase: FlowPhase | null = null;
@@ -845,16 +856,34 @@ export class InsiderBot extends EventEmitter {
   }
 
   getFollowedWallet() {
-    return this.followedWallet;
+    return this.followedWallets[0] ?? null;
+  }
+
+  getFollowedWallets(): string[] {
+    return [...this.followedWallets];
+  }
+
+  isFollowWallet(address: string): boolean {
+    try {
+      return this.followedWallets.includes(new PublicKey(address).toBase58());
+    } catch {
+      return false;
+    }
   }
 
   /** Follow wallet tied to the active follow-sourced token flow (supports delegated flows). */
   private getFlowFollowWallet(): string | null {
-    return this.flowFollowWallet ?? this.followedWallet;
+    return this.flowFollowWallet ?? this.followedWallets[0] ?? null;
   }
 
   setFollowWalletFlowDelegate(
-    delegate: ((mint: string, signature: string) => Promise<boolean>) | null,
+    delegate:
+      | ((
+          mint: string,
+          signature: string,
+          followedWallet: string,
+        ) => Promise<boolean>)
+      | null,
   ): void {
     this.followWalletFlowDelegate = delegate;
   }
@@ -1083,7 +1112,7 @@ export class InsiderBot extends EventEmitter {
 
   isRunning() {
     return (
-      this.followMonitor !== null ||
+      this.followMonitors.size > 0 ||
       this.insiderLogsSubId !== null ||
       this.insiderEnhancedWatchId !== null ||
       this.bundlerLogsSubIds.size > 0 ||
@@ -1096,26 +1125,61 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  async followWallet(address: string): Promise<void> {
+  async addFollowWallet(
+    address: string,
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
     if (this.stoppedForHeliusCredits) {
-      this.log.warn(
-        "Follow-wallet start blocked because Helius credits are exhausted",
-        {
-          followedWallet: address,
-        },
-      );
+      return {
+        ok: false,
+        error: "Follow-wallet start blocked because Helius credits are exhausted.",
+      };
+    }
+
+    let normalized: string;
+    try {
+      normalized = new PublicKey(address.trim()).toBase58();
+    } catch {
+      return { ok: false, error: "Invalid Solana wallet address." };
+    }
+
+    if (this.followedWallets.includes(normalized)) {
+      if (!this.followMonitors.has(normalized)) {
+        await this.startFollowWalletMonitor(normalized);
+      }
+      return { ok: true };
+    }
+
+    if (this.followedWallets.length >= MAX_FOLLOW_WALLETS) {
+      return {
+        ok: false,
+        error: `At most ${MAX_FOLLOW_WALLETS} follow wallets — remove one before adding another.`,
+      };
+    }
+
+    this.followedWallets.push(normalized);
+    await this.startFollowWalletMonitor(normalized);
+    return { ok: true };
+  }
+
+  async followWallet(address: string): Promise<void> {
+    const result = await this.addFollowWallet(address);
+    if (!result.ok) {
+      throw new Error(result.error);
+    }
+  }
+
+  async followAllWallets(): Promise<void> {
+    for (const wallet of this.followedWallets) {
+      if (!this.followMonitors.has(wallet)) {
+        await this.startFollowWalletMonitor(wallet);
+      }
+    }
+  }
+
+  private async startFollowWalletMonitor(normalized: string): Promise<void> {
+    if (this.followMonitors.has(normalized)) {
       return;
     }
-    const normalized = new PublicKey(address).toBase58();
-    if (this.followedWallet !== normalized) {
-      this.boughtMints.clear();
-    }
-    await this.stopFlowMonitoring();
-    if (this.followMonitor) {
-      this.followMonitor.stop();
-      this.followMonitor = null;
-    }
-    this.followedWallet = normalized;
 
     const monitor = new WalletMonitor(this.config, normalized, {
       enforceMinBuySol: false,
@@ -1124,19 +1188,22 @@ export class InsiderBot extends EventEmitter {
       logLabel: `WALLET ${this.label.toUpperCase()}`,
       enhancedWs: this.enhancedWs,
     });
-    this.followMonitor = monitor;
+    this.followMonitors.set(normalized, monitor);
     monitor.on("transaction", (event: { walletAddress: string; tx: HeliusTransaction }) => {
       this.followWalletTxNotifier?.(event.tx);
     });
     monitor.on("newToken", (event) => {
-      void this.handleFollowWalletBuy(event.mint, event.signature);
+      void this.handleFollowWalletBuy(
+        event.mint,
+        event.signature,
+        event.walletAddress,
+      );
     });
 
     try {
       await monitor.start();
     } catch (err) {
-      monitor.stop();
-      this.followMonitor = null;
+      this.followMonitors.delete(normalized);
       throw err;
     }
     for (const mint of monitor.existingMints) {
@@ -1145,30 +1212,53 @@ export class InsiderBot extends EventEmitter {
 
     this.log.info("Insider follow wallet monitoring started", {
       followedWallet: normalized,
+      followWalletCount: this.followedWallets.length,
       buySol: this.buySol,
       bundlerUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
     });
   }
 
+  private stopFollowWalletMonitor(normalized: string): void {
+    const monitor = this.followMonitors.get(normalized);
+    if (!monitor) return;
+    monitor.stop();
+    this.followMonitors.delete(normalized);
+  }
+
+  private stopAllFollowMonitors(): void {
+    for (const address of [...this.followMonitors.keys()]) {
+      this.stopFollowWalletMonitor(address);
+    }
+  }
+
+  async removeFollowWallet(address: string): Promise<void> {
+    let normalized: string;
+    try {
+      normalized = new PublicKey(address.trim()).toBase58();
+    } catch {
+      throw new Error("Invalid Solana wallet address.");
+    }
+    if (!this.followedWallets.includes(normalized)) {
+      return;
+    }
+    this.stopFollowWalletMonitor(normalized);
+    this.followedWallets = this.followedWallets.filter((w) => w !== normalized);
+    this.log.info("Insider follow wallet removed", {
+      followedWallet: normalized,
+      remainingFollowWallets: this.followedWallets,
+    });
+  }
+
   configureFollowWallet(address: string): void {
     const normalized = new PublicKey(address).toBase58();
-    if (this.followedWallet !== normalized) {
-      this.boughtMints.clear();
-    }
-    this.pause();
-    this.followedWallet = normalized;
-    this.activePosition = null;
-    this.watchingMint = null;
-    this.monitoredWallet = null;
-    this.insiderState = null;
+    if (this.followedWallets.includes(normalized)) return;
+    if (this.followedWallets.length >= MAX_FOLLOW_WALLETS) return;
+    this.followedWallets.push(normalized);
   }
 
   async stop(): Promise<void> {
     await this.stopFlowMonitoring();
-    if (this.followMonitor) {
-      this.followMonitor.stop();
-      this.followMonitor = null;
-    }
+    this.stopAllFollowMonitors();
     if (this.claimedMint) {
       this.releaseMint?.(this.claimedMint);
       this.claimedMint = null;
@@ -1185,20 +1275,14 @@ export class InsiderBot extends EventEmitter {
 
   pause(): void {
     void this.stopFlowMonitoring();
-    if (this.followMonitor) {
-      this.followMonitor.stop();
-      this.followMonitor = null;
-    }
+    this.stopAllFollowMonitors();
   }
 
   async stopForHeliusCredits(): Promise<void> {
     if (this.stoppedForHeliusCredits) return;
     this.stoppedForHeliusCredits = true;
     await this.stopFlowMonitoring();
-    if (this.followMonitor) {
-      this.followMonitor.stop();
-      this.followMonitor = null;
-    }
+    this.stopAllFollowMonitors();
     if (this.claimedMint) {
       this.releaseMint?.(this.claimedMint);
       this.claimedMint = null;
@@ -1272,7 +1356,9 @@ export class InsiderBot extends EventEmitter {
   private async handleFollowWalletBuy(
     mint: string,
     signature: string,
+    followedWallet: string,
   ): Promise<void> {
+    if (!this.isFollowWallet(followedWallet)) return;
     if (this.boughtMints.has(mint)) return;
     if (this.claimMint && !this.claimMint(mint)) {
       this.log.info(
@@ -1280,6 +1366,7 @@ export class InsiderBot extends EventEmitter {
         {
           mint,
           signature,
+          followedWallet,
         },
       );
       return;
@@ -1287,7 +1374,11 @@ export class InsiderBot extends EventEmitter {
 
     if (this.activePosition || this.watchingMint) {
       if (this.followWalletFlowDelegate) {
-        const delegated = await this.followWalletFlowDelegate(mint, signature);
+        const delegated = await this.followWalletFlowDelegate(
+          mint,
+          signature,
+          followedWallet,
+        );
         if (delegated) return;
       }
       this.log.info(
@@ -1295,6 +1386,7 @@ export class InsiderBot extends EventEmitter {
         {
           mint,
           signature,
+          followedWallet,
           watchingMint: this.watchingMint,
           activePosition: this.activePosition?.mint ?? null,
         },
@@ -1302,8 +1394,7 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    if (!this.followedWallet) return;
-    await this.startFromFollowWalletBuy(mint, signature, this.followedWallet);
+    await this.startFromFollowWalletBuy(mint, signature, followedWallet);
   }
 
   private isMintIndexingLagError(error: unknown): boolean {
@@ -6908,8 +6999,8 @@ export class InsiderBot extends EventEmitter {
     this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
 
-    if (this.followedWallet && !this.followMonitor) {
-      await this.followWallet(this.followedWallet);
+    if (this.followedWallets.length > 0 && this.followMonitors.size === 0) {
+      await this.followAllWallets();
     }
   }
 
@@ -6975,8 +7066,8 @@ export class InsiderBot extends EventEmitter {
     this.funderFirstFeePayer = null;
 
     this.log.info("InsiderBot reset; resuming followed wallet monitoring");
-    if (this.followedWallet && !this.followMonitor) {
-      await this.followWallet(this.followedWallet);
+    if (this.followedWallets.length > 0 && this.followMonitors.size === 0) {
+      await this.followAllWallets();
     }
   }
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-17 (38)
+
+### Follow-wallet: watch up to 2 wallets on bot 1
+
+- Insider bot 1 can monitor **up to 2 follow wallets** concurrently (separate Enhanced WSS monitors). **Add follow wallet** on `/start` adds without replacing; **🗑 Remove** per wallet.
+- Each wallet’s buy triggers its own backtrack flow (with idle-bot delegation unchanged). Funder-first merge checks **both** follow wallets.
+- Optional env: `INSIDER_FOLLOW_WALLET` + `INSIDER_FOLLOW_WALLET_2` load as paused defaults on startup.
+
 ## 2026-07-17 (37)
 
 ### Funder-first: 100+ SOL zero-balance handoff chain

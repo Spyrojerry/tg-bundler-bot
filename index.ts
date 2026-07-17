@@ -494,15 +494,36 @@ async function main(): Promise<void> {
     botIndex: number,
     address: string,
     source: string,
-  ): Promise<boolean> {
+  ): Promise<boolean | string> {
     try {
-      await insiderBots[botIndex].followWallet(address);
+      const result = await insiderBots[botIndex].addFollowWallet(address);
+      if (!result.ok) return result.error;
       return true;
     } catch (err) {
       if (!isHeliusUsageExhaustionError(err)) throw err;
       await stopInsiderForHeliusUsageExhaustion(botIndex, err, source);
       return false;
     }
+  }
+
+  async function resumeInsiderFollowWallets(
+    botIndex: number,
+    source: string,
+  ): Promise<boolean | string> {
+    const bot = insiderBots[botIndex];
+    const wallets = bot.getFollowedWallets();
+    if (wallets.length === 0) {
+      return "No follow wallets configured.";
+    }
+    for (const wallet of wallets) {
+      const result = await followInsiderWalletWithUsageGuard(
+        botIndex,
+        wallet,
+        source,
+      );
+      if (result !== true) return result;
+    }
+    return true;
   }
 
   async function fetchInsiderMarketCapUsd(
@@ -855,11 +876,30 @@ async function main(): Promise<void> {
             type: "insiderFollowWallet",
             index: 0,
           });
+          const current = insiderBots[0]?.getFollowedWallets() ?? [];
           return {
-            text: "Send the one wallet address for Insider Bot to follow.",
+            text: [
+              "Send a wallet address to add as a follow wallet (max 2).",
+              current.length > 0
+                ? `\nCurrently watching:\n${current.map((w) => `• <code>${html(w)}</code>`).join("\n")}`
+                : "",
+            ].join("\n"),
             trackPrompt: true,
             editCurrent: true,
           };
+        }
+        if (data.startsWith("insider:follow:remove:")) {
+          const address = data.slice("insider:follow:remove:".length);
+          try {
+            await insiderBots[0].removeFollowWallet(address);
+            log.info("[SETTINGS] Insider follow wallet removed", { address });
+          } catch (err) {
+            return {
+              text: html(err instanceof Error ? err.message : String(err)),
+              editCurrent: true,
+            };
+          }
+          return homeReply(true);
         }
         if (data === "funderfirst:funder") {
           pendingTelegramActions.set(chatId, { type: "funderFirstFunderAddress" });
@@ -986,25 +1026,22 @@ async function main(): Promise<void> {
         if (data === "insider:resume") {
           activeInsiderIndex = 0;
           const bot = insiderBots[0];
-          const followedWallet = bot.getFollowedWallet();
-          if (!followedWallet) {
+          if (bot.getFollowedWallets().length === 0) {
             pendingTelegramActions.set(chatId, {
               type: "insiderFollowWallet",
               index: 0,
             });
             return {
-              text: "Send the one wallet address for Insider Bot to follow.",
+              text: "Send a wallet address to add as a follow wallet (max 2).",
               trackPrompt: true,
               editCurrent: true,
             };
           }
-          const started = await followInsiderWalletWithUsageGuard(
-            0,
-            followedWallet,
-            "telegram resume",
-          );
-          if (!started) {
-            return "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
+          const started = await resumeInsiderFollowWallets(0, "telegram resume");
+          if (started !== true) {
+            return typeof started === "string"
+              ? started
+              : "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
           }
           return homeReply(true);
         }
@@ -1153,8 +1190,10 @@ async function main(): Promise<void> {
               text,
               "telegram follow-wallet setup",
             );
-            if (!started) {
-              return "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
+            if (started !== true) {
+              return typeof started === "string"
+                ? html(started)
+                : "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
             }
             return homeReply();
           }
@@ -1254,8 +1293,10 @@ async function main(): Promise<void> {
           text,
           "telegram follow-wallet setup",
         );
-        if (!started) {
-          return "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
+        if (started !== true) {
+          return typeof started === "string"
+            ? html(started)
+            : "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
         }
         return homeReply();
       }
@@ -1333,54 +1374,50 @@ async function main(): Promise<void> {
     insiderBots.push(bot);
   });
 
-  insiderBots[0]?.setFollowWalletFlowDelegate(async (mint, signature) => {
+  insiderBots[0]?.setFollowWalletFlowDelegate(async (mint, signature, followedWallet) => {
     const idleIndex = findIdleInsiderBotIndex();
     if (idleIndex === null) {
       log.warn("[INSIDER] Follow-wallet buy skipped — all insider bots busy", {
         mint,
         signature,
+        followedWallet,
       });
       return false;
     }
     if (idleIndex === 0) return false;
-    const followWallet = insiderBots[0]?.getFollowedWallet();
-    if (!followWallet) return false;
     log.info("[INSIDER] Delegating follow-wallet buy to idle insider bot", {
       mint,
       signature,
-      followWallet,
+      followedWallet,
       targetBotIndex: idleIndex,
       targetBotNumber: getInsiderBotNumber(idleIndex),
     });
     return insiderBots[idleIndex]!.startFromFollowWalletBuy(
       mint,
       signature,
-      followWallet,
+      followedWallet,
     );
   });
 
   async function resumePrimaryInsiderBot(): Promise<void> {
     const bot = insiderBots[0];
     if (!bot) return;
-    const wallet = bot.getFollowedWallet();
+    const wallets = bot.getFollowedWallets();
     if (
-      wallet &&
-      !bot.isStoppedForHeliusCredits() &&
-      !bot.isRunning() &&
-      !bot.getActivePosition() &&
-      !bot.getPreBuyMint()
+      wallets.length === 0 ||
+      bot.isStoppedForHeliusCredits() ||
+      bot.isRunning() ||
+      bot.getActivePosition() ||
+      bot.getPreBuyMint()
     ) {
-      const started = await followInsiderWalletWithUsageGuard(
-        0,
-        wallet,
-        "startup resume",
-      );
-      if (!started) return;
-      log.info("[INSIDER] Resumed primary follow-wallet monitoring", {
-        wallet,
-        apiPoolBots: insiderBots.length,
-      });
+      return;
     }
+    const started = await resumeInsiderFollowWallets(0, "startup resume");
+    if (started !== true) return;
+    log.info("[INSIDER] Resumed primary follow-wallet monitoring", {
+      wallets,
+      apiPoolBots: insiderBots.length,
+    });
   }
 
   // ── Seed boughtMints from DB so restarts don't re-buy previous tokens ──────
@@ -1397,17 +1434,26 @@ async function main(): Promise<void> {
   // Load default wallets from config as paused saved wallets. They do not start
   // monitoring until the user resumes or switches into the active mode.
   insiderBotDefinitions.forEach((definition, index) => {
-    if (!definition.followWallet) return;
-    try {
-      insiderBots[index].configureFollowWallet(definition.followWallet);
-      log.info(
-        `[INSIDER ${definition.botNumber}] Loaded default follow wallet in paused state: ${definition.followWallet}`,
-      );
-    } catch (err) {
-      log.error(
-        `[INSIDER ${definition.botNumber}] Failed to load default follow wallet`,
-        err,
-      );
+    const wallets =
+      index === 0
+        ? [config.insiderFollowWallet, config.insiderFollowWallet2].filter(
+            (w): w is string => Boolean(w),
+          )
+        : definition.followWallet
+          ? [definition.followWallet]
+          : [];
+    for (const wallet of wallets) {
+      try {
+        insiderBots[index].configureFollowWallet(wallet);
+        log.info(
+          `[INSIDER ${definition.botNumber}] Loaded default follow wallet in paused state: ${wallet}`,
+        );
+      } catch (err) {
+        log.error(
+          `[INSIDER ${definition.botNumber}] Failed to load default follow wallet`,
+          err,
+        );
+      }
     }
   });
 
@@ -2315,7 +2361,7 @@ async function main(): Promise<void> {
   function homeReply(editCurrent = false): TelegramReply {
     activeInsiderIndex = 0;
     const bot = insiderBots[0];
-    const followedWallet = bot.getFollowedWallet();
+    const followedWallets = bot.getFollowedWallets();
     const insiderRunning = bot.isRunning();
     const preBuyMint = bot.getPreBuyMint();
     const activePos = bot.getActivePosition();
@@ -2327,12 +2373,12 @@ async function main(): Promise<void> {
       else if (preBuyMint)
         status = `Watching token ${html(preBuyMint.slice(0, 8))}...`;
       else status = "Running";
-    } else if (followedWallet) {
+    } else if (followedWallets.length > 0) {
       status = "Paused";
     }
 
     const stopResumeButton =
-      followedWallet && !insiderRunning
+      followedWallets.length > 0 && !insiderRunning
         ? { text: "Resume", callback_data: "insider:resume" }
         : { text: "Stop", callback_data: "insider:stop" };
 
@@ -2365,12 +2411,25 @@ async function main(): Promise<void> {
       },
     ]);
 
+    const followWalletLines =
+      followedWallets.length > 0
+        ? followedWallets.map((w) => `  • <code>${html(w)}</code>`)
+        : ["  • <i>none yet</i>"];
+
+    const followWalletRemoveRows = followedWallets.map((w) => [
+      {
+        text: `🗑 Remove follow ${w.slice(0, 4)}…${w.slice(-4)}`,
+        callback_data: `insider:follow:remove:${w}`,
+      },
+    ]);
+
     return {
       text: [
         "<b>Insider Bot</b>",
         "",
         `Status: <b>${status}</b>`,
-        `Follow wallet: ${followedWallet ? `<code>${html(followedWallet)}</code>` : "<b>Not set</b>"}`,
+        `<b>Follow wallets</b> (max 2):`,
+        ...followWalletLines,
         monitoredWallet
           ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
           : "",
@@ -2393,9 +2452,9 @@ async function main(): Promise<void> {
           : "Parallel tokens: configure <b>INSIDER_HELIUS_API_KEY_2</b> (+ GMGN/RPC/WS) to run follow-wallet and funder-first on two tokens at once.",
         "",
         "<b>Follow-wallet steps</b>",
-        "1. Bot 1 follows one wallet; Helius keys 1-4 are the fallback pool.",
+        "1. Bot 1 watches up to 2 follow wallets; Helius keys 1-4 are the fallback pool.",
         "2. Skip if follow-wallet buy MC is above $80,000.",
-        "3. First four bundler buys must include the follow wallet.",
+        "3. First four bundler buys must include the follow wallet that bought.",
         "4. Shared feePayer locked → normal-mode tiny transfer-out buy signals.",
         "",
         "<b>Funder-first steps</b>",
@@ -2408,9 +2467,10 @@ async function main(): Promise<void> {
       replyMarkup: {
         inline_keyboard: [
           [
-            { text: "Follow wallet", callback_data: "insider:follow" },
+            { text: "Add follow wallet", callback_data: "insider:follow" },
             { text: "FeePayer funder", callback_data: "funderfirst:funder" },
           ],
+          ...followWalletRemoveRows,
           [
             { text: "Fast-track feePayer", callback_data: "funderfirst:fasttrack" },
           ],
@@ -2465,16 +2525,16 @@ async function main(): Promise<void> {
 
   function statusReply(editCurrent = false): TelegramReply {
     const bot = insiderBots[0];
-    const followed = bot?.getFollowedWallet();
+    const followed = bot?.getFollowedWallets() ?? [];
     const status = bot?.isRunning()
       ? "Running"
-      : followed
+      : followed.length > 0
         ? "Paused"
         : "Idle";
     const primaryInfo = [
       "<b>Primary Insider Bot</b>",
       `Status: ${status}`,
-      `Follow: ${followed ?? "not set"}`,
+      `Follow wallets: ${followed.length > 0 ? followed.map((w) => `<code>${html(w)}</code>`).join(", ") : "not set"}`,
       `Default Buy: ${bot?.getBuySol() ?? config.insiderBuySol} SOL`,
       `Normal Buy: ${bot?.getNormalFundingBuySol() ?? config.insiderNormalBuySol} SOL`,
       `Low-Funding Buy: ${bot?.getLowFundingBuySol() ?? config.insiderLowFundingBuySol} SOL`,
@@ -2483,7 +2543,7 @@ async function main(): Promise<void> {
 
     const text = [
       "<b>Bot Status</b>",
-      "Flow: follow wallet on bot 1; funder-first and overflow follow buys use the first idle insider bot in the Helius key pool.",
+      "Flow: up to 2 follow wallets on bot 1; funder-first and overflow follow buys use the first idle insider bot in the Helius key pool.",
       "Candidate rule: transfer-out confirms only when the immediate next funder tx is not a SOL transfer-in.",
       "API guard: queued Helius pool, transient-only fallback, per-key backoff, capped recipient batch sync.",
       "",
@@ -2715,7 +2775,14 @@ async function main(): Promise<void> {
         "",
         "<b>Insider</b>",
         `Enabled bots: <b>${insiderBots.length}</b> (Helius key pool)`,
-        `Bot 1 follow wallet: ${insiderBots[0]?.getFollowedWallet() ? `<code>${html(insiderBots[0]!.getFollowedWallet()!)}</code>` : "not set"}`,
+        `Bot 1 follow wallets: ${
+          (insiderBots[0]?.getFollowedWallets().length ?? 0) > 0
+            ? insiderBots[0]!
+                .getFollowedWallets()
+                .map((w) => `<code>${html(w)}</code>`)
+                .join(", ")
+            : "not set"
+        }`,
         `Bot 1 running: <b>${insiderBots[0]?.isRunning() ? "yes" : "no"}</b>`,
         "",
         "<b>Funder-First</b>",

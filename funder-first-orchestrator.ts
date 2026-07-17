@@ -427,24 +427,25 @@ export class FunderFirstOrchestrator extends EventEmitter {
    * active bundler recipient — avoids a duplicate recipient-batch subscription.
    */
   handleMergedFollowWalletTx(tx: HeliusTransaction): void {
-    const followWallet = this.getPrimaryInsiderBot().getFollowedWallet();
-    if (!followWallet || !this.isEnabled) return;
+    const followWallets = this.getPrimaryInsiderBot().getFollowedWallets();
+    if (followWallets.length === 0 || !this.isEnabled) return;
 
     for (const [feePayer, watch] of this.potentialFeePayers) {
       if (watch.status === 'stopped' || watch.status === 'active') continue;
-      const inActiveGroup = [...watch.activeGroups.values()].some(
-        (group) =>
-          group.recipients.has(followWallet) &&
-          !group.stoppedRecipients.has(followWallet),
-      );
-      if (!inActiveGroup) continue;
-      void this.handleRecipientTx(feePayer, followWallet, tx);
+      for (const followWallet of followWallets) {
+        const inActiveGroup = [...watch.activeGroups.values()].some(
+          (group) =>
+            group.recipients.has(followWallet) &&
+            !group.stoppedRecipients.has(followWallet),
+        );
+        if (!inActiveGroup) continue;
+        void this.handleRecipientTx(feePayer, followWallet, tx);
+      }
     }
   }
 
   private isMergedFollowWalletRecipient(recipient: string): boolean {
-    const followWallet = this.getPrimaryInsiderBot().getFollowedWallet();
-    return !!followWallet && recipient === followWallet;
+    return this.getPrimaryInsiderBot().isFollowWallet(recipient);
   }
 
   async start(): Promise<void> {
@@ -1777,13 +1778,15 @@ export class FunderFirstOrchestrator extends EventEmitter {
         return;
       }
 
+      const followWallets = this.getPrimaryInsiderBot().getFollowedWallets();
+      const matchedFollow = followWallets.filter((w) => overlap.includes(w));
       void this.sendTelegram([
         '<b>🚀 Funder-First: Normal Mode — Handed to Insider Bot</b>',
         `Token: <code>${this.html(mint)}</code>`,
         `FeePayer: <code>${this.html(watch.address)}</code>`,
         `Matched bundlers: <b>${overlap.length}</b>`,
-        this.getPrimaryInsiderBot().getFollowedWallet()
-          ? `Follow wallet <code>${this.html(this.getPrimaryInsiderBot().getFollowedWallet()!)}</code> is among bundlers — normal mode applies.`
+        matchedFollow.length > 0
+          ? `Follow wallet${matchedFollow.length > 1 ? 's' : ''} ${matchedFollow.map((w) => `<code>${this.html(w)}</code>`).join(', ')} among bundlers — normal mode applies.`
           : '',
       ].filter(Boolean));
     } catch (err) {
