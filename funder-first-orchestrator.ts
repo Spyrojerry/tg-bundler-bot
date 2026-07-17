@@ -33,7 +33,11 @@
 //      resolve the recipient via Helius wallet identity; if type is "exchange",
 //      stop and unsubscribe immediately.
 //    • Keep monitoring until native SOL balance hits zero.
-//    • On zero: stop and unsubscribe (no handoff to drain recipient).
+//    • On zero: unsubscribe; if a ≥100 SOL transfer-out was recorded since arm,
+//      hand off watch to the latest such recipient (same bundler pipeline).
+//      If the latest recipient is the top-level feePayer funder, stop only — the
+//      funder is already subscribed and must not be opened as a potential feePayer.
+//      If none recorded, stop with no handoff.
 //    • Telegram /start menu can fast-track a potential feePayer manually
 //      (same pipeline as a funder SOL transfer-out, using current balance baseline).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -68,6 +72,16 @@ const COOLDOWN_DEV_SYNC_LIMIT = 30;
 const COOLDOWN_DEV_SYNC_MIN_INTERVAL_MS = 1_000;
 /** Outgoing transfers up to this fraction of initial funder-receive balance trigger exchange-identity checks. */
 const EXCHANGE_DRAIN_CHECK_MAX_FRACTION = 0.5;
+/** Outgoing transfers at or above this size are tracked for zero-balance handoff. */
+const LARGE_TRANSFER_HANDOFF_MIN_SOL = 100;
+
+interface LargeTransferOutEvent {
+  recipient: string;
+  amountSol: number;
+  recipientPostBalanceSol: number;
+  signature: string;
+  timestamp: number;
+}
 
 type PotentialFeePayerStatus =
   | 'watching'
@@ -133,6 +147,8 @@ interface PotentialFeePayerWatch {
   recipientZeroBalanceSubIds: Map<string, number>;
   /** Recipients that emitted a token buy — skip drain-based unsubscribe. */
   recipientsWithBuySeen: Set<string>;
+  /** Latest ≥100 SOL transfer-out since arm — used for zero-balance handoff. */
+  latestLargeTransferOut: LargeTransferOutEvent | null;
 }
 
 export class FunderFirstOrchestrator extends EventEmitter {
@@ -339,6 +355,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.notifiedGroupAnchors.clear();
     watch.recipientBalanceAtReceive.clear();
     watch.recipientsWithBuySeen.clear();
+    watch.latestLargeTransferOut = null;
 
     log.info('Potential feePayer manually fast-tracked', {
       potentialFeePayer: address,
@@ -611,6 +628,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
         recipientBalanceAtReceive: new Map(),
         recipientZeroBalanceSubIds: new Map(),
         recipientsWithBuySeen: new Set(),
+        latestLargeTransferOut: null,
       };
       this.potentialFeePayers.set(address, watch);
     }
@@ -825,6 +843,8 @@ export class FunderFirstOrchestrator extends EventEmitter {
         return true;
       }
 
+      this.recordLargeTransferOutIfEligible(watch, transfer, tx);
+
       const recipientPostBalanceSol = this.getAccountPostBalanceSol(
         tx,
         transfer.to,
@@ -870,9 +890,44 @@ export class FunderFirstOrchestrator extends EventEmitter {
       selfPostBalanceSol !== null &&
       selfPostBalanceSol <= ZERO_BALANCE_EPSILON_SOL
     ) {
-      return this.finalizeFeePayerZeroBalance(watch, tx, source);
+      await this.finalizePotentialFeePayerZeroBalance(watch, tx, source);
+      return true;
     }
     return false;
+  }
+
+  private recordLargeTransferOutIfEligible(
+    watch: PotentialFeePayerWatch,
+    transfer: { to: string; amountSol: number },
+    tx: HeliusTransaction,
+  ): void {
+    if (transfer.amountSol < LARGE_TRANSFER_HANDOFF_MIN_SOL) return;
+    if (watch.balanceAtFunderReceiveTimestamp === null) return;
+    if (!Number.isFinite(tx.timestamp) || tx.timestamp < watch.balanceAtFunderReceiveTimestamp) {
+      return;
+    }
+    if (!transfer.to || transfer.to === watch.address) return;
+
+    const recipientPostBalanceSol = this.getAccountPostBalanceSol(tx, transfer.to);
+    if (recipientPostBalanceSol === null) return;
+
+    const previous = watch.latestLargeTransferOut;
+    if (previous && tx.timestamp < previous.timestamp) return;
+
+    watch.latestLargeTransferOut = {
+      recipient: transfer.to,
+      amountSol: transfer.amountSol,
+      recipientPostBalanceSol,
+      signature: tx.signature,
+      timestamp: tx.timestamp,
+    };
+    log.info('Recorded 100+ SOL transfer-out for potential zero-balance handoff', {
+      potentialFeePayer: watch.address,
+      recipient: transfer.to,
+      amountSol: transfer.amountSol,
+      recipientPostBalanceSol,
+      signature: tx.signature,
+    });
   }
 
   private isFeePayerBalanceZero(balanceSol: number | null): boolean {
@@ -957,22 +1012,158 @@ export class FunderFirstOrchestrator extends EventEmitter {
     return true;
   }
 
-  /** Fee payer hit zero — stop monitoring (no handoff). */
-  private finalizeFeePayerZeroBalance(
+  /** Fee payer hit zero — stop and optionally hand off to latest ≥100 SOL recipient. */
+  private async finalizePotentialFeePayerZeroBalance(
     watch: PotentialFeePayerWatch,
-    tx: HeliusTransaction,
-    source: 'wss' | 'rest',
-  ): boolean {
+    tx: HeliusTransaction | null,
+    source: 'wss' | 'rest' | 'balance_listener',
+  ): Promise<void> {
+    const latest = watch.latestLargeTransferOut;
+    const oldAddress = watch.address;
+
     log.info('Potential feePayer reached zero — stopping watch', {
-      potentialFeePayer: watch.address,
-      signature: tx.signature,
+      potentialFeePayer: oldAddress,
+      signature: tx?.signature ?? null,
+      source,
+      handoffRecipient: latest?.recipient ?? null,
+    });
+
+    this.stopPotentialFeePayerWatch(oldAddress, 'native SOL balance reached zero');
+
+    if (!latest) {
+      return;
+    }
+
+    if (latest.recipient === this.funderAddress) {
+      log.info(
+        'Potential feePayer zero — latest 100+ SOL went to feePayer funder; stop only (funder already watched)',
+        {
+          potentialFeePayer: oldAddress,
+          funderAddress: this.funderAddress,
+          amountSol: latest.amountSol,
+          signature: latest.signature,
+        },
+      );
+      void this.sendTelegram([
+        '<b>⏹️ Funder-First: Potential FeePayer Drained — Returned to Funder</b>',
+        `Drained feePayer: <code>${this.html(oldAddress)}</code>`,
+        `Latest ≥100 SOL out: <code>${this.html(this.funderAddress!)}</code> (feePayer funder)`,
+        `Amount: <b>${latest.amountSol.toFixed(4)} SOL</b>`,
+        '',
+        'Unsubscribed from drained wallet only — funder is already monitored for new transfer-outs.',
+      ]);
+      return;
+    }
+
+    await this.handoffToLargeTransferRecipient(latest, oldAddress, source);
+  }
+
+  private resetPotentialFeePayerPipelineState(watch: PotentialFeePayerWatch): void {
+    watch.status = 'watching';
+    watch.mode = null;
+    watch.detectedMint = null;
+    watch.detectedDevWallet = null;
+    watch.bundlerFundingEvents = [];
+    watch.activeGroups.clear();
+    watch.exhaustedGroupAnchors.clear();
+    watch.notifiedGroupAnchors.clear();
+    watch.recipientBalanceAtReceive.clear();
+    watch.recipientsWithBuySeen.clear();
+    watch.latestLargeTransferOut = null;
+    watch.processedSignatures.clear();
+    watch.recipientProcessedSignatures.clear();
+    watch.isSyncing = false;
+    watch.syncPending = false;
+    watch.syncPendingForce = false;
+  }
+
+  private async handoffToLargeTransferRecipient(
+    handoff: LargeTransferOutEvent,
+    fromAddress: string,
+    source: 'wss' | 'rest' | 'balance_listener',
+  ): Promise<void> {
+    const recipient = handoff.recipient;
+    if (recipient === this.funderAddress) {
+      log.info('Zero-balance handoff blocked — recipient is feePayer funder', {
+        fromFeePayer: fromAddress,
+        funderAddress: this.funderAddress,
+      });
+      return;
+    }
+    const existing = this.potentialFeePayers.get(recipient);
+    if (
+      existing &&
+      (existing.status === 'active' || existing.status === 'cooldown')
+    ) {
+      log.info('Zero-balance handoff skipped — recipient already active/cooldown', {
+        fromFeePayer: fromAddress,
+        recipient,
+        status: existing.status,
+      });
+      return;
+    }
+    if (existing?.status === 'stopped') {
+      this.potentialFeePayers.delete(recipient);
+    }
+
+    let liveBalanceSol: number;
+    try {
+      liveBalanceSol =
+        (await this.connection.getBalance(new PublicKey(recipient))) /
+        LAMPORTS_PER_SOL;
+    } catch (err) {
+      log.warn('Zero-balance handoff failed — could not fetch recipient balance', {
+        fromFeePayer: fromAddress,
+        recipient,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    if (liveBalanceSol <= ZERO_BALANCE_EPSILON_SOL) {
+      log.info('Zero-balance handoff skipped — recipient live balance is zero', {
+        fromFeePayer: fromAddress,
+        recipient,
+      });
+      return;
+    }
+
+    const watch = this.ensurePotentialFeePayerWatch(recipient);
+    if (!watch) return;
+
+    this.unsubscribeRecipientsForWatch(watch);
+    this.resetPotentialFeePayerPipelineState(watch);
+
+    watch.balanceAtFunderReceiveSol = liveBalanceSol;
+    watch.balanceAtFunderReceiveSignature = handoff.signature;
+    watch.balanceAtFunderReceiveTimestamp = handoff.timestamp;
+    watch.cursorSignature = handoff.signature;
+    watch.processedSignatures.add(handoff.signature);
+
+    log.info('Handed off potential feePayer watch after zero balance', {
+      fromFeePayer: fromAddress,
+      recipient,
+      amountSol: handoff.amountSol,
+      liveBalanceSol,
+      handoffSignature: handoff.signature,
       source,
     });
-    this.stopPotentialFeePayerWatch(
-      watch.address,
-      'native SOL balance reached zero',
+    log.info(
+      'Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (≥20 SOL post-balance, ≤0.5 SOL spread)',
+      { potentialFeePayer: recipient, postBalanceSol: liveBalanceSol },
     );
-    return true;
+
+    void this.sendTelegram([
+      '<b>🔁 Funder-First: FeePayer Zero — Handoff to 100+ SOL Recipient</b>',
+      `Drained feePayer: <code>${this.html(fromAddress)}</code>`,
+      `New potential feePayer: <code>${this.html(recipient)}</code>`,
+      `Handoff transfer: <b>${handoff.amountSol.toFixed(4)} SOL</b>`,
+      `Current balance: <b>${liveBalanceSol.toFixed(4)} SOL</b>`,
+      '',
+      'Watching for 4 bundler funding txs in 10s…',
+    ]);
+
+    await this.syncPotentialFeePayerTransactions(recipient, true);
   }
 
   private async handleFeePayerZeroBalanceDetected(address: string): Promise<void> {
@@ -986,7 +1177,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       return;
     }
 
-    this.stopPotentialFeePayerWatch(address, 'native SOL balance reached zero');
+    await this.finalizePotentialFeePayerZeroBalance(watch, null, 'balance_listener');
   }
 
   private stopPotentialFeePayerWatch(address: string, reason: string): void {
