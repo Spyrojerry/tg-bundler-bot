@@ -888,6 +888,27 @@ async function main(): Promise<void> {
             editCurrent: true,
           };
         }
+        if (data.startsWith("insider:fr:")) {
+          const index = Number.parseInt(data.slice("insider:fr:".length), 10);
+          const wallets = insiderBots[0]?.getFollowedWallets() ?? [];
+          const address = Number.isFinite(index) ? wallets[index] : undefined;
+          if (!address) {
+            return {
+              text: "That follow wallet is no longer on the list.",
+              editCurrent: true,
+            };
+          }
+          try {
+            await insiderBots[0].removeFollowWallet(address);
+            log.info("[SETTINGS] Insider follow wallet removed", { address, index });
+          } catch (err) {
+            return {
+              text: html(err instanceof Error ? err.message : String(err)),
+              editCurrent: true,
+            };
+          }
+          return homeReply(true);
+        }
         if (data.startsWith("insider:follow:remove:")) {
           const address = data.slice("insider:follow:remove:".length);
           try {
@@ -955,6 +976,29 @@ async function main(): Promise<void> {
           }
           log.info("[SETTINGS] Funder-first potential feePayer removed", {
             address: result.address,
+          });
+          return homeReply(true);
+        }
+        if (data.startsWith("funderfirst:rm:")) {
+          const index = Number.parseInt(data.slice("funderfirst:rm:".length), 10);
+          const watched = funderFirstOrchestrator.getWatchedPotentialFeePayers();
+          const address = Number.isFinite(index) ? watched[index]?.address : undefined;
+          if (!address) {
+            return {
+              text: "That potential feePayer is no longer on the list.",
+              editCurrent: true,
+            };
+          }
+          const result = funderFirstOrchestrator.removePotentialFeePayer(address);
+          if (!result.ok) {
+            return {
+              text: html(result.error),
+              editCurrent: true,
+            };
+          }
+          log.info("[SETTINGS] Funder-first potential feePayer removed", {
+            address: result.address,
+            index,
           });
           return homeReply(true);
         }
@@ -2361,6 +2405,12 @@ async function main(): Promise<void> {
   function homeReply(editCurrent = false): TelegramReply {
     activeInsiderIndex = 0;
     const bot = insiderBots[0];
+    if (!bot) {
+      return {
+        text: "<b>Insider Bot</b>\n\nNo insider bot is configured. Set <code>INSIDER_HELIUS_API_KEY</code> and related env vars, then restart.",
+        editCurrent,
+      };
+    }
     const followedWallets = bot.getFollowedWallets();
     const insiderRunning = bot.isRunning();
     const preBuyMint = bot.getPreBuyMint();
@@ -2404,10 +2454,10 @@ async function main(): Promise<void> {
       ? { text: "Stop Funder-First", callback_data: "funderfirst:stop" }
       : { text: "Start Funder-First", callback_data: "funderfirst:start" };
 
-    const feePayerRemoveRows = watchedPotential.map((w) => [
+    const feePayerRemoveRows = watchedPotential.map((w, index) => [
       {
         text: `🗑 Remove ${w.address.slice(0, 4)}…${w.address.slice(-4)} (${w.status})`,
-        callback_data: `funderfirst:remove:${w.address}`,
+        callback_data: `funderfirst:rm:${index}`,
       },
     ]);
 
@@ -2416,10 +2466,10 @@ async function main(): Promise<void> {
         ? followedWallets.map((w) => `  • <code>${html(w)}</code>`)
         : ["  • <i>none yet</i>"];
 
-    const followWalletRemoveRows = followedWallets.map((w) => [
+    const followWalletRemoveRows = followedWallets.map((w, index) => [
       {
         text: `🗑 Remove follow ${w.slice(0, 4)}…${w.slice(-4)}`,
-        callback_data: `insider:follow:remove:${w}`,
+        callback_data: `insider:fr:${index}`,
       },
     ]);
 

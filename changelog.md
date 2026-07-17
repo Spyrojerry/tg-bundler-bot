@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-17 (39)
+
+### Fix: /start menu failed when follow wallets were configured
+
+- Follow-wallet and feePayer **Remove** buttons now use short index callbacks (`insider:fr:0`, `funderfirst:rm:0`) — the previous full-address callbacks exceeded Telegram's 64-byte `callback_data` limit and caused `/start` / Refresh to fail silently.
+
 ## 2026-07-17 (38)
 
 ### Follow-wallet: watch up to 2 wallets on bot 1
