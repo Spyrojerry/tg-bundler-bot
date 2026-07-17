@@ -33,9 +33,9 @@
 //      resolve the recipient via Helius wallet identity; if type is "exchange",
 //      stop and unsubscribe immediately.
 //    • Keep monitoring until native SOL balance hits zero.
-//    • On zero: unsubscribe; if a ≥100 SOL transfer-out was recorded since arm,
-//      hand off watch to the latest such recipient (same bundler pipeline).
-//      If the latest recipient is the top-level feePayer funder, stop only — the
+//    • On zero: unsubscribe; if a ≥100 SOL transfer-out was recorded since this
+//      watch episode started, hand off to the highest such out by amount.
+//      If that recipient is the top-level feePayer funder, stop only — the
 //      funder is already subscribed and must not be opened as a potential feePayer.
 //      If none recorded, stop with no handoff.
 //    • Telegram /start menu can fast-track a potential feePayer manually
@@ -117,6 +117,8 @@ interface PotentialFeePayerWatch {
   balanceAtFunderReceiveSignature: string | null;
   /** Unix seconds when this feePayer was armed (funder receive). */
   balanceAtFunderReceiveTimestamp: number | null;
+  /** Unix seconds when this watch episode started — 100+ SOL handoff tracking begins here. */
+  watchStartedAtTimestamp: number | null;
   /** REST sync cursor — txs after funder-receive signature. */
   cursorSignature: string | null;
   isSyncing: boolean;
@@ -147,8 +149,8 @@ interface PotentialFeePayerWatch {
   recipientZeroBalanceSubIds: Map<string, number>;
   /** Recipients that emitted a token buy — skip drain-based unsubscribe. */
   recipientsWithBuySeen: Set<string>;
-  /** Latest ≥100 SOL transfer-out since arm — used for zero-balance handoff. */
-  latestLargeTransferOut: LargeTransferOutEvent | null;
+  /** Highest ≥100 SOL transfer-out since watchStartedAtTimestamp — zero-balance handoff. */
+  highestLargeTransferOut: LargeTransferOutEvent | null;
 }
 
 export class FunderFirstOrchestrator extends EventEmitter {
@@ -347,6 +349,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.balanceAtFunderReceiveSol = postBalanceSol;
     watch.balanceAtFunderReceiveSignature = null;
     watch.balanceAtFunderReceiveTimestamp = baselineTimestamp;
+    watch.watchStartedAtTimestamp = baselineTimestamp;
     watch.cursorSignature = null;
     watch.processedSignatures.clear();
     watch.bundlerFundingEvents = [];
@@ -355,7 +358,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.notifiedGroupAnchors.clear();
     watch.recipientBalanceAtReceive.clear();
     watch.recipientsWithBuySeen.clear();
-    watch.latestLargeTransferOut = null;
+    watch.highestLargeTransferOut = null;
 
     log.info('Potential feePayer manually fast-tracked', {
       potentialFeePayer: address,
@@ -547,6 +550,8 @@ export class FunderFirstOrchestrator extends EventEmitter {
       watch.processedSignatures.add(tx.signature);
 
       if (!isTopUp) {
+        watch.watchStartedAtTimestamp = tx.timestamp;
+        watch.highestLargeTransferOut = null;
         log.info('Potential feePayer received SOL from funder', {
           potentialFeePayer: recipient,
           amountSol,
@@ -605,6 +610,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
         balanceAtFunderReceiveSol: null,
         balanceAtFunderReceiveSignature: null,
         balanceAtFunderReceiveTimestamp: null,
+        watchStartedAtTimestamp: null,
         cursorSignature: null,
         isSyncing: false,
         syncPending: false,
@@ -628,7 +634,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
         recipientBalanceAtReceive: new Map(),
         recipientZeroBalanceSubIds: new Map(),
         recipientsWithBuySeen: new Set(),
-        latestLargeTransferOut: null,
+        highestLargeTransferOut: null,
       };
       this.potentialFeePayers.set(address, watch);
     }
@@ -902,8 +908,11 @@ export class FunderFirstOrchestrator extends EventEmitter {
     tx: HeliusTransaction,
   ): void {
     if (transfer.amountSol < LARGE_TRANSFER_HANDOFF_MIN_SOL) return;
-    if (watch.balanceAtFunderReceiveTimestamp === null) return;
-    if (!Number.isFinite(tx.timestamp) || tx.timestamp < watch.balanceAtFunderReceiveTimestamp) {
+    if (watch.watchStartedAtTimestamp === null) return;
+    if (
+      !Number.isFinite(tx.timestamp) ||
+      tx.timestamp < watch.watchStartedAtTimestamp
+    ) {
       return;
     }
     if (!transfer.to || transfer.to === watch.address) return;
@@ -911,23 +920,47 @@ export class FunderFirstOrchestrator extends EventEmitter {
     const recipientPostBalanceSol = this.getAccountPostBalanceSol(tx, transfer.to);
     if (recipientPostBalanceSol === null) return;
 
-    const previous = watch.latestLargeTransferOut;
-    if (previous && tx.timestamp < previous.timestamp) return;
+    const previous = watch.highestLargeTransferOut;
+    if (
+      !this.isHigherHandoffTransferOut(
+        { amountSol: transfer.amountSol, timestamp: tx.timestamp },
+        previous,
+      )
+    ) {
+      return;
+    }
 
-    watch.latestLargeTransferOut = {
+    watch.highestLargeTransferOut = {
       recipient: transfer.to,
       amountSol: transfer.amountSol,
       recipientPostBalanceSol,
       signature: tx.signature,
       timestamp: tx.timestamp,
     };
-    log.info('Recorded 100+ SOL transfer-out for potential zero-balance handoff', {
+    log.info('Recorded highest 100+ SOL transfer-out for potential zero-balance handoff', {
       potentialFeePayer: watch.address,
       recipient: transfer.to,
       amountSol: transfer.amountSol,
       recipientPostBalanceSol,
       signature: tx.signature,
+      previousHighestAmountSol: previous?.amountSol ?? null,
+      watchStartedAtTimestamp: watch.watchStartedAtTimestamp,
     });
+  }
+
+  private isHigherHandoffTransferOut(
+    candidate: { amountSol: number; timestamp: number },
+    current: { amountSol: number; timestamp: number } | null,
+  ): boolean {
+    if (!current) return true;
+    if (candidate.amountSol > current.amountSol) return true;
+    if (
+      candidate.amountSol === current.amountSol &&
+      candidate.timestamp >= current.timestamp
+    ) {
+      return true;
+    }
+    return false;
   }
 
   private isFeePayerBalanceZero(balanceSol: number | null): boolean {
@@ -1012,50 +1045,51 @@ export class FunderFirstOrchestrator extends EventEmitter {
     return true;
   }
 
-  /** Fee payer hit zero — stop and optionally hand off to latest ≥100 SOL recipient. */
+  /** Fee payer hit zero — stop and optionally hand off to highest ≥100 SOL recipient. */
   private async finalizePotentialFeePayerZeroBalance(
     watch: PotentialFeePayerWatch,
     tx: HeliusTransaction | null,
     source: 'wss' | 'rest' | 'balance_listener',
   ): Promise<void> {
-    const latest = watch.latestLargeTransferOut;
+    const highest = watch.highestLargeTransferOut;
     const oldAddress = watch.address;
 
     log.info('Potential feePayer reached zero — stopping watch', {
       potentialFeePayer: oldAddress,
       signature: tx?.signature ?? null,
       source,
-      handoffRecipient: latest?.recipient ?? null,
+      handoffRecipient: highest?.recipient ?? null,
+      handoffAmountSol: highest?.amountSol ?? null,
     });
 
     this.stopPotentialFeePayerWatch(oldAddress, 'native SOL balance reached zero');
 
-    if (!latest) {
+    if (!highest) {
       return;
     }
 
-    if (latest.recipient === this.funderAddress) {
+    if (highest.recipient === this.funderAddress) {
       log.info(
-        'Potential feePayer zero — latest 100+ SOL went to feePayer funder; stop only (funder already watched)',
+        'Potential feePayer zero — highest 100+ SOL went to feePayer funder; stop only (funder already watched)',
         {
           potentialFeePayer: oldAddress,
           funderAddress: this.funderAddress,
-          amountSol: latest.amountSol,
-          signature: latest.signature,
+          amountSol: highest.amountSol,
+          signature: highest.signature,
         },
       );
       void this.sendTelegram([
         '<b>⏹️ Funder-First: Potential FeePayer Drained — Returned to Funder</b>',
         `Drained feePayer: <code>${this.html(oldAddress)}</code>`,
-        `Latest ≥100 SOL out: <code>${this.html(this.funderAddress!)}</code> (feePayer funder)`,
-        `Amount: <b>${latest.amountSol.toFixed(4)} SOL</b>`,
+        `Highest ≥100 SOL out: <code>${this.html(this.funderAddress!)}</code> (feePayer funder)`,
+        `Amount: <b>${highest.amountSol.toFixed(4)} SOL</b>`,
         '',
         'Unsubscribed from drained wallet only — funder is already monitored for new transfer-outs.',
       ]);
       return;
     }
 
-    await this.handoffToLargeTransferRecipient(latest, oldAddress, source);
+    await this.handoffToLargeTransferRecipient(highest, oldAddress, source);
   }
 
   private resetPotentialFeePayerPipelineState(watch: PotentialFeePayerWatch): void {
@@ -1069,7 +1103,8 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.notifiedGroupAnchors.clear();
     watch.recipientBalanceAtReceive.clear();
     watch.recipientsWithBuySeen.clear();
-    watch.latestLargeTransferOut = null;
+    watch.highestLargeTransferOut = null;
+    watch.watchStartedAtTimestamp = null;
     watch.processedSignatures.clear();
     watch.recipientProcessedSignatures.clear();
     watch.isSyncing = false;
@@ -1134,9 +1169,11 @@ export class FunderFirstOrchestrator extends EventEmitter {
     this.unsubscribeRecipientsForWatch(watch);
     this.resetPotentialFeePayerPipelineState(watch);
 
+    const watchStartedAtTimestamp = Math.floor(Date.now() / 1000);
     watch.balanceAtFunderReceiveSol = liveBalanceSol;
     watch.balanceAtFunderReceiveSignature = handoff.signature;
     watch.balanceAtFunderReceiveTimestamp = handoff.timestamp;
+    watch.watchStartedAtTimestamp = watchStartedAtTimestamp;
     watch.cursorSignature = handoff.signature;
     watch.processedSignatures.add(handoff.signature);
 
@@ -1154,7 +1191,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
     );
 
     void this.sendTelegram([
-      '<b>🔁 Funder-First: FeePayer Zero — Handoff to 100+ SOL Recipient</b>',
+      '<b>🔁 Funder-First: FeePayer Zero — Handoff to Highest 100+ SOL Recipient</b>',
       `Drained feePayer: <code>${this.html(fromAddress)}</code>`,
       `New potential feePayer: <code>${this.html(recipient)}</code>`,
       `Handoff transfer: <b>${handoff.amountSol.toFixed(4)} SOL</b>`,

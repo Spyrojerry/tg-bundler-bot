@@ -4,8 +4,8 @@
 
 ### Funder-first: 100+ SOL zero-balance handoff chain
 
-- Each potential feePayer tracks **≥100 SOL** native transfer-outs after it was armed.
-- On native SOL **→ zero**: unsubscribe the drained wallet; if a ≥100 SOL out was recorded, **hand off** watch to the **latest** such recipient (live balance check, fresh bundler pipeline). If the latest recipient is the **feePayer funder**, stop only — funder is already watched, no duplicate subscribe. If none (or recipient already zero), stop with no handoff.
+- Each potential feePayer tracks **≥100 SOL** native transfer-outs **only from when that watch episode started** (funder receive, fast-track, or zero-balance handoff subscribe time).
+- On native SOL **→ zero**: unsubscribe the drained wallet; if a ≥100 SOL out was recorded in that window, **hand off** watch to the **highest** such recipient by amount (ties → most recent). Live balance check, fresh bundler pipeline. If that recipient is the **feePayer funder**, stop only — funder is already watched, no duplicate subscribe. If none (or recipient already zero), stop with no handoff.
 
 ## 2026-07-17 (36)
 

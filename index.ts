@@ -2402,7 +2402,7 @@ async function main(): Promise<void> {
         "1. Funder sends SOL → potential feePayer watches open (or use <b>Fast-track feePayer</b>).",
         "2. ≥20 SOL post-balance to 4 wallets in 10s → normal candidate → buy.",
         "3. Sub-20 SOL bundler sends are ignored (no alerts).",
-        "4. FeePayer watch continues until SOL → zero; hand off to latest ≥100 SOL out recipient unless that recipient is the feePayer funder (then stop only).",
+        "4. FeePayer watch continues until SOL → zero; hand off to highest ≥100 SOL out recorded since that watch started, unless recipient is the feePayer funder (then stop only).",
         "• Rug: dev CLOSE_ACCOUNT or zero SOL resumes feePayer watch after a trade.",
       ].join("\n"),
       replyMarkup: {
