@@ -11,9 +11,10 @@
 //    5. Confirms at least one recipient is among the token's first-four bundlers.
 //    6. Normal → hands off to InsiderBot.startFromFunderFirst for buy/sell.
 //    7. After a normal trade completes, the feePayer stays in cooldown until the
-//       token's dev wallet CLOSE_ACCOUNTs (rug), then resumes watching.
-//       On cooldown entry, recent dev txs are REST-synced so a rug is not missed
-//       if it landed before the dev Enhanced WSS subscription was armed.
+//       token's dev wallet CLOSE_ACCOUNTs or native SOL reaches zero (rug), then
+//       resumes watching. On cooldown entry, recent dev txs are REST-synced so a
+//       rug is not missed if it landed before the dev Enhanced WSS subscription
+//       was armed; dev SOL balance is also subscribed immediately.
 //
 //  Group / recipient rules:
 //    • Multiple 10s bundler groups (≥20 SOL only) can be monitored concurrently.
@@ -33,6 +34,8 @@
 //      stop and unsubscribe immediately.
 //    • Keep monitoring until native SOL balance hits zero.
 //    • On zero: stop and unsubscribe (no handoff to drain recipient).
+//    • Telegram /start menu can fast-track a potential feePayer manually
+//      (same pipeline as a funder SOL transfer-out, using current balance baseline).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Connection, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
@@ -111,6 +114,8 @@ interface PotentialFeePayerWatch {
   detectedMint: string | null;
   detectedDevWallet: string | null;
   cooldownDevWatchId: number | null;
+  /** Native SOL balance subscription on dev during cooldown — zero = rug resume. */
+  cooldownDevSolBalanceSubId: number | null;
   /** Mint tied to the active cooldown — used for rug sync/resume. */
   cooldownMint: string | null;
   /** Dev create tx timestamp — ignore CLOSE_ACCOUNT txs at or before this. */
@@ -134,7 +139,8 @@ export class FunderFirstOrchestrator extends EventEmitter {
   private readonly heliusClient: HeliusClient;
   private readonly connection: Connection;
   private readonly enhancedWs: HeliusEnhancedWsClient | null;
-  private readonly insiderBot: InsiderBot;
+  private readonly insiderBots: InsiderBot[];
+  private readonly primaryInsiderBotIndex: number;
 
   private funderAddress: string | null = null;
   private isEnabled = false;
@@ -151,12 +157,14 @@ export class FunderFirstOrchestrator extends EventEmitter {
 
   constructor(
     private readonly config: ServiceConfig,
-    insiderBot: InsiderBot,
+    insiderBots: InsiderBot[],
+    primaryInsiderBotIndex = 0,
     private readonly telegramBot: TelegramBot | null = null,
     enhancedWs: HeliusEnhancedWsClient | null = null,
   ) {
     super();
-    this.insiderBot = insiderBot;
+    this.insiderBots = insiderBots;
+    this.primaryInsiderBotIndex = primaryInsiderBotIndex;
     const heliusKey = config.insiderHeliusApiKey || config.heliusApiKey;
     this.heliusClient = new HeliusClient(heliusKey, {
       projectId: config.insiderHeliusProjectId,
@@ -176,9 +184,23 @@ export class FunderFirstOrchestrator extends EventEmitter {
         log.warn('Invalid INSIDER_FEEPAYER_FUNDER_ADDRESS in config; ignoring');
       }
     }
-    insiderBot.on('tokenFlowEnded', (event: InsiderTokenFlowEndedEvent) => {
-      void this.handleInsiderTokenFlowEnded(event);
+    insiderBots.forEach((bot) => {
+      bot.on('tokenFlowEnded', (event: InsiderTokenFlowEndedEvent) => {
+        void this.handleInsiderTokenFlowEnded(event);
+      });
     });
+  }
+
+  private getPrimaryInsiderBot(): InsiderBot {
+    return this.insiderBots[this.primaryInsiderBotIndex] ?? this.insiderBots[0];
+  }
+
+  private pickIdleInsiderBot(): InsiderBot | null {
+    for (const bot of this.insiderBots) {
+      if (bot.isStoppedForHeliusCredits?.()) continue;
+      if (bot.isIdleForFunderFirst()) return bot;
+    }
+    return null;
   }
 
   setFunderAddress(address: string): string {
@@ -215,11 +237,123 @@ export class FunderFirstOrchestrator extends EventEmitter {
   }
 
   /**
+   * Manually arm a potential feePayer watch — same pipeline as a funder SOL
+   * transfer-out, using the wallet's current native SOL balance as baseline.
+   */
+  async fastTrackPotentialFeePayer(
+    rawAddress: string,
+  ): Promise<
+    | { ok: true; address: string; postBalanceSol: number }
+    | { ok: false; error: string }
+  > {
+    if (!this.isEnabled) {
+      return {
+        ok: false,
+        error: 'Start funder-first mode before fast-tracking a potential feePayer.',
+      };
+    }
+    if (!this.enhancedWs) {
+      return {
+        ok: false,
+        error: 'Funder-first requires Enhanced WSS (Developer-plan Helius key).',
+      };
+    }
+
+    let address: string;
+    try {
+      address = new PublicKey(rawAddress.trim()).toBase58();
+    } catch {
+      return { ok: false, error: 'Invalid Solana wallet address.' };
+    }
+
+    const existing = this.potentialFeePayers.get(address);
+    if (existing?.status === 'active') {
+      return {
+        ok: false,
+        error: 'That wallet is already active (handed to Insider bot).',
+      };
+    }
+    if (existing?.status === 'cooldown') {
+      return {
+        ok: false,
+        error:
+          'That wallet is in cooldown after a trade — wait for dev rug before re-adding.',
+      };
+    }
+    if (existing?.status === 'stopped') {
+      this.potentialFeePayers.delete(address);
+    }
+
+    let postBalanceSol: number;
+    try {
+      const lamports = await this.connection.getBalance(new PublicKey(address));
+      postBalanceSol = lamports / LAMPORTS_PER_SOL;
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Failed to fetch wallet balance: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    if (postBalanceSol <= ZERO_BALANCE_EPSILON_SOL) {
+      return {
+        ok: false,
+        error: 'Wallet native SOL balance is zero — nothing to watch.',
+      };
+    }
+
+    const watch = this.ensurePotentialFeePayerWatch(address);
+    if (!watch) {
+      return { ok: false, error: 'Could not open potential feePayer watch.' };
+    }
+
+    this.unsubscribeRecipientsForWatch(watch);
+
+    const baselineTimestamp = Math.floor(Date.now() / 1000);
+    watch.status = 'watching';
+    watch.mode = null;
+    watch.detectedMint = null;
+    watch.detectedDevWallet = null;
+    watch.balanceAtFunderReceiveSol = postBalanceSol;
+    watch.balanceAtFunderReceiveSignature = null;
+    watch.balanceAtFunderReceiveTimestamp = baselineTimestamp;
+    watch.cursorSignature = null;
+    watch.processedSignatures.clear();
+    watch.bundlerFundingEvents = [];
+    watch.activeGroups.clear();
+    watch.exhaustedGroupAnchors.clear();
+    watch.notifiedGroupAnchors.clear();
+    watch.recipientBalanceAtReceive.clear();
+    watch.recipientsWithBuySeen.clear();
+
+    log.info('Potential feePayer manually fast-tracked', {
+      potentialFeePayer: address,
+      postBalanceSol,
+      baselineTimestamp,
+    });
+    log.info(
+      'Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (≥20 SOL post-balance, ≤0.5 SOL spread)',
+      { potentialFeePayer: address, postBalanceSol },
+    );
+
+    void this.sendTelegram([
+      '<b>⚡ Funder-First: Potential FeePayer Fast-Tracked</b>',
+      `Wallet: <code>${this.html(address)}</code>`,
+      `Current balance baseline: <b>${postBalanceSol.toFixed(4)} SOL</b>`,
+      '',
+      'Watching for 4 bundler funding txs in 10s…',
+    ]);
+
+    await this.syncPotentialFeePayerTransactions(address, true);
+    return { ok: true, address, postBalanceSol };
+  }
+
+  /**
    * Follow-wallet Enhanced WSS txs forwarded here when the follow wallet is an
    * active bundler recipient — avoids a duplicate recipient-batch subscription.
    */
   handleMergedFollowWalletTx(tx: HeliusTransaction): void {
-    const followWallet = this.insiderBot.getFollowedWallet();
+    const followWallet = this.getPrimaryInsiderBot().getFollowedWallet();
     if (!followWallet || !this.isEnabled) return;
 
     for (const [feePayer, watch] of this.potentialFeePayers) {
@@ -235,7 +369,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
   }
 
   private isMergedFollowWalletRecipient(recipient: string): boolean {
-    const followWallet = this.insiderBot.getFollowedWallet();
+    const followWallet = this.getPrimaryInsiderBot().getFollowedWallet();
     return !!followWallet && recipient === followWallet;
   }
 
@@ -410,6 +544,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
         detectedMint: null,
         detectedDevWallet: null,
         cooldownDevWatchId: null,
+        cooldownDevSolBalanceSubId: null,
         cooldownMint: null,
         cooldownDevCreateTimestamp: null,
         cooldownDevProcessedSignatures: new Set(),
@@ -517,31 +652,38 @@ export class FunderFirstOrchestrator extends EventEmitter {
 
     try {
       let txs: HeliusTransaction[];
-      try {
-        txs = await this.heliusClient.getAddressTransactionsAsc(
+      if (!afterSignature && watch.balanceAtFunderReceiveTimestamp !== null) {
+        txs = await this.fetchPotentialFeePayerTxsAfterTimestamp(
           syncingAddress,
-          afterSignature,
-          POTENTIAL_FEEPAYER_SYNC_LIMIT,
+          watch.balanceAtFunderReceiveTimestamp,
         );
-      } catch (err) {
-        if (
-          this.isInvalidHeliusAfterSignatureError(err) &&
-          watch.balanceAtFunderReceiveTimestamp !== null
-        ) {
-          log.info(
-            'Potential feePayer REST sync after-signature rejected — falling back to recent desc + timestamp filter',
-            {
-              address: syncingAddress,
-              afterSignature: afterSignature ?? null,
-              afterTimestamp: watch.balanceAtFunderReceiveTimestamp,
-            },
-          );
-          txs = await this.fetchPotentialFeePayerTxsAfterTimestamp(
+      } else {
+        try {
+          txs = await this.heliusClient.getAddressTransactionsAsc(
             syncingAddress,
-            watch.balanceAtFunderReceiveTimestamp!,
+            afterSignature,
+            POTENTIAL_FEEPAYER_SYNC_LIMIT,
           );
-        } else {
-          throw err;
+        } catch (err) {
+          if (
+            this.isInvalidHeliusAfterSignatureError(err) &&
+            watch.balanceAtFunderReceiveTimestamp !== null
+          ) {
+            log.info(
+              'Potential feePayer REST sync after-signature rejected — falling back to recent desc + timestamp filter',
+              {
+                address: syncingAddress,
+                afterSignature: afterSignature ?? null,
+                afterTimestamp: watch.balanceAtFunderReceiveTimestamp,
+              },
+            );
+            txs = await this.fetchPotentialFeePayerTxsAfterTimestamp(
+              syncingAddress,
+              watch.balanceAtFunderReceiveTimestamp!,
+            );
+          } else {
+            throw err;
+          }
         }
       }
       fetchedCount = txs.length;
@@ -816,6 +958,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       void this.enhancedWs?.unwatch(watch.cooldownDevWatchId).catch(() => undefined);
       watch.cooldownDevWatchId = null;
     }
+    this.stopCooldownDevSolBalanceWatch(watch);
     if (watch.detectedDevWallet) {
       this.cooldownsByDev.delete(watch.detectedDevWallet);
     }
@@ -1327,8 +1470,9 @@ export class FunderFirstOrchestrator extends EventEmitter {
       watch.detectedDevWallet = devWallet;
       watch.cooldownDevCreateTimestamp = createTx?.timestamp ?? null;
 
-      if (!this.insiderBot.isIdleForFunderFirst()) {
-        log.warn('Normal-mode funder-first handoff delayed — Insider bot busy', {
+      const targetBot = this.pickIdleInsiderBot();
+      if (!targetBot) {
+        log.warn('Normal-mode funder-first handoff delayed — all Insider bots busy', {
           mint,
           feePayer: watch.address,
         });
@@ -1339,7 +1483,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       watch.activeGroups.clear();
       this.unsubscribePotentialFeePayerOnly(watch);
 
-      const started = await this.insiderBot.startFromFunderFirst(
+      const started = await targetBot.startFromFunderFirst(
         mint,
         watch.address,
         earlyBuys,
@@ -1356,8 +1500,8 @@ export class FunderFirstOrchestrator extends EventEmitter {
         `Token: <code>${this.html(mint)}</code>`,
         `FeePayer: <code>${this.html(watch.address)}</code>`,
         `Matched bundlers: <b>${overlap.length}</b>`,
-        this.insiderBot.getFollowedWallet()
-          ? `Follow wallet <code>${this.html(this.insiderBot.getFollowedWallet()!)}</code> is among bundlers — normal mode applies.`
+        this.getPrimaryInsiderBot().getFollowedWallet()
+          ? `Follow wallet <code>${this.html(this.getPrimaryInsiderBot().getFollowedWallet()!)}</code> is among bundlers — normal mode applies.`
           : '',
       ].filter(Boolean));
     } catch (err) {
@@ -1413,12 +1557,64 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.cooldownDevWatchId = this.enhancedWs.watch(devWallet, (tx) => {
       void this.processCooldownDevTx(watch.address, mint, devWallet, tx, 'wss');
     });
+    this.subscribeCooldownDevSolBalance(watch, mint, devWallet);
     log.info('FeePayer entered cooldown; watching dev for rug', {
       feePayer: watch.address,
       mint,
       devWallet,
     });
     void this.syncCooldownDevTransactions(watch.address, true);
+    void this.checkCooldownDevZeroBalanceImmediate(watch, mint, devWallet);
+  }
+
+  private subscribeCooldownDevSolBalance(
+    watch: PotentialFeePayerWatch,
+    mint: string,
+    devWallet: string,
+  ): void {
+    if (watch.cooldownDevSolBalanceSubId !== null) return;
+    watch.cooldownDevSolBalanceSubId = this.connection.onAccountChange(
+      new PublicKey(devWallet),
+      (accountInfo) => {
+        if (accountInfo.lamports <= 0) {
+          void this.handleDevZeroBalanceDuringCooldown(watch.address, mint, devWallet);
+        }
+      },
+      'processed',
+    );
+    log.info('Subscribed to dev wallet SOL balance during cooldown', {
+      feePayer: watch.address,
+      mint,
+      devWallet,
+    });
+  }
+
+  private stopCooldownDevSolBalanceWatch(watch: PotentialFeePayerWatch): void {
+    if (watch.cooldownDevSolBalanceSubId === null) return;
+    const subId = watch.cooldownDevSolBalanceSubId;
+    watch.cooldownDevSolBalanceSubId = null;
+    void this.connection.removeAccountChangeListener(subId).catch(() => undefined);
+  }
+
+  private async checkCooldownDevZeroBalanceImmediate(
+    watch: PotentialFeePayerWatch,
+    mint: string,
+    devWallet: string,
+  ): Promise<void> {
+    if (watch.status !== 'cooldown') return;
+    try {
+      const lamports = await this.connection.getBalance(new PublicKey(devWallet));
+      if (lamports === 0) {
+        await this.handleDevZeroBalanceDuringCooldown(watch.address, mint, devWallet);
+      }
+    } catch (err) {
+      log.warn('Failed immediate dev zero-balance check during cooldown', {
+        feePayer: watch.address,
+        mint,
+        devWallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   private async ensureCooldownDevCreateTimestamp(
@@ -1555,31 +1751,67 @@ export class FunderFirstOrchestrator extends EventEmitter {
       signature: tx.signature,
       source,
     });
-    await this.handleDevTx(feePayerAddress, mint, devWallet, tx);
+    await this.resumePotentialFeePayerAfterDevRug(
+      feePayerAddress,
+      mint,
+      devWallet,
+      'close_account',
+      tx.signature,
+    );
     return watch.status !== 'cooldown';
   }
 
-  private async handleDevTx(
+  private async handleDevZeroBalanceDuringCooldown(
     feePayerAddress: string,
     mint: string,
     devWallet: string,
-    tx: HeliusTransaction,
   ): Promise<void> {
     const watch = this.potentialFeePayers.get(feePayerAddress);
     if (!watch || watch.status !== 'cooldown') return;
 
+    log.info('Dev native SOL reached zero during cooldown — treating as rug', {
+      feePayer: feePayerAddress,
+      mint,
+      devWallet,
+    });
+    await this.resumePotentialFeePayerAfterDevRug(
+      feePayerAddress,
+      mint,
+      devWallet,
+      'zero_balance',
+    );
+  }
+
+  private async resumePotentialFeePayerAfterDevRug(
+    feePayerAddress: string,
+    mint: string,
+    devWallet: string,
+    signal: 'close_account' | 'zero_balance',
+    txSignature?: string,
+  ): Promise<void> {
+    const watch = this.potentialFeePayers.get(feePayerAddress);
+    if (!watch || watch.status !== 'cooldown') return;
+
+    const telegramTitle =
+      signal === 'close_account'
+        ? '<b>🧹 Funder-First: Dev Rug Detected — Resuming FeePayer Watch</b>'
+        : '<b>🧹 Funder-First: Dev Zero Balance — Resuming FeePayer Watch</b>';
     void this.sendTelegram([
-      '<b>🧹 Funder-First: Dev Rug Detected — Resuming FeePayer Watch</b>',
+      telegramTitle,
       `Token: <code>${this.html(mint)}</code>`,
       `Dev: <code>${this.html(devWallet)}</code>`,
       `FeePayer: <code>${this.html(feePayerAddress)}</code>`,
-      `Tx: <code>${this.html(tx.signature)}</code>`,
+      ...(txSignature ? [`Tx: <code>${this.html(txSignature)}</code>`] : []),
+      ...(signal === 'zero_balance'
+        ? ['', 'Dev native SOL reached zero — treated as rug.']
+        : []),
     ]);
 
     if (watch.cooldownDevWatchId !== null) {
       void this.enhancedWs?.unwatch(watch.cooldownDevWatchId).catch(() => undefined);
       watch.cooldownDevWatchId = null;
     }
+    this.stopCooldownDevSolBalanceWatch(watch);
     this.cooldownsByDev.delete(devWallet);
     watch.status = 'watching';
     watch.detectedMint = null;
@@ -1598,12 +1830,36 @@ export class FunderFirstOrchestrator extends EventEmitter {
     this.resubscribePotentialFeePayer(watch);
   }
 
+  private async handleDevTx(
+    feePayerAddress: string,
+    mint: string,
+    devWallet: string,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    await this.resumePotentialFeePayerAfterDevRug(
+      feePayerAddress,
+      mint,
+      devWallet,
+      'close_account',
+      tx.signature,
+    );
+  }
+
   private async handleInsiderTokenFlowEnded(
     event: InsiderTokenFlowEndedEvent,
   ): Promise<void> {
     if (event.source !== 'funder-first' || !event.feePayer) return;
     const watch = this.potentialFeePayers.get(event.feePayer);
     if (!watch) return;
+
+    if (!event.hadPosition) {
+      await this.resumePotentialFeePayerAfterPreBuySkip(
+        watch,
+        event.mint ?? watch.detectedMint,
+        event.reason,
+      );
+      return;
+    }
 
     const devWallet = watch.detectedDevWallet;
     const mint = event.mint ?? watch.detectedMint;
@@ -1619,9 +1875,54 @@ export class FunderFirstOrchestrator extends EventEmitter {
       `FeePayer: <code>${this.html(event.feePayer)}</code>`,
       `Dev: <code>${this.html(devWallet)}</code>`,
       '',
-      'Watching dev wallet for CLOSE_ACCOUNT before resuming this feePayer.',
+      'Watching dev wallet for CLOSE_ACCOUNT or zero native SOL before resuming this feePayer.',
     ]);
     this.enterCooldown(watch, mint, devWallet);
+  }
+
+  /** Pre-buy skip/reset — resume watching the feePayer for the next token (no dev cooldown). */
+  private async resumePotentialFeePayerAfterPreBuySkip(
+    watch: PotentialFeePayerWatch,
+    mint: string | null,
+    reason: InsiderTokenFlowEndedEvent['reason'],
+  ): Promise<void> {
+    if (watch.cooldownDevWatchId !== null) {
+      void this.enhancedWs?.unwatch(watch.cooldownDevWatchId).catch(() => undefined);
+      watch.cooldownDevWatchId = null;
+    }
+    this.stopCooldownDevSolBalanceWatch(watch);
+    if (watch.detectedDevWallet) {
+      this.cooldownsByDev.delete(watch.detectedDevWallet);
+    }
+
+    watch.status = 'watching';
+    watch.detectedMint = null;
+    watch.detectedDevWallet = null;
+    watch.cooldownMint = null;
+    watch.cooldownDevCreateTimestamp = null;
+    watch.cooldownDevProcessedSignatures.clear();
+    watch.cooldownDevSyncing = false;
+    watch.cooldownDevSyncPending = false;
+    watch.mode = null;
+
+    void this.sendTelegram([
+      '<b>↩️ Funder-First: Token Skipped — FeePayer Watch Resumed</b>',
+      mint ? `Token: <code>${this.html(mint)}</code>` : '',
+      `FeePayer: <code>${this.html(watch.address)}</code>`,
+      '',
+      reason === 'reset'
+        ? 'Pre-buy skip (dust group, rug guard, etc.) — continuing to watch this feePayer for the next opportunity.'
+        : 'Token flow ended without a held position — feePayer watch resumed.',
+    ].filter(Boolean));
+
+    log.info('Resumed potential feePayer watch after pre-buy token skip', {
+      feePayer: watch.address,
+      mint,
+      reason,
+    });
+
+    this.resubscribePotentialFeePayer(watch);
+    void this.evaluateBundlerGroups(watch);
   }
 
   private getAccountPostBalanceSol(

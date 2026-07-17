@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-07-17 (35)
+
+### Normal mode: dust-first group skip at ≥20 txs + feePayer resume on pre-buy skip
+
+- **Dust skip threshold**: first qualifying **dust** 10s group now requires **≥20 txs** (same as round buy gate), not ≥2. Logs “waiting for 20+ txs” while 2–19 dust outs accumulate in the window.
+- **Funder-first pre-buy skip**: rug MC guard, dust-first group, excessive dust, etc. no longer enter dev cooldown. FeePayer watch resumes (`watching` / `normal_candidate`) after `tokenFlowEnded` with `hadPosition: false`.
+- **Cooldown** only after a completed trade (`hadPosition: true`). Pre-buy skip removes mint from `boughtMints` so the same token can hand off again if needed.
+
+## 2026-07-17 (34)
+
+### Parallel follow-wallet + funder-first on two tokens
+
+- **Funder-first** handoff picks the **first idle insider bot** in the Helius key pool (not only bot 1). If bot 1 is on a follow-wallet token, funder-first uses bot 2+ when configured.
+- **Follow-wallet** monitoring stays on bot 1; if bot 1 is already on a token when the follow wallet buys again, the new flow **delegates to the first idle bot** with the same follow-wallet validation.
+- Mint claiming across bots prevents the same mint on two bots. MC checks, buy/sell triggers, and cooldown `tokenFlowEnded` listeners already run per bot.
+
+## 2026-07-17 (33)
+
+### Telegram: fast-track potential feePayer from /start menu
+
+- **index.ts**: new **Fast-track feePayer** button on the home menu. Prompts for a wallet address and arms funder-first monitoring as if the feePayer funder had just funded that recipient (current SOL balance baseline, Enhanced WSS + REST sync from baseline timestamp).
+- **funder-first-orchestrator.ts**: `fastTrackPotentialFeePayer()` — validates address/balance, rejects active/cooldown/zero-balance wallets, resets group state, sends Telegram alert, runs forced REST sync. Timestamp-only baseline (no funder tx signature) uses recent desc + timestamp filter for the first sync.
+
+## 2026-07-17 (32)
+
+### Dev zero native SOL treated as rug signal
+
+- **Insider bot**: while watching a token, dev wallet native SOL balance is subscribed alongside CLOSE_ACCOUNT detection. Zero balance triggers the same pre-buy reset / in-position sell path as a dev WSOL close-account rug. Immediate balance check on subscribe catches devs already drained.
+- **Funder-first cooldown**: dev SOL balance subscription during cooldown; zero balance resumes the feePayer watch (same outcome as CLOSE_ACCOUNT rug). Immediate check on cooldown entry.
+
 ## 2026-07-16 (31)
 
 ### Normal mode: first sol group + buy at ≥20 round txs

@@ -58,6 +58,9 @@ const BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS = 2;
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY = 20;
 /** Skip when more than this many individual dust txs land before the first qualifying group. */
 const BUNDLER_FUNDER_NORMAL_MAX_DUST_TXS_BEFORE_FIRST_GROUP = 20;
+/** Dust 10s group must reach this many txs to count as the first qualifying dust group (skip). */
+const normalTinyQualifyingDustGroupTxs = (): number =>
+  BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY;
 /** Low-funding mode still bands by USD with discrete round sizes per band. */
 const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
   "lt2_5" | "2_5_to_5" | "gt5",
@@ -397,6 +400,11 @@ export class InsiderBot extends EventEmitter {
   private readonly label: string;
 
   private followedWallet: string | null = null;
+  /** Follow wallet that started the current follow-sourced flow (may differ from `followedWallet` when delegated to another bot). */
+  private flowFollowWallet: string | null = null;
+  private followWalletFlowDelegate:
+    | ((mint: string, signature: string) => Promise<boolean>)
+    | null = null;
   /** Whether the current/previous token flow was started from follow-wallet backtrack or funder-first discovery. */
   private flowSource: "follow" | "funder-first" | null = null;
   /** FeePayer locked for the active funder-first flow — emitted on tokenFlowEnded so the orchestrator can cooldown/resume. */
@@ -469,6 +477,8 @@ export class InsiderBot extends EventEmitter {
   private lowFundingDevLogsSubId: number | null = null;
   /** Websocket log subscription on the dev wallet, used to push-detect a full-exit CLOSE_ACCOUNT tx (see subscribeDevWalletFullExitWatch). */
   private devFullExitLogsSubId: number | null = null;
+  /** Native SOL balance subscription on the dev wallet — zero balance is treated as rug. */
+  private devSolBalanceSubId: number | null = null;
   /** Dedup set of dev-wallet signatures already checked for the full-exit pattern, so a duplicate log notification doesn't trigger a redundant getTransactionsBySignatures call. */
   private devFullExitSeenSignatures = new Set<string>();
   private recipientLogsSubIds = new Map<string, number>();
@@ -838,6 +848,113 @@ export class InsiderBot extends EventEmitter {
     return this.followedWallet;
   }
 
+  /** Follow wallet tied to the active follow-sourced token flow (supports delegated flows). */
+  private getFlowFollowWallet(): string | null {
+    return this.flowFollowWallet ?? this.followedWallet;
+  }
+
+  setFollowWalletFlowDelegate(
+    delegate: ((mint: string, signature: string) => Promise<boolean>) | null,
+  ): void {
+    this.followWalletFlowDelegate = delegate;
+  }
+
+  /**
+   * Starts a follow-wallet token flow on this bot (used for primary or delegated handoff).
+   */
+  async startFromFollowWalletBuy(
+    mint: string,
+    signature: string,
+    followedWallet: string,
+  ): Promise<boolean> {
+    if (this.boughtMints.has(mint)) return false;
+    if (!this.isIdleForFunderFirst()) return false;
+    if (this.claimMint && !this.claimMint(mint)) {
+      this.log.info("Follow-wallet buy delegated but mint is claimed by another bot", {
+        mint,
+        signature,
+        followedWallet,
+      });
+      return false;
+    }
+
+    this.flowFollowWallet = followedWallet;
+    this.boughtMints.add(mint);
+    this.watchingMint = mint;
+    this.claimedMint = mint;
+    this.emit("mintSeen", mint);
+
+    try {
+      const followWalletBuyMc =
+        await this.gmgnClient.fetchTokenMarketCapUsd(mint);
+      if (
+        followWalletBuyMc !== null &&
+        followWalletBuyMc > MAX_FOLLOW_WALLET_START_MARKET_CAP_USD
+      ) {
+        this.log.warn(
+          "Follow-wallet buy market cap above monitoring ceiling; skipping token",
+          {
+            mint,
+            signature,
+            followedWallet,
+            followWalletBuyMc,
+            maxFollowWalletStartMarketCapUsd:
+              MAX_FOLLOW_WALLET_START_MARKET_CAP_USD,
+            action: "reset token flow",
+          },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>⏭️ ${this.label} Token Skipped</b>`,
+            `Token: <code>${mint}</code>`,
+            `Follow wallet: <code>${followedWallet}</code>`,
+            `Follow-wallet buy MC: <b>$${followWalletBuyMc.toLocaleString()}</b>`,
+            `Monitoring ceiling: <b>$${MAX_FOLLOW_WALLET_START_MARKET_CAP_USD.toLocaleString()}</b>`,
+            "Flow reset — waiting for the next token.",
+          ].join("\n"),
+          "high-MC skip notification",
+        );
+        await this.resetForNewToken(true);
+        return false;
+      }
+      if (followWalletBuyMc === null) {
+        this.log.warn(
+          "Could not fetch follow-wallet buy MC; continuing token monitoring",
+          { mint, signature, followedWallet },
+        );
+      } else {
+        this.log.info(
+          "Follow-wallet buy MC accepted; starting token monitoring",
+          {
+            mint,
+            signature,
+            followedWallet,
+            followWalletBuyMc,
+            maxFollowWalletStartMarketCapUsd:
+              MAX_FOLLOW_WALLET_START_MARKET_CAP_USD,
+          },
+        );
+      }
+      this.initialBundlerMarketCapUsd = followWalletBuyMc;
+      await this.startInsiderFlowWithIndexingLagRetry(mint, followedWallet);
+      return true;
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.releaseMint?.(mint);
+      if (err instanceof InsiderMinBuySolFilterError) {
+        this.log.info("Insider flow skipped by min-buy SOL filter; resetting", {
+          mint,
+          reason: err.message,
+        });
+      } else {
+        this.log.error("Failed to start insider flow; resetting", err);
+        this.emit("error", err instanceof Error ? err : new Error(String(err)));
+      }
+      await this.resetForNewToken(true);
+      return false;
+    }
+  }
+
   setFollowWalletTxNotifier(
     notifier: ((tx: HeliusTransaction) => void) | null,
   ): void {
@@ -892,6 +1009,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     this.flowSource = "funder-first";
+    this.flowFollowWallet = null;
     this.funderFirstFeePayer = feePayer;
     this.watchingMint = mint;
     this.claimedMint = mint;
@@ -1156,7 +1274,6 @@ export class InsiderBot extends EventEmitter {
     signature: string,
   ): Promise<void> {
     if (this.boughtMints.has(mint)) return;
-    if (this.activePosition || this.watchingMint) return;
     if (this.claimMint && !this.claimMint(mint)) {
       this.log.info(
         "Mint active on other insider bot; ignoring follow-wallet buy",
@@ -1168,84 +1285,25 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    // Keep the follow-wallet Enhanced WSS subscription alive — watchingMint /
-    // boughtMints guards prevent duplicate flow starts; avoids unsubscribe +
-    // resubscribe churn (and extra transactionSubscribe RPCs) on every reset.
-
-    this.boughtMints.add(mint);
-    this.watchingMint = mint;
-    this.claimedMint = mint;
-    this.emit("mintSeen", mint);
-
-    try {
-      const followWalletBuyMc =
-        await this.gmgnClient.fetchTokenMarketCapUsd(mint);
-      if (
-        followWalletBuyMc !== null &&
-        followWalletBuyMc > MAX_FOLLOW_WALLET_START_MARKET_CAP_USD
-      ) {
-        this.log.warn(
-          "Follow-wallet buy market cap above monitoring ceiling; skipping token",
-          {
-            mint,
-            signature,
-            followWalletBuyMc,
-            maxFollowWalletStartMarketCapUsd:
-              MAX_FOLLOW_WALLET_START_MARKET_CAP_USD,
-            action: "reset token flow",
-          },
-        );
-        void this.sendTelegramSafe(
-          [
-            `<b>⏭️ ${this.label} Token Skipped</b>`,
-            `Token: <code>${mint}</code>`,
-            `Follow-wallet buy MC: <b>$${followWalletBuyMc.toLocaleString()}</b>`,
-            `Monitoring ceiling: <b>$${MAX_FOLLOW_WALLET_START_MARKET_CAP_USD.toLocaleString()}</b>`,
-            "Flow reset — waiting for the next token.",
-          ].join("\n"),
-          "high-MC skip notification",
-        );
-        await this.resetForNewToken(true);
-        return;
+    if (this.activePosition || this.watchingMint) {
+      if (this.followWalletFlowDelegate) {
+        const delegated = await this.followWalletFlowDelegate(mint, signature);
+        if (delegated) return;
       }
-      if (followWalletBuyMc === null) {
-        this.log.warn(
-          "Could not fetch follow-wallet buy MC; continuing token monitoring",
-          { mint, signature },
-        );
-      } else {
-        this.log.info(
-          "Follow-wallet buy MC accepted; starting token monitoring",
-          {
-            mint,
-            signature,
-            followWalletBuyMc,
-            maxFollowWalletStartMarketCapUsd:
-              MAX_FOLLOW_WALLET_START_MARKET_CAP_USD,
-          },
-        );
-      }
-      // Record this as the token's "initial bundler MC" — the buy gate later
-      // requires the market cap at actual buy time to still be at or above
-      // this, so the bot never buys into a token that's already dropped back
-      // below where the earliest bundler bought.
-      this.initialBundlerMarketCapUsd = followWalletBuyMc;
-
-      await this.startInsiderFlowWithIndexingLagRetry(mint);
-    } catch (err) {
-      void this.heliusClient.handlePossibleRateLimitError(err);
-      this.releaseMint?.(mint);
-      if (err instanceof InsiderMinBuySolFilterError) {
-        this.log.info("Insider flow skipped by min-buy SOL filter; resetting", {
+      this.log.info(
+        "Follow-wallet buy ignored because this bot is already on a token flow",
+        {
           mint,
-          reason: err.message,
-        });
-      } else {
-        this.log.error("Failed to start insider flow; resetting", err);
-        this.emit("error", err instanceof Error ? err : new Error(String(err)));
-      }
-      await this.resetForNewToken(true);
+          signature,
+          watchingMint: this.watchingMint,
+          activePosition: this.activePosition?.mint ?? null,
+        },
+      );
+      return;
     }
+
+    if (!this.followedWallet) return;
+    await this.startFromFollowWalletBuy(mint, signature, this.followedWallet);
   }
 
   private isMintIndexingLagError(error: unknown): boolean {
@@ -1271,11 +1329,12 @@ export class InsiderBot extends EventEmitter {
    */
   private async startInsiderFlowWithIndexingLagRetry(
     mint: string,
+    followedWallet: string,
     maxRetries = 2,
   ): Promise<void> {
     for (let attempt = 0; ; attempt += 1) {
       try {
-        await this.startInsiderFlow(mint);
+        await this.startInsiderFlow(mint, followedWallet);
         return;
       } catch (err) {
         if (attempt >= maxRetries || !this.isMintIndexingLagError(err)) {
@@ -1286,6 +1345,7 @@ export class InsiderBot extends EventEmitter {
           "Followed-wallet mint not indexed by Helius yet; retrying after delay",
           {
             mint,
+            followedWallet,
             attempt: attempt + 1,
             maxRetries,
             delayMs,
@@ -1297,8 +1357,12 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async startInsiderFlow(mint: string): Promise<void> {
+  private async startInsiderFlow(
+    mint: string,
+    followedWallet: string,
+  ): Promise<void> {
     this.flowSource = "follow";
+    this.flowFollowWallet = followedWallet;
     this.funderFirstFeePayer = null;
     this.resetHeliusPoolMetricsForMint(mint);
     this.resetTokenTxCounts();
@@ -1318,12 +1382,12 @@ export class InsiderBot extends EventEmitter {
     this.initialInsiderWallets.clear();
     for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
 
-    if (!this.followedWallet || !earlyBundlerWallets.includes(this.followedWallet)) {
+    if (!earlyBundlerWallets.includes(followedWallet)) {
       this.log.warn(
         "Follow wallet is not one of the first four unique bundler first-buy wallets; resetting token flow",
         {
           mint,
-          followedWallet: this.followedWallet,
+          followedWallet,
           earlyBundlers: earlyBundlerWallets,
         },
       );
@@ -1347,7 +1411,7 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>🔍 ${this.label} Bundler-Funder Flow Started</b>`,
         `Token: <code>${mint}</code>`,
-        `Follow wallet: <code>${this.followedWallet}</code>`,
+        `Follow wallet: <code>${followedWallet}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
         "Finding each bundler's zero-balance funding window, selecting the latest valid funding transfer in that window, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs for recipient buy confirmation.",
@@ -2974,7 +3038,13 @@ export class InsiderBot extends EventEmitter {
    */
   private subscribeDevWalletFullExitWatch(): void {
     if (!this.devWallet || this.devFullExitHandled) return;
-    if (this.devFullExitLogsSubId !== null || this.devFullExitEnhancedWatchId !== null) return;
+    if (
+      this.devFullExitLogsSubId !== null ||
+      this.devFullExitEnhancedWatchId !== null ||
+      this.devSolBalanceSubId !== null
+    ) {
+      return;
+    }
     if (this.enhancedWs) {
       this.devFullExitEnhancedWatchId = this.enhancedWs.watch(this.devWallet, (tx) => {
         if (this.devFullExitSeenSignatures.has(tx.signature)) return;
@@ -2986,22 +3056,35 @@ export class InsiderBot extends EventEmitter {
         devCreateSignature: this.devCreateSignature,
         devCreateTimestamp: this.devCreateTimestamp,
       });
-      return;
+    } else {
+      this.devFullExitLogsSubId = this.connection.onLogs(
+        new PublicKey(this.devWallet),
+        (logInfo) => {
+          if (!logInfo.err) {
+            void this.checkDevWalletSignatureForFullExit(logInfo.signature);
+          }
+        },
+        "processed",
+      );
+      this.log.info("Subscribed to dev wallet for full-exit (CLOSE_ACCOUNT) detection", {
+        devWallet: this.devWallet,
+        devCreateSignature: this.devCreateSignature,
+        devCreateTimestamp: this.devCreateTimestamp,
+      });
     }
-    this.devFullExitLogsSubId = this.connection.onLogs(
+    this.devSolBalanceSubId = this.connection.onAccountChange(
       new PublicKey(this.devWallet),
-      (logInfo) => {
-        if (!logInfo.err) {
-          void this.checkDevWalletSignatureForFullExit(logInfo.signature);
+      (accountInfo) => {
+        if (accountInfo.lamports === 0) {
+          void this.handleDevWalletZeroBalance();
         }
       },
       "processed",
     );
-    this.log.info("Subscribed to dev wallet for full-exit (CLOSE_ACCOUNT) detection", {
+    this.log.info("Subscribed to dev wallet native SOL balance for zero-balance rug detection", {
       devWallet: this.devWallet,
-      devCreateSignature: this.devCreateSignature,
-      devCreateTimestamp: this.devCreateTimestamp,
     });
+    void this.checkDevWalletZeroBalanceImmediate();
   }
 
   private async stopDevWalletFullExitWatch(reason: string): Promise<void> {
@@ -3014,14 +3097,42 @@ export class InsiderBot extends EventEmitter {
         reason,
       });
     }
-    if (this.devFullExitLogsSubId === null) return;
-    const subId = this.devFullExitLogsSubId;
-    this.devFullExitLogsSubId = null;
-    await this.connection.removeOnLogsListener(subId).catch(() => undefined);
-    this.log.info("Stopped dev wallet full-exit subscription", {
-      devWallet: this.devWallet,
-      reason,
-    });
+    if (this.devFullExitLogsSubId !== null) {
+      const subId = this.devFullExitLogsSubId;
+      this.devFullExitLogsSubId = null;
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+      this.log.info("Stopped dev wallet full-exit subscription", {
+        devWallet: this.devWallet,
+        reason,
+      });
+    }
+    if (this.devSolBalanceSubId !== null) {
+      const subId = this.devSolBalanceSubId;
+      this.devSolBalanceSubId = null;
+      await this.connection.removeAccountChangeListener(subId).catch(() => undefined);
+      this.log.info("Stopped dev wallet SOL balance subscription", {
+        devWallet: this.devWallet,
+        reason,
+      });
+    }
+  }
+
+  private async checkDevWalletZeroBalanceImmediate(): Promise<void> {
+    if (!this.devWallet || this.devFullExitHandled) return;
+    const mint = this.watchingMint ?? this.activePosition?.mint;
+    if (!mint) return;
+    try {
+      const lamports = await this.connection.getBalance(new PublicKey(this.devWallet));
+      if (lamports === 0) {
+        await this.handleDevWalletZeroBalance();
+      }
+    } catch (err) {
+      this.log.warn("Failed immediate dev wallet zero-balance check", {
+        mint,
+        devWallet: this.devWallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /**
@@ -3087,46 +3198,102 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     exitTx: HeliusTransaction,
   ): Promise<void> {
+    await this.handleDevWalletRugSignal(mint, {
+      kind: "close_account",
+      signature: exitTx.signature,
+      timestamp: exitTx.timestamp,
+    });
+  }
+
+  /** Dev native SOL hit zero — same rug reset/sell path as CLOSE_ACCOUNT full exit. */
+  private async handleDevWalletZeroBalance(): Promise<void> {
+    const mint = this.watchingMint ?? this.activePosition?.mint;
+    if (!mint) return;
+    await this.handleDevWalletRugSignal(mint, { kind: "zero_balance" });
+  }
+
+  private async handleDevWalletRugSignal(
+    mint: string,
+    signal:
+      | { kind: "close_account"; signature: string; timestamp: number }
+      | { kind: "zero_balance" },
+  ): Promise<void> {
     if (this.devFullExitHandled) return;
     this.devFullExitHandled = true;
-    await this.stopDevWalletFullExitWatch("full exit detected");
-
-    this.log.warn(
-      "Dev wallet closed a WSOL token account (SOLANA_PROGRAM_LIBRARY CLOSE_ACCOUNT); treating as full dev exit",
-      {
-        mint,
-        devWallet: this.devWallet,
-        signature: exitTx.signature,
-        timestamp: exitTx.timestamp,
-        phase: this.phase,
-        hasActivePosition: !!this.activePosition,
-      },
+    await this.stopDevWalletFullExitWatch(
+      signal.kind === "zero_balance" ? "dev zero balance detected" : "full exit detected",
     );
 
+    if (signal.kind === "close_account") {
+      this.log.warn(
+        "Dev wallet closed a WSOL token account (SOLANA_PROGRAM_LIBRARY CLOSE_ACCOUNT); treating as full dev exit",
+        {
+          mint,
+          devWallet: this.devWallet,
+          signature: signal.signature,
+          timestamp: signal.timestamp,
+          phase: this.phase,
+          hasActivePosition: !!this.activePosition,
+        },
+      );
+    } else {
+      this.log.warn("Dev wallet native SOL balance reached zero; treating as full dev exit", {
+        mint,
+        devWallet: this.devWallet,
+        phase: this.phase,
+        hasActivePosition: !!this.activePosition,
+      });
+    }
+
     if (this.activePosition) {
+      const reason =
+        signal.kind === "close_account"
+          ? `Dev wallet ${this.devWallet} closed its WSOL account (full exit detected)`
+          : `Dev wallet ${this.devWallet} native SOL balance reached zero (full exit detected)`;
+      const telegramLines =
+        signal.kind === "close_account"
+          ? [
+              "<b>🚨 Dev Full-Exit Detected — Selling ASAP</b>",
+              `Token: <code>${mint}</code>`,
+              `Dev wallet: <code>${this.devWallet}</code>`,
+              `Close-account tx: <code>${signal.signature}</code>`,
+              "Dev wallet closed its WSOL token account — treated as a full exit/rug signal.",
+            ]
+          : [
+              "<b>🚨 Dev Zero-Balance Exit — Selling ASAP</b>",
+              `Token: <code>${mint}</code>`,
+              `Dev wallet: <code>${this.devWallet}</code>`,
+              "Dev wallet native SOL reached zero — treated as a full exit/rug signal.",
+            ];
       await this.triggerPositionSell(
         mint,
-        `Dev wallet ${this.devWallet} closed its WSOL account (full exit detected)`,
-        [
-          "<b>🚨 Dev Full-Exit Detected — Selling ASAP</b>",
-          `Token: <code>${mint}</code>`,
-          `Dev wallet: <code>${this.devWallet}</code>`,
-          `Close-account tx: <code>${exitTx.signature}</code>`,
-          "Dev wallet closed its WSOL token account — treated as a full exit/rug signal.",
-        ],
-        exitTx.signature,
+        reason,
+        telegramLines,
+        signal.kind === "close_account" ? signal.signature : "dev-zero-balance",
       );
     } else {
       void this.sendTelegramSafe(
-        [
-          "<b>🧹 Dev Full-Exit Reset — Token Skipped</b>",
-          `Token: <code>${mint}</code>`,
-          `Dev wallet: <code>${this.devWallet}</code>`,
-          `Close-account tx: <code>${exitTx.signature}</code>`,
-          "Dev wallet closed its WSOL token account before we bought — treated as a full exit/rug signal.",
-          "Flow reset — waiting for the next token.",
-        ].join("\n"),
-        "dev full-exit reset notification",
+        (
+          signal.kind === "close_account"
+            ? [
+                "<b>🧹 Dev Full-Exit Reset — Token Skipped</b>",
+                `Token: <code>${mint}</code>`,
+                `Dev wallet: <code>${this.devWallet}</code>`,
+                `Close-account tx: <code>${signal.signature}</code>`,
+                "Dev wallet closed its WSOL token account before we bought — treated as a full exit/rug signal.",
+                "Flow reset — waiting for the next token.",
+              ]
+            : [
+                "<b>🧹 Dev Zero-Balance Reset — Token Skipped</b>",
+                `Token: <code>${mint}</code>`,
+                `Dev wallet: <code>${this.devWallet}</code>`,
+                "Dev wallet native SOL reached zero before we bought — treated as a full exit/rug signal.",
+                "Flow reset — waiting for the next token.",
+              ]
+        ).join("\n"),
+        signal.kind === "close_account"
+          ? "dev full-exit reset notification"
+          : "dev zero-balance reset notification",
       );
       await this.resetForNewToken(true);
     }
@@ -3729,12 +3896,27 @@ export class InsiderBot extends EventEmitter {
 
       if (roundTarget === null) {
         const dustWindow = this.getNormalTinyDustWindow(state, tx.timestamp);
-        if (
-          dustWindow.length >= BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS &&
-          this.isFirstQualifyingSolGroup(state, tx.timestamp, "dust")
-        ) {
-          await this.skipTokenDustFirstGroup(state, dustWindow.length, tx);
-          return true;
+        const dustSkipThreshold = normalTinyQualifyingDustGroupTxs();
+        if (dustWindow.length >= BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS) {
+          if (
+            dustWindow.length >= dustSkipThreshold &&
+            this.isFirstQualifyingSolGroup(state, tx.timestamp, "dust")
+          ) {
+            await this.skipTokenDustFirstGroup(state, dustWindow.length, tx);
+            return true;
+          }
+          if (dustWindow.length < dustSkipThreshold) {
+            this.log.info("Normal tiny dust group waiting for 20+ txs in 10s window to skip token", {
+              mint: state.mint,
+              funderWallet: state.funderWallet,
+              signature: tx.signature,
+              recipient: transferOut.to,
+              amountSol: transferOut.amountSol,
+              currentWindowTxCount: dustWindow.length,
+              requiredTxCount: dustSkipThreshold,
+              groupWindowSeconds: BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS,
+            });
+          }
         }
         return false;
       }
@@ -4321,7 +4503,10 @@ export class InsiderBot extends EventEmitter {
         !this.isKnownFunderCandidate(state, entry.signature),
     );
     for (const entry of entries) {
-      if (this.getNormalTinyDustWindow(state, entry.timestamp).length >= BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS) {
+      if (
+        this.getNormalTinyDustWindow(state, entry.timestamp).length >=
+        normalTinyQualifyingDustGroupTxs()
+      ) {
         return true;
       }
       for (const target of BUNDLER_FUNDER_NORMAL_TINY_VALID_ROUND_SOL_AMOUNTS) {
@@ -4349,7 +4534,7 @@ export class InsiderBot extends EventEmitter {
     for (const entry of entries) {
       if (
         this.getNormalTinyDustWindow(state, entry.timestamp).length >=
-        BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS
+        normalTinyQualifyingDustGroupTxs()
       ) {
         return true;
       }
@@ -4399,10 +4584,11 @@ export class InsiderBot extends EventEmitter {
         `<b>⏭️ ${this.label} Token Skipped — Dust First Group</b>`,
         `Token: <code>${state.mint}</code>`,
         `FeePayer: <code>${state.funderWallet}</code>`,
-        `First ${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s group: <b>${dustWindowTxCount}</b> dust txs (not ~0.02 / ~0.05 / ~0.1 SOL)`,
+        `First ${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s group: <b>${dustWindowTxCount}</b> dust txs (not ~0.02 / ~0.05 / ~0.1 SOL, ≥${normalTinyQualifyingDustGroupTxs()})`,
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
-        "First qualifying group must be ~0.02 / ~0.05 / ~0.1 SOL with ≥20 txs in 10s.",
+        `First qualifying dust group at ≥${normalTinyQualifyingDustGroupTxs()} txs — token skipped; feePayer watch will resume.`,
+        "First qualifying round group must be ~0.02 / ~0.05 / ~0.1 SOL with ≥20 txs in 10s to buy.",
       ].join("\n"),
       "dust first group skip notification",
     );
@@ -4976,7 +5162,7 @@ export class InsiderBot extends EventEmitter {
       this.buySubmitted = true;
       this.preBuyStopped = true;
       this.emit("buyTrigger", {
-        followedWallet: this.followedWallet!,
+        followedWallet: this.getFlowFollowWallet()!,
         mint: state.mint,
         signature,
         buySol: this.getBuySolForFundingMode(state.lowFundingMode),
@@ -5078,7 +5264,7 @@ export class InsiderBot extends EventEmitter {
       this.preBuyStopped = true;
       this.disableProfitExitAfterBuy = exitOptions.disableProfitExit ?? true;
       this.emit("buyTrigger", {
-        followedWallet: this.followedWallet!,
+        followedWallet: this.getFlowFollowWallet()!,
         mint: state.mint,
         signature,
         buySol: this.getBuySolForFundingMode(state.lowFundingMode),
@@ -5197,7 +5383,7 @@ export class InsiderBot extends EventEmitter {
         ? false
         : disableProfitExitAfterBuy;
       this.emit("buyTrigger", {
-        followedWallet: this.followedWallet!,
+        followedWallet: this.getFlowFollowWallet()!,
         mint: state.mint,
         signature,
         buySol: this.getBuySolForFundingMode(state.lowFundingMode),
@@ -6654,7 +6840,7 @@ export class InsiderBot extends EventEmitter {
     );
 
     this.emit("sellTrigger", {
-      followedWallet: this.followedWallet!,
+      followedWallet: this.getFlowFollowWallet()!,
       positionMint: mint,
       signature,
       reason,
@@ -6719,6 +6905,7 @@ export class InsiderBot extends EventEmitter {
       reason: "cycle_complete",
     });
     this.flowSource = null;
+    this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
 
     if (this.followedWallet && !this.followMonitor) {
@@ -6772,6 +6959,10 @@ export class InsiderBot extends EventEmitter {
     this.lastHeliusPoolMetricsAt = 0;
     this.resetTokenTxCounts();
 
+    if (endedSource === "funder-first" && !hadPosition && endedMint) {
+      this.boughtMints.delete(endedMint);
+    }
+
     this.emit("tokenFlowEnded", {
       mint: endedMint,
       feePayer: endedFeePayer,
@@ -6780,6 +6971,7 @@ export class InsiderBot extends EventEmitter {
       reason: "reset",
     });
     this.flowSource = null;
+    this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
 
     this.log.info("InsiderBot reset; resuming followed wallet monitoring");

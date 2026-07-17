@@ -235,7 +235,8 @@ async function main(): Promise<void> {
           | "insiderBundlerMaxUsd";
         index: number;
       }
-    | { type: "funderFirstFunderAddress" };
+    | { type: "funderFirstFunderAddress" }
+    | { type: "funderFirstFastTrackFeePayer" };
   const pendingTelegramActions = new Map<string, PendingTelegramAction>();
 
   const pendingSells = new Map<
@@ -868,6 +869,24 @@ async function main(): Promise<void> {
             editCurrent: true,
           };
         }
+        if (data === "funderfirst:fasttrack") {
+          if (!funderFirstOrchestrator.isRunning()) {
+            return {
+              text: "Start funder-first mode first, then fast-track a potential feePayer.",
+              editCurrent: true,
+            };
+          }
+          pendingTelegramActions.set(chatId, { type: "funderFirstFastTrackFeePayer" });
+          return {
+            text: [
+              "Send the <b>potential feePayer</b> wallet address to fast-track.",
+              "",
+              "The bot will arm it with the wallet's current SOL balance and watch for bundler funding — same as if your feePayer funder had just sent SOL to it.",
+            ].join("\n"),
+            trackPrompt: true,
+            editCurrent: true,
+          };
+        }
         if (data === "funderfirst:start") {
           try {
             await funderFirstOrchestrator.start();
@@ -1200,6 +1219,19 @@ async function main(): Promise<void> {
             }
             return homeReply();
           }
+          if (pendingAction.type === "funderFirstFastTrackFeePayer") {
+            const result = await funderFirstOrchestrator.fastTrackPotentialFeePayer(
+              text.trim(),
+            );
+            if (!result.ok) {
+              return html(result.error);
+            }
+            log.info("[SETTINGS] Funder-first potential feePayer fast-tracked", {
+              address: result.address,
+              postBalanceSol: result.postBalanceSol,
+            });
+            return homeReply();
+          }
         }
         const started = await followInsiderWalletWithUsageGuard(
           activeInsiderIndex,
@@ -1229,6 +1261,15 @@ async function main(): Promise<void> {
       if (bot.getActivePosition()?.mint === mint) return false;
       return true;
     });
+  }
+
+  function findIdleInsiderBotIndex(): number | null {
+    for (let i = 0; i < insiderBots.length; i++) {
+      const bot = insiderBots[i];
+      if (bot.isStoppedForHeliusCredits()) continue;
+      if (bot.isIdleForFunderFirst()) return i;
+    }
+    return null;
   }
 
   const makeClaimFn =
@@ -1274,6 +1315,32 @@ async function main(): Promise<void> {
       );
     });
     insiderBots.push(bot);
+  });
+
+  insiderBots[0]?.setFollowWalletFlowDelegate(async (mint, signature) => {
+    const idleIndex = findIdleInsiderBotIndex();
+    if (idleIndex === null) {
+      log.warn("[INSIDER] Follow-wallet buy skipped — all insider bots busy", {
+        mint,
+        signature,
+      });
+      return false;
+    }
+    if (idleIndex === 0) return false;
+    const followWallet = insiderBots[0]?.getFollowedWallet();
+    if (!followWallet) return false;
+    log.info("[INSIDER] Delegating follow-wallet buy to idle insider bot", {
+      mint,
+      signature,
+      followWallet,
+      targetBotIndex: idleIndex,
+      targetBotNumber: getInsiderBotNumber(idleIndex),
+    });
+    return insiderBots[idleIndex]!.startFromFollowWalletBuy(
+      mint,
+      signature,
+      followWallet,
+    );
   });
 
   async function resumePrimaryInsiderBot(): Promise<void> {
@@ -1336,7 +1403,8 @@ async function main(): Promise<void> {
 
   funderFirstOrchestrator = new FunderFirstOrchestrator(
     config,
-    insiderBots[0]!,
+    insiderBots,
+    0,
     telegramBot,
     sharedEnhancedWs,
   );
@@ -2297,6 +2365,9 @@ async function main(): Promise<void> {
         "<b>Flows (run in parallel)</b>",
         "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
         "<b>B) Funder-first</b> — watch a feePayer funder; detect potential feePayers funding bundlers.",
+        insiderBots.length > 1
+          ? `Parallel tokens: up to <b>${insiderBots.length}</b> insider bot key(s) — follow-wallet and funder-first can each hold a different token when a second key is free.`
+          : "Parallel tokens: configure <b>INSIDER_HELIUS_API_KEY_2</b> (+ GMGN/RPC/WS) to run follow-wallet and funder-first on two tokens at once.",
         "",
         "<b>Follow-wallet steps</b>",
         "1. Bot 1 follows one wallet; Helius keys 1-4 are the fallback pool.",
@@ -2305,17 +2376,20 @@ async function main(): Promise<void> {
         "4. Shared feePayer locked → normal-mode tiny transfer-out buy signals.",
         "",
         "<b>Funder-first steps</b>",
-        "1. Funder sends SOL → potential feePayer watches open.",
+        "1. Funder sends SOL → potential feePayer watches open (or use <b>Fast-track feePayer</b>).",
         "2. ≥20 SOL post-balance to 4 wallets in 10s → normal candidate → buy.",
         "3. Sub-20 SOL bundler sends are ignored (no alerts).",
         "4. FeePayer watch continues until SOL → zero, then stops (no handoff).",
-        "• Rug: dev CLOSE_ACCOUNT resumes feePayer watch after a trade.",
+        "• Rug: dev CLOSE_ACCOUNT or zero SOL resumes feePayer watch after a trade.",
       ].join("\n"),
       replyMarkup: {
         inline_keyboard: [
           [
             { text: "Follow wallet", callback_data: "insider:follow" },
             { text: "FeePayer funder", callback_data: "funderfirst:funder" },
+          ],
+          [
+            { text: "Fast-track feePayer", callback_data: "funderfirst:fasttrack" },
           ],
           [funderFirstStartStop],
           [
@@ -2385,7 +2459,7 @@ async function main(): Promise<void> {
 
     const text = [
       "<b>Bot Status</b>",
-      "Flow: one follow wallet, four-key Helius pool, shared bundler-funder confirmation.",
+      "Flow: follow wallet on bot 1; funder-first and overflow follow buys use the first idle insider bot in the Helius key pool.",
       "Candidate rule: transfer-out confirms only when the immediate next funder tx is not a SOL transfer-in.",
       "API guard: queued Helius pool, transient-only fallback, per-key backoff, capped recipient batch sync.",
       "",
