@@ -881,6 +881,8 @@ async function main(): Promise<void> {
             text: [
               "Send the <b>potential feePayer</b> wallet address to fast-track.",
               "",
+              "Adds it to the watch list alongside any others already watching — does not replace or remove existing feePayers.",
+              "",
               "The bot will arm it with the wallet's current SOL balance and watch for bundler funding — same as if your feePayer funder had just sent SOL to it.",
             ].join("\n"),
             trackPrompt: true,
@@ -900,6 +902,20 @@ async function main(): Promise<void> {
         }
         if (data === "funderfirst:stop") {
           funderFirstOrchestrator.stop("Stopped from Telegram");
+          return homeReply(true);
+        }
+        if (data.startsWith("funderfirst:remove:")) {
+          const address = data.slice("funderfirst:remove:".length);
+          const result = funderFirstOrchestrator.removePotentialFeePayer(address);
+          if (!result.ok) {
+            return {
+              text: html(result.error),
+              editCurrent: true,
+            };
+          }
+          log.info("[SETTINGS] Funder-first potential feePayer removed", {
+            address: result.address,
+          });
           return homeReply(true);
         }
         if (data === "insider:buysol") {
@@ -2342,6 +2358,13 @@ async function main(): Promise<void> {
       ? { text: "Stop Funder-First", callback_data: "funderfirst:stop" }
       : { text: "Start Funder-First", callback_data: "funderfirst:start" };
 
+    const feePayerRemoveRows = watchedPotential.map((w) => [
+      {
+        text: `🗑 Remove ${w.address.slice(0, 4)}…${w.address.slice(-4)} (${w.status})`,
+        callback_data: `funderfirst:remove:${w.address}`,
+      },
+    ]);
+
     return {
       text: [
         "<b>Insider Bot</b>",
@@ -2392,6 +2415,7 @@ async function main(): Promise<void> {
             { text: "Fast-track feePayer", callback_data: "funderfirst:fasttrack" },
           ],
           [funderFirstStartStop],
+          ...feePayerRemoveRows,
           [
             { text: "Default Buy SOL", callback_data: "insider:buysol" },
             { text: "Normal Buy SOL", callback_data: "insider:normalbuysol" },

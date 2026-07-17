@@ -243,7 +243,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
   async fastTrackPotentialFeePayer(
     rawAddress: string,
   ): Promise<
-    | { ok: true; address: string; postBalanceSol: number }
+    | { ok: true; address: string; postBalanceSol: number; alreadyWatching?: boolean }
     | { ok: false; error: string }
   > {
     if (!this.isEnabled) {
@@ -277,8 +277,22 @@ export class FunderFirstOrchestrator extends EventEmitter {
       return {
         ok: false,
         error:
-          'That wallet is in cooldown after a trade — wait for dev rug before re-adding.',
+          'That wallet is in cooldown after a trade — wait for dev rug or remove it from the menu first.',
       };
+    }
+    if (
+      existing &&
+      (existing.status === 'watching' || existing.status === 'normal_candidate')
+    ) {
+      const postBalanceSol =
+        existing.balanceAtFunderReceiveSol ??
+        (await this.connection.getBalance(new PublicKey(address))) /
+          LAMPORTS_PER_SOL;
+      log.info('Potential feePayer already on watch list — fast-track skipped reset', {
+        potentialFeePayer: address,
+        status: existing.status,
+      });
+      return { ok: true, address, postBalanceSol, alreadyWatching: true };
     }
     if (existing?.status === 'stopped') {
       this.potentialFeePayers.delete(address);
@@ -346,6 +360,46 @@ export class FunderFirstOrchestrator extends EventEmitter {
 
     await this.syncPotentialFeePayerTransactions(address, true);
     return { ok: true, address, postBalanceSol };
+  }
+
+  /** Stop watching and unsubscribe a potential feePayer (manual remove from menu). */
+  removePotentialFeePayer(
+    rawAddress: string,
+  ): { ok: true; address: string } | { ok: false; error: string } {
+    if (!this.isEnabled) {
+      return {
+        ok: false,
+        error: 'Start funder-first mode before removing a potential feePayer.',
+      };
+    }
+
+    let address: string;
+    try {
+      address = new PublicKey(rawAddress.trim()).toBase58();
+    } catch {
+      return { ok: false, error: 'Invalid Solana wallet address.' };
+    }
+
+    const watch = this.potentialFeePayers.get(address);
+    if (!watch) {
+      return { ok: false, error: 'That wallet is not on the potential feePayer watch list.' };
+    }
+    if (watch.status === 'active') {
+      return {
+        ok: false,
+        error:
+          'That wallet is active on Insider bot — wait for the token flow to finish before removing.',
+      };
+    }
+
+    this.stopPotentialFeePayerWatch(address, 'Removed manually from Telegram menu');
+    void this.sendTelegram([
+      '<b>🗑 Funder-First: Potential FeePayer Removed</b>',
+      `Wallet: <code>${this.html(address)}</code>`,
+      '',
+      'Unsubscribed from Enhanced WSS and recipient watches.',
+    ]);
+    return { ok: true, address };
   }
 
   /**

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-17 (36)
+
+### Fast-track adds feePayers; menu remove buttons
+
+- **Fast-track** now **adds** to the watch list without resetting other feePayers. Re-fast-tracking an address already in `watching` / `normal_candidate` is a no-op (preserves bundler group progress).
+- **/start menu**: **🗑 Remove** button per watched potential feePayer — unsubscribes Enhanced WSS, recipient watches, and cooldown dev watch. Blocked only while `active` on Insider bot.
+
 ## 2026-07-17 (35)
 
 ### Normal mode: dust-first group skip at ≥20 txs + feePayer resume on pre-buy skip
