@@ -72,6 +72,8 @@ const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
 };
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
+/** Skip normal-mode round buy when the highest initial bundler buy is below this (await rug, then resume feePayer). */
+const BUNDLER_FUNDER_NORMAL_TINY_LOW_INSIDER_BUY_SOL_THRESHOLD = 15;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 20;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
@@ -199,6 +201,8 @@ export interface InsiderTokenFlowEndedEvent {
   source: "follow" | "funder-first" | null;
   hadPosition: boolean;
   reason: "reset" | "cycle_complete";
+  /** Funder-first: pause feePayer until dev rugs, then resume watch (no buy was taken). */
+  awaitRugBeforeResume?: boolean;
 }
 
 export interface InsiderBot {
@@ -455,6 +459,8 @@ export class InsiderBot extends EventEmitter {
   private highestObservedMarketCapUsd: number | null = null;
   /** Market cap captured at the very start of the current token's flow (the follow-wallet/initial-bundler buy MC). A buy is only allowed if the market cap at buy time is still at or above this — i.e. the token hasn't round-tripped back below where the earliest bundler bought. Null if unknown (fetch failed at flow start), in which case the check is skipped entirely. */
   private initialBundlerMarketCapUsd: number | null = null;
+  /** Highest SOL spent on the first-four initial bundler buys; round buy skipped when below 15 SOL. */
+  private highestInitialInsiderBuySol: number | null = null;
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private profitExitDisabled = false;
@@ -1053,6 +1059,7 @@ export class InsiderBot extends EventEmitter {
     const earlyBundlerWallets = this.extractEarlyInsiderWallets(earlyBuys);
     this.initialInsiderWallets.clear();
     for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
+    this.highestInitialInsiderBuySol = this.getHighestInsiderBuySolFromEarlyBuys(earlyBuys);
 
     const createTx = await this.withHeliusFallback((client) =>
       client.getMintCreateTransaction(mint),
@@ -1470,6 +1477,8 @@ export class InsiderBot extends EventEmitter {
     const earlyBundlerWallets = this.extractEarlyInsiderWallets(earlyInsiderBuys);
     this.initialInsiderWallets.clear();
     for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
+    this.highestInitialInsiderBuySol =
+      this.getHighestInsiderBuySolFromEarlyBuys(earlyInsiderBuys);
 
     if (!earlyBundlerWallets.includes(followedWallet)) {
       this.log.warn(
@@ -1583,6 +1592,24 @@ export class InsiderBot extends EventEmitter {
 
   private extractEarlyInsiderWallets(buys: EarlyInsiderBuy[]): string[] {
     return [...new Set(buys.map((buy) => buy.wallet))];
+  }
+
+  private getHighestInsiderBuySolFromEarlyBuys(
+    buys: EarlyInsiderBuy[],
+  ): number | null {
+    const buySols = buys
+      .map((buy) => buy.buySol)
+      .filter((buySol): buySol is number => buySol !== null);
+    if (!buySols.length) return null;
+    return Math.max(...buySols);
+  }
+
+  private shouldSkipForLowInitialInsiderBuy(): boolean {
+    return (
+      this.highestInitialInsiderBuySol !== null &&
+      this.highestInitialInsiderBuySol <
+        BUNDLER_FUNDER_NORMAL_TINY_LOW_INSIDER_BUY_SOL_THRESHOLD
+    );
   }
 
   private assertEarlyInsidersMeetMinBuySol(
@@ -4046,6 +4073,11 @@ export class InsiderBot extends EventEmitter {
       return true;
     }
 
+    if (this.shouldSkipForLowInitialInsiderBuy()) {
+      await this.skipTokenLowInitialInsiderBuy(state, roundTarget, tx);
+      return true;
+    }
+
     state.normalTinyRoundGroupFound = true;
 
     const exitPercent = this.getNormalTinyExitPercent(roundTarget);
@@ -4616,6 +4648,41 @@ export class InsiderBot extends EventEmitter {
       "cumulative dust before round buy skip notification",
     );
     await this.resetForNewToken(true);
+  }
+
+  private async skipTokenLowInitialInsiderBuy(
+    state: BundlerFunderWatchState,
+    roundTargetSol: number,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    this.log.warn(
+      "Skipping token — highest initial bundler buy below threshold; awaiting dev rug before resuming feePayer",
+      {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        roundTargetSol,
+        highestInitialInsiderBuySol: this.highestInitialInsiderBuySol,
+        requiredMinSol: BUNDLER_FUNDER_NORMAL_TINY_LOW_INSIDER_BUY_SOL_THRESHOLD,
+        signature: tx.signature,
+      },
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏭️ ${this.label} Token Skipped — Low Initial Bundler Buy</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `FeePayer: <code>${state.funderWallet}</code>`,
+        `Saw ~${roundTargetSol} SOL 10s group (≥20 txs) but highest initial bundler buy is <b>${this.highestInitialInsiderBuySol?.toFixed(4) ?? "unknown"} SOL</b> (need ≥${BUNDLER_FUNDER_NORMAL_TINY_LOW_INSIDER_BUY_SOL_THRESHOLD} SOL).`,
+        `Trigger tx: <code>${tx.signature}</code>`,
+        "",
+        this.flowSource === "funder-first"
+          ? "No buy — feePayer paused until dev rugs, then watch resumes."
+          : "No buy — token flow reset.",
+      ].join("\n"),
+      "low initial bundler buy skip notification",
+    );
+    await this.resetForNewToken(true, {
+      awaitRugBeforeResume: this.flowSource === "funder-first",
+    });
   }
 
   private recordNormalTinyTransferOut(
@@ -6862,6 +6929,7 @@ export class InsiderBot extends EventEmitter {
     this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
     this.initialBundlerMarketCapUsd = null;
+    this.highestInitialInsiderBuySol = null;
     this.preBuyStopped = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
@@ -6888,7 +6956,10 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async resetForNewToken(clearPosition: boolean): Promise<void> {
+  private async resetForNewToken(
+    clearPosition: boolean,
+    options?: { awaitRugBeforeResume?: boolean },
+  ): Promise<void> {
     const endedMint = this.watchingMint ?? this.activePosition?.mint ?? null;
     const endedFeePayer =
       this.funderFirstFeePayer ?? this.bundlerFunderWatch?.funderWallet ?? null;
@@ -6919,6 +6990,7 @@ export class InsiderBot extends EventEmitter {
     this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
     this.initialBundlerMarketCapUsd = null;
+    this.highestInitialInsiderBuySol = null;
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.profitExitDisabled = false;
@@ -6944,6 +7016,7 @@ export class InsiderBot extends EventEmitter {
       source: endedSource,
       hadPosition,
       reason: "reset",
+      awaitRugBeforeResume: options?.awaitRugBeforeResume ?? false,
     });
     this.flowSource = null;
     this.flowFollowWallet = null;

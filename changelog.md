@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-18 (41)
+
+### Normal mode: skip round buy when highest initial bundler buy &lt; 15 SOL
+
+- When a normal-mode round buy gate would fire but the **highest** of the first-four initial bundler buys is **below 15 SOL**, the bot **does not buy** and skips the token.
+- **Funder-first**: feePayer enters cooldown and watches the dev for rug (same as post-trade pause); feePayer watch resumes after dev rug. Other pre-buy skips still resume immediately.
+- Unknown bundler buy SOL does not trigger this skip (round buy proceeds with standard +90% / +180% exits).
+
 ## 2026-07-18 (40)
 
 ### Normal mode: sub-$0.10 outs tracked as dust; round group wins the race to 20 txs

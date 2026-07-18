@@ -2138,6 +2138,13 @@ export class FunderFirstOrchestrator extends EventEmitter {
     if (!watch) return;
 
     if (!event.hadPosition) {
+      if (event.awaitRugBeforeResume) {
+        await this.enterCooldownAwaitingRugAfterSkip(
+          watch,
+          event.mint ?? watch.detectedMint,
+        );
+        return;
+      }
       await this.resumePotentialFeePayerAfterPreBuySkip(
         watch,
         event.mint ?? watch.detectedMint,
@@ -2163,6 +2170,41 @@ export class FunderFirstOrchestrator extends EventEmitter {
       'Watching dev wallet for CLOSE_ACCOUNT or zero native SOL before resuming this feePayer.',
     ]);
     this.enterCooldown(watch, mint, devWallet);
+  }
+
+  /** Pre-buy skip — pause feePayer until dev rugs, then resume (e.g. low initial bundler buy). */
+  private async enterCooldownAwaitingRugAfterSkip(
+    watch: PotentialFeePayerWatch,
+    mint: string | null,
+  ): Promise<void> {
+    const resolvedMint = mint ?? watch.detectedMint;
+    const devWallet = watch.detectedDevWallet;
+    if (!resolvedMint || !devWallet) {
+      log.warn(
+        'Low-bundler skip requested rug wait but mint/dev missing; resuming feePayer watch',
+        {
+          feePayer: watch.address,
+          mint: resolvedMint,
+          devWallet,
+        },
+      );
+      await this.resumePotentialFeePayerAfterPreBuySkip(
+        watch,
+        resolvedMint,
+        'reset',
+      );
+      return;
+    }
+
+    void this.sendTelegram([
+      '<b>⏸️ Funder-First: Skipped — FeePayer Paused Until Rug</b>',
+      `Token: <code>${this.html(resolvedMint)}</code>`,
+      `FeePayer: <code>${this.html(watch.address)}</code>`,
+      `Dev: <code>${this.html(devWallet)}</code>`,
+      '',
+      'Highest initial bundler buy was below 15 SOL — no buy taken. Watching dev for rug before resuming this feePayer.',
+    ]);
+    this.enterCooldown(watch, resolvedMint, devWallet);
   }
 
   /** Pre-buy skip/reset — resume watching the feePayer for the next token (no dev cooldown). */
