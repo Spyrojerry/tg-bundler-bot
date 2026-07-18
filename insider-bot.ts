@@ -48,7 +48,7 @@ const BUNDLER_FUNDER_LOW_FUNDING_LARGE_SWAP_HISTORY_MAX_AGE_MS = 24 * 60 * 60 * 
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS = 10;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD = 1;
 const BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD = 5;
-/** Absolute USD floor below which a feePayer transfer-out is ignored entirely (not tracked). */
+/** Sub-$0.10 transfer-outs are tracked as dust (not round SOL groups). */
 const BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
 /** Normal-mode buy only on these exact round sizes (± tolerance) as same-amount 10s groups. */
@@ -58,9 +58,7 @@ const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.004;
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS = 2;
 /** Round buy requires at least this many same-size ~0.02 / ~0.05 / ~0.1 SOL outs in 10s. */
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY = 20;
-/** Skip when more than this many individual dust txs land before the first qualifying group. */
-const BUNDLER_FUNDER_NORMAL_MAX_DUST_TXS_BEFORE_FIRST_GROUP = 20;
-/** Dust 10s group must reach this many txs to count as the first qualifying dust group (skip). */
+/** Cumulative dust txs required to skip (round still uses a 10s window). */
 const normalTinyQualifyingDustGroupTxs = (): number =>
   BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY;
 /** Low-funding mode still bands by USD with discrete round sizes per band. */
@@ -3955,19 +3953,8 @@ export class InsiderBot extends EventEmitter {
     ) {
       return false;
     }
-    if (transferOutUsd < BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD) {
-      this.log.debug("Skipping normal-mode feePayer transfer-out below the dust floor (too tiny to track at all)", {
-        mint: state.mint,
-        funderWallet: state.funderWallet,
-        signature: tx.signature,
-        recipient: transferOut.to,
-        amountSol: transferOut.amountSol,
-        amountUsd: transferOutUsd,
-        dustFloorUsd: BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD,
-      });
-      return false;
-    }
     // Record every qualifying feePayer transfer-out for dust counting and round-group detection.
+    // Sub-$0.10 outs are tracked as dust. Round buy wins unless cumulative dust reaches 20 before a round 10s group does.
     this.recordNormalTinyTransferOut(state, {
       signature: tx.signature,
       timestamp: tx.timestamp,
@@ -3976,38 +3963,41 @@ export class InsiderBot extends EventEmitter {
       amountUsd: transferOutUsd,
     });
 
-    const roundTarget = this.getNormalTinyRoundTarget(transferOut.amountSol);
+    const roundTarget =
+      transferOutUsd < BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD
+        ? null
+        : this.getNormalTinyRoundTarget(transferOut.amountSol);
 
     if (!state.normalTinyRoundGroupFound) {
-      const dustTxCount = this.countNormalTinyDustTransferOuts(state);
-      if (dustTxCount > BUNDLER_FUNDER_NORMAL_MAX_DUST_TXS_BEFORE_FIRST_GROUP) {
-        await this.skipTokenExcessiveDustTxsBeforeFirstGroup(state, dustTxCount, tx);
-        return true;
-      }
-
       if (roundTarget === null) {
-        const dustWindow = this.getNormalTinyDustWindow(state, tx.timestamp);
+        const cumulativeDustCount = this.countCumulativeNormalTinyDustTransferOuts(state);
         const dustSkipThreshold = normalTinyQualifyingDustGroupTxs();
-        if (dustWindow.length >= BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS) {
-          if (
-            dustWindow.length >= dustSkipThreshold &&
-            this.isFirstQualifyingSolGroup(state, tx.timestamp, "dust")
-          ) {
-            await this.skipTokenDustFirstGroup(state, dustWindow.length, tx);
+        if (cumulativeDustCount >= dustSkipThreshold) {
+          if (this.hasRoundGroupReachedBuyThresholdBy(state, tx.timestamp)) {
+            this.log.info(
+              "Normal cumulative dust reached skip threshold but round 10s group hit 20+ txs first — not skipping",
+              {
+                mint: state.mint,
+                funderWallet: state.funderWallet,
+                signature: tx.signature,
+                cumulativeDustTxCount: cumulativeDustCount,
+                roundBuyThreshold: BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY,
+              },
+            );
+          } else {
+            await this.skipTokenCumulativeDustThreshold(state, cumulativeDustCount, tx);
             return true;
           }
-          if (dustWindow.length < dustSkipThreshold) {
-            this.log.info("Normal tiny dust group waiting for 20+ txs in 10s window to skip token", {
-              mint: state.mint,
-              funderWallet: state.funderWallet,
-              signature: tx.signature,
-              recipient: transferOut.to,
-              amountSol: transferOut.amountSol,
-              currentWindowTxCount: dustWindow.length,
-              requiredTxCount: dustSkipThreshold,
-              groupWindowSeconds: BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS,
-            });
-          }
+        } else {
+          this.log.info("Normal tiny cumulative dust waiting for 20+ txs to skip token", {
+            mint: state.mint,
+            funderWallet: state.funderWallet,
+            signature: tx.signature,
+            recipient: transferOut.to,
+            amountSol: transferOut.amountSol,
+            cumulativeDustTxCount: cumulativeDustCount,
+            requiredTxCount: dustSkipThreshold,
+          });
         }
         return false;
       }
@@ -4051,23 +4041,8 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
-    const groupAnchorTimestamp = Math.min(...sameRoundGroup.map((entry) => entry.timestamp));
-    if (this.hasPriorDustSolGroupBefore(state, groupAnchorTimestamp)) {
-      await this.skipTokenDustFirstGroupBeforeRoundBuy(state, roundTarget, tx);
-      return true;
-    }
-
-    const dustTxCountBeforeGroup = this.countNormalTinyDustTransferOuts(
-      state,
-      groupAnchorTimestamp,
-    );
-    if (dustTxCountBeforeGroup > BUNDLER_FUNDER_NORMAL_MAX_DUST_TXS_BEFORE_FIRST_GROUP) {
-      await this.skipTokenExcessiveDustTxsBeforeFirstGroup(state, dustTxCountBeforeGroup, tx);
-      return true;
-    }
-
-    if (!this.isFirstQualifyingSolGroup(state, tx.timestamp, "round", roundTarget)) {
-      await this.skipTokenNotFirstQualifyingRoundGroup(state, roundTarget, tx);
+    if (this.hasPriorCumulativeDustSkipThresholdBefore(state, tx.timestamp)) {
+      await this.skipTokenCumulativeDustBeforeRoundBuy(state, roundTarget, tx);
       return true;
     }
 
@@ -4530,102 +4505,61 @@ export class InsiderBot extends EventEmitter {
     return BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT;
   }
 
-  private countNormalTinyDustTransferOuts(
+  private isNormalTinyDustTransferOut(
+    state: BundlerFunderWatchState,
+    entry: {
+      signature: string;
+      amountSol: number;
+      amountUsd: number;
+      recipient: string;
+    },
+  ): boolean {
+    if (state.bundlerWallets.has(entry.recipient)) return false;
+    if (this.isKnownFunderCandidate(state, entry.signature)) return false;
+    if (entry.amountUsd < BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD) return true;
+    return !this.isNormalTinyValidRoundSolAmount(entry.amountSol);
+  }
+
+  private countCumulativeNormalTinyDustTransferOuts(
     state: BundlerFunderWatchState,
     beforeTimestamp?: number,
   ): number {
     return state.normalTinyTransferOuts.filter(
       (entry) =>
-        !this.isNormalTinyValidRoundSolAmount(entry.amountSol) &&
-        !state.bundlerWallets.has(entry.recipient) &&
-        !this.isKnownFunderCandidate(state, entry.signature) &&
+        this.isNormalTinyDustTransferOut(state, entry) &&
         (beforeTimestamp === undefined || entry.timestamp < beforeTimestamp),
     ).length;
   }
 
-  /** All dust transfer-out txs in the 10s window ending at `timestamp`. */
-  private getNormalTinyDustWindow(
+  /** True when cumulative dust already reached the skip threshold before `beforeTimestamp`. */
+  private hasPriorCumulativeDustSkipThresholdBefore(
     state: BundlerFunderWatchState,
-    timestamp: number,
-  ): Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }> {
-    const start = timestamp - BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS;
-    return state.normalTinyTransferOuts.filter(
+    beforeTimestamp: number,
+  ): boolean {
+    return (
+      this.countCumulativeNormalTinyDustTransferOuts(state, beforeTimestamp) >=
+      normalTinyQualifyingDustGroupTxs()
+    );
+  }
+
+  /** True when any ~0.02 / ~0.05 / ~0.1 SOL 10s group already reached the round buy threshold by `byTimestamp`. */
+  private hasRoundGroupReachedBuyThresholdBy(
+    state: BundlerFunderWatchState,
+    byTimestamp: number,
+  ): boolean {
+    const entries = state.normalTinyTransferOuts.filter(
       (entry) =>
-        entry.timestamp >= start &&
-        entry.timestamp <= timestamp &&
+        entry.timestamp <= byTimestamp &&
         !state.bundlerWallets.has(entry.recipient) &&
         !this.isKnownFunderCandidate(state, entry.signature) &&
-        !this.isNormalTinyValidRoundSolAmount(entry.amountSol),
-    );
-  }
-
-  /**
-   * True when no earlier 10s window already had ≥2 outs of the same sol group
-   * (dust, or a specific ~0.02 / ~0.05 / ~0.1 round size).
-   */
-  private isFirstQualifyingSolGroup(
-    state: BundlerFunderWatchState,
-    timestamp: number,
-    kind: "dust" | "round",
-    roundTargetSol?: number,
-  ): boolean {
-    const anchorTimestamp =
-      kind === "dust"
-        ? Math.min(
-            ...this.getNormalTinyDustWindow(state, timestamp).map((entry) => entry.timestamp),
-          )
-        : Math.min(
-            ...this.getNormalTinySameRoundGroup(state, timestamp, roundTargetSol!).map(
-              (entry) => entry.timestamp,
-            ),
-          );
-    return !this.hasPriorAnySolGroupBefore(state, anchorTimestamp);
-  }
-
-  /** Any earlier 10s window with ≥2 dust outs or ≥2 outs at one round size. */
-  private hasPriorAnySolGroupBefore(
-    state: BundlerFunderWatchState,
-    beforeTimestamp: number,
-  ): boolean {
-    const entries = state.normalTinyTransferOuts.filter(
-      (entry) =>
-        entry.timestamp < beforeTimestamp &&
-        !state.bundlerWallets.has(entry.recipient) &&
-        !this.isKnownFunderCandidate(state, entry.signature),
+        entry.amountUsd >= BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD,
     );
     for (const entry of entries) {
+      const roundTarget = this.getNormalTinyRoundTarget(entry.amountSol);
+      if (roundTarget === null) continue;
       if (
-        this.getNormalTinyDustWindow(state, entry.timestamp).length >=
-        normalTinyQualifyingDustGroupTxs()
-      ) {
-        return true;
-      }
-      for (const target of BUNDLER_FUNDER_NORMAL_TINY_VALID_ROUND_SOL_AMOUNTS) {
-        if (
-          this.getNormalTinySameRoundGroup(state, entry.timestamp, target).length >=
-          BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS
-        ) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  private hasPriorDustSolGroupBefore(
-    state: BundlerFunderWatchState,
-    beforeTimestamp: number,
-  ): boolean {
-    const entries = state.normalTinyTransferOuts.filter(
-      (entry) =>
-        entry.timestamp < beforeTimestamp &&
-        !state.bundlerWallets.has(entry.recipient) &&
-        !this.isKnownFunderCandidate(state, entry.signature),
-    );
-    for (const entry of entries) {
-      if (
-        this.getNormalTinyDustWindow(state, entry.timestamp).length >=
-        normalTinyQualifyingDustGroupTxs()
+        this.getNormalTinySameRoundGroup(state, entry.timestamp, roundTarget).length >=
+        BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY
       ) {
         return true;
       }
@@ -4633,65 +4567,39 @@ export class InsiderBot extends EventEmitter {
     return false;
   }
 
-  private async skipTokenExcessiveDustTxsBeforeFirstGroup(
+  private async skipTokenCumulativeDustThreshold(
     state: BundlerFunderWatchState,
-    dustTxCount: number,
+    cumulativeDustTxCount: number,
     tx: HeliusTransaction,
   ): Promise<void> {
-    this.log.warn("Skipping token — too many dust transfer-outs before first qualifying group", {
+    this.log.warn("Skipping token — cumulative dust transfer-outs reached skip threshold before round buy", {
       mint: state.mint,
       funderWallet: state.funderWallet,
-      dustTxCount,
-      maxDustTxs: BUNDLER_FUNDER_NORMAL_MAX_DUST_TXS_BEFORE_FIRST_GROUP,
+      cumulativeDustTxCount,
       signature: tx.signature,
     });
     void this.sendTelegramSafe(
       [
-        `<b>⏭️ ${this.label} Token Skipped — Excessive Dust Txs Before First Group</b>`,
+        `<b>⏭️ ${this.label} Token Skipped — Cumulative Dust Threshold</b>`,
         `Token: <code>${state.mint}</code>`,
         `FeePayer: <code>${state.funderWallet}</code>`,
-        `Dust txs (not ~0.02 / ~0.05 / ~0.1 SOL): <b>${dustTxCount}</b>`,
-        `Limit: <b>${BUNDLER_FUNDER_NORMAL_MAX_DUST_TXS_BEFORE_FIRST_GROUP}</b>`,
-        `Trigger tx: <code>${tx.signature}</code>`,
-      ].join("\n"),
-      "excessive dust txs before first group skip notification",
-    );
-    await this.resetForNewToken(true);
-  }
-
-  private async skipTokenDustFirstGroup(
-    state: BundlerFunderWatchState,
-    dustWindowTxCount: number,
-    tx: HeliusTransaction,
-  ): Promise<void> {
-    this.log.warn("Skipping token — first qualifying 10s group was dust (non-round SOL outs)", {
-      mint: state.mint,
-      funderWallet: state.funderWallet,
-      dustWindowTxCount,
-      signature: tx.signature,
-    });
-    void this.sendTelegramSafe(
-      [
-        `<b>⏭️ ${this.label} Token Skipped — Dust First Group</b>`,
-        `Token: <code>${state.mint}</code>`,
-        `FeePayer: <code>${state.funderWallet}</code>`,
-        `First ${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s group: <b>${dustWindowTxCount}</b> dust txs (not ~0.02 / ~0.05 / ~0.1 SOL, ≥${normalTinyQualifyingDustGroupTxs()})`,
+        `Cumulative dust txs (not ~0.02 / ~0.05 / ~0.1 SOL): <b>${cumulativeDustTxCount}</b> (≥${normalTinyQualifyingDustGroupTxs()})`,
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
-        `First qualifying dust group at ≥${normalTinyQualifyingDustGroupTxs()} txs — token skipped; feePayer watch will resume.`,
-        "First qualifying round group must be ~0.02 / ~0.05 / ~0.1 SOL with ≥20 txs in 10s to buy.",
+        `Cumulative dust reached ≥${normalTinyQualifyingDustGroupTxs()} before any round 10s group did — token skipped; feePayer watch will resume.`,
+        "Round group must reach ≥20 txs in 10s before cumulative dust hits 20 to buy.",
       ].join("\n"),
-      "dust first group skip notification",
+      "cumulative dust threshold skip notification",
     );
     await this.resetForNewToken(true);
   }
 
-  private async skipTokenDustFirstGroupBeforeRoundBuy(
+  private async skipTokenCumulativeDustBeforeRoundBuy(
     state: BundlerFunderWatchState,
     roundTargetSol: number,
     tx: HeliusTransaction,
   ): Promise<void> {
-    this.log.warn("Skipping token — dust sol group appeared before round buy group", {
+    this.log.warn("Skipping token — cumulative dust reached skip threshold before round 10s buy group", {
       mint: state.mint,
       funderWallet: state.funderWallet,
       roundTargetSol,
@@ -4699,37 +4607,13 @@ export class InsiderBot extends EventEmitter {
     });
     void this.sendTelegramSafe(
       [
-        `<b>⏭️ ${this.label} Token Skipped — Dust Group Before Round Buy</b>`,
+        `<b>⏭️ ${this.label} Token Skipped — Cumulative Dust Before Round Buy</b>`,
         `Token: <code>${state.mint}</code>`,
         `FeePayer: <code>${state.funderWallet}</code>`,
-        `Saw ~${roundTargetSol} SOL group (≥20 txs) but a dust group came first.`,
+        `Saw ~${roundTargetSol} SOL 10s group (≥20 txs) but cumulative dust already reached ≥${normalTinyQualifyingDustGroupTxs()}.`,
         `Trigger tx: <code>${tx.signature}</code>`,
       ].join("\n"),
-      "dust group before round buy skip notification",
-    );
-    await this.resetForNewToken(true);
-  }
-
-  private async skipTokenNotFirstQualifyingRoundGroup(
-    state: BundlerFunderWatchState,
-    roundTargetSol: number,
-    tx: HeliusTransaction,
-  ): Promise<void> {
-    this.log.warn("Skipping token — round group was not the first qualifying sol group", {
-      mint: state.mint,
-      funderWallet: state.funderWallet,
-      roundTargetSol,
-      signature: tx.signature,
-    });
-    void this.sendTelegramSafe(
-      [
-        `<b>⏭️ ${this.label} Token Skipped — Not First Qualifying Sol Group</b>`,
-        `Token: <code>${state.mint}</code>`,
-        `FeePayer: <code>${state.funderWallet}</code>`,
-        `Saw ~${roundTargetSol} SOL group (≥20 txs) but an earlier sol group already qualified.`,
-        `Trigger tx: <code>${tx.signature}</code>`,
-      ].join("\n"),
-      "not first qualifying round group skip notification",
+      "cumulative dust before round buy skip notification",
     );
     await this.resetForNewToken(true);
   }
