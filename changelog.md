@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-07-19 (44)
+
+### Follow-wallet vs funder-first normal-mode funding threshold
+
+- **Follow-wallet**: normal-mode **funding** threshold lowered from **20 SOL** to **>3 SOL**. Buy signals unchanged — tiny round groups on transfer-outs **&lt; $10**, cumulative dust race-to-20, and the **$100** first-buy gate on the first two unique recipients.
+- **Funder-first**: normal-mode **funding** threshold stays **≥20 SOL**. Uses the **same** tiny round-group buy path as follow-wallet (not the old large 20 SOL+ transfer-out → wait-for-recipient-buy path).
+
+### Follow-wallet Telegram: show responsible follow wallet
+
+- Follow-sourced skip, watch-start, and buy-gate messages now include **Follow wallet: `…`** (the wallet whose buy started that token flow), including:
+  - Low-funding mode disabled / funding-below-threshold skips
+  - **Shared FeePayer Locked** (feePayer watch armed after funding gate passes)
+  - Normal round-group buy gate and dust / first-buy skip notices
+- Omitted on funder-first messages (`flowSource !== "follow"`).
+
 ## 2026-07-19 (43)
 
 ### Normal mode: round-group buy requires selected recipient first buy &gt; $100

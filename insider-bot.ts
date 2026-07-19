@@ -34,8 +34,11 @@ const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
 const BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_RETRY_DELAY_MS = 500;
+/** Funder-first normal-mode minimum bundler funding / transfer-out threshold. */
 const BUNDLER_FUNDER_LOW_FUNDING_SOL = 20;
-/** Kill switch for the whole low-funding-mode path. While false, any shared feePayer whose largest funding is below BUNDLER_FUNDER_LOW_FUNDING_SOL is skipped entirely (no watch is even created for it) instead of being handled via low-funding logic. */
+/** Follow-wallet normal-mode minimum bundler funding threshold (tiny round groups only). */
+const BUNDLER_FUNDER_FOLLOW_WALLET_NORMAL_FUNDING_MIN_SOL = 3;
+/** Kill switch for the whole low-funding-mode path. While false, any shared feePayer whose largest funding is below its flow's normal-mode threshold is skipped entirely (no watch is even created for it) instead of being handled via low-funding logic. */
 const BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED = false;
 /** Max follow wallets monitored concurrently on one insider bot. */
 const MAX_FOLLOW_WALLETS = 2;
@@ -877,6 +880,12 @@ export class InsiderBot extends EventEmitter {
     return this.flowFollowWallet ?? this.followedWallets[0] ?? null;
   }
 
+  private formatFollowWalletTelegramLine(): string {
+    const wallet = this.getFlowFollowWallet();
+    if (!wallet || this.flowSource !== "follow") return "";
+    return `Follow wallet: <code>${wallet}</code>`;
+  }
+
   setFollowWalletFlowDelegate(
     delegate:
       | ((
@@ -993,6 +1002,12 @@ export class InsiderBot extends EventEmitter {
 
   getFlowSource() {
     return this.flowSource;
+  }
+
+  private getNormalFundingMinSol(): number {
+    return this.flowSource === "funder-first"
+      ? BUNDLER_FUNDER_LOW_FUNDING_SOL
+      : BUNDLER_FUNDER_FOLLOW_WALLET_NORMAL_FUNDING_MIN_SOL;
   }
 
   /** True when the bot is not mid-flow on a token and can accept a funder-first handoff. */
@@ -1503,11 +1518,12 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>🔍 ${this.label} Bundler-Funder Flow Started</b>`,
         `Token: <code>${mint}</code>`,
-        `Follow wallet: <code>${followedWallet}</code>`,
+        this.formatFollowWalletTelegramLine() ||
+          `Follow wallet: <code>${followedWallet}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
         "Finding each bundler's zero-balance funding window, selecting the latest valid funding transfer in that window, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs for recipient buy confirmation.",
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       "flow-start notification",
     );
 
@@ -1691,14 +1707,15 @@ export class InsiderBot extends EventEmitter {
     if (buySols.some((sol) => sol === null)) return false;
 
     const maxBuySol = Math.max(...(buySols as number[]));
-    if (maxBuySol >= BUNDLER_FUNDER_LOW_FUNDING_SOL) return false;
+    const normalFundingMinSol = this.getNormalFundingMinSol();
+    if (maxBuySol >= normalFundingMinSol) return false;
 
     this.log.warn(
       "Low-funding mode disabled; skipping token from early bundler buy SOL (before funding REST)",
       {
         mint,
         maxBuySol,
-        normalFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
+        normalFundingThresholdSol: normalFundingMinSol,
         bundlerBuySols: buys.map((buy) => ({
           wallet: buy.wallet,
           buySol: buy.buySol,
@@ -1706,7 +1723,7 @@ export class InsiderBot extends EventEmitter {
         })),
       },
     );
-    await this.skipLowFundingDisabledToken(mint, null, maxBuySol);
+    await this.skipLowFundingDisabledToken(mint, null, maxBuySol, normalFundingMinSol);
     return true;
   }
 
@@ -1714,13 +1731,15 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     funderWallet: string | null,
     largestFundingSol: number,
+    normalFundingThresholdSol = this.getNormalFundingMinSol(),
   ): Promise<void> {
     void this.sendTelegramSafe(
       [
         `<b>⏭️ ${this.label} Low-Funding Mode Disabled — Token Skipped</b>`,
         `Token: <code>${mint}</code>`,
+        this.formatFollowWalletTelegramLine(),
         funderWallet ? `FeePayer: <code>${funderWallet}</code>` : "",
-        `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b> (below the ${BUNDLER_FUNDER_LOW_FUNDING_SOL} SOL normal-mode threshold)`,
+        `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b> (below the ${normalFundingThresholdSol} SOL normal-mode threshold)`,
         "Low-funding mode is currently disabled — resetting to watch for the next token.",
       ]
         .filter(Boolean)
@@ -2111,7 +2130,8 @@ export class InsiderBot extends EventEmitter {
         : best,
     );
     const largestFundingSol = Math.max(...records.map((record) => record.amountSol));
-    const lowFundingMode = largestFundingSol < BUNDLER_FUNDER_LOW_FUNDING_SOL;
+    const normalFundingMinSol = this.getNormalFundingMinSol();
+    const lowFundingMode = largestFundingSol < normalFundingMinSol;
     const funderWallet = records[0].fundingFeePayer;
     if (lowFundingMode && !BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED) {
       this.log.warn(
@@ -2120,10 +2140,15 @@ export class InsiderBot extends EventEmitter {
           mint,
           funderWallet,
           largestFundingSol,
-          normalFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
+          normalFundingThresholdSol: normalFundingMinSol,
         },
       );
-      await this.skipLowFundingDisabledToken(mint, funderWallet, largestFundingSol);
+      await this.skipLowFundingDisabledToken(
+        mint,
+        funderWallet,
+        largestFundingSol,
+        normalFundingMinSol,
+      );
       return;
     }
 
@@ -2141,9 +2166,7 @@ export class InsiderBot extends EventEmitter {
       earliestFundingTimestamp: earliest.timestamp,
       earliestFundingSignature: earliest.fundingSignature,
       largestFundingSol,
-      minTransferOutSol: lowFundingMode
-        ? 0
-        : largestFundingSol,
+      minTransferOutSol: 0,
       cursorSignature: latest.fundingSignature,
       processedSignatures: new Set(records.map((record) => record.fundingSignature)),
       validOutSignatures: new Set<string>(),
@@ -2239,16 +2262,17 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>✅ ${this.label} Shared FeePayer Locked</b>`,
         `Token: <code>${mint}</code>`,
+        this.formatFollowWalletTelegramLine(),
         `FeePayer: <code>${funderWallet}</code>`,
         `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b>`,
         activeFunderWatch.lowFundingMode
           ? `Watching feePayer tiny transfer-outs: <b>$${BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD.toFixed(2)}-$${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)}</b>`
-          : `Watching feePayer transfer-outs: <b>${activeFunderWatch.minTransferOutSol.toFixed(4)} SOL+</b>`,
+          : `Watching feePayer tiny transfer-outs: <b>~0.02 / ~0.05 / ~0.1 SOL</b> (&lt; $${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)}, ≥${normalFundingMinSol} SOL funded)`,
         "",
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
-          : "Transfer-outs that pass the filters are watched until the recipient buys this token.",
-      ].join("\n"),
+          : "Round groups, dust race-to-20, and recipient first-buy gates apply.",
+      ].filter(Boolean).join("\n"),
       "shared feePayer notification",
     );
   }
@@ -2287,7 +2311,7 @@ export class InsiderBot extends EventEmitter {
       earliestFundingTimestamp: latestBundlerBuy.timestamp,
       earliestFundingSignature: latestBundlerBuy.signature,
       largestFundingSol,
-      minTransferOutSol: largestFundingSol,
+      minTransferOutSol: 0,
       cursorSignature: latestBundlerBuy.signature,
       processedSignatures: new Set<string>(),
       validOutSignatures: new Set<string>(),
@@ -2346,8 +2370,10 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `FeePayer: <code>${feePayer}</code>`,
         `Mode: <b>Normal (funder-first)</b>`,
+        `Largest bundler funding: <b>≥${BUNDLER_FUNDER_LOW_FUNDING_SOL} SOL</b>`,
+        `Watching feePayer tiny transfer-outs: <b>~0.02 / ~0.05 / ~0.1 SOL</b> (&lt; $${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)})`,
         "",
-        "Watching feePayer tiny transfer-outs for normal-mode buy signals.",
+        "Round groups, dust race-to-20, and recipient first-buy gates apply.",
       ].join("\n"),
       "funder-first feePayer locked notification",
     );
@@ -2476,9 +2502,10 @@ export class InsiderBot extends EventEmitter {
       const record = await this.findValidBundlerFundingRecord(mint, buy, index);
       records.push(record);
       if (!record) continue;
+      const normalFundingMinSol = this.getNormalFundingMinSol();
       if (
         !BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED &&
-        record.amountSol < BUNDLER_FUNDER_LOW_FUNDING_SOL
+        record.amountSol < normalFundingMinSol
       ) {
         this.log.warn(
           "Low-funding mode disabled; aborting remaining bundler funding lookups after first sub-threshold record",
@@ -2488,13 +2515,14 @@ export class InsiderBot extends EventEmitter {
             fundingSol: record.amountSol,
             resolvedCount: records.filter(Boolean).length,
             remaining: firstFour.length - index - 1,
-            normalFundingThresholdSol: BUNDLER_FUNDER_LOW_FUNDING_SOL,
+            normalFundingThresholdSol: normalFundingMinSol,
           },
         );
         await this.skipLowFundingDisabledToken(
           mint,
           record.fundingFeePayer,
           record.amountSol,
+          normalFundingMinSol,
         );
         return null;
       }
@@ -3899,10 +3927,34 @@ export class InsiderBot extends EventEmitter {
     }
     if (state.lowFundingMode) {
       if (this.hasSolIncomingToWallet(tx, state.funderWallet)) return false;
+      let transferOutUsd: number | null = null;
+      const solPriceUsd = await this.getCachedSolPriceUsd();
+      transferOutUsd = solPriceUsd !== null ? transferOut.amountSol * solPriceUsd : null;
+      if (transferOutUsd === null) {
+        this.log.warn("Skipping tiny recipient check because SOL/USD is unavailable", {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          signature: tx.signature,
+          amountSol: transferOut.amountSol,
+          lowFundingMode: state.lowFundingMode,
+        });
+        return false;
+      }
+      if (transferOutUsd >= BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD) return false;
+      await this.handleLowFundingTinyTransferOut(state, tx, transferOut, transferOutUsd);
+      return false;
     }
-    let transferOutUsd: number | null = null;
+    return this.handleNormalModeTinyTransferOut(state, tx, transferOut);
+  }
+
+  private async handleNormalModeTinyTransferOut(
+    state: BundlerFunderWatchState,
+    tx: HeliusTransaction,
+    transferOut: { to: string; amountSol: number },
+  ): Promise<boolean> {
     const solPriceUsd = await this.getCachedSolPriceUsd();
-    transferOutUsd = solPriceUsd !== null ? transferOut.amountSol * solPriceUsd : null;
+    const transferOutUsd =
+      solPriceUsd !== null ? transferOut.amountSol * solPriceUsd : null;
     if (transferOutUsd === null) {
       this.log.warn("Skipping tiny recipient check because SOL/USD is unavailable", {
         mint: state.mint,
@@ -3911,11 +3963,6 @@ export class InsiderBot extends EventEmitter {
         amountSol: transferOut.amountSol,
         lowFundingMode: state.lowFundingMode,
       });
-      return false;
-    }
-    if (state.lowFundingMode) {
-      if (transferOutUsd >= BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD) return false;
-      await this.handleLowFundingTinyTransferOut(state, tx, transferOut, transferOutUsd);
       return false;
     }
     if (transferOutUsd >= BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD) {
@@ -3951,11 +3998,7 @@ export class InsiderBot extends EventEmitter {
       });
       return false;
     }
-    if (
-      this.isKnownFunderCandidate(state, tx.signature)
-    ) {
-      return false;
-    }
+    if (this.isKnownFunderCandidate(state, tx.signature)) return false;
     // Record every qualifying feePayer transfer-out for dust counting and round-group detection.
     // Sub-$0.10 outs are tracked as dust. Round buy wins unless cumulative dust reaches 20 before a round 10s group does.
     this.recordNormalTinyTransferOut(state, {
@@ -4125,6 +4168,7 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>🟢 ${this.label} Normal FeePayer Round SOL Group Buy Gate</b>`,
         `Token: <code>${state.mint}</code>`,
+        this.formatFollowWalletTelegramLine(),
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Round size: <b>~${roundTarget} SOL</b> (±${BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL})`,
         `Group: <b>${selectedGroup.length}/${BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES}</b> selected · <b>${sameRoundGroup.length}</b> ~${roundTarget} SOL txs in ${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s (first valid group, ≥${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY})`,
@@ -4133,7 +4177,7 @@ export class InsiderBot extends EventEmitter {
           : "",
         `Selected exit: <b>+${exitPercent}% MC</b>`,
         ...selectedGroup.map((entry, index) => `${index + 1}. <code>${entry.recipient}</code> — ${entry.amountSol.toFixed(4)} SOL — <code>${entry.signature}</code>`),
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       "normal feePayer round sol group buy gate notification",
     );
 
@@ -4725,13 +4769,14 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>⏭️ ${this.label} Token Skipped — Cumulative Dust Threshold</b>`,
         `Token: <code>${state.mint}</code>`,
+        this.formatFollowWalletTelegramLine(),
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Cumulative dust txs (not ~0.02 / ~0.05 / ~0.1 SOL): <b>${cumulativeDustTxCount}</b> (≥${normalTinyQualifyingDustGroupTxs()})`,
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
         `Cumulative dust reached ≥${normalTinyQualifyingDustGroupTxs()} before any round 10s group did — token skipped; feePayer watch will resume.`,
         "Round group must reach ≥20 txs in 10s before cumulative dust hits 20 to buy.",
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       "cumulative dust threshold skip notification",
     );
     await this.resetForNewToken(true);
@@ -4752,10 +4797,11 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>⏭️ ${this.label} Token Skipped — Cumulative Dust Before Round Buy</b>`,
         `Token: <code>${state.mint}</code>`,
+        this.formatFollowWalletTelegramLine(),
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Saw ~${roundTargetSol} SOL 10s group (≥20 txs) but cumulative dust already reached ≥${normalTinyQualifyingDustGroupTxs()}.`,
         `Trigger tx: <code>${tx.signature}</code>`,
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       "cumulative dust before round buy skip notification",
     );
     await this.resetForNewToken(true);
@@ -4789,6 +4835,7 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>⏭️ ${this.label} Token Skipped — Round Group Recipient First Buy Too Small</b>`,
         `Token: <code>${state.mint}</code>`,
+        this.formatFollowWalletTelegramLine(),
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Saw ~${roundTargetSol} SOL 10s group (≥20 txs) but neither of the first two unique recipients has a first buy on this token above <b>$${BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD}</b>.`,
         `Trigger tx: <code>${tx.signature}</code>`,
@@ -4804,7 +4851,7 @@ export class InsiderBot extends EventEmitter {
               : "none found"
           } — <b>${buyUsdLabel}</b>`;
         }),
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       "round group recipient first buy usd skip notification",
     );
     await this.resetForNewToken(true);
