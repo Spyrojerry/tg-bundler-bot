@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-20 (45)
+
+### Fix duplicate Telegram on round-group first-buy skip
+
+- When a qualifying ~0.02 / ~0.05 / ~0.1 SOL round group failed the **$100** first-buy gate, `normalTinyRoundGroupFound` was only set on **pass**, so every later transfer-out in the same sync batch re-ran the gate and sent another identical skip message.
+- Now the round group is **claimed once** (`normalTinyRoundGroupFound`) before the USD gate runs; pre-buy skip helpers stop feePayer discovery immediately (`discoveryStopped`) so only **one** Telegram is sent per token.
+
 ## 2026-07-19 (44)
 
 ### Follow-wallet vs funder-first normal-mode funding threshold

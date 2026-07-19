@@ -3651,6 +3651,7 @@ export class InsiderBot extends EventEmitter {
         state.cursorSignature = tx.signature;
         const migrated = await this.inspectBundlerFunderTransaction(state, tx);
         if (migrated) break;
+        if (state.discoveryStopped || !this.bundlerFunderWatch) break;
       }
       await this.maybeTriggerLowFundingPendingTinyBuys(state, "shared feePayer sync");
     } catch (err) {
@@ -3899,6 +3900,7 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
   ): Promise<boolean> {
+    if (state.discoveryStopped) return false;
     this.recordLowFundingFunderTx(state, tx);
     const transferOut = this.extractSolTransferOutFromWallet(
       tx,
@@ -4053,6 +4055,10 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
+    if (state.normalTinyRoundGroupFound) {
+      return false;
+    }
+
     const sameRoundGroup = this.getNormalTinySameRoundGroup(
       state,
       tx.timestamp,
@@ -4108,6 +4114,8 @@ export class InsiderBot extends EventEmitter {
       });
       return false;
     }
+    state.normalTinyRoundGroupFound = true;
+
     const recipientFirstBuyGate =
       await this.evaluateRoundGroupRecipientFirstBuyUsdGate(state, selectedGroup);
     if (!recipientFirstBuyGate.passed) {
@@ -4119,8 +4127,6 @@ export class InsiderBot extends EventEmitter {
       );
       return true;
     }
-
-    state.normalTinyRoundGroupFound = true;
 
     let watch: FunderRecipientWatch | null = null;
     for (const entry of selectedGroup) {
@@ -4759,6 +4765,11 @@ export class InsiderBot extends EventEmitter {
     cumulativeDustTxCount: number,
     tx: HeliusTransaction,
   ): Promise<void> {
+    if (state.discoveryStopped) return;
+    await this.stopBundlerFunderSourceDiscovery(
+      state,
+      "cumulative dust threshold reached before round buy",
+    );
     this.log.warn("Skipping token — cumulative dust transfer-outs reached skip threshold before round buy", {
       mint: state.mint,
       funderWallet: state.funderWallet,
@@ -4787,6 +4798,11 @@ export class InsiderBot extends EventEmitter {
     roundTargetSol: number,
     tx: HeliusTransaction,
   ): Promise<void> {
+    if (state.discoveryStopped) return;
+    await this.stopBundlerFunderSourceDiscovery(
+      state,
+      "cumulative dust reached threshold before round buy",
+    );
     this.log.warn("Skipping token — cumulative dust reached skip threshold before round 10s buy group", {
       mint: state.mint,
       funderWallet: state.funderWallet,
@@ -4820,6 +4836,11 @@ export class InsiderBot extends EventEmitter {
       }>;
     },
   ): Promise<void> {
+    if (state.discoveryStopped) return;
+    await this.stopBundlerFunderSourceDiscovery(
+      state,
+      "round group recipient first buy below USD threshold",
+    );
     this.log.warn(
       "Skipping token — no selected round-group recipient first buy above USD threshold",
       {
