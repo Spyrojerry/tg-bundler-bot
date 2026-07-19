@@ -1,12 +1,17 @@
 # Changelog
 
-## 2026-07-18 (41)
+## 2026-07-19 (43)
 
-### Normal mode: skip round buy when highest initial bundler buy &lt; 15 SOL
+### Normal mode: round-group buy requires selected recipient first buy &gt; $100
 
-- When a normal-mode round buy gate would fire but the **highest** of the first-four initial bundler buys is **below 15 SOL**, the bot **does not buy** and skips the token.
-- **Funder-first**: feePayer enters cooldown and watches the dev for rug (same as post-trade pause); feePayer watch resumes after dev rug. Other pre-buy skips still resume immediately.
-- Unknown bundler buy SOL does not trigger this skip (round buy proceeds with standard +90% / +180% exits).
+- Before a normal-mode ~0.02 / ~0.05 / ~0.1 SOL round buy, the bot picks the **first two unique recipients** in the 10s group (not the first two txs), syncs each wallet's history, and finds its **first buy on the current token**.
+- Buy proceeds if **either** recipient's first buy exceeds **$100 USD**; the qualifying wallet triggers the buy. Otherwise the token is skipped and reset.
+
+## 2026-07-19 (42)
+
+### Funder-first: ignore feePayer-funder transfer-outs below 1 SOL
+
+- `funder-first-orchestrator.ts`: outgoing SOL transfers from the configured feePayer funder below **1 SOL** are skipped and do not arm or top up a potential feePayer watch.
 
 ## 2026-07-18 (40)
 

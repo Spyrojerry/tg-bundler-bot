@@ -70,6 +70,8 @@ const POTENTIAL_FEEPAYER_SYNC_LIMIT = 20;
 const POTENTIAL_FEEPAYER_SYNC_MIN_INTERVAL_MS = 1_000;
 const COOLDOWN_DEV_SYNC_LIMIT = 30;
 const COOLDOWN_DEV_SYNC_MIN_INTERVAL_MS = 1_000;
+/** Ignore feePayer-funder SOL transfer-outs below this amount. */
+const FUNDER_MIN_OUTGOING_TRANSFER_SOL = 1;
 /** Outgoing transfers up to this fraction of initial funder-receive balance trigger exchange-identity checks. */
 const EXCHANGE_DRAIN_CHECK_MAX_FRACTION = 0.5;
 /** Outgoing transfers at or above this size are tracked for zero-balance handoff. */
@@ -513,6 +515,17 @@ export class FunderFirstOrchestrator extends EventEmitter {
       tx,
       funder,
     )) {
+      if (amountSol < FUNDER_MIN_OUTGOING_TRANSFER_SOL) {
+        log.debug('Skipping funder transfer-out below minimum SOL', {
+          funder,
+          recipient,
+          amountSol,
+          minTransferOutSol: FUNDER_MIN_OUTGOING_TRANSFER_SOL,
+          signature: tx.signature,
+        });
+        continue;
+      }
+
       let existing = this.potentialFeePayers.get(recipient);
       if (
         existing &&
@@ -2138,13 +2151,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
     if (!watch) return;
 
     if (!event.hadPosition) {
-      if (event.awaitRugBeforeResume) {
-        await this.enterCooldownAwaitingRugAfterSkip(
-          watch,
-          event.mint ?? watch.detectedMint,
-        );
-        return;
-      }
       await this.resumePotentialFeePayerAfterPreBuySkip(
         watch,
         event.mint ?? watch.detectedMint,
@@ -2170,41 +2176,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
       'Watching dev wallet for CLOSE_ACCOUNT or zero native SOL before resuming this feePayer.',
     ]);
     this.enterCooldown(watch, mint, devWallet);
-  }
-
-  /** Pre-buy skip — pause feePayer until dev rugs, then resume (e.g. low initial bundler buy). */
-  private async enterCooldownAwaitingRugAfterSkip(
-    watch: PotentialFeePayerWatch,
-    mint: string | null,
-  ): Promise<void> {
-    const resolvedMint = mint ?? watch.detectedMint;
-    const devWallet = watch.detectedDevWallet;
-    if (!resolvedMint || !devWallet) {
-      log.warn(
-        'Low-bundler skip requested rug wait but mint/dev missing; resuming feePayer watch',
-        {
-          feePayer: watch.address,
-          mint: resolvedMint,
-          devWallet,
-        },
-      );
-      await this.resumePotentialFeePayerAfterPreBuySkip(
-        watch,
-        resolvedMint,
-        'reset',
-      );
-      return;
-    }
-
-    void this.sendTelegram([
-      '<b>⏸️ Funder-First: Skipped — FeePayer Paused Until Rug</b>',
-      `Token: <code>${this.html(resolvedMint)}</code>`,
-      `FeePayer: <code>${this.html(watch.address)}</code>`,
-      `Dev: <code>${this.html(devWallet)}</code>`,
-      '',
-      'Highest initial bundler buy was below 15 SOL — no buy taken. Watching dev for rug before resuming this feePayer.',
-    ]);
-    this.enterCooldown(watch, resolvedMint, devWallet);
   }
 
   /** Pre-buy skip/reset — resume watching the feePayer for the next token (no dev cooldown). */

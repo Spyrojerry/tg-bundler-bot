@@ -72,12 +72,13 @@ const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
 };
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
-/** Skip normal-mode round buy when the highest initial bundler buy is below this (await rug, then resume feePayer). */
-const BUNDLER_FUNDER_NORMAL_TINY_LOW_INSIDER_BUY_SOL_THRESHOLD = 15;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 20;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
 const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 2;
+/** Round-group buy requires at least one selected recipient's first token buy to exceed this USD. */
+const BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD = 100;
+const BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_HISTORY_LIMIT = 50;
 const BUNDLER_FUNDER_RECIPIENT_FIRST_TX_WINDOW = 3;
 const BUNDLER_FUNDER_RECIPIENT_SWAP_HISTORY_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1_000;
 const BUNDLER_FUNDER_RECIPIENT_MIN_BUY_USD = 200;
@@ -201,8 +202,6 @@ export interface InsiderTokenFlowEndedEvent {
   source: "follow" | "funder-first" | null;
   hadPosition: boolean;
   reason: "reset" | "cycle_complete";
-  /** Funder-first: pause feePayer until dev rugs, then resume watch (no buy was taken). */
-  awaitRugBeforeResume?: boolean;
 }
 
 export interface InsiderBot {
@@ -459,8 +458,6 @@ export class InsiderBot extends EventEmitter {
   private highestObservedMarketCapUsd: number | null = null;
   /** Market cap captured at the very start of the current token's flow (the follow-wallet/initial-bundler buy MC). A buy is only allowed if the market cap at buy time is still at or above this — i.e. the token hasn't round-tripped back below where the earliest bundler bought. Null if unknown (fetch failed at flow start), in which case the check is skipped entirely. */
   private initialBundlerMarketCapUsd: number | null = null;
-  /** Highest SOL spent on the first-four initial bundler buys; round buy skipped when below 15 SOL. */
-  private highestInitialInsiderBuySol: number | null = null;
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private profitExitDisabled = false;
@@ -1059,7 +1056,6 @@ export class InsiderBot extends EventEmitter {
     const earlyBundlerWallets = this.extractEarlyInsiderWallets(earlyBuys);
     this.initialInsiderWallets.clear();
     for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
-    this.highestInitialInsiderBuySol = this.getHighestInsiderBuySolFromEarlyBuys(earlyBuys);
 
     const createTx = await this.withHeliusFallback((client) =>
       client.getMintCreateTransaction(mint),
@@ -1477,8 +1473,6 @@ export class InsiderBot extends EventEmitter {
     const earlyBundlerWallets = this.extractEarlyInsiderWallets(earlyInsiderBuys);
     this.initialInsiderWallets.clear();
     for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
-    this.highestInitialInsiderBuySol =
-      this.getHighestInsiderBuySolFromEarlyBuys(earlyInsiderBuys);
 
     if (!earlyBundlerWallets.includes(followedWallet)) {
       this.log.warn(
@@ -1592,24 +1586,6 @@ export class InsiderBot extends EventEmitter {
 
   private extractEarlyInsiderWallets(buys: EarlyInsiderBuy[]): string[] {
     return [...new Set(buys.map((buy) => buy.wallet))];
-  }
-
-  private getHighestInsiderBuySolFromEarlyBuys(
-    buys: EarlyInsiderBuy[],
-  ): number | null {
-    const buySols = buys
-      .map((buy) => buy.buySol)
-      .filter((buySol): buySol is number => buySol !== null);
-    if (!buySols.length) return null;
-    return Math.max(...buySols);
-  }
-
-  private shouldSkipForLowInitialInsiderBuy(): boolean {
-    return (
-      this.highestInitialInsiderBuySol !== null &&
-      this.highestInitialInsiderBuySol <
-        BUNDLER_FUNDER_NORMAL_TINY_LOW_INSIDER_BUY_SOL_THRESHOLD
-    );
   }
 
   private assertEarlyInsidersMeetMinBuySol(
@@ -4073,15 +4049,36 @@ export class InsiderBot extends EventEmitter {
       return true;
     }
 
-    if (this.shouldSkipForLowInitialInsiderBuy()) {
-      await this.skipTokenLowInitialInsiderBuy(state, roundTarget, tx);
+    const exitPercent = this.getNormalTinyExitPercent(roundTarget);
+    const selectedGroup = this.selectFirstUniqueRoundGroupRecipients(
+      sameRoundGroup,
+      BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES,
+    );
+    if (selectedGroup.length < BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES) {
+      this.log.info("Normal tiny round group waiting for two unique recipients", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        signature: tx.signature,
+        uniqueRecipientCount: selectedGroup.length,
+        requiredRecipientCount: BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES,
+        sameRoundGroupCount: sameRoundGroup.length,
+      });
+      return false;
+    }
+    const recipientFirstBuyGate =
+      await this.evaluateRoundGroupRecipientFirstBuyUsdGate(state, selectedGroup);
+    if (!recipientFirstBuyGate.passed) {
+      await this.skipTokenRoundGroupRecipientFirstBuyUsd(
+        state,
+        roundTarget,
+        tx,
+        recipientFirstBuyGate,
+      );
       return true;
     }
 
     state.normalTinyRoundGroupFound = true;
 
-    const exitPercent = this.getNormalTinyExitPercent(roundTarget);
-    const selectedGroup = sameRoundGroup.slice(0, BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES);
     let watch: FunderRecipientWatch | null = null;
     for (const entry of selectedGroup) {
       const entryWatch = this.addBundlerFunderRecipientWatch(state, {
@@ -4101,7 +4098,12 @@ export class InsiderBot extends EventEmitter {
       this.markFunderRecipientDirty(entryWatch.wallet);
       if (entry.signature === tx.signature) watch = entryWatch;
     }
-    watch ??= state.recipientWatches.get(selectedGroup[0]?.recipient ?? "") ?? null;
+    watch ??=
+      (recipientFirstBuyGate.qualifyingWallet
+        ? state.recipientWatches.get(recipientFirstBuyGate.qualifyingWallet)
+        : null) ??
+      state.recipientWatches.get(selectedGroup[0]?.recipient ?? "") ??
+      null;
     if (!watch) return false;
     void this.syncFunderRecipientBatch(true);
 
@@ -4112,6 +4114,7 @@ export class InsiderBot extends EventEmitter {
       amountSol: transferOut.amountSol,
       roundTargetSol: roundTarget,
       exitPercent,
+      qualifyingRecipient: recipientFirstBuyGate.qualifyingWallet,
       signature: tx.signature,
       selectedRecipients: selectedGroup.map((entry) => entry.recipient),
       selectedSignatures: selectedGroup.map((entry) => entry.signature),
@@ -4125,6 +4128,9 @@ export class InsiderBot extends EventEmitter {
         `FeePayer: <code>${state.funderWallet}</code>`,
         `Round size: <b>~${roundTarget} SOL</b> (±${BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL})`,
         `Group: <b>${selectedGroup.length}/${BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES}</b> selected · <b>${sameRoundGroup.length}</b> ~${roundTarget} SOL txs in ${BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS}s (first valid group, ≥${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY})`,
+        recipientFirstBuyGate.qualifyingWallet
+          ? `Buy triggered by: <code>${recipientFirstBuyGate.qualifyingWallet}</code> (first buy &gt; $${BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD})`
+          : "",
         `Selected exit: <b>+${exitPercent}% MC</b>`,
         ...selectedGroup.map((entry, index) => `${index + 1}. <code>${entry.recipient}</code> — ${entry.amountSol.toFixed(4)} SOL — <code>${entry.signature}</code>`),
       ].join("\n"),
@@ -4497,6 +4503,111 @@ export class InsiderBot extends EventEmitter {
     return null;
   }
 
+  private selectFirstUniqueRoundGroupRecipients<
+    T extends { recipient: string },
+  >(group: T[], maxCount: number): T[] {
+    const selected: T[] = [];
+    const seen = new Set<string>();
+    for (const entry of group) {
+      if (seen.has(entry.recipient)) continue;
+      seen.add(entry.recipient);
+      selected.push(entry);
+      if (selected.length >= maxCount) break;
+    }
+    return selected;
+  }
+
+  private async findWalletFirstTokenBuy(
+    wallet: string,
+    mint: string,
+    preferredClientIndex = 0,
+  ): Promise<HeliusTransaction | null> {
+    const txs = await this.withHeliusFallback(
+      (client) =>
+        client.getWalletTransactionsDesc(
+          wallet,
+          BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_HISTORY_LIMIT,
+        ),
+      preferredClientIndex,
+    );
+    const buys = txs
+      .filter((entry) => this.isRelevantMintTx(entry, mint))
+      .filter((entry) => this.classifyTx(entry, wallet, mint) === "buy")
+      .sort((a, b) => a.timestamp - b.timestamp || a.slot - b.slot);
+    return buys[0] ?? null;
+  }
+
+  private async estimateRecipientBuyUsd(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): Promise<number | null> {
+    const buySol = this.estimateRecipientBuySolSpent(tx, wallet);
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    if (buySol === null || solPriceUsd === null) return null;
+    return buySol * solPriceUsd;
+  }
+
+  private async evaluateRoundGroupRecipientFirstBuyUsdGate(
+    state: BundlerFunderWatchState,
+    selectedGroup: Array<{
+      signature: string;
+      timestamp: number;
+      recipient: string;
+      amountSol: number;
+      amountUsd: number;
+    }>,
+  ): Promise<{
+    passed: boolean;
+    qualifyingWallet: string | null;
+    recipients: Array<{
+      wallet: string;
+      firstBuySignature: string | null;
+      firstBuyUsd: number | null;
+    }>;
+  }> {
+    const recipients: Array<{
+      wallet: string;
+      firstBuySignature: string | null;
+      firstBuyUsd: number | null;
+    }> = [];
+    let qualifyingWallet: string | null = null;
+
+    for (const entry of selectedGroup) {
+      const firstBuy = await this.findWalletFirstTokenBuy(
+        entry.recipient,
+        state.mint,
+      );
+      const firstBuyUsd = firstBuy
+        ? await this.estimateRecipientBuyUsd(firstBuy, entry.recipient)
+        : null;
+      recipients.push({
+        wallet: entry.recipient,
+        firstBuySignature: firstBuy?.signature ?? null,
+        firstBuyUsd,
+      });
+      if (
+        qualifyingWallet === null &&
+        firstBuyUsd !== null &&
+        firstBuyUsd > BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD
+      ) {
+        qualifyingWallet = entry.recipient;
+      }
+    }
+
+    const passed = qualifyingWallet !== null;
+
+    this.log.warn("Checked round-group selected recipients first-buy USD gate", {
+      mint: state.mint,
+      funderWallet: state.funderWallet,
+      requiredMinUsd: BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD,
+      passed,
+      qualifyingWallet,
+      recipients,
+    });
+
+    return { passed, qualifyingWallet, recipients };
+  }
+
   private async findWalletCurrentTokenActivity(
     wallet: string,
     mint: string,
@@ -4650,39 +4761,53 @@ export class InsiderBot extends EventEmitter {
     await this.resetForNewToken(true);
   }
 
-  private async skipTokenLowInitialInsiderBuy(
+  private async skipTokenRoundGroupRecipientFirstBuyUsd(
     state: BundlerFunderWatchState,
     roundTargetSol: number,
     tx: HeliusTransaction,
+    gate: {
+      passed: boolean;
+      recipients: Array<{
+        wallet: string;
+        firstBuySignature: string | null;
+        firstBuyUsd: number | null;
+      }>;
+    },
   ): Promise<void> {
     this.log.warn(
-      "Skipping token — highest initial bundler buy below threshold; awaiting dev rug before resuming feePayer",
+      "Skipping token — no selected round-group recipient first buy above USD threshold",
       {
         mint: state.mint,
         funderWallet: state.funderWallet,
         roundTargetSol,
-        highestInitialInsiderBuySol: this.highestInitialInsiderBuySol,
-        requiredMinSol: BUNDLER_FUNDER_NORMAL_TINY_LOW_INSIDER_BUY_SOL_THRESHOLD,
+        requiredMinUsd: BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD,
+        recipients: gate.recipients,
         signature: tx.signature,
       },
     );
     void this.sendTelegramSafe(
       [
-        `<b>⏭️ ${this.label} Token Skipped — Low Initial Bundler Buy</b>`,
+        `<b>⏭️ ${this.label} Token Skipped — Round Group Recipient First Buy Too Small</b>`,
         `Token: <code>${state.mint}</code>`,
         `FeePayer: <code>${state.funderWallet}</code>`,
-        `Saw ~${roundTargetSol} SOL 10s group (≥20 txs) but highest initial bundler buy is <b>${this.highestInitialInsiderBuySol?.toFixed(4) ?? "unknown"} SOL</b> (need ≥${BUNDLER_FUNDER_NORMAL_TINY_LOW_INSIDER_BUY_SOL_THRESHOLD} SOL).`,
+        `Saw ~${roundTargetSol} SOL 10s group (≥20 txs) but neither of the first two unique recipients has a first buy on this token above <b>$${BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD}</b>.`,
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
-        this.flowSource === "funder-first"
-          ? "No buy — feePayer paused until dev rugs, then watch resumes."
-          : "No buy — token flow reset.",
+        ...gate.recipients.map((entry, index) => {
+          const buyUsdLabel =
+            entry.firstBuyUsd === null
+              ? "unknown"
+              : `$${entry.firstBuyUsd.toFixed(2)}`;
+          return `${index + 1}. <code>${entry.wallet}</code> — first buy: ${
+            entry.firstBuySignature
+              ? `<code>${entry.firstBuySignature}</code>`
+              : "none found"
+          } — <b>${buyUsdLabel}</b>`;
+        }),
       ].join("\n"),
-      "low initial bundler buy skip notification",
+      "round group recipient first buy usd skip notification",
     );
-    await this.resetForNewToken(true, {
-      awaitRugBeforeResume: this.flowSource === "funder-first",
-    });
+    await this.resetForNewToken(true);
   }
 
   private recordNormalTinyTransferOut(
@@ -6929,7 +7054,6 @@ export class InsiderBot extends EventEmitter {
     this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
     this.initialBundlerMarketCapUsd = null;
-    this.highestInitialInsiderBuySol = null;
     this.preBuyStopped = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
@@ -6956,10 +7080,7 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async resetForNewToken(
-    clearPosition: boolean,
-    options?: { awaitRugBeforeResume?: boolean },
-  ): Promise<void> {
+  private async resetForNewToken(clearPosition: boolean): Promise<void> {
     const endedMint = this.watchingMint ?? this.activePosition?.mint ?? null;
     const endedFeePayer =
       this.funderFirstFeePayer ?? this.bundlerFunderWatch?.funderWallet ?? null;
@@ -6990,7 +7111,6 @@ export class InsiderBot extends EventEmitter {
     this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
     this.initialBundlerMarketCapUsd = null;
-    this.highestInitialInsiderBuySol = null;
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.profitExitDisabled = false;
@@ -7016,7 +7136,6 @@ export class InsiderBot extends EventEmitter {
       source: endedSource,
       hadPosition,
       reason: "reset",
-      awaitRugBeforeResume: options?.awaitRugBeforeResume ?? false,
     });
     this.flowSource = null;
     this.flowFollowWallet = null;
