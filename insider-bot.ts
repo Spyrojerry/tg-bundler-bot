@@ -41,7 +41,7 @@ const BUNDLER_FUNDER_FOLLOW_WALLET_NORMAL_FUNDING_MIN_SOL = 3;
 /** Kill switch for the whole low-funding-mode path. While false, any shared feePayer whose largest funding is below its flow's normal-mode threshold is skipped entirely (no watch is even created for it) instead of being handled via low-funding logic. */
 const BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED = false;
 /** Max follow wallets monitored concurrently on one insider bot. */
-const MAX_FOLLOW_WALLETS = 2;
+export const MAX_FOLLOW_WALLETS = 4;
 const BUNDLER_FUNDER_LOW_FUNDING_MAX_TRANSFER_OUT_TXS = 5;
 const BUNDLER_FUNDER_LOW_FUNDING_EXIT_PERCENT = 50;
 const BUNDLER_FUNDER_LOW_FUNDING_MIN_TRANSFER_OUT_SOL = 3.5;

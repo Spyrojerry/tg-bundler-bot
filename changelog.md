@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-07-20 (49)
+
+### Follow-wallet max raised to 4
+
+- `MAX_FOLLOW_WALLETS` increased from **3** to **4** on bot 1.
+- Startup env: `INSIDER_FOLLOW_WALLET_4` now loaded with `_1` / `_2` / `_3`.
+
+## 2026-07-20 (48)
+
+### Follow-wallet max raised to 3
+
+- `MAX_FOLLOW_WALLETS` increased from **2** to **3** on bot 1 (Telegram add/remove, Enhanced WSS monitors, funder-first merge).
+- Startup env: `INSIDER_FOLLOW_WALLET_3` now loaded with `INSIDER_FOLLOW_WALLET` / `_2` (config field already existed).
+
 ## 2026-07-20 (47)
 
 ### Telegram: follow-wallet add + funder-first stop button

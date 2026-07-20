@@ -30,7 +30,7 @@ import {
   SellQuote,
 } from "./types";
 import { FunderFirstOrchestrator } from "./funder-first-orchestrator";
-import { InsiderBot } from "./insider-bot";
+import { InsiderBot, MAX_FOLLOW_WALLETS } from "./insider-bot";
 import type { InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
 import { PumpReserveMarketCapClient } from "./pump-reserve-market-cap";
@@ -879,7 +879,7 @@ async function main(): Promise<void> {
           const current = insiderBots[0]?.getFollowedWallets() ?? [];
           return {
             text: [
-              "Send a wallet address to add as a follow wallet (max 2).",
+              `Send a wallet address to add as a follow wallet (max ${MAX_FOLLOW_WALLETS}).`,
               current.length > 0
                 ? `\nCurrently watching:\n${current.map((w) => `• <code>${html(w)}</code>`).join("\n")}`
                 : "",
@@ -1076,7 +1076,7 @@ async function main(): Promise<void> {
               index: 0,
             });
             return {
-              text: "Send a wallet address to add as a follow wallet (max 2).",
+              text: `Send a wallet address to add as a follow wallet (max ${MAX_FOLLOW_WALLETS}).`,
               trackPrompt: true,
               editCurrent: true,
             };
@@ -1469,9 +1469,12 @@ async function main(): Promise<void> {
   insiderBotDefinitions.forEach((definition, index) => {
     const wallets =
       index === 0
-        ? [config.insiderFollowWallet, config.insiderFollowWallet2].filter(
-            (w): w is string => Boolean(w),
-          )
+        ? [
+            config.insiderFollowWallet,
+            config.insiderFollowWallet2,
+            config.insiderFollowWallet3,
+            config.insiderFollowWallet4,
+          ].filter((w): w is string => Boolean(w))
         : definition.followWallet
           ? [definition.followWallet]
           : [];
@@ -2467,7 +2470,7 @@ async function main(): Promise<void> {
         "<b>Insider Bot</b>",
         "",
         `Status: <b>${status}</b>`,
-        `<b>Follow wallets</b> (max 2):`,
+        `<b>Follow wallets</b> (max ${MAX_FOLLOW_WALLETS}):`,
         ...followWalletLines,
         monitoredWallet
           ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
@@ -2491,7 +2494,7 @@ async function main(): Promise<void> {
           : "Parallel tokens: configure <b>INSIDER_HELIUS_API_KEY_2</b> (+ GMGN/RPC/WS) to run follow-wallet and funder-first on two tokens at once.",
         "",
         "<b>Follow-wallet steps</b>",
-        "1. Bot 1 watches up to 2 follow wallets; Helius keys 1-4 are the fallback pool.",
+        `1. Bot 1 watches up to ${MAX_FOLLOW_WALLETS} follow wallets; Helius keys 1-4 are the fallback pool.`,
         "2. Skip if follow-wallet buy MC is above $80,000.",
         "3. First four bundler buys must include the follow wallet that bought.",
         "4. Shared feePayer locked → normal-mode tiny transfer-out buy signals.",
@@ -2582,7 +2585,7 @@ async function main(): Promise<void> {
 
     const text = [
       "<b>Bot Status</b>",
-      "Flow: up to 2 follow wallets on bot 1; funder-first and overflow follow buys use the first idle insider bot in the Helius key pool.",
+      `Flow: up to ${MAX_FOLLOW_WALLETS} follow wallets on bot 1; funder-first and overflow follow buys use the first idle insider bot in the Helius key pool.`,
       "Candidate rule: transfer-out confirms only when the immediate next funder tx is not a SOL transfer-in.",
       "API guard: queued Helius pool, transient-only fallback, per-key backoff, capped recipient batch sync.",
       "",
