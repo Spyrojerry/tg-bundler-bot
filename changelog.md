@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-21 (51)
+
+### Fix funder-first WebSocket subscription exhaustion (1000 cap)
+
+- **Cause**: each bundler recipient in an active 4-in-10s group opened its own `accountSubscribe` on the funder-first RPC WebSocket; with the **5 SOL** threshold many more groups formed and hit Helius’s **1000 subscriptions per connection** limit (`-32006`).
+- **Fix**: removed per-recipient `accountSubscribe` — recipient zero-balance is detected via Enhanced WSS txs (`checkRecipientDrain`) only.
+- Added **900** subscription budget guard + **100** concurrent potential-feePayer cap with idle-watch eviction.
+
 ## 2026-07-20 (50)
 
 ### Funder-first: 5 SOL bundler group threshold + silent until confirmed

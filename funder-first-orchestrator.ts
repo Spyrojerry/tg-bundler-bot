@@ -25,7 +25,7 @@
 //    • Valid 4-in-10s groups are tracked silently until a recipient buy overlaps
 //      the token's first-four bundlers — only then Telegram / info logs fire.
 //    • Per recipient in the active group: stop watching when native SOL → zero
-//      (unless a token buy was already seen — then keep monitoring for buy logic).
+//      (detected via Enhanced WSS recipient txs — no per-recipient accountSubscribe).
 //    • Follow wallet merged with a bundler recipient uses one Enhanced WSS watch.
 //
 //  Stop-watching rules for a potential feePayer wallet itself:
@@ -80,6 +80,10 @@ const FUNDER_MIN_OUTGOING_TRANSFER_SOL = 1;
 const EXCHANGE_DRAIN_CHECK_MAX_FRACTION = 0.5;
 /** Outgoing transfers at or above this size are tracked for zero-balance handoff. */
 const LARGE_TRANSFER_HANDOFF_MIN_SOL = 100;
+/** Helius / Solana RPC cap per WebSocket connection — stay below this. */
+const MAX_WS_ACCOUNT_SUBSCRIPTIONS = 900;
+/** Max concurrent potential feePayer watches (each uses one accountSubscribe). */
+const MAX_CONCURRENT_POTENTIAL_FEEPAYERS = 100;
 
 interface LargeTransferOutEvent {
   recipient: string;
@@ -151,7 +155,6 @@ interface PotentialFeePayerWatch {
   exhaustedGroupAnchors: Set<string>;
   /** Post-balance when the feePayer sent SOL to each recipient. */
   recipientBalanceAtReceive: Map<string, number>;
-  recipientZeroBalanceSubIds: Map<string, number>;
   /** Recipients that emitted a token buy — skip drain-based unsubscribe. */
   recipientsWithBuySeen: Set<string>;
   /** Highest ≥100 SOL transfer-out since watchStartedAtTimestamp — zero-balance handoff. */
@@ -615,6 +618,19 @@ export class FunderFirstOrchestrator extends EventEmitter {
     }
 
     if (!watch) {
+      if (this.potentialFeePayers.size >= MAX_CONCURRENT_POTENTIAL_FEEPAYERS) {
+        const evicted = this.evictIdlePotentialFeePayers(
+          this.potentialFeePayers.size - MAX_CONCURRENT_POTENTIAL_FEEPAYERS + 1,
+        );
+        if (this.potentialFeePayers.size >= MAX_CONCURRENT_POTENTIAL_FEEPAYERS) {
+          log.warn('Skipping new potential feePayer watch — concurrent watch cap reached', {
+            address,
+            maxConcurrent: MAX_CONCURRENT_POTENTIAL_FEEPAYERS,
+            evictedIdleWatches: evicted,
+          });
+          return null;
+        }
+      }
       watch = {
         address,
         status: 'watching',
@@ -647,7 +663,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
         activeGroups: new Map(),
         exhaustedGroupAnchors: new Set(),
         recipientBalanceAtReceive: new Map(),
-        recipientZeroBalanceSubIds: new Map(),
         recipientsWithBuySeen: new Set(),
         highestLargeTransferOut: null,
       };
@@ -664,17 +679,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       });
     }
 
-    if (watch.solBalanceSubId === null) {
-      watch.solBalanceSubId = this.connection.onAccountChange(
-        new PublicKey(address),
-        (info) => {
-          if (info.lamports === 0) {
-            void this.handleFeePayerZeroBalanceDetected(address);
-          }
-        },
-        'processed',
-      );
-    }
+    this.trySubscribeFeePayerSolBalance(watch);
 
     if (watch.status === 'stopped') {
       watch.status = 'watching';
@@ -1225,10 +1230,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
       watch.solBalanceSubId = null;
     }
     this.unsubscribeRecipientsForWatch(watch);
-    for (const [, subId] of watch.recipientZeroBalanceSubIds) {
-      void this.connection.removeAccountChangeListener(subId).catch(() => undefined);
-    }
-    watch.recipientZeroBalanceSubIds.clear();
     if (watch.cooldownDevWatchId !== null) {
       void this.enhancedWs?.unwatch(watch.cooldownDevWatchId).catch(() => undefined);
       watch.cooldownDevWatchId = null;
@@ -1469,31 +1470,75 @@ export class FunderFirstOrchestrator extends EventEmitter {
       );
     }
     this.subscribeRecipients(watch, [...toSubscribe]);
-    for (const recipient of toSubscribe) {
-      this.ensureRecipientZeroBalanceSub(watch, recipient);
-    }
   }
 
-  private ensureRecipientZeroBalanceSub(
+  private countAccountSubscriptions(): number {
+    let count = 0;
+    for (const watch of this.potentialFeePayers.values()) {
+      if (watch.solBalanceSubId !== null) count += 1;
+      if (watch.cooldownDevSolBalanceSubId !== null) count += 1;
+    }
+    return count;
+  }
+
+  private canAddAccountSubscription(): boolean {
+    return this.countAccountSubscriptions() < MAX_WS_ACCOUNT_SUBSCRIPTIONS;
+  }
+
+  /** Drop oldest idle feePayer watches so new ones can subscribe. */
+  private evictIdlePotentialFeePayers(maxToEvict = 5): number {
+    const idle = [...this.potentialFeePayers.entries()]
+      .filter(
+        ([, watch]) =>
+          watch.status === 'watching' &&
+          watch.activeGroups.size === 0 &&
+          watch.subscribedRecipients.size === 0,
+      )
+      .sort(
+        (a, b) =>
+          (a[1].watchStartedAtTimestamp ?? 0) -
+          (b[1].watchStartedAtTimestamp ?? 0),
+      );
+    let evicted = 0;
+    for (const [address] of idle) {
+      if (evicted >= maxToEvict) break;
+      this.stopPotentialFeePayerWatch(
+        address,
+        'evicted — idle watch to free WebSocket subscription budget',
+      );
+      evicted += 1;
+    }
+    return evicted;
+  }
+
+  private trySubscribeFeePayerSolBalance(
     watch: PotentialFeePayerWatch,
-    recipient: string,
   ): void {
-    if (this.isMergedFollowWalletRecipient(recipient)) return;
-    if (watch.recipientZeroBalanceSubIds.has(recipient)) return;
-    const subId = this.connection.onAccountChange(
-      new PublicKey(recipient),
+    if (watch.solBalanceSubId !== null) return;
+    if (!this.canAddAccountSubscription()) {
+      const evicted = this.evictIdlePotentialFeePayers();
+      if (!this.canAddAccountSubscription()) {
+        log.warn(
+          'Skipping feePayer SOL balance accountSubscribe — WebSocket subscription budget exhausted',
+          {
+            potentialFeePayer: watch.address,
+            activeSubscriptions: this.countAccountSubscriptions(),
+            maxSubscriptions: MAX_WS_ACCOUNT_SUBSCRIPTIONS,
+            evictedIdleWatches: evicted,
+          },
+        );
+        return;
+      }
+    }
+    watch.solBalanceSubId = this.connection.onAccountChange(
+      new PublicKey(watch.address),
       (info) => {
         if (info.lamports === 0) {
-          this.markRecipientStoppedInGroup(
-            watch.address,
-            recipient,
-            'native SOL balance reached zero',
-          );
+          void this.handleFeePayerZeroBalanceDetected(watch.address);
         }
       },
       'processed',
     );
-    watch.recipientZeroBalanceSubIds.set(recipient, subId);
   }
 
   private unsubscribeSingleRecipient(
@@ -1507,11 +1552,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
         this.recipientToFeePayer.delete(recipient);
       }
       void this.syncRecipientBatch();
-    }
-    const subId = watch.recipientZeroBalanceSubIds.get(recipient);
-    if (subId !== undefined) {
-      void this.connection.removeAccountChangeListener(subId).catch(() => undefined);
-      watch.recipientZeroBalanceSubIds.delete(recipient);
     }
   }
 
@@ -1609,11 +1649,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
       const owner = this.recipientToFeePayer.get(recipient);
       if (owner === watch.address) {
         this.recipientToFeePayer.delete(recipient);
-      }
-      const subId = watch.recipientZeroBalanceSubIds.get(recipient);
-      if (subId !== undefined) {
-        void this.connection.removeAccountChangeListener(subId).catch(() => undefined);
-        watch.recipientZeroBalanceSubIds.delete(recipient);
       }
     }
     watch.subscribedRecipients.clear();
@@ -1868,6 +1903,18 @@ export class FunderFirstOrchestrator extends EventEmitter {
     devWallet: string,
   ): void {
     if (watch.cooldownDevSolBalanceSubId !== null) return;
+    if (!this.canAddAccountSubscription()) {
+      log.warn(
+        'Skipping cooldown dev SOL balance accountSubscribe — WebSocket subscription budget exhausted',
+        {
+          feePayer: watch.address,
+          mint,
+          devWallet,
+          activeSubscriptions: this.countAccountSubscriptions(),
+        },
+      );
+      return;
+    }
     watch.cooldownDevSolBalanceSubId = this.connection.onAccountChange(
       new PublicKey(devWallet),
       (accountInfo) => {
