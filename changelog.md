@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-20 (46)
+
+### Normal mode: Telegram for dust vs round race outcomes
+
+- **Round wins**: when cumulative dust is ≥20 but a round 10s group already reached ≥20 txs first, sends **🏁 Round Group Won Race to 20** (one per token) instead of log-only.
+- **Dust wins at round gate**: **⏭️ Cumulative Dust Before Round Buy** skip message now includes prior dust count and round group size (follow wallet when applicable).
+
 ## 2026-07-20 (45)
 
 ### Fix duplicate Telegram on round-group first-buy skip

@@ -366,6 +366,8 @@ interface BundlerFunderWatchState {
   normalTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
   /** True once a qualifying ~0.02 / ~0.05 / ~0.1 SOL same-amount group (≥2 in 10s) is found. */
   normalTinyRoundGroupFound: boolean;
+  /** One-shot: round 10s group reached 20 before cumulative dust skip fired. */
+  roundWonDustRaceNotified: boolean;
   lowFundingFunderTxs: Array<{ signature: string; timestamp: number }>;
   lowFundingTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
   lowFundingTinyBundlerGateSeen: boolean;
@@ -2176,6 +2178,7 @@ export class InsiderBot extends EventEmitter {
       queuedTransferOuts: [],
       normalTinyTransferOuts: [],
       normalTinyRoundGroupFound: false,
+      roundWonDustRaceNotified: false,
       lowFundingFunderTxs: [],
       lowFundingTinyTransferOuts: [],
       lowFundingTinyBundlerGateSeen: false,
@@ -2321,6 +2324,7 @@ export class InsiderBot extends EventEmitter {
       queuedTransferOuts: [],
       normalTinyTransferOuts: [],
       normalTinyRoundGroupFound: false,
+      roundWonDustRaceNotified: false,
       lowFundingFunderTxs: [],
       lowFundingTinyTransferOuts: [],
       lowFundingTinyBundlerGateSeen: false,
@@ -4022,6 +4026,23 @@ export class InsiderBot extends EventEmitter {
         const dustSkipThreshold = normalTinyQualifyingDustGroupTxs();
         if (cumulativeDustCount >= dustSkipThreshold) {
           if (this.hasRoundGroupReachedBuyThresholdBy(state, tx.timestamp)) {
+            if (!state.roundWonDustRaceNotified) {
+              state.roundWonDustRaceNotified = true;
+              void this.sendTelegramSafe(
+                [
+                  `<b>🏁 ${this.label} Round Group Won Race to 20</b>`,
+                  `Token: <code>${state.mint}</code>`,
+                  this.formatFollowWalletTelegramLine(),
+                  `FeePayer: <code>${state.funderWallet}</code>`,
+                  `Cumulative dust txs: <b>${cumulativeDustCount}</b> (≥${dustSkipThreshold})`,
+                  `A ~0.02 / ~0.05 / ~0.1 SOL 10s group also reached <b>≥${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}</b> txs first — not skipping for dust.`,
+                  `Trigger tx: <code>${tx.signature}</code>`,
+                  "",
+                  "Continuing to round buy gates ($100 first-buy check).",
+                ].filter(Boolean).join("\n"),
+                "round won dust race notification",
+              );
+            }
             this.log.info(
               "Normal cumulative dust reached skip threshold but round 10s group hit 20+ txs first — not skipping",
               {
@@ -4094,7 +4115,17 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (this.hasPriorCumulativeDustSkipThresholdBefore(state, tx.timestamp)) {
-      await this.skipTokenCumulativeDustBeforeRoundBuy(state, roundTarget, tx);
+      const priorDustCount = this.countCumulativeNormalTinyDustTransferOuts(
+        state,
+        tx.timestamp,
+      );
+      await this.skipTokenCumulativeDustBeforeRoundBuy(
+        state,
+        roundTarget,
+        tx,
+        priorDustCount,
+        sameRoundGroup.length,
+      );
       return true;
     }
 
@@ -4797,6 +4828,8 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     roundTargetSol: number,
     tx: HeliusTransaction,
+    priorDustCount: number,
+    sameRoundGroupCount: number,
   ): Promise<void> {
     if (state.discoveryStopped) return;
     await this.stopBundlerFunderSourceDiscovery(
@@ -4807,6 +4840,8 @@ export class InsiderBot extends EventEmitter {
       mint: state.mint,
       funderWallet: state.funderWallet,
       roundTargetSol,
+      priorDustCount,
+      sameRoundGroupCount,
       signature: tx.signature,
     });
     void this.sendTelegramSafe(
@@ -4815,7 +4850,8 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${state.mint}</code>`,
         this.formatFollowWalletTelegramLine(),
         `FeePayer: <code>${state.funderWallet}</code>`,
-        `Saw ~${roundTargetSol} SOL 10s group (≥20 txs) but cumulative dust already reached ≥${normalTinyQualifyingDustGroupTxs()}.`,
+        `Cumulative dust txs (sub-$0.10 / non-round): <b>${priorDustCount}</b> (≥${normalTinyQualifyingDustGroupTxs()}) reached before this round group.`,
+        `Saw ~${roundTargetSol} SOL 10s group with <b>${sameRoundGroupCount}</b> txs (≥${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}) but dust hit ${normalTinyQualifyingDustGroupTxs()} first — token skipped.`,
         `Trigger tx: <code>${tx.signature}</code>`,
       ].filter(Boolean).join("\n"),
       "cumulative dust before round buy skip notification",
