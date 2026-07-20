@@ -1332,17 +1332,6 @@ async function main(): Promise<void> {
             return homeReply();
           }
         }
-        const started = await followInsiderWalletWithUsageGuard(
-          activeInsiderIndex,
-          text,
-          "telegram follow-wallet setup",
-        );
-        if (started !== true) {
-          return typeof started === "string"
-            ? html(started)
-            : "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
-        }
-        return homeReply();
       }
 
       return "Unknown command. Send /help.";
@@ -2450,8 +2439,8 @@ async function main(): Promise<void> {
           )
         : ["  • <i>none yet</i>"];
 
-    const funderFirstStartStop = funderFirstRunning
-      ? { text: "Stop Funder-First", callback_data: "funderfirst:stop" }
+    const funderFirstStartButton = funderFirstRunning
+      ? null
       : { text: "Start Funder-First", callback_data: "funderfirst:start" };
 
     const feePayerRemoveRows = watchedPotential.map((w, index) => [
@@ -2524,7 +2513,7 @@ async function main(): Promise<void> {
           [
             { text: "Fast-track feePayer", callback_data: "funderfirst:fasttrack" },
           ],
-          [funderFirstStartStop],
+          ...(funderFirstStartButton ? [[funderFirstStartButton]] : []),
           ...feePayerRemoveRows,
           [
             { text: "Default Buy SOL", callback_data: "insider:buysol" },

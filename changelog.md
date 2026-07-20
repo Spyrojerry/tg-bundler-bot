@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-20 (47)
+
+### Telegram: follow-wallet add + funder-first stop button
+
+- Plain-text wallet messages no longer add a follow wallet — only **Add follow wallet** → reply flow (or **Resume** when no wallets are configured).
+- Removed **Stop Funder-First** from the home menu while funder-first is running (**Start** still shown if stopped).
+
 ## 2026-07-20 (46)
 
 ### Normal mode: Telegram for dust vs round race outcomes
