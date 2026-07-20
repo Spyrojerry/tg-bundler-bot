@@ -6,7 +6,7 @@
 //    1. Always watches that funder for SOL transfer-outs (Enhanced WSS).
 //    2. For each new recipient, opens a potential-feePayer watch (also WSS).
 //    3. Tracks bundler-funding patterns on each potential feePayer:
-//         • 4 recipients within 10s whose *post-balance* is ≥20 SOL.
+//         • 4 recipients within 10s whose *post-balance* is ≥5 SOL.
 //    4. Subscribes to those recipient wallets and waits for a SWAP buy.
 //    5. Confirms at least one recipient is among the token's first-four bundlers.
 //    6. Normal → hands off to InsiderBot.startFromFunderFirst for buy/sell.
@@ -17,13 +17,13 @@
 //       was armed; dev SOL balance is also subscribed immediately.
 //
 //  Group / recipient rules:
-//    • Multiple 10s bundler groups (≥20 SOL only) can be monitored concurrently.
+//    • Multiple 10s bundler groups (≥5 SOL only) can be monitored concurrently.
 //    • A valid group is exactly 4 unique recipients in 10s whose post-balances
-//      are all within 0.5 SOL of each other (all ≥20 SOL). If 5+ recipients in
+//      are all within 0.5 SOL of each other (all ≥5 SOL). If 5+ recipients in
 //      the window meet the tolerance, the window is skipped entirely.
-//    • Sub-20 SOL bundler sends are ignored (no Telegram, no backend info logs).
-//    • Keep watching the feePayer for new groups until a recipient buy overlaps
-//      the token's first-four bundlers.
+//    • Sub-5 SOL bundler sends are ignored (no Telegram, no backend info logs).
+//    • Valid 4-in-10s groups are tracked silently until a recipient buy overlaps
+//      the token's first-four bundlers — only then Telegram / info logs fire.
 //    • Per recipient in the active group: stop watching when native SOL → zero
 //      (unless a token buy was already seen — then keep monitoring for buy logic).
 //    • Follow wallet merged with a bundler recipient uses one Enhanced WSS watch.
@@ -62,10 +62,14 @@ const log = createLogger('FUNDER-FIRST');
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const GROUP_WINDOW_SEC = 10;
 const BUNDLER_GROUP_SIZE = 4;
-const NORMAL_MIN_POST_SOL = 20;
+const NORMAL_MIN_POST_SOL = 5;
 const ZERO_BALANCE_EPSILON_SOL = 1e-6;
 /** Recipients in a 4-bundler group must have post-balances within this spread (SOL). */
 const POST_BALANCE_TOLERANCE_SOL = 0.5;
+
+function describeBundlerGroupWatchRule(): string {
+  return `≥${NORMAL_MIN_POST_SOL} SOL post-balance, ≤${POST_BALANCE_TOLERANCE_SOL} SOL spread`;
+}
 const POTENTIAL_FEEPAYER_SYNC_LIMIT = 20;
 const POTENTIAL_FEEPAYER_SYNC_MIN_INTERVAL_MS = 1_000;
 const COOLDOWN_DEV_SYNC_LIMIT = 30;
@@ -145,7 +149,6 @@ interface PotentialFeePayerWatch {
   /** Concurrent active 4-bundler groups keyed by anchor. */
   activeGroups: Map<string, ActiveBundlerGroup>;
   exhaustedGroupAnchors: Set<string>;
-  notifiedGroupAnchors: Set<string>;
   /** Post-balance when the feePayer sent SOL to each recipient. */
   recipientBalanceAtReceive: Map<string, number>;
   recipientZeroBalanceSubIds: Map<string, number>;
@@ -357,7 +360,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.bundlerFundingEvents = [];
     watch.activeGroups.clear();
     watch.exhaustedGroupAnchors.clear();
-    watch.notifiedGroupAnchors.clear();
     watch.recipientBalanceAtReceive.clear();
     watch.recipientsWithBuySeen.clear();
     watch.highestLargeTransferOut = null;
@@ -368,7 +370,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       baselineTimestamp,
     });
     log.info(
-      'Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (≥20 SOL post-balance, ≤0.5 SOL spread)',
+      `Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (${describeBundlerGroupWatchRule()})`,
       { potentialFeePayer: address, postBalanceSol },
     );
 
@@ -574,7 +576,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
           enhancedWatchId: watch.enhancedWatchId,
         });
         log.info(
-          'Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (≥20 SOL post-balance, ≤0.5 SOL spread)',
+          `Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (${describeBundlerGroupWatchRule()})`,
           {
             potentialFeePayer: recipient,
             postBalanceSol,
@@ -644,7 +646,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
         cooldownDevLastSyncAt: 0,
         activeGroups: new Map(),
         exhaustedGroupAnchors: new Set(),
-        notifiedGroupAnchors: new Set(),
         recipientBalanceAtReceive: new Map(),
         recipientZeroBalanceSubIds: new Map(),
         recipientsWithBuySeen: new Set(),
@@ -880,30 +881,9 @@ export class FunderFirstOrchestrator extends EventEmitter {
         timestamp: tx.timestamp,
       });
       watch.recipientBalanceAtReceive.set(transfer.to, recipientPostBalanceSol);
-      log.info('Potential feePayer bundler funding event recorded', {
-        potentialFeePayer: address,
-        bundlerRecipient: transfer.to,
-        amountSol: transfer.amountSol,
-        recipientPostBalanceSol,
-        signature: tx.signature,
-        source,
-        totalFundingEvents: watch.bundlerFundingEvents.length,
-      });
     }
 
-    const groupsBefore = watch.activeGroups.size;
     await this.evaluateBundlerGroups(watch);
-    const newGroups = watch.activeGroups.size - groupsBefore;
-    if (newGroups > 0) {
-      log.info('Potential feePayer group evaluation', {
-        potentialFeePayer: address,
-        status: watch.status,
-        fundingEvents: watch.bundlerFundingEvents.length,
-        activeGroups: watch.activeGroups.size,
-        newGroups,
-        source,
-      });
-    }
 
     const selfPostBalanceSol = this.getAccountPostBalanceSol(tx, address);
     if (
@@ -1114,7 +1094,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.bundlerFundingEvents = [];
     watch.activeGroups.clear();
     watch.exhaustedGroupAnchors.clear();
-    watch.notifiedGroupAnchors.clear();
     watch.recipientBalanceAtReceive.clear();
     watch.recipientsWithBuySeen.clear();
     watch.highestLargeTransferOut = null;
@@ -1200,7 +1179,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       source,
     });
     log.info(
-      'Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (≥20 SOL post-balance, ≤0.5 SOL spread)',
+      `Potential feePayer pipeline armed — watching for 4 bundler sends in 10s (${describeBundlerGroupWatchRule()})`,
       { potentialFeePayer: recipient, postBalanceSol: liveBalanceSol },
     );
 
@@ -1436,25 +1415,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
         event.recipient,
         event.recipientPostBalanceSol,
       );
-    }
-
-    if (!watch.notifiedGroupAnchors.has(anchorKey)) {
-      watch.notifiedGroupAnchors.add(anchorKey);
-      const spread =
-        Math.max(...group.map((e) => e.recipientPostBalanceSol)) -
-        Math.min(...group.map((e) => e.recipientPostBalanceSol));
-      void this.sendTelegram([
-        '<b>✅ Funder-First: Normal Mode Candidate (≥20 SOL post-balance)</b>',
-        `Potential FeePayer: <code>${this.html(watch.address)}</code>`,
-        `Bundlers (${group.length} in 10s, post-balance spread ≤0.5 SOL):`,
-        ...group.map(
-          (e) =>
-            `• <code>${this.html(e.recipient)}</code> — post <b>${e.recipientPostBalanceSol.toFixed(2)} SOL</b>`,
-        ),
-        `Spread: <b>${spread.toFixed(2)} SOL</b>`,
-        '',
-        'Waiting for a SWAP buy from one of these wallets…',
-      ]);
     }
 
     this.syncAllActiveGroupSubscriptions(watch);
@@ -1750,7 +1710,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
       const firstFourWallets = earlyBuys.map((b) => b.wallet);
       const overlap = firstFourWallets.filter((w) => candidateRecipients.has(w));
       if (overlap.length === 0) {
-        log.info('Recipient buy seen but no overlap with first-four bundlers', {
+        log.debug('Recipient buy seen but no overlap with first-four bundlers', {
           mint,
           feePayer: watch.address,
           buyWallet,
@@ -1759,6 +1719,31 @@ export class FunderFirstOrchestrator extends EventEmitter {
         });
         return;
       }
+
+      const confirmedGroup = [...watch.activeGroups.values()].find((group) =>
+        group.recipients.has(buyWallet),
+      );
+      const confirmedGroupRecipients = confirmedGroup
+        ? [...confirmedGroup.recipients]
+        : overlap;
+      const groupEvents = watch.bundlerFundingEvents.filter((e) =>
+        confirmedGroupRecipients.includes(e.recipient),
+      );
+      const postBalanceSpreadSol =
+        groupEvents.length > 0
+          ? Math.max(...groupEvents.map((e) => e.recipientPostBalanceSol)) -
+            Math.min(...groupEvents.map((e) => e.recipientPostBalanceSol))
+          : null;
+
+      log.info('Funder-first bundler group confirmed as initial token bundlers', {
+        mint,
+        feePayer: watch.address,
+        buyWallet,
+        matchedBundlers: overlap,
+        groupRecipients: confirmedGroupRecipients,
+        postBalanceSpreadSol,
+        groupRule: describeBundlerGroupWatchRule(),
+      });
 
       const createTx = await this.heliusClient.getMintCreateTransaction(mint);
       const devWallet = createTx?.feePayer ?? null;
@@ -1793,11 +1778,23 @@ export class FunderFirstOrchestrator extends EventEmitter {
 
       const followWallets = this.getPrimaryInsiderBot().getFollowedWallets();
       const matchedFollow = followWallets.filter((w) => overlap.includes(w));
+      const bundlerLines =
+        groupEvents.length > 0
+          ? groupEvents.map(
+              (e) =>
+                `• <code>${this.html(e.recipient)}</code> — post <b>${e.recipientPostBalanceSol.toFixed(2)} SOL</b>`,
+            )
+          : overlap.map((w) => `• <code>${this.html(w)}</code>`);
       void this.sendTelegram([
-        '<b>🚀 Funder-First: Normal Mode — Handed to Insider Bot</b>',
+        '<b>🚀 Funder-First: Initial Bundler Confirmed — Handed to Insider Bot</b>',
         `Token: <code>${this.html(mint)}</code>`,
         `FeePayer: <code>${this.html(watch.address)}</code>`,
-        `Matched bundlers: <b>${overlap.length}</b>`,
+        `4-in-10s group (${describeBundlerGroupWatchRule()}):`,
+        ...bundlerLines,
+        postBalanceSpreadSol !== null
+          ? `Spread: <b>${postBalanceSpreadSol.toFixed(2)} SOL</b>`
+          : '',
+        `Matched first-four bundlers: <b>${overlap.length}</b>`,
         matchedFollow.length > 0
           ? `Follow wallet${matchedFollow.length > 1 ? 's' : ''} ${matchedFollow.map((w) => `<code>${this.html(w)}</code>`).join(', ')} among bundlers — normal mode applies.`
           : '',
@@ -2122,7 +2119,6 @@ export class FunderFirstOrchestrator extends EventEmitter {
     watch.mode = null;
     watch.activeGroups.clear();
     watch.exhaustedGroupAnchors.clear();
-    watch.notifiedGroupAnchors.clear();
     watch.recipientBalanceAtReceive.clear();
     watch.bundlerFundingEvents = [];
     this.resubscribePotentialFeePayer(watch);

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-07-20 (50)
+
+### Funder-first: 5 SOL bundler group threshold + silent until confirmed
+
+- 4-in-10s recipient detection lowered from **≥20 SOL** to **≥5 SOL** post-balance (`NORMAL_MIN_POST_SOL`).
+- Post-balance spread tolerance unchanged: **≤0.5 SOL** (`POST_BALANCE_TOLERANCE_SOL`).
+- Valid groups are tracked silently — no Telegram or per-group backend info logs until a recipient buy overlaps the token's **first-four bundlers**; then one confirm log + handoff Telegram (with group details).
+- Insider-bot normal-mode **funding** gate after handoff stays **≥20 SOL**.
+
 ## 2026-07-20 (49)
 
 ### Follow-wallet max raised to 4
