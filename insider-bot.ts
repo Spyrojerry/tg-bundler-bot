@@ -92,7 +92,7 @@ function isNormalTinyUsdExemptRoundSolAmount(amountSol: number): boolean {
 /** Minimum txs in 10s to count as a qualifying sol group (dust or round). */
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS = 2;
 /** Round buy requires at least this many same-size round SOL outs in 10s. */
-const BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY = 20;
+const BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY = 17;
 /** Cumulative dust txs required to skip (round still uses a 10s window). */
 const normalTinyQualifyingDustGroupTxs = (): number =>
   BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY;
@@ -399,7 +399,7 @@ interface BundlerFunderWatchState {
   normalTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
   /** True once a qualifying same-round SOL group (≥2 in 10s) is found. */
   normalTinyRoundGroupFound: boolean;
-  /** One-shot: round 10s group reached 20 before cumulative dust skip fired. */
+  /** One-shot: round 10s group reached buy threshold before cumulative dust skip fired. */
   roundWonDustRaceNotified: boolean;
   lowFundingFunderTxs: Array<{ signature: string; timestamp: number }>;
   lowFundingTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
@@ -2318,7 +2318,7 @@ export class InsiderBot extends EventEmitter {
         "",
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
-          : "Round groups, dust race-to-20, and recipient first-buy gates apply.",
+          : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
       ].filter(Boolean).join("\n"),
       "shared feePayer notification",
     );
@@ -2421,7 +2421,7 @@ export class InsiderBot extends EventEmitter {
         `Largest bundler funding: <b>≥${BUNDLER_FUNDER_LOW_FUNDING_SOL} SOL</b>`,
         `Watching feePayer tiny transfer-outs: ${formatNormalTinyRoundSolWatchDescription()}`,
         "",
-        "Round groups, dust race-to-20, and recipient first-buy gates apply.",
+        `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
       ].join("\n"),
       "funder-first feePayer locked notification",
     );
@@ -4092,7 +4092,7 @@ export class InsiderBot extends EventEmitter {
     }
     if (this.isKnownFunderCandidate(state, tx.signature)) return false;
     // Record every qualifying feePayer transfer-out for dust counting and round-group detection.
-    // Sub-$0.10 outs are tracked as dust. Round buy wins unless cumulative dust reaches 20 before a round 10s group does.
+    // Sub-$0.10 outs are tracked as dust. Round buy wins unless cumulative dust reaches the buy threshold before a round 10s group does.
     this.recordNormalTinyTransferOut(state, {
       signature: tx.signature,
       timestamp: tx.timestamp,
@@ -4116,7 +4116,7 @@ export class InsiderBot extends EventEmitter {
               state.roundWonDustRaceNotified = true;
               void this.sendTelegramSafe(
                 [
-                  `<b>🏁 ${this.label} Round Group Won Race to 20</b>`,
+                  `<b>🏁 ${this.label} Round Group Won Race to ${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}</b>`,
                   `Token: <code>${state.mint}</code>`,
                   this.formatFollowWalletTelegramLine(),
                   `FeePayer: <code>${state.funderWallet}</code>`,
@@ -4130,7 +4130,7 @@ export class InsiderBot extends EventEmitter {
               );
             }
             this.log.info(
-              "Normal cumulative dust reached skip threshold but round 10s group hit 20+ txs first — not skipping",
+              `Normal cumulative dust reached skip threshold but round 10s group hit ${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}+ txs first — not skipping`,
               {
                 mint: state.mint,
                 funderWallet: state.funderWallet,
@@ -4144,7 +4144,7 @@ export class InsiderBot extends EventEmitter {
             return true;
           }
         } else {
-          this.log.info("Normal tiny cumulative dust waiting for 20+ txs to skip token", {
+          this.log.info(`Normal tiny cumulative dust waiting for ${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}+ txs to skip token`, {
             mint: state.mint,
             funderWallet: state.funderWallet,
             signature: tx.signature,
@@ -4173,7 +4173,7 @@ export class InsiderBot extends EventEmitter {
     );
     if (sameRoundGroup.length < BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY) {
       if (sameRoundGroup.length >= BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS) {
-        this.log.info("Normal tiny same-round group waiting for 20+ txs in 10s window", {
+        this.log.info(`Normal tiny same-round group waiting for ${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}+ txs in 10s window`, {
           mint: state.mint,
           funderWallet: state.funderWallet,
           signature: tx.signature,
@@ -4903,7 +4903,7 @@ export class InsiderBot extends EventEmitter {
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
         `Cumulative dust reached ≥${normalTinyQualifyingDustGroupTxs()} before any round 10s group did — token skipped; feePayer watch will resume.`,
-        "Round group must reach ≥20 txs in 10s before cumulative dust hits 20 to buy.",
+        `Round group must reach ≥${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY} txs in 10s before cumulative dust hits ${normalTinyQualifyingDustGroupTxs()} to buy.`,
       ].filter(Boolean).join("\n"),
       "cumulative dust threshold skip notification",
     );
@@ -4980,7 +4980,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${state.mint}</code>`,
         this.formatFollowWalletTelegramLine(),
         `FeePayer: <code>${state.funderWallet}</code>`,
-        `Saw ~${roundTargetSol} SOL 10s group (≥20 txs) but neither of the first two unique recipients has a first buy on this token above <b>$${BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD}</b>.`,
+        `Saw ~${roundTargetSol} SOL 10s group (≥${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY} txs) but neither of the first two unique recipients has a first buy on this token above <b>$${BUNDLER_FUNDER_ROUND_GROUP_RECIPIENT_FIRST_BUY_MIN_USD}</b>.`,
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
         ...gate.recipients.map((entry, index) => {
