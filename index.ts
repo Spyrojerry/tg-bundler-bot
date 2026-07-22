@@ -1979,12 +1979,14 @@ async function main(): Promise<void> {
         `[INSIDER ${botNumber} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${fetched?.source ?? "Unknown"})`,
       );
 
-      // Note: the old "MC below $5,000 (Rug)" reset/sell check that used to
-      // live here has been replaced by dev-wallet full-exit detection inside
-      // InsiderBot itself (a CLOSE_ACCOUNT/SOLANA_PROGRAM_LIBRARY tx from the
-      // dev wallet — see checkDevWalletFullExit in insider-bot.ts), which runs
-      // continuously in the bot's own poll loop and triggers resetForNewToken
-      // (pre-buy) or a sellTrigger (post-buy) directly.
+      // Rug reset: dev CLOSE_ACCOUNT / zero SOL (InsiderBot WSS) plus MC below $3k here.
+
+      if (await bot.tryTriggerRugMarketCapReset(currentMc)) {
+        log.warn(
+          `[INSIDER ${botNumber} RUG MC] Token ${mint} MC $${currentMc.toLocaleString()} fell below $3,000 rug reset floor.`,
+        );
+        return;
+      }
 
       if (activePos) {
         if (await bot.tryTriggerStopLossSell(currentMc)) {
@@ -2504,7 +2506,7 @@ async function main(): Promise<void> {
         "2. ≥5 SOL post-balance to 4 wallets in 10s (≤0.5 SOL spread) → silent watch → buy on first-four overlap.",
         "3. Sub-5 SOL bundler sends are ignored (no alerts).",
         "4. FeePayer watch continues until SOL → zero; hand off to highest ≥100 SOL out recorded since that watch started, unless recipient is the feePayer funder (then stop only).",
-        "• Rug: dev CLOSE_ACCOUNT or zero SOL resumes feePayer watch after a trade.",
+        "• Rug: dev CLOSE_ACCOUNT, zero SOL, or MC &lt; $3k resumes feePayer watch after a trade.",
       ].join("\n"),
       replyMarkup: {
         inline_keyboard: [

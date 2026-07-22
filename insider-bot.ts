@@ -25,6 +25,8 @@ const INSIDER_HISTORY_LIMIT = 21;
 const LOW_FUNDING_DEV_BUY_SYNC_LIMIT = 10;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
+/** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
+const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
 /** Sell when position MC P/L falls to this % vs entry MC (e.g. -40 = 40% drawdown). */
 const INSIDER_STOP_LOSS_MC_PERCENT = -40;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
@@ -54,12 +56,42 @@ const BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD = 5;
 /** Sub-$0.10 transfer-outs are tracked as dust (not round SOL groups). */
 const BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
+/** Normal-mode round sizes subject to the &lt; $10 USD cap. */
+const BUNDLER_FUNDER_NORMAL_TINY_USD_CAPPED_ROUND_SOL_AMOUNTS = [0.02, 0.05, 0.1] as const;
+/** Normal-mode round sizes allowed even when USD value exceeds $10. */
+const BUNDLER_FUNDER_NORMAL_TINY_USD_EXEMPT_ROUND_SOL_AMOUNTS = [0.15, 0.2] as const;
 /** Normal-mode buy only on these exact round sizes (± tolerance) as same-amount 10s groups. */
-const BUNDLER_FUNDER_NORMAL_TINY_VALID_ROUND_SOL_AMOUNTS = [0.02, 0.05, 0.1] as const;
+const BUNDLER_FUNDER_NORMAL_TINY_VALID_ROUND_SOL_AMOUNTS = [
+  ...BUNDLER_FUNDER_NORMAL_TINY_USD_CAPPED_ROUND_SOL_AMOUNTS,
+  ...BUNDLER_FUNDER_NORMAL_TINY_USD_EXEMPT_ROUND_SOL_AMOUNTS,
+] as const;
 const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL = 0.004;
+
+function formatNormalTinyRoundSolLabel(
+  amounts: readonly number[],
+): string {
+  return amounts.map((amount) => `~${amount}`).join(" / ") + " SOL";
+}
+
+function formatNormalTinyRoundSolWatchDescription(): string {
+  const capped = formatNormalTinyRoundSolLabel(
+    BUNDLER_FUNDER_NORMAL_TINY_USD_CAPPED_ROUND_SOL_AMOUNTS,
+  );
+  const exempt = formatNormalTinyRoundSolLabel(
+    BUNDLER_FUNDER_NORMAL_TINY_USD_EXEMPT_ROUND_SOL_AMOUNTS,
+  );
+  return `<b>${capped}</b> (&lt; $${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD}) / <b>${exempt}</b> (may exceed $10)`;
+}
+
+function isNormalTinyUsdExemptRoundSolAmount(amountSol: number): boolean {
+  return BUNDLER_FUNDER_NORMAL_TINY_USD_EXEMPT_ROUND_SOL_AMOUNTS.some(
+    (target) =>
+      Math.abs(amountSol - target) <= BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL,
+  );
+}
 /** Minimum txs in 10s to count as a qualifying sol group (dust or round). */
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS = 2;
-/** Round buy requires at least this many same-size ~0.02 / ~0.05 / ~0.1 SOL outs in 10s. */
+/** Round buy requires at least this many same-size round SOL outs in 10s. */
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY = 20;
 /** Cumulative dust txs required to skip (round still uses a 10s window). */
 const normalTinyQualifyingDustGroupTxs = (): number =>
@@ -233,6 +265,7 @@ export interface InsiderBot {
   getExitMc(): number;
   getStopLossMcPercent(): number;
   tryTriggerStopLossSell(currentMc: number): Promise<boolean>;
+  tryTriggerRugMarketCapReset(currentMc: number): Promise<boolean>;
   isProfitExitDisabled(): boolean;
   deferProfitExitUntilDevSwap(currentMc: number): Promise<boolean>;
   setExitMc(value: number): void;
@@ -364,7 +397,7 @@ interface BundlerFunderWatchState {
   recipientWatches: Map<string, FunderRecipientWatch>;
   queuedTransferOuts: FunderTransferOutCandidate[];
   normalTinyTransferOuts: Array<{ signature: string; timestamp: number; recipient: string; amountSol: number; amountUsd: number }>;
-  /** True once a qualifying ~0.02 / ~0.05 / ~0.1 SOL same-amount group (≥2 in 10s) is found. */
+  /** True once a qualifying same-round SOL group (≥2 in 10s) is found. */
   normalTinyRoundGroupFound: boolean;
   /** One-shot: round 10s group reached 20 before cumulative dust skip fired. */
   roundWonDustRaceNotified: boolean;
@@ -762,6 +795,17 @@ export class InsiderBot extends EventEmitter {
       ],
       "STOP_LOSS_MC_TRIGGER",
     );
+    return true;
+  }
+
+  async tryTriggerRugMarketCapReset(currentMc: number): Promise<boolean> {
+    if (currentMc >= INSIDER_RUG_RESET_MARKET_CAP_USD) return false;
+    const mint = this.watchingMint ?? this.activePosition?.mint;
+    if (!mint) return false;
+    await this.handleDevWalletRugSignal(mint, {
+      kind: "mc_floor",
+      currentMc,
+    });
     return true;
   }
 
@@ -2270,7 +2314,7 @@ export class InsiderBot extends EventEmitter {
         `Largest bundler funding: <b>${largestFundingSol.toFixed(4)} SOL</b>`,
         activeFunderWatch.lowFundingMode
           ? `Watching feePayer tiny transfer-outs: <b>$${BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD.toFixed(2)}-$${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)}</b>`
-          : `Watching feePayer tiny transfer-outs: <b>~0.02 / ~0.05 / ~0.1 SOL</b> (&lt; $${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)}, ≥${normalFundingMinSol} SOL funded)`,
+          : `Watching feePayer tiny transfer-outs: ${formatNormalTinyRoundSolWatchDescription()} (≥${normalFundingMinSol} SOL funded)`,
         "",
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
@@ -2375,7 +2419,7 @@ export class InsiderBot extends EventEmitter {
         `FeePayer: <code>${feePayer}</code>`,
         `Mode: <b>Normal (funder-first)</b>`,
         `Largest bundler funding: <b>≥${BUNDLER_FUNDER_LOW_FUNDING_SOL} SOL</b>`,
-        `Watching feePayer tiny transfer-outs: <b>~0.02 / ~0.05 / ~0.1 SOL</b> (&lt; $${BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD.toFixed(0)})`,
+        `Watching feePayer tiny transfer-outs: ${formatNormalTinyRoundSolWatchDescription()}`,
         "",
         "Round groups, dust race-to-20, and recipient first-buy gates apply.",
       ].join("\n"),
@@ -3340,13 +3384,18 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     signal:
       | { kind: "close_account"; signature: string; timestamp: number }
-      | { kind: "zero_balance" },
+      | { kind: "zero_balance" }
+      | { kind: "mc_floor"; currentMc: number },
   ): Promise<void> {
     if (this.devFullExitHandled) return;
     this.devFullExitHandled = true;
-    await this.stopDevWalletFullExitWatch(
-      signal.kind === "zero_balance" ? "dev zero balance detected" : "full exit detected",
-    );
+    const stopReason =
+      signal.kind === "zero_balance"
+        ? "dev zero balance detected"
+        : signal.kind === "mc_floor"
+          ? "MC below rug reset floor"
+          : "full exit detected";
+    await this.stopDevWalletFullExitWatch(stopReason);
 
     if (signal.kind === "close_account") {
       this.log.warn(
@@ -3360,10 +3409,19 @@ export class InsiderBot extends EventEmitter {
           hasActivePosition: !!this.activePosition,
         },
       );
-    } else {
+    } else if (signal.kind === "zero_balance") {
       this.log.warn("Dev wallet native SOL balance reached zero; treating as full dev exit", {
         mint,
         devWallet: this.devWallet,
+        phase: this.phase,
+        hasActivePosition: !!this.activePosition,
+      });
+    } else {
+      this.log.warn("Token market cap fell below rug reset floor; treating as rug", {
+        mint,
+        devWallet: this.devWallet,
+        currentMc: signal.currentMc,
+        rugResetThresholdUsd: INSIDER_RUG_RESET_MARKET_CAP_USD,
         phase: this.phase,
         hasActivePosition: !!this.activePosition,
       });
@@ -3373,7 +3431,9 @@ export class InsiderBot extends EventEmitter {
       const reason =
         signal.kind === "close_account"
           ? `Dev wallet ${this.devWallet} closed its WSOL account (full exit detected)`
-          : `Dev wallet ${this.devWallet} native SOL balance reached zero (full exit detected)`;
+          : signal.kind === "zero_balance"
+            ? `Dev wallet ${this.devWallet} native SOL balance reached zero (full exit detected)`
+            : `Token MC $${signal.currentMc.toLocaleString()} fell below $${INSIDER_RUG_RESET_MARKET_CAP_USD.toLocaleString()} rug reset floor`;
       const telegramLines =
         signal.kind === "close_account"
           ? [
@@ -3383,17 +3443,29 @@ export class InsiderBot extends EventEmitter {
               `Close-account tx: <code>${signal.signature}</code>`,
               "Dev wallet closed its WSOL token account — treated as a full exit/rug signal.",
             ]
-          : [
-              "<b>🚨 Dev Zero-Balance Exit — Selling ASAP</b>",
-              `Token: <code>${mint}</code>`,
-              `Dev wallet: <code>${this.devWallet}</code>`,
-              "Dev wallet native SOL reached zero — treated as a full exit/rug signal.",
-            ];
+          : signal.kind === "zero_balance"
+            ? [
+                "<b>🚨 Dev Zero-Balance Exit — Selling ASAP</b>",
+                `Token: <code>${mint}</code>`,
+                `Dev wallet: <code>${this.devWallet}</code>`,
+                "Dev wallet native SOL reached zero — treated as a full exit/rug signal.",
+              ]
+            : [
+                "<b>🚨 MC Rug Reset — Selling ASAP</b>",
+                `Token: <code>${mint}</code>`,
+                `Current MC: <b>$${signal.currentMc.toLocaleString()}</b>`,
+                `Rug reset floor: <b>$${INSIDER_RUG_RESET_MARKET_CAP_USD.toLocaleString()}</b>`,
+                "Market cap dropped below the rug reset threshold.",
+              ];
       await this.triggerPositionSell(
         mint,
         reason,
         telegramLines,
-        signal.kind === "close_account" ? signal.signature : "dev-zero-balance",
+        signal.kind === "close_account"
+          ? signal.signature
+          : signal.kind === "mc_floor"
+            ? "mc-rug-reset"
+            : "dev-zero-balance",
       );
     } else {
       void this.sendTelegramSafe(
@@ -3407,17 +3479,28 @@ export class InsiderBot extends EventEmitter {
                 "Dev wallet closed its WSOL token account before we bought — treated as a full exit/rug signal.",
                 "Flow reset — waiting for the next token.",
               ]
-            : [
-                "<b>🧹 Dev Zero-Balance Reset — Token Skipped</b>",
-                `Token: <code>${mint}</code>`,
-                `Dev wallet: <code>${this.devWallet}</code>`,
-                "Dev wallet native SOL reached zero before we bought — treated as a full exit/rug signal.",
-                "Flow reset — waiting for the next token.",
-              ]
+            : signal.kind === "zero_balance"
+              ? [
+                  "<b>🧹 Dev Zero-Balance Reset — Token Skipped</b>",
+                  `Token: <code>${mint}</code>`,
+                  `Dev wallet: <code>${this.devWallet}</code>`,
+                  "Dev wallet native SOL reached zero before we bought — treated as a full exit/rug signal.",
+                  "Flow reset — waiting for the next token.",
+                ]
+              : [
+                  "<b>🧹 MC Rug Reset — Token Skipped</b>",
+                  `Token: <code>${mint}</code>`,
+                  `Current MC: <b>$${signal.currentMc.toLocaleString()}</b>`,
+                  `Rug reset floor: <b>$${INSIDER_RUG_RESET_MARKET_CAP_USD.toLocaleString()}</b>`,
+                  "Market cap dropped below the rug reset threshold before we bought.",
+                  "Flow reset — waiting for the next token.",
+                ]
         ).join("\n"),
         signal.kind === "close_account"
           ? "dev full-exit reset notification"
-          : "dev zero-balance reset notification",
+          : signal.kind === "mc_floor"
+            ? "MC rug reset notification"
+            : "dev zero-balance reset notification",
       );
       await this.resetForNewToken(true);
     }
@@ -3971,7 +4054,10 @@ export class InsiderBot extends EventEmitter {
       });
       return false;
     }
-    if (transferOutUsd >= BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD) {
+    if (
+      !isNormalTinyUsdExemptRoundSolAmount(transferOut.amountSol) &&
+      transferOutUsd >= BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD
+    ) {
       this.log.debug("Skipping normal-mode feePayer transfer-out above tiny-recipient USD cap", {
         mint: state.mint,
         funderWallet: state.funderWallet,
@@ -4035,7 +4121,7 @@ export class InsiderBot extends EventEmitter {
                   this.formatFollowWalletTelegramLine(),
                   `FeePayer: <code>${state.funderWallet}</code>`,
                   `Cumulative dust txs: <b>${cumulativeDustCount}</b> (≥${dustSkipThreshold})`,
-                  `A ~0.02 / ~0.05 / ~0.1 SOL 10s group also reached <b>≥${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}</b> txs first — not skipping for dust.`,
+                  `A ${formatNormalTinyRoundSolLabel(BUNDLER_FUNDER_NORMAL_TINY_VALID_ROUND_SOL_AMOUNTS)} 10s group also reached <b>≥${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}</b> txs first — not skipping for dust.`,
                   `Trigger tx: <code>${tx.signature}</code>`,
                   "",
                   "Continuing to round buy gates ($100 first-buy check).",
@@ -4099,7 +4185,7 @@ export class InsiderBot extends EventEmitter {
           groupWindowSeconds: BUNDLER_FUNDER_LOW_FUNDING_TINY_GROUP_SECONDS,
         });
       } else {
-        this.log.info("Normal tiny transfer waiting for same-round 10s group (~0.02 / ~0.05 / ~0.1 SOL)", {
+        this.log.info(`Normal tiny transfer waiting for same-round 10s group (${formatNormalTinyRoundSolLabel(BUNDLER_FUNDER_NORMAL_TINY_VALID_ROUND_SOL_AMOUNTS)})`, {
           mint: state.mint,
           funderWallet: state.funderWallet,
           signature: tx.signature,
@@ -4723,7 +4809,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   private getNormalTinyExitPercent(roundTargetSol: number): number {
-    if (roundTargetSol === 0.1) {
+    if (roundTargetSol >= 0.1) {
       return BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT;
     }
     return BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT;
@@ -4766,7 +4852,7 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  /** True when any ~0.02 / ~0.05 / ~0.1 SOL 10s group already reached the round buy threshold by `byTimestamp`. */
+  /** True when any round SOL 10s group already reached the round buy threshold by `byTimestamp`. */
   private hasRoundGroupReachedBuyThresholdBy(
     state: BundlerFunderWatchState,
     byTimestamp: number,
@@ -4813,7 +4899,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${state.mint}</code>`,
         this.formatFollowWalletTelegramLine(),
         `FeePayer: <code>${state.funderWallet}</code>`,
-        `Cumulative dust txs (not ~0.02 / ~0.05 / ~0.1 SOL): <b>${cumulativeDustTxCount}</b> (≥${normalTinyQualifyingDustGroupTxs()})`,
+        `Cumulative dust txs (not ${formatNormalTinyRoundSolLabel(BUNDLER_FUNDER_NORMAL_TINY_VALID_ROUND_SOL_AMOUNTS)}): <b>${cumulativeDustTxCount}</b> (≥${normalTinyQualifyingDustGroupTxs()})`,
         `Trigger tx: <code>${tx.signature}</code>`,
         "",
         `Cumulative dust reached ≥${normalTinyQualifyingDustGroupTxs()} before any round 10s group did — token skipped; feePayer watch will resume.`,

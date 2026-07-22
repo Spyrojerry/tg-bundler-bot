@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-07-22 (53)
+
+### Normal mode: add ~0.15 / ~0.2 SOL round buy triggers
+
+- Round group sizes expanded: **~0.02 / ~0.05 / ~0.1 / ~0.15 / ~0.2 SOL** (±0.004 SOL), same 10s / ≥20 txs / $100 first-buy gates.
+- **~0.02 / ~0.05 / ~0.1** still require transfer-out **&lt; $10** USD.
+- **~0.15 / ~0.2** are **exempt** from the $10 cap (may exceed $10 at current SOL price).
+- **~0.15 / ~0.2 / ~0.1** use the +180% MC exit band; **~0.02 / ~0.05** stay at +90%.
+
+## 2026-07-22 (52)
+
+### Rug reset: MC below $3k
+
+- Added `INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000` — live MC poll triggers the same pre-buy reset / in-position sell path as dev CLOSE_ACCOUNT and dev zero-SOL rug signals.
+- Pre-buy buy-gate rug check (`INSIDER_RUG_MARKET_CAP_USD = 5_000`) unchanged.
+
 ## 2026-07-21 (51)
 
 ### Fix funder-first WebSocket subscription exhaustion (1000 cap)
