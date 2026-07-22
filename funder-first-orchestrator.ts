@@ -8,7 +8,9 @@
 //    3. Tracks bundler-funding patterns on each potential feePayer:
 //         • 4 recipients within 10s whose *post-balance* is ≥5 SOL.
 //    4. Subscribes to those recipient wallets and waits for a SWAP buy.
-//    5. Confirms at least one recipient is among the token's first-four bundlers.
+//    5. When a watched 4-in-10s group recipient buys, confirm that group's four
+//       wallets are exactly the mint's first-four initial bundlers — only then
+//       Telegram / info logs fire and the flow hands off to InsiderBot.
 //    6. Normal → hands off to InsiderBot.startFromFunderFirst for buy/sell.
 //    7. After a normal trade completes, the feePayer stays in cooldown until the
 //       token's dev wallet CLOSE_ACCOUNTs or native SOL reaches zero (rug), then
@@ -22,8 +24,8 @@
 //      are all within 0.5 SOL of each other (all ≥5 SOL). If 5+ recipients in
 //      the window meet the tolerance, the window is skipped entirely.
 //    • Sub-5 SOL bundler sends are ignored (no Telegram, no backend info logs).
-//    • Valid 4-in-10s groups are tracked silently until a recipient buy overlaps
-//      the token's first-four bundlers — only then Telegram / info logs fire.
+//    • Valid 4-in-10s groups are tracked silently until a recipient buy confirms
+//      the watched group's four wallets are the token's first-four bundlers.
 //    • Per recipient in the active group: stop watching when native SOL → zero
 //      (detected via Enhanced WSS recipient txs — no per-recipient accountSubscribe).
 //    • Follow wallet merged with a bundler recipient uses one Enhanced WSS watch.
@@ -55,7 +57,7 @@ import {
 import type { ServiceConfig } from './types';
 import { TelegramBot } from './telegram-bot';
 import { isDevRugCloseAccountTx, UNKNOWN_COUNTERPARTY } from './tx-normalizer';
-import { findWalletSwapBuyMint } from './wallet-swap-detector';
+import { findWalletSwapBuyMint, extractFirstUniqueEarlyBundlerBuys, watchedGroupMatchesFirstFourBundlers } from './wallet-swap-detector';
 
 const log = createLogger('FUNDER-FIRST');
 
@@ -1714,55 +1716,41 @@ export class FunderFirstOrchestrator extends EventEmitter {
   ): Promise<void> {
     if (watch.detectedMint === mint) return;
 
+    const watchedGroup = [...watch.activeGroups.values()].find((group) =>
+      group.recipients.has(buyWallet),
+    );
+    if (!watchedGroup) {
+      log.debug('Recipient buy ignored — wallet is not in an active watched group', {
+        mint,
+        feePayer: watch.address,
+        buyWallet,
+        activeGroups: watch.activeGroups.size,
+      });
+      return;
+    }
+
     try {
       const swaps = await this.heliusClient.getEarlyInsiderSwaps(mint, 4);
-      const earlyBuys: FunderFirstEarlyBuy[] = [];
-      const seenWallets = new Set<string>();
-      for (const tx of swaps) {
-        if (tx.type !== 'SWAP') continue;
-        for (const transfer of tx.tokenTransfers ?? []) {
-          if (transfer.mint !== mint) continue;
-          const wallet = transfer.toUserAccount;
-          if (!wallet || seenWallets.has(wallet)) continue;
-          seenWallets.add(wallet);
-          earlyBuys.push({
-            wallet,
-            tokenAmount: transfer.tokenAmount ?? 0,
-            signature: tx.signature,
-            buySol: null,
-            feePayer: tx.feePayer ?? null,
-            timestamp: tx.timestamp,
-          });
-          if (earlyBuys.length >= 4) break;
-        }
-        if (earlyBuys.length >= 4) break;
-      }
+      const earlyBuys = extractFirstUniqueEarlyBundlerBuys(swaps, mint, 4);
       if (earlyBuys.length < 4) return;
 
-      const candidateRecipients = new Set(
-        watch.bundlerFundingEvents.map((e) => e.recipient),
-      );
-      const firstFourWallets = earlyBuys.map((b) => b.wallet);
-      const overlap = firstFourWallets.filter((w) => candidateRecipients.has(w));
-      if (overlap.length === 0) {
-        log.debug('Recipient buy seen but no overlap with first-four bundlers', {
-          mint,
-          feePayer: watch.address,
-          buyWallet,
-          firstFourWallets,
-          candidateRecipients: [...candidateRecipients],
-        });
+      const firstFourWallets = earlyBuys.map((buy) => buy.wallet);
+      if (!watchedGroupMatchesFirstFourBundlers(watchedGroup.recipients, firstFourWallets)) {
+        log.debug(
+          'Recipient buy seen but watched 4-in-10s group is not the mint first-four bundlers',
+          {
+            mint,
+            feePayer: watch.address,
+            buyWallet,
+            watchedGroupRecipients: [...watchedGroup.recipients],
+            firstFourWallets,
+          },
+        );
         return;
       }
 
-      const confirmedGroup = [...watch.activeGroups.values()].find((group) =>
-        group.recipients.has(buyWallet),
-      );
-      const confirmedGroupRecipients = confirmedGroup
-        ? [...confirmedGroup.recipients]
-        : overlap;
-      const groupEvents = watch.bundlerFundingEvents.filter((e) =>
-        confirmedGroupRecipients.includes(e.recipient),
+      const groupEvents = watch.bundlerFundingEvents.filter((event) =>
+        watchedGroup.recipients.has(event.recipient),
       );
       const postBalanceSpreadSol =
         groupEvents.length > 0
@@ -1770,12 +1758,12 @@ export class FunderFirstOrchestrator extends EventEmitter {
             Math.min(...groupEvents.map((e) => e.recipientPostBalanceSol))
           : null;
 
-      log.info('Funder-first bundler group confirmed as initial token bundlers', {
+      log.info('Funder-first watched group confirmed as mint first-four initial bundlers', {
         mint,
         feePayer: watch.address,
         buyWallet,
-        matchedBundlers: overlap,
-        groupRecipients: confirmedGroupRecipients,
+        watchedGroupRecipients: [...watchedGroup.recipients],
+        firstFourWallets,
         postBalanceSpreadSol,
         groupRule: describeBundlerGroupWatchRule(),
       });
@@ -1812,24 +1800,21 @@ export class FunderFirstOrchestrator extends EventEmitter {
       }
 
       const followWallets = this.getPrimaryInsiderBot().getFollowedWallets();
-      const matchedFollow = followWallets.filter((w) => overlap.includes(w));
-      const bundlerLines =
-        groupEvents.length > 0
-          ? groupEvents.map(
-              (e) =>
-                `• <code>${this.html(e.recipient)}</code> — post <b>${e.recipientPostBalanceSol.toFixed(2)} SOL</b>`,
-            )
-          : overlap.map((w) => `• <code>${this.html(w)}</code>`);
+      const matchedFollow = followWallets.filter((w) => watchedGroup.recipients.has(w));
+      const bundlerLines = groupEvents.map(
+        (event) =>
+          `• <code>${this.html(event.recipient)}</code> — post <b>${event.recipientPostBalanceSol.toFixed(2)} SOL</b>`,
+      );
       void this.sendTelegram([
-        '<b>🚀 Funder-First: Initial Bundler Confirmed — Handed to Insider Bot</b>',
+        '<b>🚀 Funder-First: Watched Group = First-Four Bundlers — Handed to Insider Bot</b>',
         `Token: <code>${this.html(mint)}</code>`,
         `FeePayer: <code>${this.html(watch.address)}</code>`,
-        `4-in-10s group (${describeBundlerGroupWatchRule()}):`,
+        `Watched 4-in-10s group (${describeBundlerGroupWatchRule()}):`,
         ...bundlerLines,
         postBalanceSpreadSol !== null
           ? `Spread: <b>${postBalanceSpreadSol.toFixed(2)} SOL</b>`
           : '',
-        `Matched first-four bundlers: <b>${overlap.length}</b>`,
+        'Confirmed: these four wallets are the mint\'s first-four initial bundler buys.',
         matchedFollow.length > 0
           ? `Follow wallet${matchedFollow.length > 1 ? 's' : ''} ${matchedFollow.map((w) => `<code>${this.html(w)}</code>`).join(', ')} among bundlers — normal mode applies.`
           : '',

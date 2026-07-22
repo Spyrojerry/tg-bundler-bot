@@ -17,6 +17,7 @@ import { TelegramBot } from "./telegram-bot";
 import { WalletMonitor } from "./wallet-monitor";
 import { HeliusEnhancedWsClient } from "./helius-enhanced-ws";
 import { isDevRugCloseAccountTx } from "./tx-normalizer";
+import { extractFirstUniqueEarlyBundlerBuys } from "./wallet-swap-detector";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const NATIVE_SOL_BALANCE_MINT =
@@ -1605,45 +1606,12 @@ export class InsiderBot extends EventEmitter {
     swaps: HeliusTransaction[],
     mint: string,
   ): EarlyInsiderBuy[] {
-    const firstBuys: EarlyInsiderBuy[] = [];
-    const seenWallets = new Set<string>();
-    const sortedSwaps = [...swaps].sort(
-      (a, b) => a.slot - b.slot || a.timestamp - b.timestamp,
+    return extractFirstUniqueEarlyBundlerBuys(
+      swaps,
+      mint,
+      BUNDLER_FUNDER_REQUIRED_COUNT,
+      (tx, wallet) => this.estimateEarlyBuySol(tx, wallet),
     );
-
-    for (const tx of sortedSwaps) {
-      if (tx.type !== "SWAP") continue;
-      for (const transfer of tx.tokenTransfers ?? []) {
-        if (transfer.mint !== mint) continue;
-        const wallet = transfer.toUserAccount;
-        if (!wallet) continue;
-        if (seenWallets.has(wallet)) {
-          this.log.info(
-            "Ignoring follow-up bundler buy; first wallet tx already locked",
-            {
-              mint,
-              wallet,
-              ignoredSignature: tx.signature,
-            },
-          );
-          continue;
-        }
-        seenWallets.add(wallet);
-        firstBuys.push({
-          wallet,
-          tokenAmount: transfer.tokenAmount ?? 0,
-          signature: tx.signature,
-          buySol: this.estimateEarlyBuySol(tx, wallet),
-          feePayer: tx.feePayer ?? null,
-          timestamp: tx.timestamp,
-        });
-        if (firstBuys.length >= BUNDLER_FUNDER_REQUIRED_COUNT) {
-          return firstBuys;
-        }
-      }
-    }
-
-    return firstBuys;
   }
 
   private extractEarlyInsiderWallets(buys: EarlyInsiderBuy[]): string[] {

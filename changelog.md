@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-22 (55)
+
+### Funder-first: confirm watched group = mint first-four bundlers
+
+- Handoff Telegram / info logs only when the **active watched 4-in-10s group** (recipients being monitored) **exactly matches** the mint's first-four initial SWAP buyers (slot-sorted Helius extract).
+- Removed loose overlap against all feePayer funding history; mismatches are debug-only (no TG / info spam).
+- Shared `extractFirstUniqueEarlyBundlerBuys` + `watchedGroupMatchesFirstFourBundlers` in `wallet-swap-detector.ts`.
+
 ## 2026-07-22 (54)
 
 ### Normal mode: round/dust buy threshold 20 → 17 txs

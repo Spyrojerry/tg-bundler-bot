@@ -408,3 +408,68 @@ export function collectWalletsWithBalanceChanges(
 
   return wallets;
 }
+
+export interface EarlyBundlerBuyRecord {
+  wallet: string;
+  tokenAmount: number;
+  signature: string;
+  buySol: number | null;
+  feePayer: string | null;
+  timestamp: number;
+}
+
+/** First N unique token recipients from chronological SWAP txs on a mint. */
+export function extractFirstUniqueEarlyBundlerBuys(
+  swaps: HeliusTransaction[],
+  mint: string,
+  requiredCount = 4,
+  estimateBuySol?: (tx: HeliusTransaction, wallet: string) => number | null,
+): EarlyBundlerBuyRecord[] {
+  const firstBuys: EarlyBundlerBuyRecord[] = [];
+  const seenWallets = new Set<string>();
+  const sortedSwaps = [...swaps].sort(
+    (a, b) => a.slot - b.slot || a.timestamp - b.timestamp,
+  );
+
+  for (const tx of sortedSwaps) {
+    if (tx.type !== 'SWAP') continue;
+    for (const transfer of tx.tokenTransfers ?? []) {
+      if (transfer.mint !== mint) continue;
+      const wallet = transfer.toUserAccount;
+      if (!wallet || seenWallets.has(wallet)) continue;
+      seenWallets.add(wallet);
+      firstBuys.push({
+        wallet,
+        tokenAmount: transfer.tokenAmount ?? 0,
+        signature: tx.signature,
+        buySol: estimateBuySol?.(tx, wallet) ?? null,
+        feePayer: tx.feePayer ?? null,
+        timestamp: tx.timestamp,
+      });
+      if (firstBuys.length >= requiredCount) {
+        return firstBuys;
+      }
+    }
+  }
+
+  return firstBuys;
+}
+
+function walletSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const wallet of a) {
+    if (!b.has(wallet)) return false;
+  }
+  return true;
+}
+
+/** True when every wallet in `groupRecipients` is in `firstFourWallets` and sizes match. */
+export function watchedGroupMatchesFirstFourBundlers(
+  groupRecipients: ReadonlySet<string>,
+  firstFourWallets: readonly string[],
+): boolean {
+  if (firstFourWallets.length < 4 || groupRecipients.size !== 4) {
+    return false;
+  }
+  return walletSetsEqual(groupRecipients, new Set(firstFourWallets));
+}
