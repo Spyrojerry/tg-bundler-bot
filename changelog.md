@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-22 (56)
+
+### Funder-first: latest ≥100 SOL handoff when watched 4-in-10s group exists
+
+- On potential feePayer drain (zero SOL), if that wallet had at least one watched **4-in-10s** bundler group (active, exhausted, subscribed recipients, or `normal_candidate`), zero-balance handoff uses the **latest** ≥100 SOL transfer-out since watch start — not the highest by amount.
+- FeePayers with no watched group keep **highest** ≥100 SOL handoff unchanged.
+- Telegram handoff titles reflect latest vs highest.
+
 ## 2026-07-22 (55)
 
 ### Funder-first: confirm watched group = mint first-four bundlers
