@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-23 (57)
+
+### Funder-first: handoff Telegram shows only the confirmed group events
+
+- Fixed handoff message listing every historical fund to the four group wallets (e.g. 7 SOL then 8 SOL re-funds) — it now shows only the four **10s-window** events that formed the active watched group and spread is computed from those.
+
 ## 2026-07-22 (56)
 
 ### Funder-first: latest ≥100 SOL handoff when watched 4-in-10s group exists

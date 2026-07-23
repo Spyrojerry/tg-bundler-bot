@@ -114,6 +114,8 @@ interface BundlerFundingEvent {
 
 interface ActiveBundlerGroup {
   anchorKey: string;
+  /** The four funding events that formed this 10s group (not later re-funds to same wallets). */
+  events: BundlerFundingEvent[];
   recipients: Set<string>;
   stoppedRecipients: Set<string>;
 }
@@ -1450,6 +1452,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
 
     watch.activeGroups.set(anchorKey, {
       anchorKey,
+      events: [...group],
       recipients: new Set(group.map((e) => e.recipient)),
       stoppedRecipients: new Set(),
     });
@@ -1790,9 +1793,7 @@ export class FunderFirstOrchestrator extends EventEmitter {
         return;
       }
 
-      const groupEvents = watch.bundlerFundingEvents.filter((event) =>
-        watchedGroup.recipients.has(event.recipient),
-      );
+      const groupEvents = watchedGroup.events;
       const postBalanceSpreadSol =
         groupEvents.length > 0
           ? Math.max(...groupEvents.map((e) => e.recipientPostBalanceSol)) -
