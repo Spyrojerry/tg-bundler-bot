@@ -430,6 +430,7 @@ interface BundlerFunderWatchState {
 
 export class InsiderBot extends EventEmitter {
   private readonly log: Logger;
+  private readonly followWalletLog: Logger;
   private readonly config: ServiceConfig;
   private readonly connection: Connection;
   private readonly telegramBot: TelegramBot | null;
@@ -655,6 +656,7 @@ export class InsiderBot extends EventEmitter {
     this.releaseMint = releaseMint;
     this.label = label;
     this.log = createLogger(label.toUpperCase());
+    this.followWalletLog = createLogger('FOLLOW-WALLET');
     this.buySol = config.insiderBuySol;
     this.normalFundingBuySol = config.insiderNormalBuySol;
     this.lowFundingBuySol = config.insiderLowFundingBuySol;
@@ -936,6 +938,15 @@ export class InsiderBot extends EventEmitter {
     return `Follow wallet: <code>${wallet}</code>`;
   }
 
+  private followWalletBackend(
+    message: string,
+    data?: Record<string, unknown>,
+  ): void {
+    if (!this.config.insiderFollowWalletVerboseLogs) return;
+    if (data) this.followWalletLog.info(message, data);
+    else this.followWalletLog.info(message);
+  }
+
   setFollowWalletFlowDelegate(
     delegate:
       | ((
@@ -1023,6 +1034,13 @@ export class InsiderBot extends EventEmitter {
               MAX_FOLLOW_WALLET_START_MARKET_CAP_USD,
           },
         );
+        this.followWalletBackend("Follow-wallet buy MC accepted; starting flow", {
+          bot: this.label,
+          mint,
+          signature,
+          followedWallet,
+          followWalletBuyMc,
+        });
       }
       this.initialBundlerMarketCapUsd = followWalletBuyMc;
       await this.startInsiderFlowWithIndexingLagRetry(mint, followedWallet);
@@ -1326,7 +1344,10 @@ export class InsiderBot extends EventEmitter {
       enforceMinBuySol: false,
       rpcUrl: this.rpcUrl,
       wsUrl: this.wsUrl,
-      logLabel: `WALLET ${this.label.toUpperCase()}`,
+      logLabel: this.config.insiderFollowWalletVerboseLogs
+        ? `FOLLOW-WALLET ${normalized.slice(0, 6)}`
+        : `WALLET ${this.label.toUpperCase()}`,
+      verboseActivityLogs: this.config.insiderFollowWalletVerboseLogs,
       enhancedWs: this.enhancedWs,
     });
     this.followMonitors.set(normalized, monitor);
@@ -1357,6 +1378,12 @@ export class InsiderBot extends EventEmitter {
       buySol: this.buySol,
       bundlerUsdRange: `${this.bundlerBuyMinUsd}-${this.bundlerBuyMaxUsd}`,
     });
+    this.followWalletBackend("Follow-wallet monitoring started", {
+      bot: this.label,
+      followedWallet: normalized,
+      followWalletCount: this.followedWallets.length,
+      enhancedWs: !!this.enhancedWs,
+    });
   }
 
   private stopFollowWalletMonitor(normalized: string): void {
@@ -1381,6 +1408,10 @@ export class InsiderBot extends EventEmitter {
     this.log.info('Follow-wallet monitoring paused', {
       followWallets: this.followedWallets,
     });
+    this.followWalletBackend('Follow-wallet monitoring paused', {
+      bot: this.label,
+      followWallets: this.followedWallets,
+    });
   }
 
   async resumeFollowWalletMonitoring(): Promise<void> {
@@ -1401,6 +1432,11 @@ export class InsiderBot extends EventEmitter {
     this.followedWallets = this.followedWallets.filter((w) => w !== normalized);
     this.log.info("Insider follow wallet removed", {
       followedWallet: normalized,
+      remainingFollowWallets: this.followedWallets,
+    });
+    this.followWalletBackend("Follow wallet removed", {
+      bot: this.label,
+      removedWallet: normalized,
       remainingFollowWallets: this.followedWallets,
     });
   }
@@ -1515,6 +1551,12 @@ export class InsiderBot extends EventEmitter {
     followedWallet: string,
   ): Promise<void> {
     if (!this.isFollowWallet(followedWallet)) return;
+    this.followWalletBackend("Follow-wallet buy detected", {
+      bot: this.label,
+      mint,
+      signature,
+      followedWallet,
+    });
     if (this.boughtMints.has(mint)) return;
     if (this.claimMint && !this.claimMint(mint)) {
       this.log.info(
@@ -1763,6 +1805,12 @@ export class InsiderBot extends EventEmitter {
       ].filter(Boolean).join("\n"),
       "flow-start notification",
     );
+    this.followWalletBackend("Follow-wallet bundler-funder flow started", {
+      bot: this.label,
+      mint,
+      followedWallet,
+      earlyBundlerWallets,
+    });
 
     this.startPollLoop();
     await this.startBundlerFunderFlow(mint, earlyInsiderBuys);
@@ -7490,6 +7538,10 @@ export class InsiderBot extends EventEmitter {
     this.funderFirstFeePayer = null;
 
     this.log.info("InsiderBot reset; resuming followed wallet monitoring");
+    this.followWalletBackend("Follow-wallet flow reset; resuming wallet monitoring", {
+      bot: this.label,
+      followWallets: this.followedWallets,
+    });
     if (this.followedWallets.length > 0 && this.followMonitors.size === 0) {
       await this.followAllWallets();
     }

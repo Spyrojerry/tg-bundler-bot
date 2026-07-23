@@ -191,6 +191,8 @@ export interface ServiceConfig {
   insiderFeePayerFunderAddress: string | null;
   /** Auto-start follow-wallet monitoring on boot when true. */
   insiderFollowWalletEnabled: boolean;
+  /** Emit [FOLLOW-WALLET] backend info logs (wallet txs, buys, flow lifecycle) while testing. */
+  insiderFollowWalletVerboseLogs: boolean;
   /** Auto-start funder-first on boot when true (still requires funder address). */
   insiderFunderFirstEnabled: boolean;
   /** Enable follow-token Pump.fun migration listener on startup (still requires Start in Telegram unless auto-resumed). */

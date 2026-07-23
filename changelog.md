@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-07-23 (64)
+
+### Follow-wallet: verbose backend logs for testing
+
+- New **`INSIDER_FOLLOW_WALLET_VERBOSE_LOGS`** (default **`true`**) — emits **`[FOLLOW-WALLET]`** info logs for monitoring start/pause/resume, buy detection, flow start, and every Enhanced WSS wallet tx (not just buys).
+- Follow-wallet monitors use the **`FOLLOW-WALLET`** log label when verbose (easier to filter in backend logs). Set **`INSIDER_FOLLOW_WALLET_VERBOSE_LOGS=false`** when done testing.
+
+## 2026-07-23 (63)
+
+### Follow-token: Bitquery V2 auth + creator count query
+
+- Bitquery client uses **`https://streaming.bitquery.io/graphql`** with **`Authorization: Bearer <BITQUERY_ACCESS_TOKEN>`** (V2 OAuth `ory_at_...`, not v1 API key).
+- Strips accidental `Bearer ` prefix from env; clearer **403** hint when token/endpoint mismatch.
+- Creator count query uses **`dataset: combined`** and Pump.fun program address filter for full historical create count.
+
 ## 2026-07-23 (62)
 
 ### Follow-token: Bitquery Pump.fun creator count

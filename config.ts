@@ -157,6 +157,10 @@ export function loadConfig(): ServiceConfig {
     'INSIDER_FEEPAYER_FUNDER_ADDRESS',
   );
   const insiderFollowWalletEnabled = optionalBoolean('INSIDER_FOLLOW_WALLET_ENABLED', false);
+  const insiderFollowWalletVerboseLogs = optionalBoolean(
+    'INSIDER_FOLLOW_WALLET_VERBOSE_LOGS',
+    true,
+  );
   const insiderFunderFirstEnabled = optionalBoolean('INSIDER_FUNDER_FIRST_ENABLED', false);
   const insiderFollowTokenEnabled = optionalBoolean('INSIDER_FOLLOW_TOKEN_ENABLED', false);
   const insiderFollowTokenMaxMigrationAgeSec = optionalInt(
@@ -275,6 +279,7 @@ export function loadConfig(): ServiceConfig {
     insiderFollowWallet4,
     insiderFeePayerFunderAddress,
     insiderFollowWalletEnabled,
+    insiderFollowWalletVerboseLogs,
     insiderFunderFirstEnabled,
     insiderFollowTokenEnabled,
     insiderFollowTokenMaxMigrationAgeSec,

@@ -42,6 +42,7 @@ import { PublicKey } from "@solana/web3.js";
 import { randomBytes } from "crypto";
 
 const log = createLogger("MAIN");
+const followWalletLog = createLogger("FOLLOW-WALLET");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const MCAP_CHECK_INTERVAL_MS = 2_000;
@@ -524,6 +525,14 @@ async function main(): Promise<void> {
         source,
       );
       if (result !== true) return result;
+    }
+    if (config.insiderFollowWalletVerboseLogs) {
+      followWalletLog.info("Follow-wallet monitoring resumed", {
+        botIndex,
+        botNumber: getInsiderBotNumber(botIndex),
+        wallets,
+        source,
+      });
     }
     return true;
   }

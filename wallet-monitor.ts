@@ -50,6 +50,7 @@ export class WalletMonitor extends EventEmitter {
   /** Enhanced WSS watch handle when `options.enhancedWs` is provided. */
   private enhancedWatchId: number | null = null;
   private readonly enhancedWs: HeliusEnhancedWsClient | null;
+  private readonly verboseActivityLogs: boolean;
   private readonly enhancedSeenSignatures = new Set<string>();
 
   /** Signatures currently being parsed from websocket notifications. */
@@ -69,6 +70,8 @@ export class WalletMonitor extends EventEmitter {
       rpcUrl?: string;
       wsUrl?: string;
       logLabel?: string;
+      /** Log every Enhanced WSS tx at info (not just buys) — follow-wallet testing. */
+      verboseActivityLogs?: boolean;
       /** When set, uses Helius `transactionSubscribe` instead of `onLogs` + RPC fetch. */
       enhancedWs?: HeliusEnhancedWsClient | null;
     } = {}
@@ -101,6 +104,7 @@ export class WalletMonitor extends EventEmitter {
     }
     this.wsEndpoint = wsUrl;
     this.enhancedWs = options.enhancedWs ?? null;
+    this.verboseActivityLogs = options.verboseActivityLogs ?? false;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -180,6 +184,13 @@ export class WalletMonitor extends EventEmitter {
 
     const wallet = this.walletPubkey.toBase58();
     this.emit('transaction', { walletAddress: wallet, tx });
+
+    if (this.verboseActivityLogs) {
+      this.log.info(`[ENHANCED WS TX] ${tx.signature}`, {
+        type: tx.type ?? null,
+        wallet,
+      });
+    }
 
     const boughtMints = this.detectBoughtMintsFromHeliusTx(tx, wallet);
     if (boughtMints.length === 0) return;
