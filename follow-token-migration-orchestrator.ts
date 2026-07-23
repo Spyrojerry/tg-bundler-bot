@@ -41,6 +41,7 @@ interface CoreMigrationFilterContext {
   migrationAgeSec: number;
   funding: Awaited<ReturnType<HeliusClient['getWalletFundedBy']>>;
   metadata: EarlyMigrationFilterContext;
+  devCreateCount: number;
 }
 
 export class FollowTokenMigrationOrchestrator extends EventEmitter {
@@ -112,8 +113,8 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     void this.sendTelegram([
       '<b>▶️ Follow-Token: Pump Migration Listener Started</b>',
       'Source: <b>PumpPortal subscribeMigration</b>',
-      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
-      'PumpPortal migration feed unsubscribes while a follow-token bundler-funder flow is active.',
+      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created 0–1 tokens (Helius CREATE history; 0 requires valid first-four bundlers), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
+      'PumpPortal migration feed unsubscribes while a follow-token bundler-funder flow is active; resubscribes when the token is skipped or reset (not after dev rug alone).',
     ]);
   }
 
@@ -146,15 +147,31 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return;
     }
 
+    const endedMint = event.mint ?? this.activeFollowTokenMint;
     this.activeFollowTokenMint = null;
+
+    if (!this.pumpPortalWs.isMigrationFeedSuspended()) {
+      log.debug('Follow-token flow ended but PumpPortal migration feed was not suspended', {
+        mint: endedMint,
+        reason: event.reason,
+        hadPosition: event.hadPosition,
+        feePayer: event.feePayer,
+      });
+      return;
+    }
+
     this.pumpPortalWs.resumeMigrationFeed(
       `follow-token flow ended (${event.reason}${event.hadPosition ? ', had position' : ''})`,
     );
-    log.info('Follow-token flow ended — PumpPortal migration feed resubscribed', {
-      mint: event.mint,
-      reason: event.reason,
-      hadPosition: event.hadPosition,
-    });
+    log.info(
+      'Follow-token flow ended — token watches torn down; PumpPortal migration feed resubscribed',
+      {
+        mint: endedMint,
+        reason: event.reason,
+        hadPosition: event.hadPosition,
+        feePayer: event.feePayer,
+      },
+    );
   }
 
   private unsubscribeMigrationFeedForActiveFlow(mint: string): void {
@@ -206,47 +223,29 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.inFlightMints.add(mint);
 
     try {
-      if (!mint.endsWith(PUMP_MINT_SUFFIX)) {
+      const earlyResult = await this.evaluateEarlyMigrationFilters(mint);
+      if (!earlyResult.ok) {
         this.seenMigrationMints.add(mint);
-        log.info('Follow-token filter 1 failed — mint suffix', {
+        log.debug('Follow-token migration skipped — early filter', {
           mint,
           signature,
-          skipReason: 'mint does not end in pump',
+          skipReason: earlyResult.reason,
         });
         return;
       }
-      log.info('Follow-token filter 1 passed — mint suffix', { mint, signature });
 
-      const metadataResult = await this.fetchMetadataUriWithRetry(mint);
-      if (!metadataResult.ok) {
-        this.seenMigrationMints.add(mint);
-        log.info('Follow-token filter 2 failed — metadata URI', {
-          mint,
-          signature,
-          skipReason: metadataResult.reason,
-          uri: metadataResult.uri,
-          metadataUrl: metadataResult.metadataUrl,
-        });
-        return;
-      }
-      log.info('Follow-token filter 2 passed — metadata URI', {
+      log.info('Follow-token migration passed early filters (pump + metadata URI)', {
         mint,
         signature,
-        uri: metadataResult.uri,
-        metadataUrl: metadataResult.metadataUrl,
-        metadataPda: metadataResult.metadataPda,
+        metadataUrl: earlyResult.metadata.metadataUrl,
+        uri: earlyResult.metadata.uri,
+        metadataPda: earlyResult.metadata.metadataPda,
       });
-
-      const earlyMetadata: EarlyMigrationFilterContext = {
-        uri: metadataResult.uri,
-        metadataUrl: metadataResult.metadataUrl,
-        metadataPda: metadataResult.metadataPda,
-      };
 
       const coreResult = await this.evaluateCoreMigrationFilters(
         mint,
         migrationTimestamp,
-        earlyMetadata,
+        earlyResult.metadata,
       );
       if (typeof coreResult === 'string') {
         this.seenMigrationMints.add(mint);
@@ -258,12 +257,13 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         return;
       }
 
-      const { devWallet, migrationAgeSec, funding } = coreResult;
+      const { devWallet, migrationAgeSec, funding, devCreateCount } = coreResult;
       log.info('Follow-token migration passed core filters', {
         mint,
         signature,
         devWallet,
         migrationAgeSec,
+        devCreateCount,
         devFunder: funding?.funder ?? null,
         devFunderName: funding?.funderName ?? null,
         devFunderType: funding?.funderType ?? null,
@@ -275,8 +275,17 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         log.info('Follow-token migration skipped — first-four bundlers not ready', {
           mint,
           signature,
+          devCreateCount,
         });
         return;
+      }
+
+      if (devCreateCount === 0) {
+        log.info('Follow-token dev CREATE history empty — accepted via first-four bundler validation', {
+          mint,
+          signature,
+          devWallet,
+        });
       }
 
       if (this.config.insiderFollowTokenEnabled) {
@@ -311,6 +320,32 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     }
   }
 
+  /** Gate 1: mint suffix + Helius DAS metadata URI (info logs start after both pass). */
+  private async evaluateEarlyMigrationFilters(
+    mint: string,
+  ): Promise<
+    | { ok: true; metadata: EarlyMigrationFilterContext }
+    | { ok: false; reason: string }
+  > {
+    if (!mint.endsWith(PUMP_MINT_SUFFIX)) {
+      return { ok: false, reason: 'mint does not end in pump' };
+    }
+
+    const metadataResult = await this.fetchMetadataUriWithRetry(mint);
+    if (!metadataResult.ok) {
+      return { ok: false, reason: metadataResult.reason };
+    }
+
+    return {
+      ok: true,
+      metadata: {
+        uri: metadataResult.uri,
+        metadataUrl: metadataResult.metadataUrl,
+        metadataPda: metadataResult.metadataPda,
+      },
+    };
+  }
+
   /** Core filters: CREATE tx, migrate age, dev create count, exchange funder. */
   private async evaluateCoreMigrationFilters(
     mint: string,
@@ -336,8 +371,8 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
 
     const devCreateCount =
       await this.heliusClient.countDevCreatedTokenMints(devWallet);
-    if (devCreateCount !== 1) {
-      return `dev created ${devCreateCount} tokens in Helius CREATE history (expected exactly 1)`;
+    if (devCreateCount > 1) {
+      return `dev created ${devCreateCount} tokens in Helius CREATE history (expected 0 or 1)`;
     }
 
     const funding = await this.heliusClient.getWalletFundedBy(devWallet);
@@ -345,7 +380,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return `dev funder is not a Centralized Exchange (${funding?.funderType ?? funding?.funder ?? 'unknown'})`;
     }
 
-    return { devWallet, migrationAgeSec, funding, metadata };
+    return { devWallet, migrationAgeSec, funding, metadata, devCreateCount };
   }
 
   private async fetchMetadataUriWithRetry(

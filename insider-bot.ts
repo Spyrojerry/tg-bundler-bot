@@ -1115,11 +1115,11 @@ export class InsiderBot extends EventEmitter {
         return false;
       }
       this.initialBundlerMarketCapUsd = migrationMc;
-      await this.startInsiderFlowFromMigrationWithIndexingLagRetry(
+      const flowActive = await this.startInsiderFlowFromMigrationWithIndexingLagRetry(
         mint,
         migrationSignature,
       );
-      return true;
+      return flowActive;
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
       this.releaseMint?.(mint);
@@ -1649,7 +1649,7 @@ export class InsiderBot extends EventEmitter {
   private async startInsiderFlowFromMigrationWithIndexingLagRetry(
     mint: string,
     migrationSignature: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const delaysMs = [0, 4_000, 8_000];
     for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
       const delayMs = delaysMs[attempt] ?? 0;
@@ -1657,8 +1657,7 @@ export class InsiderBot extends EventEmitter {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
       try {
-        await this.startInsiderFlowFromMigration(mint, migrationSignature);
-        return;
+        return await this.startInsiderFlowFromMigration(mint, migrationSignature);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const retryable =
@@ -1675,12 +1674,22 @@ export class InsiderBot extends EventEmitter {
         });
       }
     }
+    return false;
+  }
+
+  private isFollowTokenFlowActive(mint: string): boolean {
+    return (
+      this.flowSource === "follow-token" &&
+      (this.watchingMint === mint ||
+        this.bundlerFunderWatch?.mint === mint ||
+        this.activePosition?.mint === mint)
+    );
   }
 
   private async startInsiderFlowFromMigration(
     mint: string,
     migrationSignature: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     this.flowSource = "follow-token";
     this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
@@ -1712,13 +1721,13 @@ export class InsiderBot extends EventEmitter {
         },
       );
       await this.resetForNewToken(true);
-      return;
+      return false;
     }
 
     if (
       await this.trySkipLowFundingDisabledFromEarlyBuys(mint, earlyInsiderBuys)
     ) {
-      return;
+      return false;
     }
 
     this.preBuyStopped = false;
@@ -1741,6 +1750,7 @@ export class InsiderBot extends EventEmitter {
 
     this.startPollLoop();
     await this.startBundlerFunderFlow(mint, earlyInsiderBuys);
+    return this.isFollowTokenFlowActive(mint);
   }
 
   private async startInsiderFlow(

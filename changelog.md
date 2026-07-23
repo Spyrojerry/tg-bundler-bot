@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-07-23 (75)
+
+### Follow-token: resubscribe PumpPortal on skip/reset, not only after rug
+
+- **`startFromFollowTokenMigration`** now returns **`true` only when the bundler-funder flow is still active** after startup (fixes PumpPortal staying suspended when startup skip/reset fired `tokenFlowEnded` before unsubscribe).
+- PumpPortal **resubscribes on `tokenFlowEnded`** (`reset` or `cycle_complete`) once **`resetForNewToken` / `completeFlowCycle`** tear down feePayer, recipients, and other token watches — no need to wait for on-chain dev rug while the bot has already skipped/reset.
+
+## 2026-07-23 (74)
+
+### Follow-token: revert early-filter fail logs; accept 0 dev CREATE count with bundlers
+
+- Filters 1–2 failures back to **debug**; **info** only after pump + metadata URI pass.
+- Dev CREATE history accepts **0 or 1** mint(s); **>1** still rejected. When count is **0**, token continues only if first-four SWAP bundlers validate.
+
 ## 2026-07-23 (73)
 
 ### Follow-token: always log filters 1–2 at info (pass or fail)
