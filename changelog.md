@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-07-23 (73)
+
+### Follow-token: always log filters 1–2 at info (pass or fail)
+
+- **Filter 1** (mint suffix) and **filter 2** (Helius DAS metadata URI) now emit **`info`** logs on both pass and fail; later filters unchanged.
+
+## 2026-07-23 (72)
+
+### Follow-token: metadata URI via Helius DAS getAsset
+
+- Replaced Metaplex metadata PDA + RPC `getAccountInfo` with **Helius DAS `getAsset(mint)`** (`content.json_uri`) for the ipfs.io/baf metadata filter.
+- Retry/debug logs now refer to DAS indexing lag instead of metadata account lookup.
+
+## 2026-07-23 (71)
+
+### Normal mode: round/dust buy threshold 17 → 15 txs
+
+- `BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY` lowered from **17** to **15** (same 10s window; cumulative dust skip uses the same threshold).
+
+## 2026-07-23 (70)
+
+### Follow-token: tiered backend logs + unsubscribe PumpPortal during active flow
+
+- Backend **info** logs for a migration start only after **pump suffix + metadata URI** pass; earlier skips stay **debug**.
+- **PumpPortal migration feed unsubscribes** (`unsubscribeMigration` + WebSocket disconnect, no reconnect) when follow-token bundler-funder flow starts; **resubscribes** (`connect` + `subscribeMigration`) on `tokenFlowEnded` for that follow-token mint (rug/reset or cycle complete).
+- Removed **`INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS`** (behavior is now fixed, not env-gated).
+
 ## 2026-07-23 (69)
 
 ### Follow-token: Metaplex metadata URI filter (`https://ipfs.io/ipfs/baf…`)

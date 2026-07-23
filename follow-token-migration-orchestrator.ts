@@ -7,7 +7,10 @@
 import { EventEmitter } from 'events';
 import { createLogger } from './logger';
 import { HeliusClient } from './helius-client';
-import { InsiderBot } from './insider-bot';
+import {
+  InsiderBot,
+  type InsiderTokenFlowEndedEvent,
+} from './insider-bot';
 import type { ServiceConfig } from './types';
 import { TelegramBot } from './telegram-bot';
 import { isExchangeFundedBy } from './pump-migrate-detector';
@@ -27,10 +30,17 @@ const REQUIRED_BUNDLER_COUNT = 4;
 /** Delays before retrying Helius when mint CREATE / early SWAP data is not indexed yet. */
 const HELIUS_INDEXING_RETRY_DELAYS_MS = [4_000, 8_000];
 
+interface EarlyMigrationFilterContext {
+  uri: string;
+  metadataUrl: string;
+  metadataPda: string;
+}
+
 interface CoreMigrationFilterContext {
   devWallet: string;
   migrationAgeSec: number;
   funding: Awaited<ReturnType<HeliusClient['getWalletFundedBy']>>;
+  metadata: EarlyMigrationFilterContext;
 }
 
 export class FollowTokenMigrationOrchestrator extends EventEmitter {
@@ -41,6 +51,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private pumpPortalWs: PumpPortalWsClient | null = null;
   private isEnabled = false;
   private isShuttingDown = false;
+  private activeFollowTokenMint: string | null = null;
   private readonly seenMigrationMints = new Set<string>();
   private readonly seenMigrationSignatures = new Set<string>();
   private readonly inFlightMints = new Set<string>();
@@ -57,16 +68,17 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       label: 'Follow-Token Helius',
       projectId: config.insiderHeliusProjectId || undefined,
     });
-    const metadataRpcUrl =
-      config.insiderSolanaRpcUrl ||
-      (heliusKey
-        ? `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(heliusKey)}`
-        : config.solanaRpcUrl);
-    this.metadataClient = new TokenMetaplexMetadataClient(metadataRpcUrl);
+    this.metadataClient = new TokenMetaplexMetadataClient(heliusKey);
     this.maxMigrationAgeSec =
       config.insiderFollowTokenMaxMigrationAgeSec > 0
         ? config.insiderFollowTokenMaxMigrationAgeSec
         : DEFAULT_MAX_MIGRATION_AGE_SEC;
+
+    insiderBots.forEach((bot) => {
+      bot.on('tokenFlowEnded', (event: InsiderTokenFlowEndedEvent) => {
+        this.handleInsiderTokenFlowEnded(event);
+      });
+    });
   }
 
   isRunning(): boolean {
@@ -84,12 +96,8 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       'Follow-Token PumpPortal',
     );
     this.isEnabled = true;
+    this.activeFollowTokenMint = null;
     this.pumpPortalWs.onMigration((event) => {
-      this.logMigration('PumpPortal migration received', {
-        mint: event.mint,
-        signature: event.signature,
-        migrationTimestamp: event.timestamp,
-      });
       void this.processMigrationCandidate(
         event.mint,
         event.signature,
@@ -100,19 +108,21 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     log.info('Follow-token migration listener started', {
       source: 'PumpPortal subscribeMigration',
       maxMigrationAgeSec: this.maxMigrationAgeSec,
-      verboseLogs: this.config.insiderFollowTokenVerboseLogs,
     });
     void this.sendTelegram([
       '<b>▶️ Follow-Token: Pump Migration Listener Started</b>',
       'Source: <b>PumpPortal subscribeMigration</b>',
       `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
+      'PumpPortal migration feed unsubscribes while a follow-token bundler-funder flow is active.',
     ]);
   }
 
   stop(reason = 'Stopped'): void {
     if (!this.isEnabled) return;
     this.isEnabled = false;
+    this.activeFollowTokenMint = null;
     this.pumpPortalWs?.close();
+    this.pumpPortalWs = null;
     log.info('Follow-token migration listener stopped', { reason });
     void this.sendTelegram([
       `<b>⏹️ Follow-Token: Migration Listener Stopped</b>`,
@@ -125,12 +135,36 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.stop('Process shutdown');
   }
 
-  private logMigration(
-    message: string,
-    data: Record<string, unknown>,
-  ): void {
-    if (!this.config.insiderFollowTokenVerboseLogs) return;
-    log.info(message, data);
+  private handleInsiderTokenFlowEnded(event: InsiderTokenFlowEndedEvent): void {
+    if (event.source !== 'follow-token') return;
+    if (!this.isEnabled || !this.pumpPortalWs) return;
+    if (
+      this.activeFollowTokenMint &&
+      event.mint &&
+      event.mint !== this.activeFollowTokenMint
+    ) {
+      return;
+    }
+
+    this.activeFollowTokenMint = null;
+    this.pumpPortalWs.resumeMigrationFeed(
+      `follow-token flow ended (${event.reason}${event.hadPosition ? ', had position' : ''})`,
+    );
+    log.info('Follow-token flow ended — PumpPortal migration feed resubscribed', {
+      mint: event.mint,
+      reason: event.reason,
+      hadPosition: event.hadPosition,
+    });
+  }
+
+  private unsubscribeMigrationFeedForActiveFlow(mint: string): void {
+    this.activeFollowTokenMint = mint;
+    this.pumpPortalWs?.suspendMigrationFeed(
+      'follow-token bundler-funder flow started',
+    );
+    log.info('Follow-token bundler-funder flow started — PumpPortal migration feed unsubscribed', {
+      mint,
+    });
   }
 
   private async processMigrationCandidate(
@@ -139,8 +173,16 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     migrationTimestamp: number,
   ): Promise<void> {
     if (!this.isEnabled) return;
+    if (this.activeFollowTokenMint || this.pumpPortalWs?.isMigrationFeedSuspended()) {
+      log.debug('Follow-token migration ignored — PumpPortal migration feed unsubscribed (active follow-token flow)', {
+        mint,
+        signature,
+        activeMint: this.activeFollowTokenMint,
+      });
+      return;
+    }
     if (this.seenMigrationSignatures.has(signature)) {
-      this.logMigration('Follow-token migration skipped — duplicate signature', {
+      log.debug('Follow-token migration skipped — duplicate signature', {
         mint,
         signature,
       });
@@ -148,14 +190,14 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     }
     this.seenMigrationSignatures.add(signature);
     if (this.seenMigrationMints.has(mint)) {
-      this.logMigration('Follow-token migration skipped — mint already processed', {
+      log.debug('Follow-token migration skipped — mint already processed', {
         mint,
         signature,
       });
       return;
     }
     if (this.inFlightMints.has(mint)) {
-      this.logMigration('Follow-token migration skipped — mint already in flight', {
+      log.debug('Follow-token migration skipped — mint already in flight', {
         mint,
         signature,
       });
@@ -163,30 +205,56 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     }
     this.inFlightMints.add(mint);
 
-    this.logMigration('Follow-token evaluating migration', {
-      mint,
-      signature,
-      migrationTimestamp,
-    });
-
     try {
+      if (!mint.endsWith(PUMP_MINT_SUFFIX)) {
+        this.seenMigrationMints.add(mint);
+        log.info('Follow-token filter 1 failed — mint suffix', {
+          mint,
+          signature,
+          skipReason: 'mint does not end in pump',
+        });
+        return;
+      }
+      log.info('Follow-token filter 1 passed — mint suffix', { mint, signature });
+
+      const metadataResult = await this.fetchMetadataUriWithRetry(mint);
+      if (!metadataResult.ok) {
+        this.seenMigrationMints.add(mint);
+        log.info('Follow-token filter 2 failed — metadata URI', {
+          mint,
+          signature,
+          skipReason: metadataResult.reason,
+          uri: metadataResult.uri,
+          metadataUrl: metadataResult.metadataUrl,
+        });
+        return;
+      }
+      log.info('Follow-token filter 2 passed — metadata URI', {
+        mint,
+        signature,
+        uri: metadataResult.uri,
+        metadataUrl: metadataResult.metadataUrl,
+        metadataPda: metadataResult.metadataPda,
+      });
+
+      const earlyMetadata: EarlyMigrationFilterContext = {
+        uri: metadataResult.uri,
+        metadataUrl: metadataResult.metadataUrl,
+        metadataPda: metadataResult.metadataPda,
+      };
+
       const coreResult = await this.evaluateCoreMigrationFilters(
         mint,
         migrationTimestamp,
+        earlyMetadata,
       );
       if (typeof coreResult === 'string') {
         this.seenMigrationMints.add(mint);
-        if (this.config.insiderFollowTokenVerboseLogs) {
-          log.info('Follow-token migration skipped — core filter', {
-            mint,
-            signature,
-            skipReason: coreResult,
-          });
-        } else {
-          log.debug('Follow-token migration skipped before core filters', {
-            skipReason: coreResult,
-          });
-        }
+        log.info('Follow-token migration skipped — core filter', {
+          mint,
+          signature,
+          skipReason: coreResult,
+        });
         return;
       }
 
@@ -226,6 +294,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       const started = await this.tryStartFollowTokenFlow(mint, signature);
       this.seenMigrationMints.add(mint);
       if (started) {
+        this.unsubscribeMigrationFeedForActiveFlow(mint);
         log.info('Follow-token migration passed all filters and started insider flow', {
           mint,
           signature,
@@ -242,20 +311,12 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     }
   }
 
-  /** Core filters only — mint suffix, single dev create, migrate age, exchange funder. */
+  /** Core filters: CREATE tx, migrate age, dev create count, exchange funder. */
   private async evaluateCoreMigrationFilters(
     mint: string,
     migrationTimestamp: number,
+    metadata: EarlyMigrationFilterContext,
   ): Promise<string | CoreMigrationFilterContext> {
-    if (!mint.endsWith(PUMP_MINT_SUFFIX)) {
-      return 'mint does not end in pump';
-    }
-
-    const metadataResult = await this.fetchMetadataUriWithRetry(mint);
-    if (!metadataResult.ok) {
-      return metadataResult.reason;
-    }
-
     const createTx = await this.fetchMintCreateTransactionWithRetry(mint);
     if (!createTx?.timestamp) {
       return 'mint create transaction not found';
@@ -284,7 +345,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return `dev funder is not a Centralized Exchange (${funding?.funderType ?? funding?.funder ?? 'unknown'})`;
     }
 
-    return { devWallet, migrationAgeSec, funding };
+    return { devWallet, migrationAgeSec, funding, metadata };
   }
 
   private async fetchMetadataUriWithRetry(
@@ -301,14 +362,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       const metadata = await this.metadataClient.fetchTokenMetadataUri(mint);
       if (metadata) {
         if (hasRequiredIpfsIoBafUri(metadata.metadataUrl)) {
-          if (attempt > 0) {
-            log.info('Token metadata URI found after indexing retry', {
-              mint,
-              attempt,
-              metadataPda: metadata.metadataPda,
-              metadataUrl: metadata.metadataUrl,
-            });
-          }
           return {
             ok: true,
             uri: metadata.uri,
@@ -328,23 +381,15 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       const delayMs = HELIUS_INDEXING_RETRY_DELAYS_MS[attempt];
       if (delayMs === undefined) break;
 
-      if (this.config.insiderFollowTokenVerboseLogs) {
-        log.info('Token metadata account not indexed yet — retrying', {
-          mint,
-          attempt: attempt + 1,
-          retryInMs: delayMs,
-        });
-      } else {
-        log.debug('Token metadata account not indexed yet — retrying', {
-          mint,
-          attempt: attempt + 1,
-          retryInMs: delayMs,
-        });
-      }
+      log.debug('Helius DAS getAsset metadata not indexed yet — retrying', {
+        mint,
+        attempt: attempt + 1,
+        retryInMs: delayMs,
+      });
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
 
-    return { ok: false, reason: 'token metadata account or uri not found' };
+    return { ok: false, reason: 'Helius DAS getAsset metadata uri not found' };
   }
 
   private async fetchMintCreateTransactionWithRetry(
@@ -370,19 +415,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       const delayMs = HELIUS_INDEXING_RETRY_DELAYS_MS[attempt];
       if (delayMs === undefined) break;
 
-      if (this.config.insiderFollowTokenVerboseLogs) {
-        log.info('Mint CREATE transaction not indexed yet — retrying', {
-          mint,
-          attempt: attempt + 1,
-          retryInMs: delayMs,
-        });
-      } else {
-        log.debug('Mint CREATE transaction not indexed yet — retrying', {
-          mint,
-          attempt: attempt + 1,
-          retryInMs: delayMs,
-        });
-      }
+      log.info('Mint CREATE transaction not indexed yet — retrying', {
+        mint,
+        attempt: attempt + 1,
+        retryInMs: delayMs,
+      });
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
 
@@ -398,19 +435,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
           return true;
         }
       } catch (err) {
-        if (this.config.insiderFollowTokenVerboseLogs) {
-          log.info('First-four bundler fetch not ready yet', {
-            mint,
-            attempt,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        } else {
-          log.debug('First-four bundler fetch not ready yet', {
-            mint,
-            attempt,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
+        log.info('First-four bundler fetch not ready yet', {
+          mint,
+          attempt,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
       const delayMs = HELIUS_INDEXING_RETRY_DELAYS_MS[attempt];
       if (delayMs === undefined) break;

@@ -33,6 +33,8 @@ export class PumpPortalWsClient {
   private lastPongAt = Date.now();
   private migrationCallback: MigrationCallback | null = null;
   private migrationSubscribed = false;
+  /** When true, migration feed is torn down (unsubscribe + disconnect) until resumed. */
+  private migrationFeedSuspended = false;
 
   constructor(apiKey: string, label = 'PumpPortal WS') {
     const key = apiKey.trim();
@@ -60,7 +62,9 @@ export class PumpPortalWsClient {
       this.migrationSubscribed = false;
       this.log.info('Connected to PumpPortal WebSocket');
       this.startHeartbeat();
-      this.sendSubscribeMigration();
+      if (!this.migrationFeedSuspended) {
+        this.sendSubscribeMigration();
+      }
     });
 
     ws.on('message', (data: WebSocket.Data) => {
@@ -83,12 +87,14 @@ export class PumpPortalWsClient {
         clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
       }
-      if (!this.closedByUser) {
+      if (!this.closedByUser && !this.migrationFeedSuspended) {
         this.log.warn('PumpPortal WebSocket closed, will reconnect', {
           code,
           reason: reason?.toString?.() || undefined,
         });
         this.scheduleReconnect();
+      } else if (this.migrationFeedSuspended) {
+        this.log.info('PumpPortal WebSocket closed — migration feed suspended (no reconnect)');
       }
     });
   }
@@ -103,6 +109,53 @@ export class PumpPortalWsClient {
 
   get isConnected(): boolean {
     return this.connected;
+  }
+
+  isMigrationFeedSuspended(): boolean {
+    return this.migrationFeedSuspended;
+  }
+
+  /** Unsubscribe from migration events and disconnect until resumeMigrationFeed(). */
+  suspendMigrationFeed(reason: string): void {
+    if (this.migrationFeedSuspended) return;
+    this.migrationFeedSuspended = true;
+    this.log.info('Unsubscribing from PumpPortal migration feed', { reason });
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    this.sendUnsubscribeMigration();
+    this.migrationSubscribed = false;
+
+    if (this.ws) {
+      const ws = this.ws;
+      this.ws = null;
+      this.connecting = false;
+      this.connected = false;
+      if (this.heartbeatTimer) {
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
+      }
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  /** Reconnect to PumpPortal and subscribe to migration events again. */
+  resumeMigrationFeed(reason: string): void {
+    if (!this.migrationFeedSuspended) return;
+    this.migrationFeedSuspended = false;
+    this.log.info('Resubscribing to PumpPortal migration feed', { reason });
+    if (!this.connected && !this.connecting) {
+      this.connect();
+      return;
+    }
+    this.sendSubscribeMigration();
   }
 
   private scheduleReconnect(): void {
@@ -137,11 +190,30 @@ export class PumpPortalWsClient {
     }, HEARTBEAT_INTERVAL_MS);
   }
 
+  private sendUnsubscribeMigration(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      this.ws.send(JSON.stringify({ method: 'unsubscribeMigration' }));
+      this.log.info('Sent PumpPortal unsubscribeMigration');
+    } catch (err) {
+      this.log.warn('Failed to send PumpPortal unsubscribeMigration', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private sendSubscribeMigration(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ method: 'subscribeMigration' }));
-    this.migrationSubscribed = true;
-    this.log.info('Subscribed to PumpPortal migration events');
+    if (this.migrationFeedSuspended) return;
+    try {
+      this.ws.send(JSON.stringify({ method: 'subscribeMigration' }));
+      this.migrationSubscribed = true;
+      this.log.info('Sent PumpPortal subscribeMigration');
+    } catch (err) {
+      this.log.warn('Failed to send PumpPortal subscribeMigration', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   private handleMessage(data: WebSocket.Data): void {
@@ -152,6 +224,8 @@ export class PumpPortalWsClient {
       this.log.debug('PumpPortal WS message was not JSON');
       return;
     }
+
+    if (this.migrationFeedSuspended) return;
 
     const event = parsePumpPortalMigrationEvent(parsed);
     if (!event) return;

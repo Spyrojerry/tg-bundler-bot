@@ -2623,7 +2623,6 @@ async function main(): Promise<void> {
         `Follow-wallet: <b>${config.insiderFollowWalletEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FOLLOW_WALLET_ENABLED</code>)`,
         `Funder-first: <b>${config.insiderFunderFirstEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FUNDER_FIRST_ENABLED</code>)`,
         `Follow-token TG alerts: <b>${config.insiderFollowTokenEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FOLLOW_TOKEN_ENABLED</code>)`,
-        `Follow-token verbose logs: <b>${config.insiderFollowTokenVerboseLogs ? "on" : "off"}</b> (<code>INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS</code>)`,
       ].join("\n"),
       replyMarkup: {
         inline_keyboard: [

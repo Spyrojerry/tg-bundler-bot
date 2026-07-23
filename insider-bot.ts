@@ -93,7 +93,7 @@ function isNormalTinyUsdExemptRoundSolAmount(amountSol: number): boolean {
 /** Minimum txs in 10s to count as a qualifying sol group (dust or round). */
 const BUNDLER_FUNDER_NORMAL_TINY_MIN_SOL_GROUP_TXS = 2;
 /** Round buy requires at least this many same-size round SOL outs in 10s. */
-const BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY = 17;
+const BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY = 15;
 /** Cumulative dust txs required to skip (round still uses a 10s window). */
 const normalTinyQualifyingDustGroupTxs = (): number =>
   BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY;
@@ -235,7 +235,7 @@ export interface InsiderSellTrigger {
 export interface InsiderTokenFlowEndedEvent {
   mint: string | null;
   feePayer: string | null;
-  source: "follow" | "funder-first" | null;
+  source: "follow" | "funder-first" | "follow-token" | null;
   hadPosition: boolean;
   reason: "reset" | "cycle_complete";
 }

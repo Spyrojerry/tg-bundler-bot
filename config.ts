@@ -162,10 +162,6 @@ export function loadConfig(): ServiceConfig {
   );
   const insiderFunderFirstEnabled = optionalBoolean('INSIDER_FUNDER_FIRST_ENABLED', false);
   const insiderFollowTokenEnabled = optionalBoolean('INSIDER_FOLLOW_TOKEN_ENABLED', false);
-  const insiderFollowTokenVerboseLogs = optionalBoolean(
-    'INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS',
-    true,
-  );
   const insiderFollowTokenMaxMigrationAgeSec = optionalInt(
     'INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC',
     60,
@@ -284,7 +280,6 @@ export function loadConfig(): ServiceConfig {
     insiderFollowWalletVerboseLogs,
     insiderFunderFirstEnabled,
     insiderFollowTokenEnabled,
-    insiderFollowTokenVerboseLogs,
     insiderFollowTokenMaxMigrationAgeSec,
     logLevel: rawLogLevel,
     telegramBotToken,
