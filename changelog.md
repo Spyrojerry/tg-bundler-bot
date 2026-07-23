@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-23 (68)
+
+### Follow-token: retry Helius mint CREATE lookup on indexing lag
+
+- When **`mint create transaction not found`**, retries **`getMintCreateTransaction`** after **4s** and **8s** (same delays as first-four bundler fetch) before skipping the migration.
+
 ## 2026-07-23 (67)
 
 ### Follow-token: verbose backend logs for every PumpPortal migration

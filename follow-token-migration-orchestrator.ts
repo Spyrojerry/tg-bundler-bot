@@ -19,7 +19,8 @@ const log = createLogger('FOLLOW-TOKEN');
 const PUMP_MINT_SUFFIX = 'pump';
 const DEFAULT_MAX_MIGRATION_AGE_SEC = 60;
 const REQUIRED_BUNDLER_COUNT = 4;
-const BUNDLER_INDEXING_RETRY_DELAYS_MS = [4_000, 8_000];
+/** Delays before retrying Helius when mint CREATE / early SWAP data is not indexed yet. */
+const HELIUS_INDEXING_RETRY_DELAYS_MS = [4_000, 8_000];
 
 interface CoreMigrationFilterContext {
   devWallet: string;
@@ -238,7 +239,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return 'mint does not end in pump';
     }
 
-    const createTx = await this.heliusClient.getMintCreateTransaction(mint);
+    const createTx = await this.fetchMintCreateTransactionWithRetry(mint);
     if (!createTx?.timestamp) {
       return 'mint create transaction not found';
     }
@@ -269,8 +270,50 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     return { devWallet, migrationAgeSec, funding };
   }
 
+  private async fetchMintCreateTransactionWithRetry(
+    mint: string,
+  ): Promise<Awaited<ReturnType<HeliusClient['getMintCreateTransaction']>>> {
+    for (
+      let attempt = 0;
+      attempt <= HELIUS_INDEXING_RETRY_DELAYS_MS.length;
+      attempt += 1
+    ) {
+      const createTx = await this.heliusClient.getMintCreateTransaction(mint);
+      if (createTx?.timestamp) {
+        if (attempt > 0) {
+          log.info('Mint CREATE transaction found after Helius indexing retry', {
+            mint,
+            attempt,
+            createSignature: createTx.signature,
+          });
+        }
+        return createTx;
+      }
+
+      const delayMs = HELIUS_INDEXING_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined) break;
+
+      if (this.config.insiderFollowTokenVerboseLogs) {
+        log.info('Mint CREATE transaction not indexed yet — retrying', {
+          mint,
+          attempt: attempt + 1,
+          retryInMs: delayMs,
+        });
+      } else {
+        log.debug('Mint CREATE transaction not indexed yet — retrying', {
+          mint,
+          attempt: attempt + 1,
+          retryInMs: delayMs,
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+
+    return null;
+  }
+
   private async validateFirstFourBundlers(mint: string): Promise<boolean> {
-    for (let attempt = 0; attempt <= BUNDLER_INDEXING_RETRY_DELAYS_MS.length; attempt += 1) {
+    for (let attempt = 0; attempt <= HELIUS_INDEXING_RETRY_DELAYS_MS.length; attempt += 1) {
       try {
         const swaps = await this.heliusClient.getEarlyInsiderSwaps(mint, REQUIRED_BUNDLER_COUNT);
         const earlyBuys = extractFirstUniqueEarlyBundlerBuys(swaps, mint, REQUIRED_BUNDLER_COUNT);
@@ -292,7 +335,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
           });
         }
       }
-      const delayMs = BUNDLER_INDEXING_RETRY_DELAYS_MS[attempt];
+      const delayMs = HELIUS_INDEXING_RETRY_DELAYS_MS[attempt];
       if (delayMs === undefined) break;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
