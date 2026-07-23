@@ -126,7 +126,6 @@ export interface TokenSummary {
 
 /** Config pulled from environment variables (all validated at startup) */
 export interface ServiceConfig {
-  walletAddress: string | null;
   tradingWalletAddress: string | null;
   solanaRpcUrl: string;
   solanaWsUrl: string;
@@ -143,18 +142,10 @@ export interface ServiceConfig {
   jupiterPriceApiKey: string;
   pumpPortalApiKey: string | null;
   pumpPortalWalletAddress: string | null;
-  monitorInterval: number;
-  monitoringWindowMs: number;  // legacy env setting; linked tokens use apply-sample decisions
   rateLimitMinTime: number;
   rateLimitMaxConcurrent: number;
   dbPath: string;
   heliusApiKey: string;
-  receiverHeliusApiKey: string;
-  receiverSolanaRpcUrl: string;
-  receiverSolanaWsUrl: string;
-  f1HeliusApiKey: string;
-  f1SolanaRpcUrl: string;
-  f1SolanaWsUrl: string;
   insiderHeliusApiKey: string;
   insiderHeliusApiKey2: string;
   insiderHeliusApiKey3: string;
@@ -177,7 +168,6 @@ export interface ServiceConfig {
   insiderEntryMc: number;
   insiderExitMc: number;
   insiderExitPercent: number;
-  insiderMinTransferProfit: number;
   insiderBundlerBuyMinUsd: number;
   insiderBundlerBuyMaxUsd: number;
   insiderRequiredSells: number;
@@ -204,7 +194,6 @@ export interface ServiceConfig {
   sellSlippage: number;
   sellAutoSlippage: boolean;
   sellPriorityFeeSol: number;
-  sellAntiMev: boolean;
   port: number;
 }
 
@@ -259,7 +248,6 @@ export interface SellOptions {
   slippage: number;
   autoSlippage: boolean;
   priorityFeeSol: number;
-  antiMev: boolean;
 }
 
 export interface BuyOptions {

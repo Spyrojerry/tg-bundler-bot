@@ -72,7 +72,6 @@ function isValidGmgnFetchMode(s: string): s is ServiceConfig['gmgnFetchMode'] {
 }
 
 export function loadConfig(): ServiceConfig {
-  const walletAddress    = optionalNullable('WALLET_ADDRESS');
   const tradingWalletAddress = optionalNullable('TRADING_WALLET_ADDRESS');
   const gmgnApiKey       = required('GMGN_API_KEY');
   const gmgnApiKey2      = optional('GMGN_API_KEY_2', gmgnApiKey);
@@ -89,24 +88,6 @@ export function loadConfig(): ServiceConfig {
   const pumpPortalApiKey = optionalNullable('PUMPPORTAL_API_KEY');
   const pumpPortalWalletAddress = optionalNullable('PUMPPORTAL_WALLET_ADDRESS');
   const heliusApiKey     = optional('HELIUS_API_KEY', '');
-  const receiverHeliusApiKey = optional('RECEIVER_HELIUS_API_KEY', '');
-  const receiverSolanaRpcUrl = optional(
-    'RECEIVER_SOLANA_RPC_URL',
-    receiverHeliusApiKey ? heliusRpcUrl(receiverHeliusApiKey) : solanaRpcUrl
-  );
-  const receiverSolanaWsUrl = optional(
-    'RECEIVER_SOLANA_WS_URL',
-    deriveWsUrl(receiverSolanaRpcUrl)
-  );
-  const f1HeliusApiKey = optional('F1_HELIUS_API_KEY', '');
-  const f1SolanaRpcUrl = optional(
-    'F1_SOLANA_RPC_URL',
-    f1HeliusApiKey ? heliusRpcUrl(f1HeliusApiKey) : solanaRpcUrl
-  );
-  const f1SolanaWsUrl = optional(
-    'F1_SOLANA_WS_URL',
-    deriveWsUrl(f1SolanaRpcUrl)
-  );
   const insiderHeliusApiKey = optional('INSIDER_HELIUS_API_KEY', '');
   const insiderHeliusApiKey2 = optional('INSIDER_HELIUS_API_KEY_2', '');
   const insiderHeliusApiKey3 = optional('INSIDER_HELIUS_API_KEY_3', '');
@@ -170,11 +151,8 @@ export function loadConfig(): ServiceConfig {
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
   const sellAutoSlippage = optionalBoolean('SELL_AUTO_SLIPPAGE', false);
-  const sellAntiMev      = optionalBoolean('SELL_ANTI_MEV', true);
 
   const minBuySol              = optionalNumber('MIN_BUY_SOL', 8);
-  const monitorInterval        = optionalInt('MONITOR_INTERVAL', 2_000);
-  const monitoringWindowMs     = optionalInt('MONITOR_WINDOW_MS', 60_000);
   const rateLimitMinTime       = optionalInt('RATE_LIMIT_MIN_TIME', 500);
   const rateLimitMaxConcurrent = optionalInt('RATE_LIMIT_MAX_CONCURRENT', 1);
   const sellPercent            = optionalNumber('SELL_PERCENT', 100);
@@ -186,7 +164,6 @@ export function loadConfig(): ServiceConfig {
   const insiderEntryMc         = optionalNumber('INSIDER_ENTRY_MC', 15_000);
   const insiderExitMc          = optionalNumber('INSIDER_EXIT_MC', 30_000);
   const insiderExitPercent     = optionalNumber('INSIDER_EXIT_PERCENT', 40);
-  const insiderMinTransferProfit = optionalNumber('INSIDER_MIN_TRANSFER_PROFIT', 70);
   const insiderBundlerBuyMinUsd = optionalNumber('INSIDER_BUNDLER_BUY_MIN_USD', 100);
   const insiderBundlerBuyMaxUsd = optionalNumber('INSIDER_BUNDLER_BUY_MAX_USD', 200);
   const insiderRequiredSells = optionalInt('INSIDER_REQUIRED_SELLS', 5);
@@ -200,14 +177,8 @@ export function loadConfig(): ServiceConfig {
   }
 
   // Sanity checks
-  if (monitorInterval < 1_000) {
-    throw new Error('MONITOR_INTERVAL must be at least 1000ms');
-  }
   if (rateLimitMinTime < 100) {
     throw new Error('RATE_LIMIT_MIN_TIME must be at least 100ms (do not exceed API rate limits)');
-  }
-  if (monitoringWindowMs < monitorInterval) {
-    throw new Error('MONITOR_WINDOW_MS must be >= MONITOR_INTERVAL');
   }
   if (sellPercent <= 0 || sellPercent > 100) {
     throw new Error('SELL_PERCENT must be greater than 0 and at most 100');
@@ -216,7 +187,6 @@ export function loadConfig(): ServiceConfig {
     throw new Error('SELL_SLIPPAGE must be between 0 and 100');
   }
   return {
-    walletAddress,
     tradingWalletAddress,
     solanaRpcUrl,
     solanaWsUrl,
@@ -233,18 +203,10 @@ export function loadConfig(): ServiceConfig {
     jupiterPriceApiKey,
     pumpPortalApiKey,
     pumpPortalWalletAddress,
-    monitorInterval,
-    monitoringWindowMs,
     rateLimitMinTime,
     rateLimitMaxConcurrent,
     dbPath,
     heliusApiKey,
-    receiverHeliusApiKey,
-    receiverSolanaRpcUrl,
-    receiverSolanaWsUrl,
-    f1HeliusApiKey,
-    f1SolanaRpcUrl,
-    f1SolanaWsUrl,
     insiderHeliusApiKey,
     insiderHeliusApiKey2,
     insiderHeliusApiKey3,
@@ -267,7 +229,6 @@ export function loadConfig(): ServiceConfig {
     insiderEntryMc,
     insiderExitMc,
     insiderExitPercent,
-    insiderMinTransferProfit,
     insiderBundlerBuyMinUsd,
     insiderBundlerBuyMaxUsd,
     insiderRequiredSells,
@@ -288,7 +249,6 @@ export function loadConfig(): ServiceConfig {
     sellSlippage,
     sellAutoSlippage,
     sellPriorityFeeSol,
-    sellAntiMev,
     port,
   };
 }

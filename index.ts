@@ -131,18 +131,11 @@ async function main(): Promise<void> {
   log.info("  GMGN Bundler Monitor  — starting up");
   log.info("═══════════════════════════════════════");
   log.info("Config", {
-    wallet: config.walletAddress,
     tradingWallet: config.tradingWalletAddress,
 
     // Global solana endpoints (used by wallet monitors / default gmgn client)
     rpc: config.solanaRpcUrl,
     ws: config.solanaWsUrl,
-
-    receiverRpc: config.receiverSolanaRpcUrl,
-    receiverWs: config.receiverSolanaWsUrl,
-
-    f1Rpc: config.f1SolanaRpcUrl,
-    f1Ws: config.f1SolanaWsUrl,
 
     insiderBots: insiderBotDefinitions.map((definition) => ({
       bot: definition.botNumber,
@@ -156,7 +149,6 @@ async function main(): Promise<void> {
 
     minBuySol: config.minBuySol,
     gmgnFetchMode: config.gmgnFetchMode,
-    monitorInterval: config.monitorInterval,
     rateLimitMinTime: config.rateLimitMinTime,
     dbPath: config.dbPath,
   });
@@ -1166,7 +1158,6 @@ async function main(): Promise<void> {
               `Selling: <b>${config.sellPercent}%</b> for SOL`,
               `Slippage: <b>${config.sellAutoSlippage ? "auto" : config.sellSlippage}</b>`,
               `Priority fee: <b>${config.sellPriorityFeeSol} SOL</b>`,
-              `Anti-MEV: <b>${config.sellAntiMev ? "on" : "off"}</b>`,
               "",
               "I will send the receipt here when GMGN returns the order result.",
             ].join("\n");
@@ -2854,7 +2845,6 @@ async function main(): Promise<void> {
           slippage: config.sellSlippage,
           autoSlippage: config.sellAutoSlippage,
           priorityFeeSol: config.sellPriorityFeeSol,
-          antiMev: config.sellAntiMev,
           preFetchedBalance: startingBalance ?? undefined,
         },
       );

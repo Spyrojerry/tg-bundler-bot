@@ -113,6 +113,12 @@ const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
 /** Round targets at or above this SOL use HIGH exit; smaller rounds use MID. */
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_MIN_ROUND_SOL = 0.1;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
+/** Recent feePayer txs scanned at lock when live balance is zero. */
+const BUNDLER_FUNDER_STARTUP_HANDOFF_HISTORY_LIMIT = 50;
+const BUNDLER_FUNDER_STARTUP_HANDOFF_MAX_CHAIN = 5;
+const ZERO_BALANCE_EPSILON_SOL = 1e-6;
+/** Follow-token: also watch the wallet that funded the shared feePayer if funded within this window. */
+const FOLLOW_TOKEN_FEEPAYER_FUNDER_MAX_AGE_SEC = 6 * 60 * 60;
 const BUNDLER_FUNDER_SYNC_LIMIT = 20;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
 const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 2;
@@ -430,6 +436,10 @@ interface BundlerFunderWatchState {
   discoveryStopped: boolean;
   /** Wall-clock time (ms) the shared feePayer was locked. */
   lockedAt: number;
+  /** Follow-token: Helius funded-by wallet for shared feePayer (parallel round/dust watch). */
+  parallelFeePayerFunderWallet: string | null;
+  parallelFeePayerFunderCursorSignature: string | null;
+  parallelFeePayerFunderFundedAtSec: number | null;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -521,6 +531,7 @@ export class InsiderBot extends EventEmitter {
   private insiderEnhancedWatchId: number | null = null;
   private bundlerEnhancedWatchIds = new Map<string, number>();
   private bundlerFunderEnhancedWatchId: number | null = null;
+  private bundlerFunderParallelEnhancedWatchId: number | null = null;
   private devFullExitEnhancedWatchId: number | null = null;
   private recipientEnhancedWatchIds = new Map<string, number>();
   /** Per-recipient dedup for Enhanced WSS notifications — a reconnect can resubscribe and redeliver a signature already applied, and unlike the REST batch path (which consumes/clears dirty signatures as it goes) this push path has no other natural at-most-once guarantee. */
@@ -533,6 +544,11 @@ export class InsiderBot extends EventEmitter {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
   private bundlerFunderLogsSubId: number | null = null;
+  private bundlerFunderParallelLogsSubId: number | null = null;
+  /** Active primary shared-feePayer subscription address (dedup vs parallel watch). */
+  private bundlerFunderPrimaryWatchAddress: string | null = null;
+  /** Active parallel feePayer-funder subscription address (dedup vs primary watch). */
+  private bundlerFunderParallelWatchAddress: string | null = null;
   private lowFundingDevLogsSubId: number | null = null;
   /** Websocket log subscription on the dev wallet, used to push-detect a full-exit CLOSE_ACCOUNT tx (see subscribeDevWalletFullExitWatch). */
   private devFullExitLogsSubId: number | null = null;
@@ -546,6 +562,8 @@ export class InsiderBot extends EventEmitter {
   private bundlerFunderSyncPending = false;
   private bundlerFunderSyncPendingForce = false;
   private lastBundlerFunderSyncAt = 0;
+  private isParallelFeePayerFunderSyncing = false;
+  private lastParallelFeePayerFunderSyncAt = 0;
   private dirtyFunderRecipients = new Set<string>();
   private dirtyFunderRecipientSignatures = new Map<string, Set<string>>();
   private isFunderRecipientBatchSyncing = false;
@@ -707,6 +725,7 @@ export class InsiderBot extends EventEmitter {
     this.phase = "holding";
     this.startPollLoop();
     void this.syncBundlerFunderTransactions(true);
+    void this.syncParallelFeePayerFunderTransactions(true);
     void this.syncFunderRecipientBatch(true);
     this.log.warn(
       "Sell failed; active position retained and shared feePayer monitoring rearmed",
@@ -1282,6 +1301,8 @@ export class InsiderBot extends EventEmitter {
       this.bundlerEnhancedWatchIds.size > 0 ||
       this.bundlerFunderLogsSubId !== null ||
       this.bundlerFunderEnhancedWatchId !== null ||
+      this.bundlerFunderParallelLogsSubId !== null ||
+      this.bundlerFunderParallelEnhancedWatchId !== null ||
       this.recipientLogsSubIds.size > 0 ||
       this.recipientEnhancedWatchIds.size > 0 ||
       this.pollTimer !== null
@@ -1518,6 +1539,7 @@ export class InsiderBot extends EventEmitter {
     this.disableProfitExitAfterBuy = false;
 
     void this.syncBundlerFunderTransactions(true);
+    void this.syncParallelFeePayerFunderTransactions(true);
     void this.syncFunderRecipientBatch(true);
     void this.auditFunderRecipientsAfterBuy();
   }
@@ -2463,9 +2485,21 @@ export class InsiderBot extends EventEmitter {
       lowFundingLargeTransferBuyUsed: false,
       discoveryStopped: false,
       lockedAt: Date.now(),
+      parallelFeePayerFunderWallet: null,
+      parallelFeePayerFunderCursorSignature: null,
+      parallelFeePayerFunderFundedAtSec: null,
     };
 
     this.subscribeBundlerFunder(funderWallet);
+    await this.maybeHandoffEmptyBundlerFunderAtStartupChain(this.bundlerFunderWatch!);
+    if (
+      !this.bundlerFunderWatch ||
+      this.bundlerFunderWatch.mint !== mint ||
+      this.watchingMint !== mint ||
+      this.phase !== "pre_buy"
+    ) {
+      return;
+    }
     if (lowFundingMode) {
       await this.evaluateLowFundingSharedFeePayerBuy({
         state: this.bundlerFunderWatch!,
@@ -2494,6 +2528,9 @@ export class InsiderBot extends EventEmitter {
     }
     if (!this.buySubmitted) {
       await this.syncBundlerFunderTransactions(true);
+    }
+    if (this.bundlerFunderWatch) {
+      await this.maybeSubscribeFollowTokenFeePayerFunderWatch(this.bundlerFunderWatch);
     }
     const activeFunderWatch = this.bundlerFunderWatch;
     if (
@@ -2539,6 +2576,9 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
+        activeFunderWatch.parallelFeePayerFunderWallet
+          ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
+          : "",
       ].filter(Boolean).join("\n"),
       "shared feePayer notification",
     );
@@ -2609,11 +2649,26 @@ export class InsiderBot extends EventEmitter {
       lowFundingLargeTransferBuyUsed: false,
       discoveryStopped: false,
       lockedAt: Date.now(),
+      parallelFeePayerFunderWallet: null,
+      parallelFeePayerFunderCursorSignature: null,
+      parallelFeePayerFunderFundedAtSec: null,
     };
 
     this.subscribeBundlerFunder(feePayer);
+    await this.maybeHandoffEmptyBundlerFunderAtStartupChain(this.bundlerFunderWatch!);
+    if (
+      !this.bundlerFunderWatch ||
+      this.bundlerFunderWatch.mint !== mint ||
+      this.watchingMint !== mint ||
+      this.phase !== "pre_buy"
+    ) {
+      return;
+    }
     if (!this.buySubmitted) {
       await this.syncBundlerFunderTransactions(true);
+    }
+    if (this.bundlerFunderWatch) {
+      await this.maybeSubscribeFollowTokenFeePayerFunderWatch(this.bundlerFunderWatch);
     }
 
     const activeFunderWatch = this.bundlerFunderWatch;
@@ -3206,12 +3261,330 @@ export class InsiderBot extends EventEmitter {
     this.bundlerWatch = null;
   }
 
+  private isPrimaryBundlerFunderWatchActive(): boolean {
+    return (
+      this.bundlerFunderLogsSubId !== null ||
+      this.bundlerFunderEnhancedWatchId !== null
+    );
+  }
+
+  private isParallelBundlerFunderWatchActive(): boolean {
+    return (
+      this.bundlerFunderParallelLogsSubId !== null ||
+      this.bundlerFunderParallelEnhancedWatchId !== null
+    );
+  }
+
+  private isPrimaryBundlerFunderSubscribedTo(address: string): boolean {
+    return (
+      this.isPrimaryBundlerFunderWatchActive() &&
+      this.bundlerFunderPrimaryWatchAddress === address
+    );
+  }
+
+  private isParallelBundlerFunderSubscribedTo(address: string): boolean {
+    return (
+      this.isParallelBundlerFunderWatchActive() &&
+      this.bundlerFunderParallelWatchAddress === address
+    );
+  }
+
+  private isBundlerFunderAddressWatched(address: string): boolean {
+    return (
+      this.isPrimaryBundlerFunderSubscribedTo(address) ||
+      this.isParallelBundlerFunderSubscribedTo(address)
+    );
+  }
+
+  private async clearParallelFeePayerFunderWatch(
+    state: BundlerFunderWatchState,
+    reason: string,
+  ): Promise<void> {
+    const hadParallel =
+      state.parallelFeePayerFunderWallet !== null ||
+      this.isParallelBundlerFunderWatchActive();
+    if (!hadParallel) return;
+    await this.unsubscribeParallelBundlerFunder();
+    state.parallelFeePayerFunderWallet = null;
+    state.parallelFeePayerFunderCursorSignature = null;
+    state.parallelFeePayerFunderFundedAtSec = null;
+    this.log.info("Cleared parallel feePayer-funder watch", {
+      mint: state.mint,
+      sharedFeePayer: state.funderWallet,
+      reason,
+    });
+  }
+
+  private subscribeParallelBundlerFunder(address: string): void {
+    if (this.isParallelBundlerFunderSubscribedTo(address)) {
+      return;
+    }
+    if (this.isPrimaryBundlerFunderSubscribedTo(address)) {
+      this.log.debug(
+        "Skipping parallel feePayer-funder subscribe — address already on primary watch",
+        { address },
+      );
+      return;
+    }
+    if (this.isParallelBundlerFunderWatchActive()) {
+      this.log.warn(
+        "Skipping parallel feePayer-funder subscribe — another parallel watch is already active",
+        {
+          activeAddress: this.bundlerFunderParallelWatchAddress,
+          requestedAddress: address,
+        },
+      );
+      return;
+    }
+    if (this.enhancedWs) {
+      this.bundlerFunderParallelEnhancedWatchId = this.enhancedWs.watch(address, (tx) => {
+        void this.applyParallelBundlerFunderNotificationTx(tx);
+      });
+      this.bundlerFunderParallelWatchAddress = address;
+      this.log.info(
+        "Subscribed to parallel feePayer-funder transactions via Enhanced WSS",
+        { address },
+      );
+      return;
+    }
+    this.bundlerFunderParallelLogsSubId = this.connection.onLogs(
+      new PublicKey(address),
+      (logInfo) => {
+        if (!logInfo.err) {
+          this.log.debug(
+            "Parallel feePayer-funder logs notification ignored — Enhanced WSS required for push detection",
+            { signature: logInfo.signature },
+          );
+        }
+      },
+      "processed",
+    );
+    this.bundlerFunderParallelWatchAddress = address;
+    this.log.info(
+      "Subscribed to parallel feePayer-funder transactions (logs only — Enhanced WSS recommended)",
+      { address, syncLimit: BUNDLER_FUNDER_SYNC_LIMIT },
+    );
+  }
+
+  private async unsubscribeParallelBundlerFunder(): Promise<void> {
+    if (this.bundlerFunderParallelEnhancedWatchId !== null) {
+      const id = this.bundlerFunderParallelEnhancedWatchId;
+      this.bundlerFunderParallelEnhancedWatchId = null;
+      await this.enhancedWs?.unwatch(id).catch(() => undefined);
+    }
+    if (this.bundlerFunderParallelLogsSubId !== null) {
+      const subId = this.bundlerFunderParallelLogsSubId;
+      this.bundlerFunderParallelLogsSubId = null;
+      await this.connection.removeOnLogsListener(subId).catch(() => undefined);
+    }
+    this.bundlerFunderParallelWatchAddress = null;
+  }
+
+  /** Follow-token normal mode: also watch the wallet that funded the shared feePayer if funded ≤6h ago. */
+  private async maybeSubscribeFollowTokenFeePayerFunderWatch(
+    state: BundlerFunderWatchState,
+  ): Promise<void> {
+    if (this.flowSource !== "follow-token") return;
+    if (state.lowFundingMode) return;
+    if (state.parallelFeePayerFunderWallet) return;
+
+    let funding: Awaited<ReturnType<HeliusClient["getWalletFundedBy"]>>;
+    try {
+      funding = await this.withHeliusFallback((client) =>
+        client.getWalletFundedBy(state.funderWallet),
+      );
+    } catch (err) {
+      this.log.warn("Failed to resolve shared feePayer funded-by for parallel watch", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (!funding?.funder) {
+      this.log.debug("Shared feePayer has no Helius funded-by record; skipping parallel funder watch", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+      });
+      return;
+    }
+
+    const fundedAtSec = funding.timestamp;
+    if (!fundedAtSec || !Number.isFinite(fundedAtSec)) {
+      this.log.debug("Shared feePayer funded-by has no timestamp; skipping parallel funder watch", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        funder: funding.funder,
+      });
+      return;
+    }
+
+    const ageSec = Math.floor(Date.now() / 1000) - fundedAtSec;
+    if (ageSec > FOLLOW_TOKEN_FEEPAYER_FUNDER_MAX_AGE_SEC) {
+      this.log.info("Shared feePayer funder is older than 6h; skipping parallel watch", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        funder: funding.funder,
+        fundedAtSec,
+        ageSec,
+        maxAgeSec: FOLLOW_TOKEN_FEEPAYER_FUNDER_MAX_AGE_SEC,
+      });
+      return;
+    }
+
+    const funderWallet = funding.funder;
+    if (
+      funderWallet === state.funderWallet ||
+      funderWallet === state.originalFunderWallet ||
+      state.bundlerWallets.has(funderWallet) ||
+      this.isBundlerFunderAddressWatched(funderWallet)
+    ) {
+      this.log.debug("Shared feePayer funder overlaps feePayer/bundler set or existing watch; skipping parallel watch", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        parallelFunder: funderWallet,
+        alreadyWatched: this.isBundlerFunderAddressWatched(funderWallet),
+      });
+      return;
+    }
+
+    this.subscribeParallelBundlerFunder(funderWallet);
+    if (!this.isParallelBundlerFunderSubscribedTo(funderWallet)) {
+      return;
+    }
+
+    state.parallelFeePayerFunderWallet = funderWallet;
+    state.parallelFeePayerFunderFundedAtSec = fundedAtSec;
+    state.parallelFeePayerFunderCursorSignature = funding.signature ?? null;
+    if (funding.signature) {
+      state.processedSignatures.add(funding.signature);
+    }
+
+    if (!this.buySubmitted) {
+      await this.syncParallelFeePayerFunderTransactions(true);
+    }
+
+    this.log.warn("Follow-token: parallel feePayer-funder watch started", {
+      mint: state.mint,
+      sharedFeePayer: state.funderWallet,
+      parallelFunder: funderWallet,
+      fundedAtSec,
+      ageSec,
+      fundingSignature: funding.signature ?? null,
+    });
+  }
+
+  /** Enhanced WSS push path for the parallel feePayer-funder wallet (no migration/handoff). */
+  private async applyParallelBundlerFunderNotificationTx(
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    const watchedWallet = state?.parallelFeePayerFunderWallet;
+    if (!state || !watchedWallet || this.positionSellTriggered) return;
+    if (state.discoveryStopped) return;
+    if (state.processedSignatures.has(tx.signature)) return;
+    if (
+      state.parallelFeePayerFunderFundedAtSec !== null &&
+      tx.timestamp < state.parallelFeePayerFunderFundedAtSec
+    ) {
+      return;
+    }
+    state.processedSignatures.add(tx.signature);
+    state.parallelFeePayerFunderCursorSignature = tx.signature;
+    try {
+      await this.inspectBundlerFunderTransaction(state, tx, watchedWallet);
+    } catch (err) {
+      this.log.warn("Failed to apply parallel feePayer-funder Enhanced WSS notification", {
+        mint: state.mint,
+        parallelFunder: watchedWallet,
+        sharedFeePayer: state.funderWallet,
+        signature: tx.signature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async syncParallelFeePayerFunderTransactions(force = false): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    const watchedWallet = state?.parallelFeePayerFunderWallet;
+    if (!state || !watchedWallet || this.positionSellTriggered) return;
+    if (state.discoveryStopped) return;
+    if (state.lowFundingMode) return;
+    if (this.hasReachedFunderRecipientBuyCap(state)) return;
+    if (this.isParallelFeePayerFunderSyncing) return;
+    if (
+      !force &&
+      Date.now() - this.lastParallelFeePayerFunderSyncAt <
+        BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    this.isParallelFeePayerFunderSyncing = true;
+    this.lastParallelFeePayerFunderSyncAt = Date.now();
+    const syncingWallet = watchedWallet;
+    try {
+      const txs = await this.withHeliusFallback((client) =>
+        client.getAddressTransactionsAsc(
+          syncingWallet,
+          state.parallelFeePayerFunderCursorSignature ?? undefined,
+          BUNDLER_FUNDER_SYNC_LIMIT,
+        ),
+      );
+      for (const tx of txs) {
+        if (state.parallelFeePayerFunderWallet !== syncingWallet) break;
+        if (this.hasReachedFunderRecipientBuyCap(state)) break;
+        if (state.processedSignatures.has(tx.signature)) continue;
+        if (
+          state.parallelFeePayerFunderFundedAtSec !== null &&
+          tx.timestamp < state.parallelFeePayerFunderFundedAtSec
+        ) {
+          continue;
+        }
+        state.processedSignatures.add(tx.signature);
+        state.parallelFeePayerFunderCursorSignature = tx.signature;
+        await this.inspectBundlerFunderTransaction(state, tx, syncingWallet);
+        if (state.discoveryStopped || !this.bundlerFunderWatch) break;
+      }
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Parallel feePayer-funder sync failed", {
+        mint: state.mint,
+        parallelFunder: watchedWallet,
+        sharedFeePayer: state.funderWallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.isParallelFeePayerFunderSyncing = false;
+    }
+  }
+
   private subscribeBundlerFunder(address: string): void {
-    if (this.bundlerFunderLogsSubId !== null || this.bundlerFunderEnhancedWatchId !== null) return;
+    if (this.isPrimaryBundlerFunderSubscribedTo(address)) {
+      return;
+    }
+    if (this.isParallelBundlerFunderSubscribedTo(address)) {
+      this.log.warn(
+        "subscribeBundlerFunder blocked — address is still on parallel watch; clear parallel first",
+        { address },
+      );
+      return;
+    }
+    if (this.isPrimaryBundlerFunderWatchActive()) {
+      this.log.warn(
+        "subscribeBundlerFunder skipped — primary watch already active on a different address",
+        {
+          activeAddress: this.bundlerFunderPrimaryWatchAddress,
+          requestedAddress: address,
+        },
+      );
+      return;
+    }
     if (this.enhancedWs) {
       this.bundlerFunderEnhancedWatchId = this.enhancedWs.watch(address, (tx) => {
         void this.applyBundlerFunderNotificationTx(tx);
       });
+      this.bundlerFunderPrimaryWatchAddress = address;
       this.log.info("Subscribed to shared bundler funder transactions via Enhanced WSS", {
         address,
       });
@@ -3229,6 +3602,7 @@ export class InsiderBot extends EventEmitter {
       },
       "processed",
     );
+    this.bundlerFunderPrimaryWatchAddress = address;
     this.log.info("Subscribed to shared bundler funder transactions (logs only — Enhanced WSS recommended)", {
       address,
       syncLimit: BUNDLER_FUNDER_SYNC_LIMIT,
@@ -3262,7 +3636,7 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async unsubscribeBundlerFunder(): Promise<void> {
+  private async unsubscribePrimaryBundlerFunder(): Promise<void> {
     if (this.bundlerFunderEnhancedWatchId !== null) {
       const id = this.bundlerFunderEnhancedWatchId;
       this.bundlerFunderEnhancedWatchId = null;
@@ -3273,6 +3647,12 @@ export class InsiderBot extends EventEmitter {
       this.bundlerFunderLogsSubId = null;
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
     }
+    this.bundlerFunderPrimaryWatchAddress = null;
+  }
+
+  private async unsubscribeBundlerFunder(): Promise<void> {
+    await this.unsubscribeParallelBundlerFunder();
+    await this.unsubscribePrimaryBundlerFunder();
   }
 
   private async switchBundlerFunderWatchAddress(
@@ -3282,7 +3662,13 @@ export class InsiderBot extends EventEmitter {
     reason: string,
   ): Promise<void> {
     if (nextWallet === state.funderWallet) return;
-    await this.unsubscribeBundlerFunder();
+    if (state.parallelFeePayerFunderWallet === nextWallet) {
+      await this.clearParallelFeePayerFunderWatch(
+        state,
+        "handoff target already watched as parallel feePayer funder",
+      );
+    }
+    await this.unsubscribePrimaryBundlerFunder();
     const previousWallet = state.funderWallet;
     state.funderWallet = nextWallet;
     state.migrationCount += 1;
@@ -3909,6 +4295,10 @@ export class InsiderBot extends EventEmitter {
     this.isBundlerFunderSyncing = false;
     this.bundlerFunderSyncPending = false;
     this.bundlerFunderSyncPendingForce = false;
+    this.isParallelFeePayerFunderSyncing = false;
+    this.lastParallelFeePayerFunderSyncAt = 0;
+    this.bundlerFunderPrimaryWatchAddress = null;
+    this.bundlerFunderParallelWatchAddress = null;
     this.dirtyFunderRecipients.clear();
     this.dirtyFunderRecipientSignatures.clear();
     this.isFunderRecipientBatchSyncing = false;
@@ -4206,17 +4596,32 @@ export class InsiderBot extends EventEmitter {
   private async inspectBundlerFunderTransaction(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
+    watchedWallet: string = state.funderWallet,
   ): Promise<boolean> {
     if (state.discoveryStopped) return false;
-    this.recordLowFundingFunderTx(state, tx);
+    const isPrimaryWatch = watchedWallet === state.funderWallet;
+    if (isPrimaryWatch) {
+      this.recordLowFundingFunderTx(state, tx);
+    }
     const transferOut = this.extractSolTransferOutFromWallet(
       tx,
-      state.funderWallet,
+      watchedWallet,
       0,
     );
     if (!transferOut) return false;
     if (transferOut.amountSol > BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL) {
-      const watchedWallet = state.funderWallet;
+      if (!isPrimaryWatch) {
+        this.log.debug("Skipping parallel feePayer-funder transfer-out above normal-mode max (no migration)", {
+          mint: state.mint,
+          parallelFunder: watchedWallet,
+          sharedFeePayer: state.funderWallet,
+          signature: tx.signature,
+          amountSol: transferOut.amountSol,
+          maxTransferOutSol: BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL,
+          recipient: transferOut.to,
+        });
+        return false;
+      }
       const migrated = await this.maybeMoveBundlerFunderWatchAfterLargeDrain(
         state,
         tx,
@@ -4235,14 +4640,15 @@ export class InsiderBot extends EventEmitter {
       return migrated;
     }
     if (state.lowFundingMode) {
-      if (this.hasSolIncomingToWallet(tx, state.funderWallet)) return false;
+      if (!isPrimaryWatch) return false;
+      if (this.hasSolIncomingToWallet(tx, watchedWallet)) return false;
       let transferOutUsd: number | null = null;
       const solPriceUsd = await this.getCachedSolPriceUsd();
       transferOutUsd = solPriceUsd !== null ? transferOut.amountSol * solPriceUsd : null;
       if (transferOutUsd === null) {
         this.log.warn("Skipping tiny recipient check because SOL/USD is unavailable", {
           mint: state.mint,
-          funderWallet: state.funderWallet,
+          funderWallet: watchedWallet,
           signature: tx.signature,
           amountSol: transferOut.amountSol,
           lowFundingMode: state.lowFundingMode,
@@ -4253,21 +4659,25 @@ export class InsiderBot extends EventEmitter {
       await this.handleLowFundingTinyTransferOut(state, tx, transferOut, transferOutUsd);
       return false;
     }
-    return this.handleNormalModeTinyTransferOut(state, tx, transferOut);
+    return this.handleNormalModeTinyTransferOut(state, tx, transferOut, watchedWallet);
   }
 
   private async handleNormalModeTinyTransferOut(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
     transferOut: { to: string; amountSol: number },
+    sourceWallet: string = state.funderWallet,
   ): Promise<boolean> {
+    const isParallelSource = sourceWallet !== state.funderWallet;
     const solPriceUsd = await this.getCachedSolPriceUsd();
     const transferOutUsd =
       solPriceUsd !== null ? transferOut.amountSol * solPriceUsd : null;
     if (transferOutUsd === null) {
       this.log.warn("Skipping tiny recipient check because SOL/USD is unavailable", {
         mint: state.mint,
-        funderWallet: state.funderWallet,
+        funderWallet: sourceWallet,
+        sharedFeePayer: state.funderWallet,
+        parallelFunder: isParallelSource,
         signature: tx.signature,
         amountSol: transferOut.amountSol,
         lowFundingMode: state.lowFundingMode,
@@ -4280,7 +4690,9 @@ export class InsiderBot extends EventEmitter {
     ) {
       this.log.debug("Skipping normal-mode feePayer transfer-out above tiny-recipient USD cap", {
         mint: state.mint,
-        funderWallet: state.funderWallet,
+        funderWallet: sourceWallet,
+        sharedFeePayer: state.funderWallet,
+        parallelFunder: isParallelSource,
         signature: tx.signature,
         amountSol: transferOut.amountSol,
         amountUsd: transferOutUsd,
@@ -4289,10 +4701,12 @@ export class InsiderBot extends EventEmitter {
       });
       return false;
     }
-    if (this.hasSolIncomingToWallet(tx, state.funderWallet)) {
+    if (this.hasSolIncomingToWallet(tx, sourceWallet)) {
       this.log.debug("Skipping funder transfer-out because same tx also has transfer-in", {
         mint: state.mint,
-        funderWallet: state.funderWallet,
+        funderWallet: sourceWallet,
+        sharedFeePayer: state.funderWallet,
+        parallelFunder: isParallelSource,
         signature: tx.signature,
         amountSol: transferOut.amountSol,
         recipient: transferOut.to,
@@ -4302,7 +4716,9 @@ export class InsiderBot extends EventEmitter {
     if (state.bundlerWallets.has(transferOut.to)) {
       this.log.info("Skipping feePayer transfer-out because recipient is one of the first-four bundlers", {
         mint: state.mint,
-        funderWallet: state.funderWallet,
+        funderWallet: sourceWallet,
+        sharedFeePayer: state.funderWallet,
+        parallelFunder: isParallelSource,
         signature: tx.signature,
         amountSol: transferOut.amountSol,
         recipient: transferOut.to,
@@ -4536,6 +4952,188 @@ export class InsiderBot extends EventEmitter {
     return false;
   }
 
+  private async maybeHandoffEmptyBundlerFunderAtStartupChain(
+    state: BundlerFunderWatchState,
+  ): Promise<number> {
+    let migrations = 0;
+    for (let attempt = 0; attempt < BUNDLER_FUNDER_STARTUP_HANDOFF_MAX_CHAIN; attempt += 1) {
+      const active = this.bundlerFunderWatch;
+      if (!active || active.mint !== state.mint) break;
+      const migrated = await this.maybeHandoffEmptyBundlerFunderAtStartup(active);
+      if (!migrated) break;
+      migrations += 1;
+    }
+    return migrations;
+  }
+
+  private async getBundlerFunderLiveBalanceSol(
+    wallet: string,
+  ): Promise<number | null> {
+    try {
+      const lamports = await this.connection.getBalance(new PublicKey(wallet));
+      return lamports / LAMPORTS_PER_SOL;
+    } catch (err) {
+      this.log.warn("Failed to fetch shared feePayer live SOL balance", {
+        wallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  private async isFunderWalletDrainedAfterTx(
+    wallet: string,
+    tx: HeliusTransaction,
+  ): Promise<boolean> {
+    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return false;
+    try {
+      let balance = await this.getConfirmedWalletBalanceAt(
+        wallet,
+        NATIVE_SOL_BALANCE_MINT,
+        tx.timestamp,
+      );
+      let balanceRaw = BigInt(balance.balanceRaw || "0");
+      if (balanceRaw !== 0n) {
+        const nextSecondBalance = await this.getConfirmedWalletBalanceAt(
+          wallet,
+          NATIVE_SOL_BALANCE_MINT,
+          tx.timestamp + 1,
+        );
+        balanceRaw = BigInt(nextSecondBalance.balanceRaw || "0");
+      }
+      return balanceRaw === 0n;
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Failed to confirm shared feePayer zero balance after transfer-out", {
+        wallet,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
+
+  private async maybeHandoffEmptyBundlerFunderAtStartup(
+    state: BundlerFunderWatchState,
+  ): Promise<boolean> {
+    const wallet = state.funderWallet;
+    const liveBalanceSol = await this.getBundlerFunderLiveBalanceSol(wallet);
+    if (liveBalanceSol === null) {
+      return false;
+    }
+    if (liveBalanceSol > ZERO_BALANCE_EPSILON_SOL) {
+      this.log.debug("Startup shared feePayer handoff not needed — wallet still holds SOL", {
+        mint: state.mint,
+        funderWallet: wallet,
+        liveBalanceSol,
+      });
+      return false;
+    }
+
+    this.log.warn(
+      "Shared feePayer live balance is zero at lock — searching for latest large drain to hand off",
+      {
+        mint: state.mint,
+        funderWallet: wallet,
+        originalFunderWallet: state.originalFunderWallet,
+        earliestFundingTimestamp: state.earliestFundingTimestamp,
+      },
+    );
+
+    let txs: HeliusTransaction[];
+    try {
+      txs = await this.withHeliusFallback((client) =>
+        client.getWalletTransactionsDesc(
+          wallet,
+          BUNDLER_FUNDER_STARTUP_HANDOFF_HISTORY_LIMIT,
+        ),
+      );
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Startup shared feePayer handoff failed — could not load recent txs", {
+        mint: state.mint,
+        funderWallet: wallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+
+    for (const tx of txs) {
+      if (
+        Number.isFinite(state.earliestFundingTimestamp) &&
+        tx.timestamp < state.earliestFundingTimestamp
+      ) {
+        continue;
+      }
+      const transferOut = this.extractSolTransferOutFromWallet(tx, wallet, 0);
+      if (
+        !transferOut ||
+        transferOut.amountSol <= BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL
+      ) {
+        continue;
+      }
+      if (!transferOut.to || transferOut.to === wallet) continue;
+      if (transferOut.to === state.originalFunderWallet) {
+        this.log.info(
+          "Startup shared feePayer handoff skipped — latest large drain returned to original feePayer",
+          {
+            mint: state.mint,
+            funderWallet: wallet,
+            originalFunderWallet: state.originalFunderWallet,
+            signature: tx.signature,
+            amountSol: transferOut.amountSol,
+            recipient: transferOut.to,
+          },
+        );
+        return false;
+      }
+
+      const drained = await this.isFunderWalletDrainedAfterTx(wallet, tx);
+      if (!drained) continue;
+
+      const recipientBalanceSol = await this.getBundlerFunderLiveBalanceSol(
+        transferOut.to,
+      );
+      if (
+        recipientBalanceSol === null ||
+        recipientBalanceSol <= ZERO_BALANCE_EPSILON_SOL
+      ) {
+        this.log.info(
+          "Startup shared feePayer handoff skipped — large-drain recipient is also at zero",
+          {
+            mint: state.mint,
+            funderWallet: wallet,
+            recipient: transferOut.to,
+            signature: tx.signature,
+            amountSol: transferOut.amountSol,
+          },
+        );
+        continue;
+      }
+
+      state.processedSignatures.add(tx.signature);
+      await this.switchBundlerFunderWatchAddress(
+        state,
+        transferOut.to,
+        tx.signature,
+        `Shared feePayer already at zero SOL at lock; handed off to latest ≥${BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL} SOL drain recipient.`,
+      );
+      return true;
+    }
+
+    this.log.warn(
+      "Shared feePayer at zero at lock but no qualifying large-drain handoff found",
+      {
+        mint: state.mint,
+        funderWallet: wallet,
+        scannedTxs: txs.length,
+        minDrainSol: BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL,
+      },
+    );
+    return false;
+  }
+
   private async maybeMoveBundlerFunderWatchAfterLargeDrain(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
@@ -4544,38 +5142,20 @@ export class InsiderBot extends EventEmitter {
     if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return false;
     if (!transferOut.to || transferOut.to === state.funderWallet) return false;
     try {
-      let balance = await this.getConfirmedWalletBalanceAt(
+      const drained = await this.isFunderWalletDrainedAfterTx(
         state.funderWallet,
-        NATIVE_SOL_BALANCE_MINT,
-        tx.timestamp,
+        tx,
       );
-      let balanceRaw = BigInt(balance.balanceRaw || "0");
-      let balanceTimestamp = tx.timestamp;
-      if (balanceRaw !== 0n) {
-        const nextSecondBalance = await this.getConfirmedWalletBalanceAt(
-          state.funderWallet,
-          NATIVE_SOL_BALANCE_MINT,
-          tx.timestamp + 1,
-        );
-        const nextSecondBalanceRaw = BigInt(nextSecondBalance.balanceRaw || "0");
-        if (nextSecondBalanceRaw === 0n) {
-          balance = nextSecondBalance;
-          balanceRaw = nextSecondBalanceRaw;
-          balanceTimestamp = tx.timestamp + 1;
-        }
-      }
       this.log.info("Checked shared feePayer balance after over-max transfer-out", {
         mint: state.mint,
         watchedWallet: state.funderWallet,
         recipient: transferOut.to,
         signature: tx.signature,
         timestamp: tx.timestamp,
-        balanceTimestamp,
         amountSol: transferOut.amountSol,
-        balance: balance.balance,
-        balanceRaw: balance.balanceRaw,
+        drained,
       });
-      if (balanceRaw !== 0n) return false;
+      if (!drained) return false;
 
       await this.switchBundlerFunderWatchAddress(
         state,

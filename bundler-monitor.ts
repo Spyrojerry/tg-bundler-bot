@@ -115,19 +115,13 @@ export class BundlerMonitor extends EventEmitter {
     super();
     this.config = config;
     this.heliusClient = heliusClient;
-    this.receiverHeliusClient = new HeliusClient(config.receiverHeliusApiKey || config.heliusApiKey);
+    this.receiverHeliusClient = new HeliusClient(config.heliusApiKey);
     this.connection = new Connection(config.solanaRpcUrl, {
       commitment: 'processed',
       wsEndpoint: config.solanaWsUrl,
     });
-    this.receiverConnection = new Connection(config.receiverSolanaRpcUrl, {
-      commitment: 'processed',
-      wsEndpoint: config.receiverSolanaWsUrl,
-    });
-    this.f1Connection = new Connection(config.f1SolanaRpcUrl, {
-      commitment: 'processed',
-      wsEndpoint: config.f1SolanaWsUrl,
-    });
+    this.receiverConnection = this.connection;
+    this.f1Connection = this.connection;
   }
 
   /**
@@ -305,7 +299,7 @@ export class BundlerMonitor extends EventEmitter {
       log.info('Creator vault F1 monitoring started', {
         creatorVaultAddress: this.creatorVaultAddress,
         mint: this.mint,
-        f1RpcUrl: this.config.f1SolanaRpcUrl,
+        f1RpcUrl: this.config.solanaRpcUrl,
       });
     } catch (err) {
       log.warn(`Failed to subscribe to creator vault ${this.creatorVaultAddress}`, err);
@@ -719,7 +713,7 @@ export class BundlerMonitor extends EventEmitter {
       signature,
       slot,
       timestamp,
-      receiverRpcUrl: this.config.receiverSolanaRpcUrl,
+      receiverRpcUrl: this.config.solanaRpcUrl,
     });
   }
  

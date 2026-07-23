@@ -133,24 +133,6 @@ export class GmgnClient {
       : null;
     this.baselineMinTime = config.rateLimitMinTime;
     this.fetchMode = config.gmgnFetchMode;
-
-    const jupPrivKey = process.env.JUPITER_PRIVATE_KEY;
-    if (jupPrivKey) {
-      try {
-        if (jupPrivKey.startsWith("[")) {
-          this.tradingKeypair = Keypair.fromSecretKey(
-            Uint8Array.from(JSON.parse(jupPrivKey)),
-          );
-        } else {
-          this.tradingKeypair = Keypair.fromSecretKey(bs58.decode(jupPrivKey));
-        }
-        log.info(
-          `Trading keypair loaded for ${this.tradingKeypair.publicKey.toBase58()}`,
-        );
-      } catch (err) {
-        log.error("Failed to load JUPITER_PRIVATE_KEY", err);
-      }
-    }
   }
 
   // ── Public: fetch Market Cap (Primary: GMGN API, Secondary: Jupiter + RPC) ──
@@ -995,7 +977,7 @@ export class GmgnClient {
         );
       }
 
-      log.warn("PumpPortal Lightning sell failed; trying direct backup sell", {
+      log.warn("PumpPortal Lightning sell failed", {
         mint,
         walletAddress,
         venue,
@@ -1003,14 +985,7 @@ export class GmgnClient {
           balanceAfterLightningFailure?.toString() ?? null,
         error: err instanceof Error ? err.message : String(err),
       });
-      return this.sellTokenForSolViaDirectBackup(
-        walletAddress,
-        mint,
-        options,
-        venue,
-        err,
-        balanceAfterLightningFailure ?? undefined,
-      );
+      throw err;
     }
   }
 

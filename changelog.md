@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-07-23 (80)
+
+### Follow-token: parallel feePayer-funder watch (≤6h)
+
+- When **follow-token** locks a shared feePayer in **normal mode**, Helius **funded-by** is checked.
+- If the feePayer was funded **within 6 hours**, the bot also subscribes to that **funder wallet** in parallel.
+- Parallel funder uses the same round-group / dust-race / recipient-watch logic as the primary feePayer (shared state).
+- Parallel wallet does **not** trigger **>100 SOL** migration/handoff — only the primary feePayer watch migrates.
+- **Shared FeePayer Locked** Telegram includes the parallel funder when active.
+- Primary and parallel watches dedupe by address: handoff to the parallel funder absorbs the parallel subscription instead of opening a second connection.
+
+## 2026-07-23 (79)
+
+### Insider: startup handoff when shared feePayer is already at zero SOL
+
+- On **Shared FeePayer Locked**, if live balance is **0**, scan recent feePayer txs (since earliest bundler funding) for the **latest transfer-out &gt; 100 SOL** that drained the wallet.
+- Hand off monitoring to that recipient automatically (same migration path as live large-drain), up to **5** chained hops if intermediates are also empty.
+- Skips handoff when the drain returned to the **original** feePayer or the recipient is also at zero.
+
 ## 2026-07-23 (78)
 
 ### Follow-token: reject 0 dev CREATE count again

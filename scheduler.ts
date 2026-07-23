@@ -22,6 +22,7 @@ import {
 const log = createLogger('SCHED');
 
 const SCHEDULER_TICK_MS = 500; // internal resolution — half the min interval
+const SCHEDULER_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_APPLY_SAMPLE = 20;
 
 // ── Scheduler ─────────────────────────────────────────────────────────────────
@@ -57,7 +58,7 @@ export class Scheduler extends EventEmitter {
     this.running = true;
     this.scheduleTick();
     log.info(
-      `Scheduler started — interval ${this.config.monitorInterval}ms, ` +
+      `Scheduler started — interval ${SCHEDULER_POLL_INTERVAL_MS}ms, ` +
       `sample-count driven summaries`
     );
   }
@@ -122,7 +123,7 @@ export class Scheduler extends EventEmitter {
   // ── Capacity advisory ─────────────────────────────────────────────────────
 
   get safeTokenCapacity(): number {
-    return Math.floor(this.config.monitorInterval / this.limiter.currentDelay);
+    return Math.floor(SCHEDULER_POLL_INTERVAL_MS / this.limiter.currentDelay);
   }
 
   private logCapacityWarning(): void {
@@ -154,7 +155,7 @@ export class Scheduler extends EventEmitter {
       // ── 2. Adaptive effective interval ────────────────────────────────────
       const activeEntries = [...this.entries.values()];
       const effectiveInterval = Math.max(
-        this.config.monitorInterval,
+        SCHEDULER_POLL_INTERVAL_MS,
         activeEntries.length * this.limiter.currentDelay
       );
 
