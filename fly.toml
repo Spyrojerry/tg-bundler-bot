@@ -1,28 +1,39 @@
-app = "gmgn-monitor"
-primary_region = "iad"
+# fly.toml app configuration file generated for tg-bundler-bot-q03nlw on 2026-07-23T21:07:09Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'tg-bundler-bot-q03nlw'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  DB_PATH = "/data/monitor.db"
-  PORT = "8080"
-  GMGN_FETCH_MODE = "cli"
-  LOG_LEVEL = "info"
+  DB_PATH = '/data/monitor.db'
+  GMGN_FETCH_MODE = 'cli'
+  LOG_LEVEL = 'info'
+  PORT = '8080'
 
-[mounts]
-  source = "gmgn_data"
-  destination = "/data"
+[[mounts]]
+  source = 'gmgn_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
   [[http_service.checks]]
-    interval = "15s"
-    timeout = "2s"
-    method = "GET"
-    path = "/health"
+    interval = '15s'
+    timeout = '2s'
+    method = 'GET'
+    path = '/health'
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
