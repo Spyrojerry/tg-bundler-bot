@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-07-23 (78)
+
+### Follow-token: reject 0 dev CREATE count again
+
+- Migrated tokens with **0** dev CREATE txs in Helius history are skipped again (no bundler fallback). Filter requires **exactly 1** create.
+
+## 2026-07-23 (77)
+
+### Normal mode: -50% stop-loss; +180% take profit for ~0.1–0.5 SOL rounds
+
+- Position stop-loss widened from **-40%** to **-50%** P/L vs entry MC.
+- Round groups **~0.1 SOL through ~0.5 SOL** use **+180% MC** take profit; **~0.02 / ~0.05 SOL** stay at **+90%**.
+- **$100 first-buy gate unchanged**: among the **first two unique round-group recipients**, buy only proceeds if at least one recipient’s first token buy exceeds **$100**.
+
+## 2026-07-23 (76)
+
+### Normal mode: expand round SOL sizes; tiered MC exit
+
+- Round group sizes: **~0.02 / ~0.05** (&lt; $10 cap) and **~0.1–0.5 SOL** in **0.05 steps** (USD-exempt, may exceed $10).
+- Exit bands: **+90% MC** for ~0.02 / ~0.05 SOL; **+180% MC** for ~0.1–0.5 SOL (see **2026-07-23 (77)** for stop-loss update).
+
 ## 2026-07-23 (75)
 
 ### Follow-token: resubscribe PumpPortal on skip/reset, not only after rug

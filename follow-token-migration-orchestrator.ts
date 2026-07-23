@@ -113,7 +113,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     void this.sendTelegram([
       '<b>▶️ Follow-Token: Pump Migration Listener Started</b>',
       'Source: <b>PumpPortal subscribeMigration</b>',
-      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created 0–1 tokens (Helius CREATE history; 0 requires valid first-four bundlers), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
+      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
       'PumpPortal migration feed unsubscribes while a follow-token bundler-funder flow is active; resubscribes when the token is skipped or reset (not after dev rug alone).',
     ]);
   }
@@ -275,17 +275,8 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         log.info('Follow-token migration skipped — first-four bundlers not ready', {
           mint,
           signature,
-          devCreateCount,
         });
         return;
-      }
-
-      if (devCreateCount === 0) {
-        log.info('Follow-token dev CREATE history empty — accepted via first-four bundler validation', {
-          mint,
-          signature,
-          devWallet,
-        });
       }
 
       if (this.config.insiderFollowTokenEnabled) {
@@ -371,8 +362,8 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
 
     const devCreateCount =
       await this.heliusClient.countDevCreatedTokenMints(devWallet);
-    if (devCreateCount > 1) {
-      return `dev created ${devCreateCount} tokens in Helius CREATE history (expected 0 or 1)`;
+    if (devCreateCount !== 1) {
+      return `dev created ${devCreateCount} tokens in Helius CREATE history (expected exactly 1)`;
     }
 
     const funding = await this.heliusClient.getWalletFundedBy(devWallet);

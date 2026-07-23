@@ -28,8 +28,8 @@ const REQUIRED_BUNDLER_MATCHES = 2;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
 const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
-/** Sell when position MC P/L falls to this % vs entry MC (e.g. -40 = 40% drawdown). */
-const INSIDER_STOP_LOSS_MC_PERCENT = -40;
+/** Sell when position MC P/L falls to this % vs entry MC (e.g. -50 = 50% drawdown). */
+const INSIDER_STOP_LOSS_MC_PERCENT = -50;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
 const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
@@ -58,9 +58,11 @@ const BUNDLER_FUNDER_LOW_FUNDING_TINY_COPYSELL_MIN_USD = 5;
 const BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1;
 const BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD = 10;
 /** Normal-mode round sizes subject to the &lt; $10 USD cap. */
-const BUNDLER_FUNDER_NORMAL_TINY_USD_CAPPED_ROUND_SOL_AMOUNTS = [0.02, 0.05, 0.1] as const;
+const BUNDLER_FUNDER_NORMAL_TINY_USD_CAPPED_ROUND_SOL_AMOUNTS = [0.02, 0.05] as const;
 /** Normal-mode round sizes allowed even when USD value exceeds $10. */
-const BUNDLER_FUNDER_NORMAL_TINY_USD_EXEMPT_ROUND_SOL_AMOUNTS = [0.15, 0.2] as const;
+const BUNDLER_FUNDER_NORMAL_TINY_USD_EXEMPT_ROUND_SOL_AMOUNTS = [
+  0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5,
+] as const;
 /** Normal-mode buy only on these exact round sizes (± tolerance) as same-amount 10s groups. */
 const BUNDLER_FUNDER_NORMAL_TINY_VALID_ROUND_SOL_AMOUNTS = [
   ...BUNDLER_FUNDER_NORMAL_TINY_USD_CAPPED_ROUND_SOL_AMOUNTS,
@@ -108,6 +110,8 @@ const BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_AMOUNTS_BY_BAND: Record<
 };
 const BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT = 90;
 const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT = 180;
+/** Round targets at or above this SOL use HIGH exit; smaller rounds use MID. */
+const BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_MIN_ROUND_SOL = 0.1;
 const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_SYNC_LIMIT = 20;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
@@ -5025,7 +5029,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   private getNormalTinyExitPercent(roundTargetSol: number): number {
-    if (roundTargetSol >= 0.1) {
+    if (roundTargetSol >= BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_MIN_ROUND_SOL) {
       return BUNDLER_FUNDER_NORMAL_TINY_HIGH_EXIT_PERCENT;
     }
     return BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT;
