@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-23 (81)
+
+### Follow-token: dev CREATE count 1–3
+
+- Follow-token migration filter accepts dev wallets with **1, 2, or 3** CREATE txs in Helius history (was exactly **1**). **0** or **4+** still rejected.
+
 ## 2026-07-23 (80)
 
 ### Follow-token: parallel feePayer-funder watch (≤6h)

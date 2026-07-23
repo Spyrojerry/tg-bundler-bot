@@ -27,6 +27,9 @@ const log = createLogger('FOLLOW-TOKEN');
 const PUMP_MINT_SUFFIX = 'pump';
 const DEFAULT_MAX_MIGRATION_AGE_SEC = 60;
 const REQUIRED_BUNDLER_COUNT = 4;
+/** Accepted dev CREATE history counts (Helius fee-payer CREATE txs). */
+const FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN = 1;
+const FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX = 3;
 /** Delays before retrying Helius when mint CREATE / early SWAP data is not indexed yet. */
 const HELIUS_INDEXING_RETRY_DELAYS_MS = [4_000, 8_000];
 
@@ -113,7 +116,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     void this.sendTelegram([
       '<b>▶️ Follow-Token: Pump Migration Listener Started</b>',
       'Source: <b>PumpPortal subscribeMigration</b>',
-      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
+      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created <b>${FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN}–${FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX}</b> tokens (Helius CREATE history), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
       'PumpPortal migration feed unsubscribes while a follow-token bundler-funder flow is active; resubscribes when the token is skipped or reset (not after dev rug alone).',
     ]);
   }
@@ -362,8 +365,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
 
     const devCreateCount =
       await this.heliusClient.countDevCreatedTokenMints(devWallet);
-    if (devCreateCount !== 1) {
-      return `dev created ${devCreateCount} tokens in Helius CREATE history (expected exactly 1)`;
+    if (
+      devCreateCount < FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN ||
+      devCreateCount > FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX
+    ) {
+      return `dev created ${devCreateCount} tokens in Helius CREATE history (expected ${FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN}–${FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX})`;
     }
 
     const funding = await this.heliusClient.getWalletFundedBy(devWallet);
