@@ -117,7 +117,7 @@ function findFollowTokenGmgnSecondBundlerGroup(
   groups: GmgnBundlerTimestampGroup[],
   initialBundlers: Set<string>,
   devCreateTimestampSec: number,
-  maxSecondGroupWallets: number,
+  minSecondGroupWallets: number,
   maxAgeSecFromCreate: number,
 ): GmgnBundlerTimestampGroup | null {
   const firstGroupIndex = groups.findIndex((group) =>
@@ -128,8 +128,7 @@ function findFollowTokenGmgnSecondBundlerGroup(
   const firstGroup = groups[firstGroupIndex]!;
   for (let index = firstGroupIndex + 1; index < groups.length; index += 1) {
     const group = groups[index]!;
-    if (group.wallets.length === 0) continue;
-    if (group.wallets.length > maxSecondGroupWallets) continue;
+    if (group.wallets.length < minSecondGroupWallets) continue;
     if (group.anchorTimestamp <= firstGroup.anchorTimestamp) continue;
     if (group.anchorTimestamp - devCreateTimestampSec > maxAgeSecFromCreate) {
       continue;
@@ -188,8 +187,8 @@ const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS = 2_000;
 const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC = 60;
 /** Follow-token buy trigger: cluster bundlers whose start_holding_at falls within this many seconds. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC = 2;
-/** Follow-token buy trigger: second bundler group must have at most this many wallets. */
-const FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MAX_WALLETS = 4;
+/** Follow-token buy trigger: second bundler group must have at least this many wallets. */
+const FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS = 4;
 /** Follow-token buy trigger: take-profit MC exit when second bundler group fires. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT =
   BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT;
@@ -3289,7 +3288,7 @@ export class InsiderBot extends EventEmitter {
       pollIntervalMs: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS,
       pollMaxAgeSec: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC,
       groupToleranceSec: FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC,
-      secondGroupMaxWallets: FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MAX_WALLETS,
+      secondGroupMinWallets: FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
       exitPercent: FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT,
     });
 
@@ -3410,7 +3409,7 @@ export class InsiderBot extends EventEmitter {
         groups,
         state.bundlerWallets,
         devCreateTimestamp,
-        FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MAX_WALLETS,
+        FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
         FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC,
       );
       if (!secondGroup) {
@@ -3512,7 +3511,7 @@ export class InsiderBot extends EventEmitter {
           `<b>🟢 ${this.label} Follow-Token GMGN Second Bundler Group Buy</b>`,
           `Token: <code>${state.mint}</code>`,
           `FeePayer: <code>${state.funderWallet}</code>`,
-          `Second group: <b>${secondGroup.wallets.length}</b> wallet(s) at <b>${secondGroup.anchorTimestamp}</b> (±${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC}s)`,
+          `Second group: <b>${secondGroup.wallets.length}</b> wallet(s) (≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}) at <b>${secondGroup.anchorTimestamp}</b> (±${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC}s)`,
           `Exit: <b>+${exitPercent}% MC</b> · Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b>`,
           "",
           walletLines,
@@ -3543,7 +3542,7 @@ export class InsiderBot extends EventEmitter {
           "<b>Follow-Token GMGN Second Bundler Group Buy Gate Passed</b>",
           `FeePayer: <code>${state.funderWallet}</code>`,
           `Second group timestamp: <b>${secondGroup.anchorTimestamp}</b> (±${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC}s)`,
-          `Second group wallets: <b>${secondGroup.wallets.length}</b> (max ${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MAX_WALLETS})`,
+          `Second group wallets: <b>${secondGroup.wallets.length}</b> (≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS})`,
           `Initial bundlers validated in first GMGN group: <b>${state.bundlerWallets.size}</b>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           `Exit target: <b>+${exitPercent}% MC</b>`,
