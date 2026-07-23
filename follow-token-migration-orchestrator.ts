@@ -13,6 +13,11 @@ import { TelegramBot } from './telegram-bot';
 import { isExchangeFundedBy } from './pump-migrate-detector';
 import { extractFirstUniqueEarlyBundlerBuys } from './wallet-swap-detector';
 import { PumpPortalWsClient } from './pump-portal-ws';
+import {
+  hasRequiredIpfsIoBafUri,
+  REQUIRED_IPFS_IO_BAF_URI_PREFIX,
+  TokenMetaplexMetadataClient,
+} from './token-metaplex-metadata';
 
 const log = createLogger('FOLLOW-TOKEN');
 
@@ -30,6 +35,7 @@ interface CoreMigrationFilterContext {
 
 export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private readonly heliusClient: HeliusClient;
+  private readonly metadataClient: TokenMetaplexMetadataClient;
   private readonly insiderBots: InsiderBot[];
   private readonly maxMigrationAgeSec: number;
   private pumpPortalWs: PumpPortalWsClient | null = null;
@@ -51,6 +57,12 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       label: 'Follow-Token Helius',
       projectId: config.insiderHeliusProjectId || undefined,
     });
+    const metadataRpcUrl =
+      config.insiderSolanaRpcUrl ||
+      (heliusKey
+        ? `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(heliusKey)}`
+        : config.solanaRpcUrl);
+    this.metadataClient = new TokenMetaplexMetadataClient(metadataRpcUrl);
     this.maxMigrationAgeSec =
       config.insiderFollowTokenMaxMigrationAgeSec > 0
         ? config.insiderFollowTokenMaxMigrationAgeSec
@@ -93,7 +105,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     void this.sendTelegram([
       '<b>▶️ Follow-Token: Pump Migration Listener Started</b>',
       'Source: <b>PumpPortal subscribeMigration</b>',
-      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
+      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
     ]);
   }
 
@@ -239,6 +251,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return 'mint does not end in pump';
     }
 
+    const metadataResult = await this.fetchMetadataUriWithRetry(mint);
+    if (!metadataResult.ok) {
+      return metadataResult.reason;
+    }
+
     const createTx = await this.fetchMintCreateTransactionWithRetry(mint);
     if (!createTx?.timestamp) {
       return 'mint create transaction not found';
@@ -268,6 +285,66 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     }
 
     return { devWallet, migrationAgeSec, funding };
+  }
+
+  private async fetchMetadataUriWithRetry(
+    mint: string,
+  ): Promise<
+    | { ok: true; uri: string; metadataUrl: string; metadataPda: string }
+    | { ok: false; reason: string; uri?: string; metadataUrl?: string }
+  > {
+    for (
+      let attempt = 0;
+      attempt <= HELIUS_INDEXING_RETRY_DELAYS_MS.length;
+      attempt += 1
+    ) {
+      const metadata = await this.metadataClient.fetchTokenMetadataUri(mint);
+      if (metadata) {
+        if (hasRequiredIpfsIoBafUri(metadata.metadataUrl)) {
+          if (attempt > 0) {
+            log.info('Token metadata URI found after indexing retry', {
+              mint,
+              attempt,
+              metadataPda: metadata.metadataPda,
+              metadataUrl: metadata.metadataUrl,
+            });
+          }
+          return {
+            ok: true,
+            uri: metadata.uri,
+            metadataUrl: metadata.metadataUrl,
+            metadataPda: metadata.metadataPda,
+          };
+        }
+
+        return {
+          ok: false,
+          reason: `metadata uri does not start with ${REQUIRED_IPFS_IO_BAF_URI_PREFIX} (${metadata.metadataUrl})`,
+          uri: metadata.uri,
+          metadataUrl: metadata.metadataUrl,
+        };
+      }
+
+      const delayMs = HELIUS_INDEXING_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined) break;
+
+      if (this.config.insiderFollowTokenVerboseLogs) {
+        log.info('Token metadata account not indexed yet — retrying', {
+          mint,
+          attempt: attempt + 1,
+          retryInMs: delayMs,
+        });
+      } else {
+        log.debug('Token metadata account not indexed yet — retrying', {
+          mint,
+          attempt: attempt + 1,
+          retryInMs: delayMs,
+        });
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+
+    return { ok: false, reason: 'token metadata account or uri not found' };
   }
 
   private async fetchMintCreateTransactionWithRetry(

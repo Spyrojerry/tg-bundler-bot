@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-23 (69)
+
+### Follow-token: Metaplex metadata URI filter (`https://ipfs.io/ipfs/baf…`)
+
+- New core filter after **mint ends in pump**: derive Metaplex metadata PDA, read URI via Helius RPC `getAccountInfo`, normalize to **ipfs.io**, require prefix **`https://ipfs.io/ipfs/baf`** before CREATE-tx / migrate-age checks.
+- Retries metadata lookup on indexing lag (4s / 8s) when the metadata account is missing; wrong URI prefix fails immediately.
+- Added **`token-metaplex-metadata.ts`** (PDA + on-chain decode — same flow as `findMetadataPda` + `fetchMetadata`, no extra npm deps).
+
 ## 2026-07-23 (68)
 
 ### Follow-token: retry Helius mint CREATE lookup on indexing lag

@@ -2616,7 +2616,7 @@ async function main(): Promise<void> {
         "<b>Follow-token steps</b>",
         "1. <b>Start Follow-Token</b> (or set <code>INSIDER_FOLLOW_TOKEN_ENABLED=true</code>).",
         "2. PumpPortal <b>subscribeMigration</b> via <code>PUMPPORTAL_API_KEY</code>.",
-        `3. Filters: mint ends <b>pump</b>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${config.insiderFollowTokenMaxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>.`,
+        `3. Filters: mint ends <b>pump</b>, metadata URI <code>https://ipfs.io/ipfs/baf…</code>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${config.insiderFollowTokenMaxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>.`,
         "4. First-four unique SWAP buys → same bundler-funder monitoring as follow-wallet.",
         "",
         "<b>Env auto-start flags</b>",
