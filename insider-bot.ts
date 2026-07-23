@@ -76,6 +76,69 @@ function formatNormalTinyRoundSolLabel(
   return amounts.map((amount) => `~${amount}`).join(" / ") + " SOL";
 }
 
+interface GmgnBundlerTraderSnapshot {
+  address: string;
+  startHoldingAt: number;
+}
+
+interface GmgnBundlerTimestampGroup {
+  anchorTimestamp: number;
+  wallets: string[];
+}
+
+function groupGmgnBundlersByStartHoldingAt(
+  entries: GmgnBundlerTraderSnapshot[],
+  toleranceSec: number,
+): GmgnBundlerTimestampGroup[] {
+  const sorted = [...entries].sort(
+    (left, right) => left.startHoldingAt - right.startHoldingAt,
+  );
+  const groups: GmgnBundlerTimestampGroup[] = [];
+  for (const entry of sorted) {
+    const current = groups[groups.length - 1];
+    if (
+      current &&
+      entry.startHoldingAt - current.anchorTimestamp <= toleranceSec
+    ) {
+      if (!current.wallets.includes(entry.address)) {
+        current.wallets.push(entry.address);
+      }
+      continue;
+    }
+    groups.push({
+      anchorTimestamp: entry.startHoldingAt,
+      wallets: [entry.address],
+    });
+  }
+  return groups;
+}
+
+function findFollowTokenGmgnSecondBundlerGroup(
+  groups: GmgnBundlerTimestampGroup[],
+  initialBundlers: Set<string>,
+  devCreateTimestampSec: number,
+  maxSecondGroupWallets: number,
+  maxAgeSecFromCreate: number,
+): GmgnBundlerTimestampGroup | null {
+  const firstGroupIndex = groups.findIndex((group) =>
+    [...initialBundlers].every((wallet) => group.wallets.includes(wallet)),
+  );
+  if (firstGroupIndex < 0) return null;
+
+  const firstGroup = groups[firstGroupIndex]!;
+  for (let index = firstGroupIndex + 1; index < groups.length; index += 1) {
+    const group = groups[index]!;
+    if (group.wallets.length === 0) continue;
+    if (group.wallets.length > maxSecondGroupWallets) continue;
+    if (group.anchorTimestamp <= firstGroup.anchorTimestamp) continue;
+    if (group.anchorTimestamp - devCreateTimestampSec > maxAgeSecFromCreate) {
+      continue;
+    }
+    return group;
+  }
+  return null;
+}
+
 function formatNormalTinyRoundSolWatchDescription(): string {
   const capped = formatNormalTinyRoundSolLabel(
     BUNDLER_FUNDER_NORMAL_TINY_USD_CAPPED_ROUND_SOL_AMOUNTS,
@@ -119,6 +182,17 @@ const BUNDLER_FUNDER_STARTUP_HANDOFF_MAX_CHAIN = 5;
 const ZERO_BALANCE_EPSILON_SOL = 1e-6;
 /** Follow-token: also watch the wallet that funded the shared feePayer if funded within this window. */
 const FOLLOW_TOKEN_FEEPAYER_FUNDER_MAX_AGE_SEC = 6 * 60 * 60;
+/** Follow-token buy trigger: poll GMGN bundler traders on this interval after shared feePayer lock. */
+const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS = 2_000;
+/** Follow-token buy trigger: stop GMGN polling this many seconds after token CREATE. */
+const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC = 60;
+/** Follow-token buy trigger: cluster bundlers whose start_holding_at falls within this many seconds. */
+const FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC = 2;
+/** Follow-token buy trigger: second bundler group must have at most this many wallets. */
+const FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MAX_WALLETS = 4;
+/** Follow-token buy trigger: take-profit MC exit when second bundler group fires. */
+const FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT =
+  BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT;
 const BUNDLER_FUNDER_SYNC_LIMIT = 20;
 const BUNDLER_FUNDER_SYNC_MIN_INTERVAL_MS = 1_000;
 const BUNDLER_FUNDER_MAX_RECIPIENT_WATCHES = 2;
@@ -300,6 +374,7 @@ export interface InsiderBot {
   isStoppedForHeliusCredits(): boolean;
   isRunning(): boolean;
   isFollowWalletMonitoringActive(): boolean;
+  isFollowWalletPaused(): boolean;
   pauseFollowWalletMonitoring(): Promise<void>;
   resumeFollowWalletMonitoring(): Promise<void>;
   isBuyInProgress(): boolean;
@@ -490,6 +565,8 @@ export class InsiderBot extends EventEmitter {
   private buyDisabled = false;
 
   private followMonitors = new Map<string, WalletMonitor>();
+  /** User paused follow-wallet via Telegram — blocks auto-resume after token flow reset/complete. */
+  private followWalletPaused = false;
   private followWalletTxNotifier: ((tx: HeliusTransaction) => void) | null = null;
   private watchingMint: string | null = null;
   private phase: FlowPhase | null = null;
@@ -542,6 +619,9 @@ export class InsiderBot extends EventEmitter {
   private pendingSignaturesBatch: string[] = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private followTokenGmgnBundlerPollTimer: ReturnType<typeof setInterval> | null =
+    null;
+  private followTokenGmgnBundlerPollInFlight = false;
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
   private bundlerFunderLogsSubId: number | null = null;
   private bundlerFunderParallelLogsSubId: number | null = null;
@@ -955,6 +1035,13 @@ export class InsiderBot extends EventEmitter {
     return this.flowFollowWallet ?? this.followedWallets[0] ?? null;
   }
 
+  /** Wallet label stored on buyTrigger/activePosition when no follow wallet is set (follow-token). */
+  private getBuyTriggerFollowedWallet(
+    state?: BundlerFunderWatchState | null,
+  ): string {
+    return this.getFlowFollowWallet() ?? state?.funderWallet ?? "follow-token";
+  }
+
   private formatFollowWalletTelegramLine(): string {
     const wallet = this.getFlowFollowWallet();
     if (!wallet || this.flowSource !== "follow") return "";
@@ -1327,7 +1414,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (this.followedWallets.includes(normalized)) {
-      if (!this.followMonitors.has(normalized)) {
+      if (!this.followMonitors.has(normalized) && !this.followWalletPaused) {
         await this.startFollowWalletMonitor(normalized);
       }
       return { ok: true };
@@ -1341,7 +1428,9 @@ export class InsiderBot extends EventEmitter {
     }
 
     this.followedWallets.push(normalized);
-    await this.startFollowWalletMonitor(normalized);
+    if (!this.followWalletPaused) {
+      await this.startFollowWalletMonitor(normalized);
+    }
     return { ok: true };
   }
 
@@ -1353,6 +1442,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   async followAllWallets(): Promise<void> {
+    if (this.followWalletPaused) return;
     for (const wallet of this.followedWallets) {
       if (!this.followMonitors.has(wallet)) {
         await this.startFollowWalletMonitor(wallet);
@@ -1428,7 +1518,12 @@ export class InsiderBot extends EventEmitter {
     return this.followMonitors.size > 0;
   }
 
+  isFollowWalletPaused(): boolean {
+    return this.followWalletPaused;
+  }
+
   async pauseFollowWalletMonitoring(): Promise<void> {
+    this.followWalletPaused = true;
     this.stopAllFollowMonitors();
     this.log.info('Follow-wallet monitoring paused', {
       followWallets: this.followedWallets,
@@ -1440,6 +1535,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   async resumeFollowWalletMonitoring(): Promise<void> {
+    this.followWalletPaused = false;
     await this.followAllWallets();
   }
 
@@ -2575,13 +2671,23 @@ export class InsiderBot extends EventEmitter {
         "",
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
-          : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
+          : this.flowSource === "follow-token"
+            ? `Follow-token buy trigger: GMGN bundler second-group poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s for ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC}s (+${FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT}% MC exit, ${INSIDER_STOP_LOSS_MC_PERCENT}% stop-loss). Round/dust gates disabled.`
+            : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
           : "",
       ].filter(Boolean).join("\n"),
       "shared feePayer notification",
     );
+
+    if (
+      this.flowSource === "follow-token" &&
+      !activeFunderWatch.lowFundingMode &&
+      !this.buySubmitted
+    ) {
+      this.startFollowTokenGmgnBundlerPoll(activeFunderWatch);
+    }
   }
 
   /**
@@ -3147,6 +3253,309 @@ export class InsiderBot extends EventEmitter {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
+    }
+    this.stopFollowTokenGmgnBundlerPoll("poll loop stopped");
+  }
+
+  private stopFollowTokenGmgnBundlerPoll(reason: string): void {
+    if (this.followTokenGmgnBundlerPollTimer) {
+      clearInterval(this.followTokenGmgnBundlerPollTimer);
+      this.followTokenGmgnBundlerPollTimer = null;
+    }
+    this.followTokenGmgnBundlerPollInFlight = false;
+    if (reason !== "poll loop stopped") {
+      this.log.debug("Follow-token GMGN bundler poll stopped", { reason });
+    }
+  }
+
+  private startFollowTokenGmgnBundlerPoll(state: BundlerFunderWatchState): void {
+    if (this.flowSource !== "follow-token") return;
+    if (state.lowFundingMode) return;
+    if (this.buySubmitted) return;
+
+    this.stopFollowTokenGmgnBundlerPoll("restarting poll");
+    const devCreateTimestamp = this.devCreateTimestamp;
+    if (!devCreateTimestamp) {
+      this.log.warn(
+        "Follow-token GMGN bundler poll skipped because dev CREATE timestamp is unavailable",
+        { mint: state.mint },
+      );
+      return;
+    }
+
+    this.log.info("Starting follow-token GMGN bundler second-group poll", {
+      mint: state.mint,
+      devCreateTimestamp,
+      pollIntervalMs: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS,
+      pollMaxAgeSec: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC,
+      groupToleranceSec: FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC,
+      secondGroupMaxWallets: FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MAX_WALLETS,
+      exitPercent: FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT,
+    });
+
+    void this.pollFollowTokenGmgnBundlerBuy();
+    this.followTokenGmgnBundlerPollTimer = setInterval(() => {
+      void this.pollFollowTokenGmgnBundlerBuy();
+    }, FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS);
+  }
+
+  private extractGmgnTraderList(data: unknown): unknown[] {
+    if (Array.isArray(data)) return data;
+    if (!data || typeof data !== "object") return [];
+
+    const record = data as Record<string, unknown>;
+    for (const key of ["list", "traders", "items"]) {
+      const candidate = record[key];
+      if (Array.isArray(candidate)) return candidate;
+    }
+
+    const nested = record.data;
+    if (Array.isArray(nested)) return nested;
+    if (nested && typeof nested === "object") {
+      const nestedRecord = nested as Record<string, unknown>;
+      for (const key of ["list", "traders", "items"]) {
+        const candidate = nestedRecord[key];
+        if (Array.isArray(candidate)) return candidate;
+      }
+    }
+    return [];
+  }
+
+  private extractGmgnBundlerTraderSnapshots(
+    data: unknown,
+  ): GmgnBundlerTraderSnapshot[] {
+    const snapshots: GmgnBundlerTraderSnapshot[] = [];
+    const seen = new Set<string>();
+    for (const rawEntry of this.extractGmgnTraderList(data)) {
+      if (!rawEntry || typeof rawEntry !== "object") continue;
+      const entry = rawEntry as Record<string, unknown>;
+      const address =
+        typeof entry.address === "string"
+          ? entry.address
+          : typeof entry.account_address === "string"
+            ? entry.account_address
+            : null;
+      const startHoldingAtRaw =
+        entry.start_holding_at ?? entry.startHoldingAt ?? null;
+      const startHoldingAt =
+        typeof startHoldingAtRaw === "number"
+          ? startHoldingAtRaw
+          : typeof startHoldingAtRaw === "string"
+            ? Number(startHoldingAtRaw)
+            : NaN;
+      if (!address || !Number.isFinite(startHoldingAt) || startHoldingAt <= 0) {
+        continue;
+      }
+      if (seen.has(address)) continue;
+      seen.add(address);
+      snapshots.push({ address, startHoldingAt });
+    }
+    return snapshots;
+  }
+
+  private async pollFollowTokenGmgnBundlerBuy(): Promise<void> {
+    if (this.followTokenGmgnBundlerPollInFlight) return;
+    const state = this.bundlerFunderWatch;
+    if (
+      !state ||
+      this.flowSource !== "follow-token" ||
+      state.lowFundingMode ||
+      this.phase !== "pre_buy" ||
+      this.buySubmitted ||
+      this.buyDisabled
+    ) {
+      this.stopFollowTokenGmgnBundlerPoll("flow no longer eligible");
+      return;
+    }
+
+    const devCreateTimestamp = this.devCreateTimestamp;
+    if (!devCreateTimestamp) {
+      this.stopFollowTokenGmgnBundlerPoll("dev CREATE timestamp unavailable");
+      return;
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (nowSec - devCreateTimestamp > FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC) {
+      this.stopFollowTokenGmgnBundlerPoll("poll window elapsed");
+      void this.sendTelegramSafe(
+        [
+          `<b>⏱️ ${this.label} Follow-Token GMGN Poll Ended</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `No second bundler group within <b>${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC}s</b> of CREATE.`,
+          "FeePayer watch continues; round/dust buy gates are disabled for follow-token.",
+        ].join("\n"),
+        "follow-token gmgn poll timeout notification",
+      );
+      return;
+    }
+
+    this.followTokenGmgnBundlerPollInFlight = true;
+    try {
+      const traders = await this.gmgnClient.fetchBundlerTraders(state.mint, 50);
+      const snapshots = this.extractGmgnBundlerTraderSnapshots(traders);
+      if (snapshots.length === 0) {
+        this.log.debug("Follow-token GMGN bundler poll returned no trader rows", {
+          mint: state.mint,
+          devCreateTimestamp,
+          elapsedSec: nowSec - devCreateTimestamp,
+        });
+        return;
+      }
+
+      const groups = groupGmgnBundlersByStartHoldingAt(
+        snapshots,
+        FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC,
+      );
+      const secondGroup = findFollowTokenGmgnSecondBundlerGroup(
+        groups,
+        state.bundlerWallets,
+        devCreateTimestamp,
+        FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MAX_WALLETS,
+        FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC,
+      );
+      if (!secondGroup) {
+        this.log.debug("Follow-token GMGN bundler poll waiting for second group", {
+          mint: state.mint,
+          devCreateTimestamp,
+          elapsedSec: nowSec - devCreateTimestamp,
+          groupCount: groups.length,
+          initialBundlerCount: state.bundlerWallets.size,
+        });
+        return;
+      }
+
+      await this.emitFollowTokenGmgnBundlerBuy(state, secondGroup, groups);
+    } catch (err) {
+      this.log.warn("Follow-token GMGN bundler poll failed", {
+        mint: state.mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.followTokenGmgnBundlerPollInFlight = false;
+    }
+  }
+
+  private async emitFollowTokenGmgnBundlerBuy(
+    state: BundlerFunderWatchState,
+    secondGroup: GmgnBundlerTimestampGroup,
+    allGroups: GmgnBundlerTimestampGroup[],
+  ): Promise<void> {
+    if (
+      this.buySubmitted ||
+      this.buyDisabled ||
+      this.isBuyExecuting ||
+      this.isBuyGateEvaluating
+    ) {
+      return;
+    }
+
+    this.isBuyGateEvaluating = true;
+    try {
+      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
+      if (currentMc === null) {
+        this.log.warn(
+          "Follow-token GMGN second bundler group found, but current market cap is unavailable; waiting before buy",
+          {
+            mint: state.mint,
+            secondGroupTimestamp: secondGroup.anchorTimestamp,
+            secondGroupWallets: secondGroup.wallets,
+          },
+        );
+        return;
+      }
+
+      this.recordObservedMarketCapUsd(currentMc);
+      if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
+        this.log.warn(
+          "Follow-token GMGN second bundler group found, but token is below rug threshold; resetting instead of buying",
+          {
+            mint: state.mint,
+            currentMc,
+            rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
+          },
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
+      if (this.isBelowInitialBundlerMarketCap(currentMc)) {
+        this.log.warn(
+          "Follow-token GMGN second bundler group found, but current market cap is below the token's initial bundler-buy MC; resetting instead of buying",
+          {
+            mint: state.mint,
+            currentMc,
+            initialBundlerMarketCapUsd: this.initialBundlerMarketCapUsd,
+          },
+        );
+        await this.resetForNewToken(true);
+        return;
+      }
+
+      const exitPercent = FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT;
+      const newExitMc = currentMc * (1 + exitPercent / 100);
+      this.setExitMc(newExitMc);
+      this.setEntryMc(currentMc);
+      this.setBuyExecuting(true);
+      this.buySubmitted = true;
+      this.preBuyStopped = true;
+      this.disableProfitExitAfterBuy = false;
+
+      const signature = `gmgn-bundler-group-${secondGroup.anchorTimestamp}`;
+      const walletLines = secondGroup.wallets
+        .map(
+          (wallet, index) =>
+            `${index + 1}. <code>${wallet}</code> — start_holding_at ${secondGroup.anchorTimestamp}`,
+        )
+        .join("\n");
+
+      void this.sendTelegramSafe(
+        [
+          `<b>🟢 ${this.label} Follow-Token GMGN Second Bundler Group Buy</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `FeePayer: <code>${state.funderWallet}</code>`,
+          `Second group: <b>${secondGroup.wallets.length}</b> wallet(s) at <b>${secondGroup.anchorTimestamp}</b> (±${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC}s)`,
+          `Exit: <b>+${exitPercent}% MC</b> · Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b>`,
+          "",
+          walletLines,
+        ].join("\n"),
+        "follow-token gmgn second bundler group buy notification",
+      );
+
+      this.log.warn("Follow-token GMGN second bundler group accepted for buy", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        secondGroupTimestamp: secondGroup.anchorTimestamp,
+        secondGroupWallets: secondGroup.wallets,
+        groupCount: allGroups.length,
+        currentMc,
+        exitPercent,
+        exitMc: newExitMc,
+      });
+
+      this.stopFollowTokenGmgnBundlerPoll("buy triggered");
+      this.emit("buyTrigger", {
+        followedWallet: this.getBuyTriggerFollowedWallet(state),
+        mint: state.mint,
+        signature,
+        buySol: this.getBuySolForFundingMode(state.lowFundingMode),
+        entryMc: currentMc,
+        monitoredWallet: secondGroup.wallets[0],
+        tradersListStr: [
+          "<b>Follow-Token GMGN Second Bundler Group Buy Gate Passed</b>",
+          `FeePayer: <code>${state.funderWallet}</code>`,
+          `Second group timestamp: <b>${secondGroup.anchorTimestamp}</b> (±${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC}s)`,
+          `Second group wallets: <b>${secondGroup.wallets.length}</b> (max ${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MAX_WALLETS})`,
+          `Initial bundlers validated in first GMGN group: <b>${state.bundlerWallets.size}</b>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          `Exit target: <b>+${exitPercent}% MC</b>`,
+          `Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b>`,
+          "",
+          ...secondGroup.wallets.map(
+            (wallet, index) => `${index + 1}. <code>${wallet}</code>`,
+          ),
+        ].join("\n"),
+      });
+    } finally {
+      this.isBuyGateEvaluating = false;
     }
   }
 
@@ -4668,6 +5077,9 @@ export class InsiderBot extends EventEmitter {
     transferOut: { to: string; amountSol: number },
     sourceWallet: string = state.funderWallet,
   ): Promise<boolean> {
+    if (this.flowSource === "follow-token") {
+      return false;
+    }
     const isParallelSource = sourceWallet !== state.funderWallet;
     const solPriceUsd = await this.getCachedSolPriceUsd();
     const transferOutUsd =
@@ -8004,6 +8416,27 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private async maybeAutoResumeFollowWalletMonitoring(source: string): Promise<void> {
+    if (this.followWalletPaused) {
+      this.followWalletBackend("Follow-wallet auto-resume skipped — user paused", {
+        bot: this.label,
+        source,
+        followWallets: this.followedWallets,
+      });
+      return;
+    }
+    if (this.followedWallets.length === 0 || this.followMonitors.size > 0) {
+      return;
+    }
+    this.log.info("InsiderBot resuming followed wallet monitoring", { source });
+    this.followWalletBackend("Follow-wallet flow ended; resuming wallet monitoring", {
+      bot: this.label,
+      source,
+      followWallets: this.followedWallets,
+    });
+    await this.followAllWallets();
+  }
+
   private async sendTelegramSafe(text: string, context: string): Promise<void> {
     if (!this.telegramBot) return;
     try {
@@ -8066,7 +8499,7 @@ export class InsiderBot extends EventEmitter {
     this.funderFirstFeePayer = null;
 
     if (this.followedWallets.length > 0 && this.followMonitors.size === 0) {
-      await this.followAllWallets();
+      await this.maybeAutoResumeFollowWalletMonitoring("cycle_complete");
     }
   }
 
@@ -8131,13 +8564,8 @@ export class InsiderBot extends EventEmitter {
     this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
 
-    this.log.info("InsiderBot reset; resuming followed wallet monitoring");
-    this.followWalletBackend("Follow-wallet flow reset; resuming wallet monitoring", {
-      bot: this.label,
-      followWallets: this.followedWallets,
-    });
     if (this.followedWallets.length > 0 && this.followMonitors.size === 0) {
-      await this.followAllWallets();
+      await this.maybeAutoResumeFollowWalletMonitoring("reset");
     }
   }
 }

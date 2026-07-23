@@ -510,13 +510,12 @@ async function main(): Promise<void> {
     if (wallets.length === 0) {
       return "No follow wallets configured.";
     }
-    for (const wallet of wallets) {
-      const result = await followInsiderWalletWithUsageGuard(
-        botIndex,
-        wallet,
-        source,
-      );
-      if (result !== true) return result;
+    try {
+      await bot.resumeFollowWalletMonitoring();
+    } catch (err) {
+      if (!isHeliusUsageExhaustionError(err)) throw err;
+      await stopInsiderForHeliusUsageExhaustion(botIndex, err, source);
+      return false;
     }
     if (config.insiderFollowWalletVerboseLogs) {
       followWalletLog.info("Follow-wallet monitoring resumed", {
@@ -1484,6 +1483,7 @@ async function main(): Promise<void> {
     if (!config.insiderFollowWalletEnabled) return;
     const bot = insiderBots[0];
     if (!bot) return;
+    if (bot.isFollowWalletPaused()) return;
     const wallets = bot.getFollowedWallets();
     if (
       wallets.length === 0 ||
@@ -2490,6 +2490,7 @@ async function main(): Promise<void> {
     }
 
     const followWalletMonitoringActive = bot.isFollowWalletMonitoringActive();
+    const followWalletExplicitlyPaused = bot.isFollowWalletPaused();
     const canResumeFollowWallet =
       followedWallets.length > 0 &&
       !followWalletMonitoringActive &&
@@ -2566,7 +2567,15 @@ async function main(): Promise<void> {
         "<b>Insider Bot</b>",
         "",
         `Status: <b>${status}</b>`,
-        `<b>Follow wallets</b> (max ${MAX_FOLLOW_WALLETS})${followWalletMonitoringActive ? " — <b>monitoring</b>" : followedWallets.length > 0 ? " — <b>paused</b>" : ""}:`,
+        `<b>Follow wallets</b> (max ${MAX_FOLLOW_WALLETS})${
+          followWalletMonitoringActive
+            ? " — <b>monitoring</b>"
+            : followedWallets.length > 0
+              ? followWalletExplicitlyPaused
+                ? " — <b>paused (manual)</b>"
+                : " — <b>idle</b>"
+              : ""
+        }:`,
         ...followWalletLines,
         monitoredWallet
           ? `Insider wallet: <code>${html(monitoredWallet)}</code>`

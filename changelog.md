@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-07-23 (83)
+
+### Follow-token: GMGN bundler second-group buy trigger
+
+- After **Shared FeePayer Locked**, follow-token normal mode polls GMGN bundler traders every **2s** for up to **60s** from token CREATE (`fetchBundlerTraders`, limit 50).
+- Bundlers are grouped by `start_holding_at` with **±2s** tolerance. The first group must include all **4** initial bundlers; a **second** group (1–4 wallets, still within the first minute from CREATE) triggers buy immediately and stops polling.
+- Round-group and cumulative-dust buy gates are **disabled** for follow-token (feePayer watch continues).
+- Buy exit: **+90% MC**; stop-loss remains **-50% P/L**.
+
+## 2026-07-23 (82)
+
+### Follow-wallet: respect manual pause across token flow resets
+
+- **Pause Follow-Wallet** now sets a persistent in-bot `followWalletPaused` flag.
+- Auto-resume after `resetForNewToken` / `completeFlowCycle` (follow-token skip, rug, sell complete, etc.) is skipped while paused.
+- **Resume Follow-Wallet** clears the flag; startup auto-resume also skips when paused.
+
 ## 2026-07-23 (81)
 
 ### Follow-token: dev CREATE count 1–3
