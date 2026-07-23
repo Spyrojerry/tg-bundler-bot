@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-07-23 (67)
+
+### Follow-token: verbose backend logs for every PumpPortal migration
+
+- New **`INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS`** (default **`true`**) — `[FOLLOW-TOKEN]` info logs for every migration received, evaluation start, duplicate skips, core filter failures (with reason), and bundler indexing retries.
+- When **`false`**, core/bundler skip details stay at **debug** (prior behavior); passes/failures at info/warn unchanged.
+
+## 2026-07-23 (66)
+
+### Follow-token: revert dev create count to Helius CREATE history
+
+- Restored **`HeliusClient.countDevCreatedTokenMints`** (dev fee-payer CREATE txs, first N results) for the “exactly 1 create” filter.
+- Removed Bitquery dependency from follow-token start — no **`BITQUERY_*`** env vars required.
+- Deleted **`bitquery-client.ts`**.
+
+## 2026-07-23 (65)
+
+### Follow-token: Bitquery OAuth client-credentials + startup auth check
+
+- **`BITQUERY_CLIENT_ID`** + **`BITQUERY_CLIENT_SECRET`** — auto-fetch/refresh V2 tokens from `https://oauth2.bitquery.io/oauth2/token` (avoids expired 12h IDE tokens on servers).
+- Follow-token **startup** runs **`verifyAuth()`** — fails immediately with a clear error if Bitquery returns 403, instead of failing on the first migration.
+- Bitquery HTTP GraphQL auth uses **`?token=ory_at_...`** on `https://streaming.bitquery.io/graphql` (same URL-token pattern as WSS); **`Authorization: Bearer`** is fallback only.
+- Strips accidental quotes/`Bearer` prefix from `BITQUERY_ACCESS_TOKEN`.
+
 ## 2026-07-23 (64)
 
 ### Follow-wallet: verbose backend logs for testing

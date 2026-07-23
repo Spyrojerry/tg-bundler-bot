@@ -13,7 +13,6 @@ import { TelegramBot } from './telegram-bot';
 import { isExchangeFundedBy } from './pump-migrate-detector';
 import { extractFirstUniqueEarlyBundlerBuys } from './wallet-swap-detector';
 import { PumpPortalWsClient } from './pump-portal-ws';
-import { BitqueryClient } from './bitquery-client';
 
 const log = createLogger('FOLLOW-TOKEN');
 
@@ -30,7 +29,6 @@ interface CoreMigrationFilterContext {
 
 export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private readonly heliusClient: HeliusClient;
-  private readonly bitqueryClient: BitqueryClient | null;
   private readonly insiderBots: InsiderBot[];
   private readonly maxMigrationAgeSec: number;
   private pumpPortalWs: PumpPortalWsClient | null = null;
@@ -52,9 +50,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       label: 'Follow-Token Helius',
       projectId: config.insiderHeliusProjectId || undefined,
     });
-    this.bitqueryClient = config.bitqueryAccessToken
-      ? new BitqueryClient(config.bitqueryAccessToken)
-      : null;
     this.maxMigrationAgeSec =
       config.insiderFollowTokenMaxMigrationAgeSec > 0
         ? config.insiderFollowTokenMaxMigrationAgeSec
@@ -70,9 +65,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     if (!this.config.pumpPortalApiKey) {
       throw new Error('Follow-token requires PUMPPORTAL_API_KEY in .env');
     }
-    if (!this.bitqueryClient) {
-      throw new Error('Follow-token requires BITQUERY_ACCESS_TOKEN in .env');
-    }
     this.pumpPortalWs?.close();
     this.pumpPortalWs = new PumpPortalWsClient(
       this.config.pumpPortalApiKey,
@@ -80,6 +72,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     );
     this.isEnabled = true;
     this.pumpPortalWs.onMigration((event) => {
+      this.logMigration('PumpPortal migration received', {
+        mint: event.mint,
+        signature: event.signature,
+        migrationTimestamp: event.timestamp,
+      });
       void this.processMigrationCandidate(
         event.mint,
         event.signature,
@@ -90,11 +87,12 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     log.info('Follow-token migration listener started', {
       source: 'PumpPortal subscribeMigration',
       maxMigrationAgeSec: this.maxMigrationAgeSec,
+      verboseLogs: this.config.insiderFollowTokenVerboseLogs,
     });
     void this.sendTelegram([
       '<b>▶️ Follow-Token: Pump Migration Listener Started</b>',
       'Source: <b>PumpPortal subscribeMigration</b>',
-      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, dev created exactly 1 Pump.fun token (Bitquery), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
+      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, dev created exactly 1 token (Helius CREATE history), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
     ]);
   }
 
@@ -114,16 +112,49 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.stop('Process shutdown');
   }
 
+  private logMigration(
+    message: string,
+    data: Record<string, unknown>,
+  ): void {
+    if (!this.config.insiderFollowTokenVerboseLogs) return;
+    log.info(message, data);
+  }
+
   private async processMigrationCandidate(
     mint: string,
     signature: string,
     migrationTimestamp: number,
   ): Promise<void> {
     if (!this.isEnabled) return;
-    if (this.seenMigrationSignatures.has(signature)) return;
+    if (this.seenMigrationSignatures.has(signature)) {
+      this.logMigration('Follow-token migration skipped — duplicate signature', {
+        mint,
+        signature,
+      });
+      return;
+    }
     this.seenMigrationSignatures.add(signature);
-    if (this.seenMigrationMints.has(mint) || this.inFlightMints.has(mint)) return;
+    if (this.seenMigrationMints.has(mint)) {
+      this.logMigration('Follow-token migration skipped — mint already processed', {
+        mint,
+        signature,
+      });
+      return;
+    }
+    if (this.inFlightMints.has(mint)) {
+      this.logMigration('Follow-token migration skipped — mint already in flight', {
+        mint,
+        signature,
+      });
+      return;
+    }
     this.inFlightMints.add(mint);
+
+    this.logMigration('Follow-token evaluating migration', {
+      mint,
+      signature,
+      migrationTimestamp,
+    });
 
     try {
       const coreResult = await this.evaluateCoreMigrationFilters(
@@ -132,9 +163,17 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       );
       if (typeof coreResult === 'string') {
         this.seenMigrationMints.add(mint);
-        log.debug('Follow-token migration skipped before core filters', {
-          skipReason: coreResult,
-        });
+        if (this.config.insiderFollowTokenVerboseLogs) {
+          log.info('Follow-token migration skipped — core filter', {
+            mint,
+            signature,
+            skipReason: coreResult,
+          });
+        } else {
+          log.debug('Follow-token migration skipped before core filters', {
+            skipReason: coreResult,
+          });
+        }
         return;
       }
 
@@ -217,9 +256,9 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     }
 
     const devCreateCount =
-      await this.bitqueryClient!.countPumpFunTokensCreatedByWallet(devWallet);
+      await this.heliusClient.countDevCreatedTokenMints(devWallet);
     if (devCreateCount !== 1) {
-      return `dev created ${devCreateCount} Pump.fun tokens (expected exactly 1)`;
+      return `dev created ${devCreateCount} tokens in Helius CREATE history (expected exactly 1)`;
     }
 
     const funding = await this.heliusClient.getWalletFundedBy(devWallet);
@@ -239,11 +278,19 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
           return true;
         }
       } catch (err) {
-        log.debug('First-four bundler fetch not ready yet', {
-          mint,
-          attempt,
-          error: err instanceof Error ? err.message : String(err),
-        });
+        if (this.config.insiderFollowTokenVerboseLogs) {
+          log.info('First-four bundler fetch not ready yet', {
+            mint,
+            attempt,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } else {
+          log.debug('First-four bundler fetch not ready yet', {
+            mint,
+            attempt,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
       const delayMs = BUNDLER_INDEXING_RETRY_DELAYS_MS[attempt];
       if (delayMs === undefined) break;

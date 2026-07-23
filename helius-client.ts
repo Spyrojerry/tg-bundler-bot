@@ -714,4 +714,32 @@ export class HeliusClient {
     }
     return (await response.json()) as HeliusWalletFundingSource;
   }
+
+  /** Count distinct mints the dev wallet created (CREATE txs as fee payer). */
+  async countDevCreatedTokenMints(devWallet: string, limit = 20): Promise<number> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'asc',
+      'api-key': this.apiKey,
+      limit: String(limit),
+      type: 'CREATE',
+    });
+    const url = `${this.baseUrl}/v0/addresses/${devWallet}/transactions?${params.toString()}`;
+
+    const response = await this.fetchWithCreditCheck(url);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+
+    const data = await response.json() as HeliusTransaction[];
+    const mints = new Set<string>();
+    for (const tx of data) {
+      if (tx.feePayer !== devWallet) continue;
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint) mints.add(transfer.mint);
+      }
+    }
+    return mints.size;
+  }
 }
