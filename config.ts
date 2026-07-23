@@ -155,6 +155,11 @@ export function loadConfig(): ServiceConfig {
   const insiderFeePayerFunderAddress = optionalNullable(
     'INSIDER_FEEPAYER_FUNDER_ADDRESS',
   );
+  const insiderFollowTokenEnabled = optionalBoolean('INSIDER_FOLLOW_TOKEN_ENABLED', false);
+  const insiderFollowTokenMaxMigrationAgeSec = optionalInt(
+    'INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC',
+    60,
+  );
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
@@ -265,6 +270,8 @@ export function loadConfig(): ServiceConfig {
     insiderFollowWallet3,
     insiderFollowWallet4,
     insiderFeePayerFunderAddress,
+    insiderFollowTokenEnabled,
+    insiderFollowTokenMaxMigrationAgeSec,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,

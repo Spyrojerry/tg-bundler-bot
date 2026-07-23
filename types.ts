@@ -187,6 +187,10 @@ export interface ServiceConfig {
   insiderFollowWallet4: string | null;
   /** Top-level feePayer funder wallet for the parallel funder-first discovery flow. */
   insiderFeePayerFunderAddress: string | null;
+  /** Enable follow-token Pump.fun migration listener on startup (still requires Start in Telegram unless auto-resumed). */
+  insiderFollowTokenEnabled: boolean;
+  /** Max seconds between token CREATE and migrate for follow-token filter (default 60). */
+  insiderFollowTokenMaxMigrationAgeSec: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;

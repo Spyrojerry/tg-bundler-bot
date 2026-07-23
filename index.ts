@@ -30,6 +30,7 @@ import {
   SellQuote,
 } from "./types";
 import { FunderFirstOrchestrator } from "./funder-first-orchestrator";
+import { FollowTokenMigrationOrchestrator } from "./follow-token-migration-orchestrator";
 import { InsiderBot, MAX_FOLLOW_WALLETS } from "./insider-bot";
 import type { InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
@@ -217,6 +218,7 @@ async function main(): Promise<void> {
 
   // ── 4. Orchestrators ──────────────────────────────────────────────────────
   let funderFirstOrchestrator: FunderFirstOrchestrator;
+  let followTokenOrchestrator: FollowTokenMigrationOrchestrator;
 
   const healthServer = startHealthServer(config.port);
   const walletMonitors = new Map<string, WalletMonitor>();
@@ -965,6 +967,21 @@ async function main(): Promise<void> {
           funderFirstOrchestrator.stop("Stopped from Telegram");
           return homeReply(true);
         }
+        if (data === "followtoken:start") {
+          try {
+            await followTokenOrchestrator.start();
+          } catch (err) {
+            return {
+              text: html(err instanceof Error ? err.message : String(err)),
+              editCurrent: true,
+            };
+          }
+          return homeReply(true);
+        }
+        if (data === "followtoken:stop") {
+          followTokenOrchestrator.stop("Stopped from Telegram");
+          return homeReply(true);
+        }
         if (data.startsWith("funderfirst:remove:")) {
           const address = data.slice("funderfirst:remove:".length);
           const result = funderFirstOrchestrator.removePotentialFeePayer(address);
@@ -1505,6 +1522,12 @@ async function main(): Promise<void> {
     0,
     telegramBot,
     sharedEnhancedWs,
+  );
+  followTokenOrchestrator = new FollowTokenMigrationOrchestrator(
+    config,
+    insiderBots,
+    sharedEnhancedWs,
+    telegramBot,
   );
   insiderBots[0]!.setFollowWalletTxNotifier((tx) => {
     funderFirstOrchestrator.handleMergedFollowWalletTx(tx);
@@ -2248,6 +2271,18 @@ async function main(): Promise<void> {
     return `Continued monitoring <code>${normalized}</code>`;
   }
 
+  async function startFollowTokenModeServices(): Promise<void> {
+    if (!config.insiderFollowTokenEnabled) return;
+    try {
+      await followTokenOrchestrator.start();
+      log.info("Follow-token migration listener auto-started from config");
+    } catch (err) {
+      log.warn("Follow-token migration listener failed to auto-start", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   async function startFunderFirstModeServices(): Promise<void> {
     if (!funderFirstOrchestrator.getFunderAddress()) return;
     try {
@@ -2435,6 +2470,7 @@ async function main(): Promise<void> {
     const monitoredWallet = bot.getMonitoredWallet();
     const funderAddress = funderFirstOrchestrator.getFunderAddress();
     const funderFirstRunning = funderFirstOrchestrator.isRunning();
+    const followTokenRunning = followTokenOrchestrator.isRunning();
     const watchedPotential = funderFirstOrchestrator.getWatchedPotentialFeePayers();
     const potentialLines =
       watchedPotential.length > 0
@@ -2447,6 +2483,13 @@ async function main(): Promise<void> {
     const funderFirstStartButton = funderFirstRunning
       ? null
       : { text: "Start Funder-First", callback_data: "funderfirst:start" };
+
+    const followTokenStartButton = followTokenRunning
+      ? null
+      : { text: "Start Follow-Token", callback_data: "followtoken:start" };
+    const followTokenStopButton = followTokenRunning
+      ? { text: "Stop Follow-Token", callback_data: "followtoken:stop" }
+      : null;
 
     const feePayerRemoveRows = watchedPotential.map((w, index) => [
       {
@@ -2479,6 +2522,7 @@ async function main(): Promise<void> {
           : "",
         `FeePayer funder: ${funderAddress ? `<code>${html(funderAddress)}</code>` : "<b>Not set</b>"}`,
         `Funder-first: <b>${funderFirstRunning ? "Running" : "Stopped"}</b>`,
+        `Follow-token (Pump migrate): <b>${followTokenRunning ? "Running" : "Stopped"}</b>`,
         "<b>Watched potential feePayers:</b>",
         ...potentialLines,
         `Default Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
@@ -2491,9 +2535,10 @@ async function main(): Promise<void> {
         "<b>Flows (run in parallel)</b>",
         "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
         "<b>B) Funder-first</b> — watch a feePayer funder; detect potential feePayers funding bundlers.",
+        "<b>C) Follow-token</b> — listen for Pump.fun migrate/migrate_v2; filter + first-four bundler logic → shared feePayer monitoring.",
         insiderBots.length > 1
-          ? `Parallel tokens: up to <b>${insiderBots.length}</b> insider bot key(s) — follow-wallet and funder-first can each hold a different token when a second key is free.`
-          : "Parallel tokens: configure <b>INSIDER_HELIUS_API_KEY_2</b> (+ GMGN/RPC/WS) to run follow-wallet and funder-first on two tokens at once.",
+          ? `Parallel tokens: up to <b>${insiderBots.length}</b> insider bot key(s) — follow-wallet, funder-first, and follow-token can each hold a different token when keys are free.`
+          : "Parallel tokens: configure <b>INSIDER_HELIUS_API_KEY_2</b> (+ GMGN/RPC/WS) to run multiple discovery flows on two tokens at once.",
         "",
         "<b>Follow-wallet steps</b>",
         `1. Bot 1 watches up to ${MAX_FOLLOW_WALLETS} follow wallets; Helius keys 1-4 are the fallback pool.`,
@@ -2507,6 +2552,12 @@ async function main(): Promise<void> {
         "3. Sub-5 SOL bundler sends are ignored (no alerts).",
         "4. FeePayer watch continues until SOL → zero; hand off to highest ≥100 SOL out since watch started — or latest ≥100 SOL out if a watched 4-in-10s group was seen — unless recipient is the feePayer funder (then stop only).",
         "• Rug: dev CLOSE_ACCOUNT, zero SOL, or MC &lt; $3k resumes feePayer watch after a trade.",
+        "",
+        "<b>Follow-token steps</b>",
+        "1. <b>Start Follow-Token</b> (or set <code>INSIDER_FOLLOW_TOKEN_ENABLED=true</code>).",
+        "2. Listen for Pump.fun <b>migrate / migrate_v2</b> via Enhanced WS.",
+        `3. Filters: mint ends <b>pump</b>, dev created exactly 1 token, migrate ≤ <b>${config.insiderFollowTokenMaxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b> (Helius funded-by).`,
+        "4. Must have four first unique SWAP buys → same bundler-funder monitoring as follow-wallet (no follow wallet required).",
       ].join("\n"),
       replyMarkup: {
         inline_keyboard: [
@@ -2519,6 +2570,8 @@ async function main(): Promise<void> {
             { text: "Fast-track feePayer", callback_data: "funderfirst:fasttrack" },
           ],
           ...(funderFirstStartButton ? [[funderFirstStartButton]] : []),
+          ...(followTokenStartButton ? [[followTokenStartButton]] : []),
+          ...(followTokenStopButton ? [[followTokenStopButton]] : []),
           ...feePayerRemoveRows,
           [
             { text: "Default Buy SOL", callback_data: "insider:buysol" },
@@ -2795,6 +2848,7 @@ async function main(): Promise<void> {
 
   // ── 6. Start active services ─────────────────────────────────────────────
   await startFunderFirstModeServices();
+  await startFollowTokenModeServices();
   await resumePrimaryInsiderBot();
 
   // Only now, with every orchestrator/bot fully wired up, do we start
@@ -2862,6 +2916,7 @@ async function main(): Promise<void> {
     healthServer.close();
 
     await funderFirstOrchestrator.shutdown();
+    await followTokenOrchestrator.shutdown();
     sharedEnhancedWs?.close();
 
     await Promise.all(

@@ -55,6 +55,10 @@ const RPC_ACK_TIMEOUT_MS = 15_000;
 
 type TxCallback = (tx: HeliusTransaction) => void;
 type MultiTxCallback = (matchedAddress: string, tx: HeliusTransaction) => void;
+type ParsedProgramCallback = (
+  tx: HeliusTransaction,
+  raw: RawEnhancedWsTransactionResult,
+) => void;
 
 interface Watch {
   localId: number;
@@ -63,6 +67,14 @@ interface Watch {
   addressSet: Set<string>;
   callback: TxCallback | MultiTxCallback;
   isMulti: boolean;
+  serverSubId: number | null;
+}
+
+interface ParsedProgramWatch {
+  localId: number;
+  programs: string[];
+  instructionNames: string[];
+  callback: ParsedProgramCallback;
   serverSubId: number | null;
 }
 
@@ -88,7 +100,8 @@ export class HeliusEnhancedWsClient {
   private nextLocalId = 1;
   private nextRpcId = 1;
   private readonly watches = new Map<number, Watch>();
-  private readonly watchesByServerSubId = new Map<number, Watch>();
+  private readonly parsedProgramWatches = new Map<number, ParsedProgramWatch>();
+  private readonly watchesByServerSubId = new Map<number, Watch | ParsedProgramWatch>();
   private readonly pendingRpc = new Map<number, PendingRpc>();
 
   constructor(apiKey: string, label = 'Helius Enhanced WS') {
@@ -134,6 +147,44 @@ export class HeliusEnhancedWsClient {
     this.watches.set(localId, watchEntry);
     if (this.connected && unique.length > 0) this.sendSubscribe(watchEntry);
     return localId;
+  }
+
+  /**
+   * Subscribes to parsed program instructions (Helius `parsedTransactionSubscribe`).
+   * Requires Developer plan. Callback receives normalized tx + raw payload.
+   */
+  watchParsedProgramInstructions(
+    programs: readonly string[],
+    instructionNames: readonly string[],
+    callback: ParsedProgramCallback,
+  ): number {
+    const localId = this.nextLocalId;
+    this.nextLocalId += 1;
+    const watchEntry: ParsedProgramWatch = {
+      localId,
+      programs: [...new Set(programs.filter(Boolean))],
+      instructionNames: [...new Set(instructionNames.filter(Boolean))],
+      callback,
+      serverSubId: null,
+    };
+    this.parsedProgramWatches.set(localId, watchEntry);
+    if (this.connected && watchEntry.programs.length > 0) {
+      this.sendParsedProgramSubscribe(watchEntry);
+    }
+    return localId;
+  }
+
+  /** Stops a `watchParsedProgramInstructions` subscription. */
+  async unwatchParsedProgramInstructions(localId: number): Promise<void> {
+    const watchEntry = this.parsedProgramWatches.get(localId);
+    if (!watchEntry) return;
+    this.parsedProgramWatches.delete(localId);
+    if (watchEntry.serverSubId !== null) {
+      this.watchesByServerSubId.delete(watchEntry.serverSubId);
+      if (this.connected) {
+        await this.sendUnsubscribe(watchEntry.serverSubId).catch(() => undefined);
+      }
+    }
   }
 
   /** Replaces the address set on an existing `watchMulti` subscription. */
@@ -238,6 +289,9 @@ export class HeliusEnhancedWsClient {
       }
       this.failAllPendingRpc(new Error('WebSocket closed'));
       for (const watchEntry of this.watches.values()) watchEntry.serverSubId = null;
+      for (const watchEntry of this.parsedProgramWatches.values()) {
+        watchEntry.serverSubId = null;
+      }
       this.watchesByServerSubId.clear();
       if (!this.closedByUser) {
         this.log.warn('Helius Enhanced WebSocket closed, will reconnect', {
@@ -287,6 +341,41 @@ export class HeliusEnhancedWsClient {
         this.sendSubscribe(watchEntry);
       }
     }
+    for (const watchEntry of this.parsedProgramWatches.values()) {
+      if (watchEntry.programs.length > 0) {
+        this.sendParsedProgramSubscribe(watchEntry);
+      }
+    }
+  }
+
+  private sendParsedProgramSubscribe(watchEntry: ParsedProgramWatch): void {
+    if (watchEntry.programs.length === 0) return;
+    const rpcId = this.nextRpcId;
+    this.nextRpcId += 1;
+    const request = {
+      jsonrpc: '2.0',
+      id: rpcId,
+      method: 'parsedTransactionSubscribe',
+      params: [
+        {
+          programs: watchEntry.programs,
+          instructionNames: watchEntry.instructionNames,
+          includeFailed: false,
+          includeCpi: false,
+        },
+        {
+          commitment: 'confirmed',
+          details: 'full',
+        },
+      ],
+    };
+    this.sendRpc(rpcId, request, 'subscribe', watchEntry.localId).catch((err) => {
+      this.log.warn('parsedTransactionSubscribe failed', {
+        programs: watchEntry.programs,
+        instructionNames: watchEntry.instructionNames,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   private sendSubscribe(watchEntry: Watch): void {
@@ -409,7 +498,9 @@ export class HeliusEnhancedWsClient {
         return;
       }
       if (pending.kind === 'subscribe') {
-        const watchEntry = this.watches.get(pending.localId);
+        const watchEntry =
+          this.watches.get(pending.localId) ??
+          this.parsedProgramWatches.get(pending.localId);
         if (watchEntry && typeof parsed.result === 'number') {
           watchEntry.serverSubId = parsed.result;
           this.watchesByServerSubId.set(parsed.result, watchEntry);
@@ -424,7 +515,7 @@ export class HeliusEnhancedWsClient {
       const result: RawEnhancedWsTransactionResult | undefined = parsed.params?.result;
       if (typeof subscription !== 'number' || !result) return;
       const watchEntry = this.watchesByServerSubId.get(subscription);
-      if (!watchEntry) return;
+      if (!watchEntry || !('addresses' in watchEntry)) return;
       const tx = normalizeEnhancedWsTransaction(result);
       if (!tx) return;
       try {
@@ -439,6 +530,25 @@ export class HeliusEnhancedWsClient {
       } catch (err) {
         this.log.error('transactionSubscribe callback threw', {
           addresses: watchEntry.addresses,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return;
+    }
+
+    if (parsed.method === 'parsedTransactionNotification') {
+      const subscription = parsed.params?.subscription;
+      const result: RawEnhancedWsTransactionResult | undefined = parsed.params?.result;
+      if (typeof subscription !== 'number' || !result) return;
+      const watchEntry = this.watchesByServerSubId.get(subscription);
+      if (!watchEntry || !('programs' in watchEntry)) return;
+      const tx = normalizeEnhancedWsTransaction(result);
+      if (!tx) return;
+      try {
+        watchEntry.callback(tx, result);
+      } catch (err) {
+        this.log.error('parsedTransactionSubscribe callback threw', {
+          programs: watchEntry.programs,
           error: err instanceof Error ? err.message : String(err),
         });
       }

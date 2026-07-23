@@ -456,8 +456,8 @@ export class InsiderBot extends EventEmitter {
         followedWallet: string,
       ) => Promise<boolean>)
     | null = null;
-  /** Whether the current/previous token flow was started from follow-wallet backtrack or funder-first discovery. */
-  private flowSource: "follow" | "funder-first" | null = null;
+  /** Whether the current/previous token flow was started from follow-wallet backtrack, funder-first discovery, or follow-token migration. */
+  private flowSource: "follow" | "funder-first" | "follow-token" | null = null;
   /** FeePayer locked for the active funder-first flow — emitted on tokenFlowEnded so the orchestrator can cooldown/resume. */
   private funderFirstFeePayer: string | null = null;
   private buySol: number;
@@ -1041,6 +1041,81 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  /**
+   * Starts a follow-token flow from a Pump.fun migration event (no follow wallet).
+   */
+  async startFromFollowTokenMigration(
+    mint: string,
+    migrationSignature: string,
+  ): Promise<boolean> {
+    if (this.boughtMints.has(mint)) return false;
+    if (!this.isIdleForFunderFirst()) return false;
+    if (this.claimMint && !this.claimMint(mint)) {
+      this.log.info("Follow-token migration delegated but mint is claimed by another bot", {
+        mint,
+        migrationSignature,
+      });
+      return false;
+    }
+
+    this.flowFollowWallet = null;
+    this.boughtMints.add(mint);
+    this.watchingMint = mint;
+    this.claimedMint = mint;
+    this.emit("mintSeen", mint);
+
+    try {
+      const migrationMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
+      if (
+        migrationMc !== null &&
+        migrationMc > MAX_FOLLOW_WALLET_START_MARKET_CAP_USD
+      ) {
+        this.log.warn(
+          "Follow-token migration MC above monitoring ceiling; skipping token",
+          {
+            mint,
+            migrationSignature,
+            migrationMc,
+            maxFollowWalletStartMarketCapUsd:
+              MAX_FOLLOW_WALLET_START_MARKET_CAP_USD,
+          },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
+            `Token: <code>${mint}</code>`,
+            `Migration MC: <b>$${migrationMc.toLocaleString()}</b>`,
+            `Monitoring ceiling: <b>$${MAX_FOLLOW_WALLET_START_MARKET_CAP_USD.toLocaleString()}</b>`,
+            "Flow reset — waiting for the next migration.",
+          ].join("\n"),
+          "follow-token high-MC skip notification",
+        );
+        await this.resetForNewToken(true);
+        return false;
+      }
+      this.initialBundlerMarketCapUsd = migrationMc;
+      await this.startInsiderFlowFromMigrationWithIndexingLagRetry(
+        mint,
+        migrationSignature,
+      );
+      return true;
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.releaseMint?.(mint);
+      if (err instanceof InsiderMinBuySolFilterError) {
+        this.log.info("Follow-token flow skipped by min-buy SOL filter; resetting", {
+          mint,
+          reason: err.message,
+        });
+      } else {
+        this.log.error("Failed to start follow-token flow; resetting", err);
+        this.emit("error", err instanceof Error ? err : new Error(String(err)));
+      }
+      await this.resetForNewToken(true);
+      return false;
+    }
+  }
+
   setFollowWalletTxNotifier(
     notifier: ((tx: HeliusTransaction) => void) | null,
   ): void {
@@ -1509,6 +1584,103 @@ export class InsiderBot extends EventEmitter {
         await this.delay(delayMs);
       }
     }
+  }
+
+  private async startInsiderFlowFromMigrationWithIndexingLagRetry(
+    mint: string,
+    migrationSignature: string,
+  ): Promise<void> {
+    const delaysMs = [0, 4_000, 8_000];
+    for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
+      const delayMs = delaysMs[attempt] ?? 0;
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      try {
+        await this.startInsiderFlowFromMigration(mint, migrationSignature);
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const retryable =
+          message.includes("No SWAP transactions found") ||
+          message.includes("Failed to fetch early insider swaps");
+        if (!retryable || attempt === delaysMs.length - 1) {
+          throw err;
+        }
+        this.log.warn("Follow-token insider flow waiting for Helius indexing", {
+          mint,
+          migrationSignature,
+          attempt: attempt + 1,
+          error: message,
+        });
+      }
+    }
+  }
+
+  private async startInsiderFlowFromMigration(
+    mint: string,
+    migrationSignature: string,
+  ): Promise<void> {
+    this.flowSource = "follow-token";
+    this.flowFollowWallet = null;
+    this.funderFirstFeePayer = null;
+    this.resetHeliusPoolMetricsForMint(mint);
+    this.resetTokenTxCounts();
+    this.insiderSellsReady = false;
+    this.bundlerMatchesReady = false;
+    this.highestObservedMarketCapUsd = null;
+    this.clearBundlerAccumulation();
+
+    const swaps = await this.withHeliusFallback((client) =>
+      client.getEarlyInsiderSwaps(mint, 4),
+    );
+    const earlyInsiderBuys = this.extractFirstUniqueEarlyBundlerBuys(
+      swaps,
+      mint,
+    );
+    const earlyBundlerWallets = this.extractEarlyInsiderWallets(earlyInsiderBuys);
+    this.initialInsiderWallets.clear();
+    for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
+
+    if (earlyBundlerWallets.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
+      this.log.warn(
+        "Follow-token migration has fewer than four first unique bundler buys; resetting",
+        {
+          mint,
+          migrationSignature,
+          earlyBundlerCount: earlyBundlerWallets.length,
+        },
+      );
+      await this.resetForNewToken(true);
+      return;
+    }
+
+    if (
+      await this.trySkipLowFundingDisabledFromEarlyBuys(mint, earlyInsiderBuys)
+    ) {
+      return;
+    }
+
+    this.preBuyStopped = false;
+    this.positionSellTriggered = false;
+    this.monitoredWallet = null;
+    this.insiderState = null;
+    this.phase = "pre_buy";
+
+    void this.sendTelegramSafe(
+      [
+        `<b>🔍 ${this.label} Follow-Token Bundler-Funder Flow Started</b>`,
+        `Token: <code>${mint}</code>`,
+        `Migration tx: <code>${migrationSignature}</code>`,
+        `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
+        "",
+        "Finding each bundler's zero-balance funding window, selecting the latest valid funding transfer in that window, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs for recipient buy confirmation.",
+      ].join("\n"),
+      "follow-token flow-start notification",
+    );
+
+    this.startPollLoop();
+    await this.startBundlerFunderFlow(mint, earlyInsiderBuys);
   }
 
   private async startInsiderFlow(

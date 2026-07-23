@@ -116,6 +116,16 @@ export interface HeliusWalletIdentity {
   website?: string;
 }
 
+/** First incoming SOL transfer that funded a wallet (Helius Wallet API). */
+export interface HeliusWalletFundingSource {
+  funder: string;
+  funderName?: string | null;
+  funderType?: string | null;
+  amount?: number;
+  signature?: string;
+  timestamp?: number;
+}
+
 interface HeliusClientOptions {
   projectId?: string;
   label?: string;
@@ -685,5 +695,51 @@ export class HeliusClient {
     }
 
     return undefined;
+  }
+
+  /**
+   * Returns the wallet that originally funded `wallet` (first incoming SOL).
+   * Requires a paid Helius plan — returns null on 404.
+   */
+  async getWalletFundedBy(wallet: string): Promise<HeliusWalletFundingSource | null> {
+    const url = `https://api.helius.xyz/v1/wallet/${wallet}/funded-by?api-key=${this.apiKey}`;
+
+    const response = await this.fetchWithCreditCheck(url);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `Helius wallet funded-by API error: ${response.status} ${response.statusText} - ${text}`,
+      );
+    }
+    return (await response.json()) as HeliusWalletFundingSource;
+  }
+
+  /** Count distinct mints the dev wallet created (CREATE txs as fee payer). */
+  async countDevCreatedTokenMints(devWallet: string, limit = 20): Promise<number> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'asc',
+      'api-key': this.apiKey,
+      limit: String(limit),
+      type: 'CREATE',
+    });
+    const url = `${this.baseUrl}/v0/addresses/${devWallet}/transactions?${params.toString()}`;
+
+    const response = await this.fetchWithCreditCheck(url);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+
+    const data = await response.json() as HeliusTransaction[];
+    const mints = new Set<string>();
+    for (const tx of data) {
+      if (tx.feePayer !== devWallet) continue;
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint) mints.add(transfer.mint);
+      }
+    }
+    return mints.size;
   }
 }

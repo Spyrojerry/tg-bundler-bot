@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-07-23 (60)
+
+### Follow-token: funded-by requires `Centralized Exchange`
+
+- Dev funder filter now requires Helius funded-by `funderType` **`Centralized Exchange`** (case-insensitive), matching the Wallet API response (e.g. Bybit Hot Wallet). Removed legacy `exchange` / name-heuristic fallback.
+
+## 2026-07-23 (59)
+
+### Follow-token: tiered logging and Telegram gates
+
+- **Backend info logs** include the token only after core migration filters pass (pump suffix, dev single create, migrate age, exchange funder). Earlier skips are **debug-only** without mint spam.
+- **Telegram** token alerts (filters passed, handoff delayed/skipped) fire only after **first-four bundlers** confirm and only when **`INSIDER_FOLLOW_TOKEN_ENABLED=true`**. Start/stop listener TG unchanged.
+
+## 2026-07-23 (58)
+
+### Follow-token: Pump.fun migration listener
+
+- New **follow-token** flow listens for Pump.fun **`migrate` / `migrate_v2`** on program `6EF8…` via Helius **`parsedTransactionSubscribe`**.
+- Migration filters: mint ends **`pump`**, dev created **exactly 1** token, migrate within **`INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC`** (default 60s) of create, dev **funded by Centralized Exchange** (Helius `/v1/wallet/{wallet}/funded-by`, `funderType=Centralized Exchange`).
+- After filters pass, validates **first-four unique SWAP buys** and starts the same **bundler-funder monitoring** as follow-wallet (`startFromFollowTokenMigration` — no follow wallet required).
+- Telegram: **Start / Stop Follow-Token**; optional auto-start via `INSIDER_FOLLOW_TOKEN_ENABLED=true`.
+- Added `getWalletFundedBy`, `countDevCreatedTokenMints` on `HeliusClient`; `pump-migrate-detector.ts`; `FollowTokenMigrationOrchestrator`.
+
 ## 2026-07-23 (57)
 
 ### Funder-first: handoff Telegram shows only the confirmed group events
