@@ -1560,6 +1560,11 @@ async function main(): Promise<void> {
     insiderBots,
     telegramBot,
   );
+  insiderBots.forEach((bot) => {
+    bot.setFollowTokenMigrationSuspendDelegate((mint) => {
+      followTokenOrchestrator.suspendMigrationFeedForActiveFlow(mint);
+    });
+  });
   insiderBots[0]!.setFollowWalletTxNotifier((tx) => {
     funderFirstOrchestrator.handleMergedFollowWalletTx(tx);
   });
@@ -2046,6 +2051,13 @@ async function main(): Promise<void> {
         if (await bot.tryTriggerStopLossSell(currentMc)) {
           log.warn(
             `[INSIDER ${botNumber} STOP-LOSS] Current MC $${currentMc.toLocaleString()} hit ${bot.getStopLossMcPercent()}% P/L floor for ${activePos.mint}. Triggering SELL.`,
+          );
+          return;
+        }
+
+        if (await bot.tryTriggerFollowTokenTopBuyerFullExitSell()) {
+          log.warn(
+            `[INSIDER ${botNumber} FOLLOW-TOKEN TOP BUYER EXIT] Top buyer fully exited for ${activePos.mint}. Triggering SELL.`,
           );
           return;
         }
@@ -2866,7 +2878,7 @@ async function main(): Promise<void> {
       // Cleanup cache
       activePositionCache.delete(pending.event.mint);
       if (pending.event.insiderBotIndex !== undefined) {
-        insiderBots[pending.event.insiderBotIndex]?.clearActivePosition();
+        insiderBots[pending.event.insiderBotIndex]?.clearActivePositionAfterSuccessfulSell();
       }
 
       const receiptResult = lastResult;

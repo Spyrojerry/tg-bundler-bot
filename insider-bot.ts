@@ -79,11 +79,30 @@ function formatNormalTinyRoundSolLabel(
 interface GmgnBundlerTraderSnapshot {
   address: string;
   startHoldingAt: number;
+  buyVolumeCur: number;
+  buyAmountCur: number;
 }
 
 interface GmgnBundlerTimestampGroup {
   anchorTimestamp: number;
   wallets: string[];
+}
+
+function pickFollowTokenTopBuyerWallet(
+  wallets: string[],
+  snapshots: GmgnBundlerTraderSnapshot[],
+): string | null {
+  let bestWallet: string | null = null;
+  let bestScore = -1;
+  for (const wallet of wallets) {
+    const snapshot = snapshots.find((entry) => entry.address === wallet);
+    const score = snapshot?.buyVolumeCur ?? snapshot?.buyAmountCur ?? 0;
+    if (score > bestScore) {
+      bestScore = score;
+      bestWallet = wallet;
+    }
+  }
+  return bestWallet ?? wallets[0] ?? null;
 }
 
 function groupGmgnBundlersByStartHoldingAt(
@@ -113,23 +132,33 @@ function groupGmgnBundlersByStartHoldingAt(
   return groups;
 }
 
-function findFollowTokenGmgnSecondBundlerGroup(
+function findFollowTokenGmgnInitialBundlerGroup(
   groups: GmgnBundlerTimestampGroup[],
   initialBundlers: Set<string>,
+): GmgnBundlerTimestampGroup | null {
+  return (
+    groups.find((group) =>
+      [...initialBundlers].every((wallet) => group.wallets.includes(wallet)),
+    ) ?? null
+  );
+}
+
+function findFollowTokenGmgnSecondBundlerGroupAfterFirst(
+  groups: GmgnBundlerTimestampGroup[],
+  firstGroup: GmgnBundlerTimestampGroup,
   devCreateTimestampSec: number,
   minSecondGroupWallets: number,
   maxAgeSecFromCreate: number,
 ): GmgnBundlerTimestampGroup | null {
-  const firstGroupIndex = groups.findIndex((group) =>
-    [...initialBundlers].every((wallet) => group.wallets.includes(wallet)),
+  const firstGroupIndex = groups.findIndex(
+    (group) => group.anchorTimestamp === firstGroup.anchorTimestamp,
   );
-  if (firstGroupIndex < 0) return null;
+  const searchFromIndex = firstGroupIndex >= 0 ? firstGroupIndex + 1 : 0;
 
-  const firstGroup = groups[firstGroupIndex]!;
-  for (let index = firstGroupIndex + 1; index < groups.length; index += 1) {
+  for (let index = searchFromIndex; index < groups.length; index += 1) {
     const group = groups[index]!;
-    if (group.wallets.length < minSecondGroupWallets) continue;
     if (group.anchorTimestamp <= firstGroup.anchorTimestamp) continue;
+    if (group.wallets.length < minSecondGroupWallets) continue;
     if (group.anchorTimestamp - devCreateTimestampSec > maxAgeSecFromCreate) {
       continue;
     }
@@ -185,10 +214,14 @@ const FOLLOW_TOKEN_FEEPAYER_FUNDER_MAX_AGE_SEC = 6 * 60 * 60;
 const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS = 2_000;
 /** Follow-token buy trigger: stop GMGN polling this many seconds after token CREATE. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC = 60;
-/** Follow-token buy trigger: cluster bundlers whose start_holding_at falls within this many seconds. */
-const FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC = 2;
+/** Follow-token buy trigger: max seconds after a group's anchor start_holding_at to stay in the same cluster (same second + 1s grace). */
+const FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC = 1;
 /** Follow-token buy trigger: second bundler group must have at least this many wallets. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS = 4;
+/** REST backfill lookback before Enhanced WSS subscribe (covers connect / reconnect lag). */
+const FOLLOW_TOKEN_TOP_BUYER_WATCH_BACKFILL_BUFFER_SEC = 20;
+/** Recent tx page size for follow-token top-buyer / second-group watch backfill. */
+const FOLLOW_TOKEN_TOP_BUYER_WATCH_BACKFILL_LIMIT = INSIDER_HISTORY_LIMIT;
 /** Follow-token buy trigger: take-profit MC exit when second bundler group fires. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT =
   BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT;
@@ -343,12 +376,14 @@ export interface InsiderBot {
   getPreBuyMint(): string | null;
   markPositionBought(trigger: InsiderBuyTrigger): void;
   clearActivePosition(): void;
+  clearActivePositionAfterSuccessfulSell(): void;
   rearmPositionMonitoringAfterSellFailure(mint: string): void;
   clearPreBuyMint(): void;
   getEntryMc(): number;
   getExitMc(): number;
   getStopLossMcPercent(): number;
   tryTriggerStopLossSell(currentMc: number): Promise<boolean>;
+  tryTriggerFollowTokenTopBuyerFullExitSell(): Promise<boolean>;
   tryTriggerRugMarketCapReset(currentMc: number): Promise<boolean>;
   isProfitExitDisabled(): boolean;
   deferProfitExitUntilDevSwap(currentMc: number): Promise<boolean>;
@@ -384,6 +419,9 @@ export interface InsiderBot {
   addFollowWallet(
     address: string,
   ): Promise<{ ok: true } | { ok: false; error: string }>;
+  setFollowTokenMigrationSuspendDelegate(
+    delegate: ((mint: string) => void) | null,
+  ): void;
   stop(): Promise<void>;
 }
 
@@ -519,6 +557,7 @@ interface BundlerFunderWatchState {
 export class InsiderBot extends EventEmitter {
   private readonly log: Logger;
   private readonly followWalletLog: Logger;
+  private readonly followTokenGmgnLog: Logger;
   private readonly config: ServiceConfig;
   private readonly connection: Connection;
   private readonly telegramBot: TelegramBot | null;
@@ -548,6 +587,8 @@ export class InsiderBot extends EventEmitter {
         followedWallet: string,
       ) => Promise<boolean>)
     | null = null;
+  private followTokenMigrationSuspendDelegate: ((mint: string) => void) | null =
+    null;
   /** Whether the current/previous token flow was started from follow-wallet backtrack, funder-first discovery, or follow-token migration. */
   private flowSource: "follow" | "funder-first" | "follow-token" | null = null;
   /** FeePayer locked for the active funder-first flow — emitted on tokenFlowEnded so the orchestrator can cooldown/resume. */
@@ -621,6 +662,29 @@ export class InsiderBot extends EventEmitter {
   private followTokenGmgnBundlerPollTimer: ReturnType<typeof setInterval> | null =
     null;
   private followTokenGmgnBundlerPollInFlight = false;
+  /** Latched once GMGN shows a same-second + 1s grace group containing all four initial bundlers. */
+  private followTokenGmgnInitialBundlerGroup: GmgnBundlerTimestampGroup | null =
+    null;
+  /** Wallets from the GMGN second bundler group that triggered the follow-token buy. */
+  private followTokenGmgnBuySecondGroupWallets: string[] | null = null;
+  /** Top buyer in the GMGN second group — watched for copysell / re-entry. */
+  private followTokenTopBuyerWallet: string | null = null;
+  private followTokenTopBuyerMint: string | null = null;
+  private followTokenTopBuyerEntryKind:
+    | "initial_copysell"
+    | "reentry_full_exit"
+    | null = null;
+  private followTokenTopBuyerEnhancedWatchId: number | null = null;
+  /** Multi-watch on second-group wallets after top buyer has sold (handoff / rebuy detection). */
+  private followTokenSecondGroupHandoffWatchId: number | null = null;
+  /** True once the watched top buyer has a sell tx on this mint (enables second-group handoff). */
+  private followTokenTopBuyerHasSold = false;
+  /** Earliest tx timestamp (unix sec) to include in REST backfill after a watch subscribe. */
+  private followTokenTopBuyerWatchConnectStartedAtSec: number | null = null;
+  private followTokenTopBuyerWatchLastBackfillAtSec: number | null = null;
+  private followTokenTopBuyerWatchBackfillInFlight = false;
+  private followTokenTopBuyerWatchBackfillPending = false;
+  private followTokenTopBuyerSeenSignatures = new Set<string>();
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
   private bundlerFunderLogsSubId: number | null = null;
   private bundlerFunderParallelLogsSubId: number | null = null;
@@ -758,6 +822,7 @@ export class InsiderBot extends EventEmitter {
     this.label = label;
     this.log = createLogger(label.toUpperCase());
     this.followWalletLog = createLogger('FOLLOW-WALLET');
+    this.followTokenGmgnLog = createLogger('FOLLOW-TOKEN-GMGN');
     this.buySol = config.insiderBuySol;
     this.normalFundingBuySol = config.insiderNormalBuySol;
     this.lowFundingBuySol = config.insiderLowFundingBuySol;
@@ -795,6 +860,14 @@ export class InsiderBot extends EventEmitter {
   }
 
   clearActivePosition(): void {
+    void this.resetForNewToken(true);
+  }
+
+  clearActivePositionAfterSuccessfulSell(): void {
+    if (this.followTokenTopBuyerWallet && this.followTokenTopBuyerMint) {
+      void this.resetFollowTokenAfterSellKeepTopBuyerWatch();
+      return;
+    }
     void this.resetForNewToken(true);
   }
 
@@ -902,6 +975,59 @@ export class InsiderBot extends EventEmitter {
         `Stop-loss threshold: <b>${INSIDER_STOP_LOSS_MC_PERCENT}%</b>`,
       ],
       "STOP_LOSS_MC_TRIGGER",
+    );
+    return true;
+  }
+
+  async tryTriggerFollowTokenTopBuyerFullExitSell(): Promise<boolean> {
+    if (!this.activePosition || this.positionSellTriggered) return false;
+    if (this.followTokenTopBuyerEntryKind !== "reentry_full_exit") return false;
+
+    const wallet = this.followTokenTopBuyerWallet;
+    const mint = this.activePosition.mint;
+    if (!wallet || this.followTokenTopBuyerMint !== mint) return false;
+
+    let balances: Map<string, bigint>;
+    try {
+      balances = await this.gmgnClient.getTokenRawBalancesForWalletsBatch(
+        [wallet],
+        mint,
+      );
+    } catch (err) {
+      this.followTokenGmgnLog.warn(
+        "Follow-token top-buyer full-exit balance batch failed",
+        {
+          mint,
+          wallet,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      return false;
+    }
+
+    const balance = balances.get(wallet) ?? 0n;
+    const fullyExited = balance === 0n;
+    this.followTokenGmgnBundlerBackend("Follow-token top-buyer full-exit check", {
+      mint,
+      wallet,
+      balance: balance.toString(),
+      fullyExited,
+      entryKind: this.followTokenTopBuyerEntryKind,
+    });
+    if (!fullyExited) return false;
+
+    await this.triggerPositionSell(
+      mint,
+      `Follow-token top buyer ${wallet} fully exited on-chain (re-entry)`,
+      [
+        `<b>🚨 ${this.label} Follow-Token Top Buyer Full Exit</b>`,
+        `Token: <code>${mint}</code>`,
+        `Top buyer: <code>${wallet}</code>`,
+        `On-chain token balance: <b>0</b>`,
+        "",
+        "Re-entry exit: selling full position because the watched top buyer has no token balance left.",
+      ],
+      "FOLLOW_TOKEN_TOP_BUYER_FULL_EXIT",
     );
     return true;
   }
@@ -1056,6 +1182,597 @@ export class InsiderBot extends EventEmitter {
     else this.followWalletLog.info(message);
   }
 
+  private followTokenGmgnBundlerBackend(
+    message: string,
+    data?: Record<string, unknown>,
+  ): void {
+    if (data) this.followTokenGmgnLog.info(message, data);
+    else this.followTokenGmgnLog.info(message);
+  }
+
+  private summarizeGmgnBundlerGroupsForLog(
+    groups: GmgnBundlerTimestampGroup[],
+  ): Array<{ anchorTimestamp: number; walletCount: number; wallets: string[] }> {
+    return groups.map((group) => ({
+      anchorTimestamp: group.anchorTimestamp,
+      walletCount: group.wallets.length,
+      wallets: group.wallets,
+    }));
+  }
+
+  private canAcceptFollowTokenTopBuyerReentry(mint: string): boolean {
+    return (
+      !this.activePosition &&
+      !this.watchingMint &&
+      !this.buySubmitted &&
+      !this.isBuyExecuting &&
+      !this.isBuyGateEvaluating &&
+      this.followTokenTopBuyerWallet !== null &&
+      this.followTokenTopBuyerMint === mint &&
+      this.followTokenTopBuyerHasSold &&
+      !this.devFullExitHandled
+    );
+  }
+
+  private ensureFollowTokenTopBuyerWatchSubscribed(): void {
+    this.syncFollowTokenTopBuyerWatch();
+  }
+
+  private markFollowTokenTopBuyerWatchConnectStart(): void {
+    const nowSec = Math.floor(Date.now() / 1000);
+    this.followTokenTopBuyerWatchConnectStartedAtSec =
+      nowSec - FOLLOW_TOKEN_TOP_BUYER_WATCH_BACKFILL_BUFFER_SEC;
+    this.followTokenTopBuyerWatchLastBackfillAtSec = null;
+  }
+
+  private getFollowTokenTopBuyerWatchedWallets(): string[] {
+    if (this.followTokenSecondGroupHandoffWatchId !== null) {
+      return this.followTokenGmgnBuySecondGroupWallets
+        ? [...this.followTokenGmgnBuySecondGroupWallets]
+        : [];
+    }
+    if (
+      this.followTokenTopBuyerEnhancedWatchId !== null &&
+      this.followTokenTopBuyerWallet
+    ) {
+      return [this.followTokenTopBuyerWallet];
+    }
+    return [];
+  }
+
+  private scheduleFollowTokenTopBuyerWatchBackfill(
+    wallets: readonly string[],
+    reason: string,
+  ): void {
+    const uniqueWallets = [...new Set(wallets.filter(Boolean))];
+    if (uniqueWallets.length === 0) return;
+    void this.runFollowTokenTopBuyerWatchBackfill(uniqueWallets, reason);
+  }
+
+  private async runFollowTokenTopBuyerWatchBackfill(
+    wallets: string[],
+    reason: string,
+  ): Promise<void> {
+    const mint = this.followTokenTopBuyerMint;
+    if (!mint || wallets.length === 0) return;
+
+    if (this.followTokenTopBuyerWatchBackfillInFlight) {
+      this.followTokenTopBuyerWatchBackfillPending = true;
+      return;
+    }
+
+    const floorSec =
+      this.followTokenTopBuyerWatchLastBackfillAtSec !== null
+        ? this.followTokenTopBuyerWatchLastBackfillAtSec - 2
+        : this.followTokenTopBuyerWatchConnectStartedAtSec ??
+          Math.floor(Date.now() / 1000) -
+            FOLLOW_TOKEN_TOP_BUYER_WATCH_BACKFILL_BUFFER_SEC;
+
+    this.followTokenTopBuyerWatchBackfillInFlight = true;
+    try {
+      const collected: Array<{ wallet: string; tx: HeliusTransaction }> = [];
+      for (const wallet of wallets) {
+        let txs: HeliusTransaction[];
+        try {
+          txs = await this.withHeliusFallback((client) =>
+            client.getWalletTransactionsDesc(
+              wallet,
+              FOLLOW_TOKEN_TOP_BUYER_WATCH_BACKFILL_LIMIT,
+            ),
+          );
+        } catch (err) {
+          void this.heliusClient.handlePossibleRateLimitError(err);
+          this.followTokenGmgnLog.warn(
+            "Follow-token top-buyer watch backfill fetch failed",
+            {
+              mint,
+              wallet,
+              reason,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
+          continue;
+        }
+
+        for (const tx of txs) {
+          if (tx.timestamp < floorSec) continue;
+          if (!this.isRelevantMintTx(tx, mint)) continue;
+          const action = this.classifyTx(tx, wallet, mint);
+          if (action !== "buy" && action !== "sell") continue;
+          collected.push({ wallet, tx });
+        }
+      }
+
+      collected.sort(
+        (a, b) =>
+          a.tx.timestamp - b.tx.timestamp ||
+          a.tx.signature.localeCompare(b.tx.signature),
+      );
+
+      this.followTokenGmgnBundlerBackend(
+        "Follow-token top-buyer watch backfill processing",
+        {
+          mint,
+          reason,
+          floorSec,
+          walletCount: wallets.length,
+          txCount: collected.length,
+        },
+      );
+
+      for (const { wallet, tx } of collected) {
+        if (this.followTokenTopBuyerMint !== mint) break;
+        await this.handleFollowTokenTopBuyerTransaction(tx, wallet);
+      }
+
+      this.followTokenTopBuyerWatchLastBackfillAtSec = Math.floor(
+        Date.now() / 1000,
+      );
+    } finally {
+      this.followTokenTopBuyerWatchBackfillInFlight = false;
+      if (this.followTokenTopBuyerWatchBackfillPending) {
+        this.followTokenTopBuyerWatchBackfillPending = false;
+        const retryWallets = this.getFollowTokenTopBuyerWatchedWallets();
+        if (retryWallets.length > 0) {
+          void this.runFollowTokenTopBuyerWatchBackfill(
+            retryWallets,
+            "pending_retry",
+          );
+        }
+      }
+    }
+  }
+
+  private syncFollowTokenTopBuyerWatch(): void {
+    const wallet = this.followTokenTopBuyerWallet;
+    const mint = this.followTokenTopBuyerMint;
+    if (!wallet || !mint) return;
+
+    const prevSingleWatchId = this.followTokenTopBuyerEnhancedWatchId;
+    const prevMultiWatchId = this.followTokenSecondGroupHandoffWatchId;
+
+    const secondGroup = this.followTokenGmgnBuySecondGroupWallets;
+    const useSecondGroupHandoffWatch =
+      this.followTokenTopBuyerHasSold &&
+      !this.activePosition &&
+      !this.watchingMint &&
+      secondGroup !== null &&
+      secondGroup.length > 0;
+
+    if (useSecondGroupHandoffWatch) {
+      void this.stopFollowTokenTopBuyerSingleWatch();
+      this.ensureFollowTokenSecondGroupHandoffWatchSubscribed();
+    } else {
+      void this.stopFollowTokenSecondGroupHandoffWatch();
+      this.ensureFollowTokenTopBuyerSingleWatchSubscribed();
+    }
+
+    const watchedWallets = this.getFollowTokenTopBuyerWatchedWallets();
+    const watchChanged =
+      prevSingleWatchId !== this.followTokenTopBuyerEnhancedWatchId ||
+      prevMultiWatchId !== this.followTokenSecondGroupHandoffWatchId;
+    if (watchedWallets.length > 0) {
+      this.scheduleFollowTokenTopBuyerWatchBackfill(
+        watchedWallets,
+        watchChanged ? "watch_subscribed" : "watch_resync",
+      );
+    }
+  }
+
+  private ensureFollowTokenTopBuyerSingleWatchSubscribed(): void {
+    const wallet = this.followTokenTopBuyerWallet;
+    const mint = this.followTokenTopBuyerMint;
+    if (!wallet || !mint) return;
+    if (this.followTokenTopBuyerEnhancedWatchId !== null) return;
+
+    if (!this.enhancedWs) {
+      this.followTokenGmgnLog.warn(
+        "Follow-token top-buyer watch requires Enhanced WSS; watch not started",
+        { wallet, mint },
+      );
+      return;
+    }
+
+    this.markFollowTokenTopBuyerWatchConnectStart();
+    this.followTokenTopBuyerEnhancedWatchId = this.enhancedWs.watch(
+      wallet,
+      (tx) => {
+        void this.handleFollowTokenTopBuyerTransaction(tx, wallet);
+      },
+    );
+    this.followTokenGmgnBundlerBackend("Follow-token top-buyer watch subscribed", {
+      wallet,
+      mint,
+      entryKind: this.followTokenTopBuyerEntryKind,
+      topBuyerHasSold: this.followTokenTopBuyerHasSold,
+    });
+  }
+
+  private ensureFollowTokenSecondGroupHandoffWatchSubscribed(): void {
+    const mint = this.followTokenTopBuyerMint;
+    const wallets = this.followTokenGmgnBuySecondGroupWallets;
+    if (!mint || !wallets || wallets.length === 0) return;
+    if (this.followTokenSecondGroupHandoffWatchId !== null) return;
+
+    if (!this.enhancedWs) {
+      this.followTokenGmgnLog.warn(
+        "Follow-token second-group handoff watch requires Enhanced WSS; watch not started",
+        { mint, walletCount: wallets.length },
+      );
+      return;
+    }
+
+    this.markFollowTokenTopBuyerWatchConnectStart();
+    this.followTokenSecondGroupHandoffWatchId = this.enhancedWs.watchMulti(
+      wallets,
+      (matchedAddress, tx) => {
+        void this.handleFollowTokenTopBuyerTransaction(tx, matchedAddress);
+      },
+    );
+    this.followTokenGmgnBundlerBackend(
+      "Follow-token second-group handoff watch subscribed",
+      {
+        mint,
+        topBuyerWallet: this.followTokenTopBuyerWallet,
+        walletCount: wallets.length,
+        wallets,
+      },
+    );
+  }
+
+  private async stopFollowTokenTopBuyerSingleWatch(): Promise<void> {
+    if (this.followTokenTopBuyerEnhancedWatchId === null) return;
+    const id = this.followTokenTopBuyerEnhancedWatchId;
+    this.followTokenTopBuyerEnhancedWatchId = null;
+    await this.enhancedWs?.unwatch(id).catch(() => undefined);
+  }
+
+  private async stopFollowTokenSecondGroupHandoffWatch(): Promise<void> {
+    if (this.followTokenSecondGroupHandoffWatchId === null) return;
+    const id = this.followTokenSecondGroupHandoffWatchId;
+    this.followTokenSecondGroupHandoffWatchId = null;
+    await this.enhancedWs?.unwatch(id).catch(() => undefined);
+  }
+
+  private async stopFollowTokenTopBuyerWatch(reason: string): Promise<void> {
+    await this.stopFollowTokenTopBuyerSingleWatch();
+    await this.stopFollowTokenSecondGroupHandoffWatch();
+    this.followTokenTopBuyerSeenSignatures.clear();
+    this.followTokenTopBuyerWallet = null;
+    this.followTokenTopBuyerMint = null;
+    this.followTokenTopBuyerEntryKind = null;
+    this.followTokenTopBuyerHasSold = false;
+    this.followTokenTopBuyerWatchConnectStartedAtSec = null;
+    this.followTokenTopBuyerWatchLastBackfillAtSec = null;
+    this.followTokenTopBuyerWatchBackfillInFlight = false;
+    this.followTokenTopBuyerWatchBackfillPending = false;
+    this.followTokenGmgnBuySecondGroupWallets = null;
+    this.followTokenGmgnBundlerBackend("Follow-token top-buyer watch stopped", {
+      reason,
+    });
+  }
+
+  private async handleFollowTokenTopBuyerTransaction(
+    tx: HeliusTransaction,
+    watchWallet?: string,
+  ): Promise<void> {
+    const topBuyerWallet = this.followTokenTopBuyerWallet;
+    const mint = this.followTokenTopBuyerMint;
+    const wallet = watchWallet ?? topBuyerWallet;
+    if (!wallet || !mint || !topBuyerWallet) return;
+    if (this.followTokenTopBuyerSeenSignatures.has(tx.signature)) return;
+    if (!this.isRelevantMintTx(tx, mint)) return;
+
+    this.followTokenTopBuyerSeenSignatures.add(tx.signature);
+    const action = this.classifyTx(tx, wallet, mint);
+    if (!action) return;
+
+    const isTopBuyer = wallet === topBuyerWallet;
+    const secondGroup = this.followTokenGmgnBuySecondGroupWallets;
+    const inSecondGroup = secondGroup?.includes(wallet) ?? false;
+
+    this.followTokenGmgnBundlerBackend("Follow-token top-buyer tx observed", {
+      mint,
+      wallet,
+      topBuyerWallet,
+      isTopBuyer,
+      inSecondGroup,
+      action,
+      signature: tx.signature,
+      entryKind: this.followTokenTopBuyerEntryKind,
+      topBuyerHasSold: this.followTokenTopBuyerHasSold,
+      phase: this.phase,
+      hasActivePosition: !!this.activePosition,
+    });
+
+    if (action === "buy") {
+      if (!this.canAcceptFollowTokenTopBuyerReentry(mint)) return;
+
+      if (isTopBuyer) {
+        await this.emitFollowTokenTopBuyerRebuy(tx);
+        return;
+      }
+
+      if (inSecondGroup) {
+        await this.handoffFollowTokenTopBuyerToSecondGroupWallet(wallet, tx);
+      }
+      return;
+    }
+
+    if (action === "sell" && isTopBuyer) {
+      this.followTokenTopBuyerHasSold = true;
+
+      if (
+        this.activePosition?.mint === mint &&
+        this.phase === "holding" &&
+        !this.positionSellTriggered &&
+        this.followTokenTopBuyerEntryKind === "initial_copysell"
+      ) {
+        await this.triggerPositionSell(
+          mint,
+          `Follow-token top buyer ${wallet} sold on ${mint}`,
+          [
+            `<b>🚨 ${this.label} Follow-Token Top Buyer Copy-Sell</b>`,
+            `Token: <code>${mint}</code>`,
+            `Top buyer: <code>${wallet}</code>`,
+            `Sell tx: <code>${tx.signature}</code>`,
+            "",
+            "Copy-selling full position because the watched top buyer sold.",
+          ],
+          tx.signature,
+        );
+        return;
+      }
+
+      if (!this.activePosition && !this.watchingMint) {
+        this.syncFollowTokenTopBuyerWatch();
+      }
+    }
+  }
+
+  private async handoffFollowTokenTopBuyerToSecondGroupWallet(
+    newWallet: string,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    const oldWallet = this.followTokenTopBuyerWallet;
+    const mint = this.followTokenTopBuyerMint;
+    if (!oldWallet || !mint || newWallet === oldWallet) return;
+
+    this.followTokenTopBuyerWallet = newWallet;
+    this.followTokenTopBuyerHasSold = false;
+
+    await this.stopFollowTokenSecondGroupHandoffWatch();
+    this.syncFollowTokenTopBuyerWatch();
+
+    this.followTokenGmgnBundlerBackend(
+      "Follow-token top-buyer handoff to second-group wallet",
+      {
+        mint,
+        oldWallet,
+        newWallet,
+        signature: tx.signature,
+      },
+    );
+
+    void this.sendTelegramSafe(
+      [
+        `<b>🔁 ${this.label} Follow-Token Top Buyer Handoff</b>`,
+        `Token: <code>${mint}</code>`,
+        `Previous top buyer: <code>${oldWallet}</code> (sold)`,
+        `New top buyer: <code>${newWallet}</code>`,
+        `Buy tx: <code>${tx.signature}</code>`,
+        "",
+        "Re-entering and watching the new top buyer; exit when they fully exit on-chain.",
+      ].join("\n"),
+      "follow-token top buyer handoff notification",
+    );
+
+    await this.emitFollowTokenTopBuyerRebuy(tx, {
+      handoffFromWallet: oldWallet,
+    });
+  }
+
+  private async emitFollowTokenTopBuyerRebuy(
+    tx: HeliusTransaction,
+    options?: { handoffFromWallet?: string },
+  ): Promise<void> {
+    const wallet = this.followTokenTopBuyerWallet;
+    const mint = this.followTokenTopBuyerMint;
+    if (!wallet || !mint) return;
+    if (
+      this.buySubmitted ||
+      this.buyDisabled ||
+      this.isBuyExecuting ||
+      this.isBuyGateEvaluating
+    ) {
+      return;
+    }
+
+    this.isBuyGateEvaluating = true;
+    try {
+      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
+      if (currentMc === null) {
+        this.followTokenGmgnLog.warn(
+          "Follow-token top-buyer re-entry skipped — market cap unavailable",
+          { mint, wallet, signature: tx.signature },
+        );
+        return;
+      }
+      if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
+        this.followTokenGmgnLog.warn(
+          "Follow-token top-buyer re-entry skipped — token below rug threshold",
+          { mint, wallet, currentMc },
+        );
+        return;
+      }
+      if (currentMc < INSIDER_RUG_RESET_MARKET_CAP_USD) {
+        this.followTokenGmgnLog.warn(
+          "Follow-token top-buyer re-entry skipped — token below rug reset floor",
+          { mint, wallet, currentMc, rugResetFloorUsd: INSIDER_RUG_RESET_MARKET_CAP_USD },
+        );
+        await this.stopFollowTokenTopBuyerWatch("mc below rug reset floor before re-entry");
+        return;
+      }
+
+      if (this.claimMint && !this.claimMint(mint)) {
+        this.followTokenGmgnLog.info(
+          "Follow-token top-buyer re-entry delegated — mint claimed by another bot",
+          { mint, wallet },
+        );
+        return;
+      }
+
+      this.followTokenMigrationSuspendDelegate?.(mint);
+      this.flowSource = "follow-token";
+      this.flowFollowWallet = null;
+      this.claimedMint = mint;
+      this.followTokenTopBuyerEntryKind = "reentry_full_exit";
+      this.disableProfitExitAfterBuy = true;
+      this.setEntryMc(currentMc);
+      this.setBuyExecuting(true);
+      this.buySubmitted = true;
+      this.boughtMints.add(mint);
+
+      void this.sendTelegramSafe(
+        [
+          `<b>🟢 ${this.label} Follow-Token Top Buyer Re-Entry Buy</b>`,
+          `Token: <code>${mint}</code>`,
+          options?.handoffFromWallet
+            ? `Handoff from: <code>${options.handoffFromWallet}</code>`
+            : "",
+          `Top buyer: <code>${wallet}</code>`,
+          `Buy tx: <code>${tx.signature}</code>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          "",
+          "Exit: sell when top buyer fully exits on-chain. +90% TP disabled; -50% SL remains.",
+        ].filter(Boolean).join("\n"),
+        "follow-token top buyer re-entry buy notification",
+      );
+
+      this.followTokenGmgnBundlerBackend("Follow-token top-buyer re-entry buy emitted", {
+        mint,
+        wallet,
+        handoffFromWallet: options?.handoffFromWallet ?? null,
+        signature: tx.signature,
+        currentMc,
+        entryKind: this.followTokenTopBuyerEntryKind,
+      });
+
+      this.emit("buyTrigger", {
+        followedWallet: this.getBuyTriggerFollowedWallet(),
+        mint,
+        signature: tx.signature,
+        buySol: this.getBuySolForFundingMode(false),
+        entryMc: currentMc,
+        monitoredWallet: wallet,
+        tradersListStr: [
+          "<b>Follow-Token Top Buyer Re-Entry Buy</b>",
+          options?.handoffFromWallet
+            ? `Handoff from: <code>${options.handoffFromWallet}</code>`
+            : "",
+          `Top buyer: <code>${wallet}</code>`,
+          `Trigger tx: <code>${tx.signature}</code>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          "Exit: top buyer full on-chain exit. +90% TP disabled; -50% SL active.",
+        ].filter(Boolean).join("\n"),
+      });
+    } finally {
+      this.isBuyGateEvaluating = false;
+    }
+  }
+
+  private async resetFollowTokenAfterSellKeepTopBuyerWatch(): Promise<void> {
+    const endedMint =
+      this.activePosition?.mint ?? this.followTokenTopBuyerMint ?? null;
+    const endedFeePayer = this.bundlerFunderWatch?.funderWallet ?? null;
+    const hadPosition = !!this.activePosition;
+    const topBuyerWallet = this.followTokenTopBuyerWallet;
+    const topBuyerMint = this.followTokenTopBuyerMint;
+    const endedEntryKind = this.followTokenTopBuyerEntryKind;
+    const secondGroupWallets = this.followTokenGmgnBuySecondGroupWallets;
+
+    if (this.claimedMint) {
+      this.releaseMint?.(this.claimedMint);
+      this.claimedMint = null;
+    }
+
+    await this.stopBundlerFunderMonitoring();
+    await this.stopBundlerMonitoring();
+    await this.stopInsiderMonitoring();
+    await this.stopDevWalletFullExitWatch("follow-token sell completed");
+    this.stopFollowTokenGmgnBundlerPoll("follow-token sell completed");
+
+    this.activePosition = null;
+    this.watchingMint = null;
+    this.phase = null;
+    this.monitoredWallet = null;
+    this.insiderState = null;
+    this.bundlerWatch = null;
+    this.bundlerFunderWatch = null;
+    this.buySubmitted = false;
+    this.isBuyExecuting = false;
+    this.isBuyGateEvaluating = false;
+    this.positionSellTriggered = false;
+    this.profitExitDisabled = false;
+    this.disableProfitExitAfterBuy = false;
+    this.flowSource = null;
+    this.flowFollowWallet = null;
+    this.followTokenTopBuyerEntryKind = null;
+    this.followTokenGmgnInitialBundlerGroup = null;
+
+    if (endedEntryKind === "reentry_full_exit") {
+      this.followTokenTopBuyerHasSold = true;
+    }
+
+    if (topBuyerWallet && topBuyerMint) {
+      this.followTokenTopBuyerWallet = topBuyerWallet;
+      this.followTokenTopBuyerMint = topBuyerMint;
+      this.followTokenGmgnBuySecondGroupWallets = secondGroupWallets
+        ? [...secondGroupWallets]
+        : null;
+      this.syncFollowTokenTopBuyerWatch();
+    }
+
+    this.emit("tokenFlowEnded", {
+      mint: endedMint,
+      feePayer: endedFeePayer,
+      source: "follow-token",
+      hadPosition,
+      reason: "reset",
+    });
+
+    this.followTokenGmgnBundlerBackend(
+      "Follow-token sell completed — PumpPortal resumed, top-buyer watch kept",
+      {
+        mint: endedMint,
+        topBuyerWallet,
+        topBuyerMint,
+        topBuyerHasSold: this.followTokenTopBuyerHasSold,
+        secondGroupWalletCount: secondGroupWallets?.length ?? 0,
+      },
+    );
+  }
+
   setFollowWalletFlowDelegate(
     delegate:
       | ((
@@ -1066,6 +1783,12 @@ export class InsiderBot extends EventEmitter {
       | null,
   ): void {
     this.followWalletFlowDelegate = delegate;
+  }
+
+  setFollowTokenMigrationSuspendDelegate(
+    delegate: ((mint: string) => void) | null,
+  ): void {
+    this.followTokenMigrationSuspendDelegate = delegate;
   }
 
   /**
@@ -1633,6 +2356,10 @@ export class InsiderBot extends EventEmitter {
     this.profitExitDisabled = this.disableProfitExitAfterBuy;
     this.disableProfitExitAfterBuy = false;
 
+    if (this.followTokenTopBuyerWallet && this.followTokenTopBuyerMint === trigger.mint) {
+      this.ensureFollowTokenTopBuyerWatchSubscribed();
+    }
+
     void this.syncBundlerFunderTransactions(true);
     void this.syncParallelFeePayerFunderTransactions(true);
     void this.syncFunderRecipientBatch(true);
@@ -1859,19 +2586,137 @@ export class InsiderBot extends EventEmitter {
 
     void this.sendTelegramSafe(
       [
-        `<b>🔍 ${this.label} Follow-Token Bundler-Funder Flow Started</b>`,
+        `<b>🔍 ${this.label} Follow-Token GMGN Flow Started</b>`,
         `Token: <code>${mint}</code>`,
         `Migration tx: <code>${migrationSignature}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
-        "Finding each bundler's zero-balance funding window, selecting the latest valid funding transfer in that window, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs for recipient buy confirmation.",
+        `Buy trigger: GMGN bundler second-group poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s for ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC}s from CREATE.`,
+        "Bundler feePayer backtrack skipped for follow-token (GMGN-only path).",
       ].join("\n"),
       "follow-token flow-start notification",
     );
 
     this.startPollLoop();
-    await this.startBundlerFunderFlow(mint, earlyInsiderBuys);
+    await this.startFollowTokenGmgnOnlyFlow(mint, earlyInsiderBuys);
     return this.isFollowTokenFlowActive(mint);
+  }
+
+  private buildFollowTokenGmgnWatchStub(
+    mint: string,
+    firstFour: EarlyInsiderBuy[],
+  ): BundlerFunderWatchState {
+    const placeholderFunder =
+      this.devWallet ?? firstFour[0]?.feePayer ?? firstFour[0]?.wallet ?? mint;
+    return {
+      mint,
+      funderWallet: placeholderFunder,
+      originalFunderWallet: placeholderFunder,
+      migrationCount: 0,
+      lowFundingMode: false,
+      earliestFundingTimestamp: 0,
+      earliestFundingSignature: "",
+      largestFundingSol: 0,
+      minTransferOutSol: 0,
+      cursorSignature: null,
+      processedSignatures: new Set<string>(),
+      validOutSignatures: new Set<string>(),
+      invalidOutSignatures: new Set<string>(),
+      bundlerWallets: new Set(firstFour.map((buy) => buy.wallet)),
+      recipientWatches: new Map<string, FunderRecipientWatch>(),
+      queuedTransferOuts: [],
+      normalTinyTransferOuts: [],
+      normalTinyRoundGroupFound: false,
+      roundWonDustRaceNotified: false,
+      lowFundingFunderTxs: [],
+      lowFundingTinyTransferOuts: [],
+      lowFundingTinyBundlerGateSeen: false,
+      lowFundingTinyEntryTimestamp: null,
+      lowFundingTinyCandidateWallets: new Set<string>(),
+      lowFundingTinySellGroupSignatures: new Set<string>(),
+      lowFundingTinyBoughtUsdBands: new Set(),
+      lowFundingTinySoldUsdBands: new Set(),
+      lowFundingPendingTinyBuyWallets: new Set<string>(),
+      lowFundingDevBuySignatures: new Set<string>(),
+      lowFundingDevBuyAfterCreateSignature: null,
+      lowFundingDevBuyAfterCreateTimestamp: null,
+      lowFundingTinyMcExitPending: false,
+      lowFundingTinyMcExitReachedMc: null,
+      lowFundingTinyDevExitSwapSignature: null,
+      lowFundingTinyDevExitBaselineSignature: null,
+      lowFundingTinyDevExitBaselineTimestamp: null,
+      lowFundingLargeTransferBuyUsed: false,
+      discoveryStopped: true,
+      lockedAt: Date.now(),
+      parallelFeePayerFunderWallet: null,
+      parallelFeePayerFunderCursorSignature: null,
+      parallelFeePayerFunderFundedAtSec: null,
+    };
+  }
+
+  /**
+   * Follow-token buy path: skip bundler funding feePayer backtrack and poll GMGN
+   * for the second bundler group directly (migrated tokens often lack zero-balance
+   * funding windows in Helius history).
+   */
+  private async startFollowTokenGmgnOnlyFlow(
+    mint: string,
+    earlyBuys: EarlyInsiderBuy[],
+  ): Promise<void> {
+    const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
+    if (firstFour.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
+      this.log.warn("Follow-token GMGN flow has fewer than four early bundler buys; resetting", {
+        mint,
+        earlyBuyCount: firstFour.length,
+      });
+      await this.resetForNewToken(true);
+      return;
+    }
+
+    await this.ensureDevWalletLoaded(mint);
+    if (!this.devCreateTimestamp) {
+      this.log.warn(
+        "Follow-token GMGN flow skipped because dev CREATE timestamp is unavailable",
+        { mint },
+      );
+      await this.resetForNewToken(true);
+      return;
+    }
+
+    this.bundlerFunderWatch = this.buildFollowTokenGmgnWatchStub(mint, firstFour);
+    if (this.devWallet) {
+      this.subscribeDevWalletFullExitWatch();
+    }
+
+    this.log.warn("Follow-token GMGN-only flow started; bundler feePayer backtrack skipped", {
+      mint,
+      devCreateTimestamp: this.devCreateTimestamp,
+      initialBundlers: [...this.bundlerFunderWatch.bundlerWallets],
+      pollIntervalMs: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS,
+      pollMaxAgeSec: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC,
+    });
+
+    void this.sendTelegramSafe(
+      [
+        `<b>✅ ${this.label} Follow-Token GMGN Watch Started</b>`,
+        `Token: <code>${mint}</code>`,
+        `Dev CREATE: <b>${this.devCreateTimestamp}</b>`,
+        `Initial bundlers: <b>${firstFour.length}</b>`,
+        "",
+        `Polling GMGN bundler traders every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s for ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC}s.`,
+        `Exit: top-buyer copy-sell (1st entry) / full exit (re-entry). +90% TP disabled; ${INSIDER_STOP_LOSS_MC_PERCENT}% SL active.`,
+      ].join("\n"),
+      "follow-token gmgn watch started notification",
+    );
+
+    if (
+      this.flowSource === "follow-token" &&
+      this.watchingMint === mint &&
+      this.phase === "pre_buy" &&
+      !this.buySubmitted
+    ) {
+      this.startFollowTokenGmgnBundlerPoll(this.bundlerFunderWatch);
+    }
   }
 
   private async startInsiderFlow(
@@ -3262,8 +4107,9 @@ export class InsiderBot extends EventEmitter {
       this.followTokenGmgnBundlerPollTimer = null;
     }
     this.followTokenGmgnBundlerPollInFlight = false;
+    this.followTokenGmgnInitialBundlerGroup = null;
     if (reason !== "poll loop stopped") {
-      this.log.debug("Follow-token GMGN bundler poll stopped", { reason });
+      this.followTokenGmgnBundlerBackend("GMGN bundler poll stopped", { reason });
     }
   }
 
@@ -3273,23 +4119,25 @@ export class InsiderBot extends EventEmitter {
     if (this.buySubmitted) return;
 
     this.stopFollowTokenGmgnBundlerPoll("restarting poll");
+    this.followTokenGmgnInitialBundlerGroup = null;
     const devCreateTimestamp = this.devCreateTimestamp;
     if (!devCreateTimestamp) {
-      this.log.warn(
-        "Follow-token GMGN bundler poll skipped because dev CREATE timestamp is unavailable",
+      this.followTokenGmgnBundlerBackend(
+        "GMGN bundler poll skipped because dev CREATE timestamp is unavailable",
         { mint: state.mint },
       );
       return;
     }
 
-    this.log.info("Starting follow-token GMGN bundler second-group poll", {
+    this.followTokenGmgnBundlerBackend("GMGN bundler poll started", {
       mint: state.mint,
       devCreateTimestamp,
       pollIntervalMs: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS,
       pollMaxAgeSec: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC,
-      groupToleranceSec: FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC,
+      groupGraceSec: FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC,
       secondGroupMinWallets: FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
       exitPercent: FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT,
+      expectedInitialBundlers: [...state.bundlerWallets],
     });
 
     void this.pollFollowTokenGmgnBundlerBuy();
@@ -3345,11 +4193,31 @@ export class InsiderBot extends EventEmitter {
       if (!address || !Number.isFinite(startHoldingAt) || startHoldingAt <= 0) {
         continue;
       }
+      const buyVolumeCur = this.readGmgnNumericField(
+        entry.buy_volume_cur ?? entry.buyVolumeCur,
+      );
+      const buyAmountCur = this.readGmgnNumericField(
+        entry.buy_amount_cur ?? entry.buyAmountCur ?? entry.accu_amount,
+      );
       if (seen.has(address)) continue;
       seen.add(address);
-      snapshots.push({ address, startHoldingAt });
+      snapshots.push({
+        address,
+        startHoldingAt,
+        buyVolumeCur,
+        buyAmountCur,
+      });
     }
     return snapshots;
+  }
+
+  private readGmgnNumericField(value: unknown): number {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return 0;
   }
 
   private async pollFollowTokenGmgnBundlerBuy(): Promise<void> {
@@ -3375,6 +4243,15 @@ export class InsiderBot extends EventEmitter {
 
     const nowSec = Math.floor(Date.now() / 1000);
     if (nowSec - devCreateTimestamp > FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC) {
+      this.followTokenGmgnBundlerBackend("GMGN bundler poll window elapsed", {
+        mint: state.mint,
+        devCreateTimestamp,
+        elapsedSec: nowSec - devCreateTimestamp,
+        pollMaxAgeSec: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC,
+        initialGroupConfirmed: !!this.followTokenGmgnInitialBundlerGroup,
+        initialGroupTimestamp:
+          this.followTokenGmgnInitialBundlerGroup?.anchorTimestamp ?? null,
+      });
       this.stopFollowTokenGmgnBundlerPoll("poll window elapsed");
       void this.sendTelegramSafe(
         [
@@ -3392,40 +4269,86 @@ export class InsiderBot extends EventEmitter {
     try {
       const traders = await this.gmgnClient.fetchBundlerTraders(state.mint, 50);
       const snapshots = this.extractGmgnBundlerTraderSnapshots(traders);
+      const groups = groupGmgnBundlersByStartHoldingAt(
+        snapshots,
+        FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC,
+      );
+      const pollPhase = !this.followTokenGmgnInitialBundlerGroup
+        ? "waiting_initial_group"
+        : "waiting_second_group";
+
+      this.followTokenGmgnBundlerBackend("GMGN bundler poll tick", {
+        mint: state.mint,
+        devCreateTimestamp,
+        elapsedSec: nowSec - devCreateTimestamp,
+        phase: pollPhase,
+        expectedInitialBundlers: [...state.bundlerWallets],
+        traderCount: snapshots.length,
+        traders: snapshots,
+        groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+        initialGroupConfirmed: this.followTokenGmgnInitialBundlerGroup
+          ? {
+              anchorTimestamp:
+                this.followTokenGmgnInitialBundlerGroup.anchorTimestamp,
+              walletCount: this.followTokenGmgnInitialBundlerGroup.wallets.length,
+              wallets: this.followTokenGmgnInitialBundlerGroup.wallets,
+            }
+          : null,
+      });
+
       if (snapshots.length === 0) {
-        this.log.debug("Follow-token GMGN bundler poll returned no trader rows", {
-          mint: state.mint,
-          devCreateTimestamp,
-          elapsedSec: nowSec - devCreateTimestamp,
-        });
         return;
       }
 
-      const groups = groupGmgnBundlersByStartHoldingAt(
-        snapshots,
-        FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC,
-      );
-      const secondGroup = findFollowTokenGmgnSecondBundlerGroup(
+      if (!this.followTokenGmgnInitialBundlerGroup) {
+        const initialGroup = findFollowTokenGmgnInitialBundlerGroup(
+          groups,
+          state.bundlerWallets,
+        );
+        if (!initialGroup) {
+          return;
+        }
+
+        this.followTokenGmgnInitialBundlerGroup = initialGroup;
+        this.followTokenGmgnBundlerBackend("GMGN initial bundler group confirmed", {
+          mint: state.mint,
+          anchorTimestamp: initialGroup.anchorTimestamp,
+          walletCount: initialGroup.wallets.length,
+          wallets: initialGroup.wallets,
+          expectedInitialBundlers: [...state.bundlerWallets],
+          groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+        });
+      }
+
+      const secondGroup = findFollowTokenGmgnSecondBundlerGroupAfterFirst(
         groups,
-        state.bundlerWallets,
+        this.followTokenGmgnInitialBundlerGroup,
         devCreateTimestamp,
         FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
         FOLLOW_TOKEN_GMGN_BUNDLER_POLL_MAX_AGE_SEC,
       );
       if (!secondGroup) {
-        this.log.debug("Follow-token GMGN bundler poll waiting for second group", {
-          mint: state.mint,
-          devCreateTimestamp,
-          elapsedSec: nowSec - devCreateTimestamp,
-          groupCount: groups.length,
-          initialBundlerCount: state.bundlerWallets.size,
-        });
         return;
       }
 
-      await this.emitFollowTokenGmgnBundlerBuy(state, secondGroup, groups);
+      this.followTokenGmgnBundlerBackend("GMGN second bundler group detected", {
+        mint: state.mint,
+        firstGroupTimestamp: this.followTokenGmgnInitialBundlerGroup.anchorTimestamp,
+        secondGroupTimestamp: secondGroup.anchorTimestamp,
+        secondGroupWalletCount: secondGroup.wallets.length,
+        secondGroupWallets: secondGroup.wallets,
+        groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+      });
+
+      await this.emitFollowTokenGmgnBundlerBuy(
+        state,
+        secondGroup,
+        groups,
+        this.followTokenGmgnInitialBundlerGroup,
+        snapshots,
+      );
     } catch (err) {
-      this.log.warn("Follow-token GMGN bundler poll failed", {
+      this.followTokenGmgnLog.warn("GMGN bundler poll failed", {
         mint: state.mint,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -3438,6 +4361,8 @@ export class InsiderBot extends EventEmitter {
     state: BundlerFunderWatchState,
     secondGroup: GmgnBundlerTimestampGroup,
     allGroups: GmgnBundlerTimestampGroup[],
+    firstGroup: GmgnBundlerTimestampGroup,
+    snapshots: GmgnBundlerTraderSnapshot[],
   ): Promise<void> {
     if (
       this.buySubmitted ||
@@ -3489,14 +4414,30 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
-      const exitPercent = FOLLOW_TOKEN_GMGN_BUNDLER_BUY_EXIT_PERCENT;
-      const newExitMc = currentMc * (1 + exitPercent / 100);
-      this.setExitMc(newExitMc);
+      const topBuyerWallet = pickFollowTokenTopBuyerWallet(
+        secondGroup.wallets,
+        snapshots,
+      );
+      if (!topBuyerWallet) {
+        this.log.warn("Follow-token GMGN second group missing top buyer wallet", {
+          mint: state.mint,
+          secondGroupWallets: secondGroup.wallets,
+        });
+        return;
+      }
+      const topBuyerSnapshot = snapshots.find(
+        (entry) => entry.address === topBuyerWallet,
+      );
+
       this.setEntryMc(currentMc);
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
-      this.disableProfitExitAfterBuy = false;
+      this.disableProfitExitAfterBuy = true;
+      this.followTokenTopBuyerWallet = topBuyerWallet;
+      this.followTokenTopBuyerMint = state.mint;
+      this.followTokenTopBuyerEntryKind = "initial_copysell";
+      this.ensureFollowTokenTopBuyerWatchSubscribed();
 
       const signature = `gmgn-bundler-group-${secondGroup.anchorTimestamp}`;
       const walletLines = secondGroup.wallets
@@ -3511,41 +4452,52 @@ export class InsiderBot extends EventEmitter {
           `<b>🟢 ${this.label} Follow-Token GMGN Second Bundler Group Buy</b>`,
           `Token: <code>${state.mint}</code>`,
           `FeePayer: <code>${state.funderWallet}</code>`,
-          `Second group: <b>${secondGroup.wallets.length}</b> wallet(s) (≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}) at <b>${secondGroup.anchorTimestamp}</b> (±${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC}s)`,
-          `Exit: <b>+${exitPercent}% MC</b> · Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b>`,
+          `Top buyer watch: <code>${topBuyerWallet}</code>`,
+          topBuyerSnapshot
+            ? `Top buyer GMGN buy: <b>$${topBuyerSnapshot.buyVolumeCur.toLocaleString()}</b> / <b>${topBuyerSnapshot.buyAmountCur.toLocaleString()}</b> tokens`
+            : "",
+          `Initial bundler GMGN group: <b>${firstGroup.wallets.length}</b> wallet(s) at <b>${firstGroup.anchorTimestamp}</b>`,
+          `Second group: <b>${secondGroup.wallets.length}</b> wallet(s) (≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}) at <b>${secondGroup.anchorTimestamp}</b> (same second + ${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC}s grace)`,
+          `Exit: <b>copy-sell on top buyer sell</b> · Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b> (+90% TP disabled)`,
           "",
           walletLines,
-        ].join("\n"),
+        ].filter(Boolean).join("\n"),
         "follow-token gmgn second bundler group buy notification",
       );
 
-      this.log.warn("Follow-token GMGN second bundler group accepted for buy", {
+      this.followTokenGmgnBundlerBackend("GMGN second bundler group accepted for buy", {
         mint: state.mint,
         funderWallet: state.funderWallet,
+        topBuyerWallet,
+        topBuyerBuyVolumeCur: topBuyerSnapshot?.buyVolumeCur ?? null,
+        topBuyerBuyAmountCur: topBuyerSnapshot?.buyAmountCur ?? null,
         secondGroupTimestamp: secondGroup.anchorTimestamp,
         secondGroupWallets: secondGroup.wallets,
+        firstGroupTimestamp: firstGroup.anchorTimestamp,
         groupCount: allGroups.length,
         currentMc,
-        exitPercent,
-        exitMc: newExitMc,
+        profitExitDisabled: true,
       });
 
       this.stopFollowTokenGmgnBundlerPoll("buy triggered");
+      this.followTokenGmgnBuySecondGroupWallets = [...secondGroup.wallets];
       this.emit("buyTrigger", {
         followedWallet: this.getBuyTriggerFollowedWallet(state),
         mint: state.mint,
         signature,
         buySol: this.getBuySolForFundingMode(state.lowFundingMode),
         entryMc: currentMc,
-        monitoredWallet: secondGroup.wallets[0],
+        monitoredWallet: topBuyerWallet,
         tradersListStr: [
           "<b>Follow-Token GMGN Second Bundler Group Buy Gate Passed</b>",
           `FeePayer: <code>${state.funderWallet}</code>`,
-          `Second group timestamp: <b>${secondGroup.anchorTimestamp}</b> (±${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_TOLERANCE_SEC}s)`,
+          `Top buyer watch: <code>${topBuyerWallet}</code>`,
+          `Initial bundler GMGN group timestamp: <b>${firstGroup.anchorTimestamp}</b>`,
+          `Second group timestamp: <b>${secondGroup.anchorTimestamp}</b> (same second + ${FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC}s grace)`,
           `Second group wallets: <b>${secondGroup.wallets.length}</b> (≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS})`,
           `Initial bundlers validated in first GMGN group: <b>${state.bundlerWallets.size}</b>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-          `Exit target: <b>+${exitPercent}% MC</b>`,
+          `Exit: copy-sell on top buyer sell tx (+90% TP disabled)`,
           `Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b>`,
           "",
           ...secondGroup.wallets.map(
@@ -4402,6 +5354,9 @@ export class InsiderBot extends EventEmitter {
       | { kind: "mc_floor"; currentMc: number },
   ): Promise<void> {
     if (this.devFullExitHandled) return;
+    if (this.followTokenTopBuyerMint === mint) {
+      await this.stopFollowTokenTopBuyerWatch(`rug signal (${signal.kind})`);
+    }
     this.devFullExitHandled = true;
     const stopReason =
       signal.kind === "zero_balance"
@@ -8408,7 +9363,7 @@ export class InsiderBot extends EventEmitter {
     );
 
     this.emit("sellTrigger", {
-      followedWallet: this.getFlowFollowWallet()!,
+      followedWallet: this.getBuyTriggerFollowedWallet(this.bundlerFunderWatch),
       positionMint: mint,
       signature,
       reason,
@@ -8496,6 +9451,7 @@ export class InsiderBot extends EventEmitter {
     this.flowSource = null;
     this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
+    this.followTokenGmgnBuySecondGroupWallets = null;
 
     if (this.followedWallets.length > 0 && this.followMonitors.size === 0) {
       await this.maybeAutoResumeFollowWalletMonitoring("cycle_complete");
@@ -8515,6 +9471,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     await this.stopFlowMonitoring();
+    await this.stopFollowTokenTopBuyerWatch("token flow reset");
     if (clearPosition) {
       this.activePosition = null;
     }
@@ -8562,6 +9519,7 @@ export class InsiderBot extends EventEmitter {
     this.flowSource = null;
     this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
+    this.followTokenGmgnBuySecondGroupWallets = null;
 
     if (this.followedWallets.length > 0 && this.followMonitors.size === 0) {
       await this.maybeAutoResumeFollowWalletMonitoring("reset");

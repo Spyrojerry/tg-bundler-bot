@@ -95,6 +95,7 @@ export class GmgnClient {
   private readonly pumpPortalApiKey: string | null;
   private readonly pumpPortalWalletAddress: string | null;
   private readonly connection: Connection;
+  private readonly rpcEndpoint: string;
   private readonly chain = "sol";
   private readonly limiter: RateLimiter;
   private readonly fallbackApiKey: string | null;
@@ -119,10 +120,8 @@ export class GmgnClient {
     this.jupiterPriceApiKey = config.jupiterPriceApiKey;
     this.pumpPortalApiKey = config.pumpPortalApiKey;
     this.pumpPortalWalletAddress = config.pumpPortalWalletAddress;
-    this.connection = new Connection(
-      rpcUrlOverride || config.solanaRpcUrl,
-      "confirmed",
-    );
+    this.rpcEndpoint = rpcUrlOverride || config.solanaRpcUrl;
+    this.connection = new Connection(this.rpcEndpoint, "confirmed");
     this.pumpSdk = new OnlinePumpSdk(this.connection);
     this.pumpAmmSdk = new OnlinePumpAmmSdk(this.connection);
     this.limiter = limiter;
@@ -2147,6 +2146,104 @@ private async sendRawTransactionAndAssertSuccess(
 
   async getTokenRawBalance(wallet: string, mint: string): Promise<bigint> {
     return this.getTokenBalance(wallet, mint);
+  }
+
+  /**
+   * Batched on-chain token balances for many wallets and one mint.
+   * Sends all getTokenAccountsByOwner calls in one JSON-RPC HTTP batch (SPL + Token-2022 per wallet).
+   * Sums multiple token accounts per wallet; missing accounts resolve to 0.
+   */
+  async getTokenRawBalancesForWalletsBatch(
+    wallets: string[],
+    mint: string,
+  ): Promise<Map<string, bigint>> {
+    this.validateSolAddress(mint, "mint");
+    const uniqueWallets = [...new Set(wallets.filter(Boolean))];
+    const balances = new Map<string, bigint>();
+    for (const wallet of uniqueWallets) {
+      this.validateSolAddress(wallet, "wallet");
+      balances.set(wallet, 0n);
+    }
+    if (uniqueWallets.length === 0) return balances;
+
+    const mintBase58 = new PublicKey(mint).toBase58();
+    type BatchItem = { id: number; wallet: string; programId: PublicKey };
+    const batchItems: BatchItem[] = [];
+    let nextId = 1;
+    for (const wallet of uniqueWallets) {
+      for (const programId of TOKEN_PROGRAM_IDS) {
+        batchItems.push({ id: nextId, wallet, programId });
+        nextId += 1;
+      }
+    }
+
+    const body = batchItems.map((item) => ({
+      jsonrpc: "2.0",
+      id: item.id,
+      method: "getTokenAccountsByOwner",
+      params: [
+        item.wallet,
+        { mint: mintBase58, programId: item.programId.toBase58() },
+        { encoding: "jsonParsed" },
+      ],
+    }));
+
+    const response = await fetch(this.rpcEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      throw new Error(
+        `Batch getTokenAccountsByOwner failed: HTTP ${response.status}`,
+      );
+    }
+
+    const json = (await response.json()) as
+      | {
+          id: number;
+          result?: {
+            value: Array<{ account: { data: ParsedAccountData } }>;
+          };
+          error?: { message?: string };
+        }
+      | Array<{
+          id: number;
+          result?: {
+            value: Array<{ account: { data: ParsedAccountData } }>;
+          };
+          error?: { message?: string };
+        }>;
+    const entries = Array.isArray(json) ? json : [json];
+    const byId = new Map(entries.map((entry) => [entry.id, entry]));
+
+    for (const item of batchItems) {
+      const entry = byId.get(item.id);
+      if (!entry) continue;
+      if (entry.error) {
+        const message = entry.error.message ?? "";
+        if (!this.isMissingMintTokenAccountLookup(message)) {
+          log.debug("Batch getTokenAccountsByOwner entry failed", {
+            wallet: item.wallet,
+            mint,
+            programId: item.programId.toBase58(),
+            error: message,
+          });
+        }
+        continue;
+      }
+
+      for (const tokenAccount of entry.result?.value ?? []) {
+        const parsed = tokenAccount.account.data as ParsedAccountData;
+        const amount = parsed?.parsed?.info?.tokenAmount?.amount;
+        if (typeof amount === "string" && /^\d+$/.test(amount)) {
+          const current = balances.get(item.wallet) ?? 0n;
+          balances.set(item.wallet, current + BigInt(amount));
+        }
+      }
+    }
+
+    return balances;
   }
 
   async getSubmittedBuyReconciliationState(

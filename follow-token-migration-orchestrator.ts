@@ -177,6 +177,10 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     );
   }
 
+  suspendMigrationFeedForActiveFlow(mint: string): void {
+    this.unsubscribeMigrationFeedForActiveFlow(mint);
+  }
+
   private unsubscribeMigrationFeedForActiveFlow(mint: string): void {
     this.activeFollowTokenMint = mint;
     this.pumpPortalWs?.suspendMigrationFeed(
@@ -290,7 +294,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
           `Dev: <code>${this.html(devWallet)}</code>`,
           `Create → migrate: <b>${migrationAgeSec.toFixed(0)}s</b>`,
           `Dev funder: <code>${this.html(funding?.funder ?? 'unknown')}</code>${funding?.funderName ? ` (${this.html(funding.funderName)})` : ''}`,
-          'First-four unique SWAP buys confirmed — starting bundler-funder monitoring…',
+          'First-four unique SWAP buys confirmed — starting GMGN bundler watch…',
         ]);
       }
 

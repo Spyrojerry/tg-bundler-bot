@@ -1,13 +1,44 @@
 # Changelog
 
+## 2026-07-23 (87)
+
+### Follow-token: second-group rebuy only after top buyer sell tx
+
+- Re-entry and second-group handoff buys are ignored until the GMGN **top buyer** has a **sell tx** on the token. Buys from the top buyer or any other second-group wallet before that sell are not considered (including REST backfill replay).
+
+## 2026-07-23 (86)
+
+### Follow-token: REST backfill while top-buyer / second-group WSS watch connects
+
+- When subscribing (or re-syncing) the Enhanced WSS top-buyer or second-group handoff watch, the bot now **REST-backfills recent wallet history** for the watched address(es) from slightly before subscribe time.
+- Catches buy/sell txs that land while the WebSocket is connecting, reconnecting, or between our buy submit and holding start. Signatures are deduped with live WSS notifications; txs are replayed oldest-first through the same handler.
+
+## 2026-07-23 (85)
+
+### Follow-token: second-group top-buyer handoff after original top buyer sells
+
+- After the GMGN second-group **top buyer** has a **sell tx** and the bot is idle (post copy-sell or post re-entry full exit), the bot keeps the second-group wallet list and opens a **multi-wallet Enhanced WSS watch** on that group.
+- If the **same** top buyer buys again → existing re-entry (full on-chain exit sell).
+- If a **different** wallet in the second group buys → **hand off** top-buyer watch to that wallet, re-enter, and exit when the **new** top buyer fully exits on-chain (+90% TP disabled; -50% SL remains).
+
+## 2026-07-23 (84)
+
+### Follow-token: GMGN-only flow (skip feePayer backtrack)
+
+- Follow-token no longer runs the Helius bundler **zero-balance funding / shared feePayer** backtrack before buy. Migrated tokens often have no funding TRANSFER history in that window (`transferCount: 0`), which blocked GMGN polling entirely.
+- After migration filters + first-four bundlers, the bot loads dev CREATE time and starts the **GMGN second-group poll** immediately (dev rug watch still active).
+
 ## 2026-07-23 (83)
 
 ### Follow-token: GMGN bundler second-group buy trigger
 
 - After **Shared FeePayer Locked**, follow-token normal mode polls GMGN bundler traders every **2s** for up to **60s** from token CREATE (`fetchBundlerTraders`, limit 50).
-- Bundlers are grouped by `start_holding_at` with **±2s** tolerance. The first group must include all **4** initial bundlers; a **second** group with **≥4 wallets** (still within the first minute from CREATE) triggers buy immediately and stops polling.
+- Bundlers are grouped by `start_holding_at` using the anchor second plus **1s grace** (same timestamp second and the next second only — not +2s). Polling is two-phase: keep polling until GMGN shows a first group containing all **4** initial bundlers (may not appear on the first request), then wait for the **next** group with **≥4 wallets** within the first minute from CREATE to trigger buy and stop polling.
 - Round-group and cumulative-dust buy gates are **disabled** for follow-token (feePayer watch continues).
 - Buy exit: **+90% MC**; stop-loss remains **-50% P/L**.
+- Backend logs: each poll emits **`[FOLLOW-TOKEN-GMGN]`** info lines with trader snapshots, same-second + 1s grace groups, and poll phase (`waiting_initial_group` / `waiting_second_group`).
+- **Post-buy sell trigger:** while holding a follow-token position, batched on-chain `getTokenAccountsByOwner` checks (SPL + Token-2022, one JSON-RPC batch per tick) run on the **top buyer wallet** during **re-entry** only. When that wallet has zero token balance, the bot sells the full position.
+- **Top buyer watch:** after the GMGN second-group buy, the wallet with the highest GMGN `buy_volume_cur` in that group is watched via Enhanced WSS. **First entry:** copy-sell on any top-buyer sell tx (+90% TP disabled, -50% SL kept). **After sell:** PumpPortal migration resumes but the top-buyer watch stays active. **Re-entry:** if the top buyer buys again before rug, migration feed suspends and the bot re-buys; **second entry** exits when the top buyer fully exits on-chain.
 
 ## 2026-07-23 (82)
 
