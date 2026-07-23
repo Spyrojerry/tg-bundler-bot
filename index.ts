@@ -963,6 +963,10 @@ async function main(): Promise<void> {
           }
           return homeReply(true);
         }
+        if (data === "funderfirst:pause") {
+          funderFirstOrchestrator.stop("Paused from Telegram");
+          return homeReply(true);
+        }
         if (data === "funderfirst:stop") {
           funderFirstOrchestrator.stop("Stopped from Telegram");
           return homeReply(true);
@@ -1084,9 +1088,36 @@ async function main(): Promise<void> {
           await insiderBots[0].stop();
           return homeReply(true);
         }
+        if (data === "insider:pause:follow") {
+          activeInsiderIndex = 0;
+          await insiderBots[0].pauseFollowWalletMonitoring();
+          return homeReply(true);
+        }
+        if (data === "insider:resume:follow") {
+          activeInsiderIndex = 0;
+          if (!config.insiderFollowWalletEnabled) {
+            return {
+              text: "Follow-wallet auto-start is disabled. Set <code>INSIDER_FOLLOW_WALLET_ENABLED=true</code> in .env and restart, or use this after enabling.",
+              editCurrent: true,
+            };
+          }
+          const started = await resumeInsiderFollowWallets(0, "telegram follow-wallet resume");
+          if (started !== true) {
+            return typeof started === "string"
+              ? started
+              : "Insider bot stopped because its Helius RPC/WS usage is exhausted.";
+          }
+          return homeReply(true);
+        }
         if (data === "insider:resume") {
           activeInsiderIndex = 0;
           const bot = insiderBots[0];
+          if (!config.insiderFollowWalletEnabled) {
+            return {
+              text: "Follow-wallet auto-start is disabled. Set <code>INSIDER_FOLLOW_WALLET_ENABLED=true</code> in .env and restart, or use Resume Follow-Wallet after enabling.",
+              editCurrent: true,
+            };
+          }
           if (bot.getFollowedWallets().length === 0) {
             pendingTelegramActions.set(chatId, {
               type: "insiderFollowWallet",
@@ -1450,6 +1481,7 @@ async function main(): Promise<void> {
   });
 
   async function resumePrimaryInsiderBot(): Promise<void> {
+    if (!config.insiderFollowWalletEnabled) return;
     const bot = insiderBots[0];
     if (!bot) return;
     const wallets = bot.getFollowedWallets();
@@ -1526,7 +1558,6 @@ async function main(): Promise<void> {
   followTokenOrchestrator = new FollowTokenMigrationOrchestrator(
     config,
     insiderBots,
-    sharedEnhancedWs,
     telegramBot,
   );
   insiderBots[0]!.setFollowWalletTxNotifier((tx) => {
@@ -2220,6 +2251,7 @@ async function main(): Promise<void> {
       enforceMinBuySol: true,
       minBuySol,
       logLabel: `WALLET WATCHED ${normalized.slice(0, 6)}`,
+      enhancedWs: sharedEnhancedWs,
     });
     wireWatchedWalletMonitor(monitor);
     pausedWallets.delete(normalized);
@@ -2284,6 +2316,7 @@ async function main(): Promise<void> {
   }
 
   async function startFunderFirstModeServices(): Promise<void> {
+    if (!config.insiderFunderFirstEnabled) return;
     if (!funderFirstOrchestrator.getFunderAddress()) return;
     try {
       await funderFirstOrchestrator.start();
@@ -2456,10 +2489,24 @@ async function main(): Promise<void> {
       status = "Paused";
     }
 
-    const stopResumeButton =
-      followedWallets.length > 0 && !insiderRunning
-        ? { text: "Resume", callback_data: "insider:resume" }
-        : { text: "Stop", callback_data: "insider:stop" };
+    const followWalletMonitoringActive = bot.isFollowWalletMonitoringActive();
+    const canResumeFollowWallet =
+      followedWallets.length > 0 &&
+      !followWalletMonitoringActive &&
+      !preBuyMint &&
+      !activePos;
+
+    const followWalletPauseButton =
+      followedWallets.length > 0 && followWalletMonitoringActive
+        ? { text: "Pause Follow-Wallet", callback_data: "insider:pause:follow" }
+        : null;
+    const followWalletResumeButton = canResumeFollowWallet
+      ? { text: "Resume Follow-Wallet", callback_data: "insider:resume:follow" }
+      : null;
+
+    const stopButton = insiderRunning
+      ? { text: "Stop All", callback_data: "insider:stop" }
+      : null;
 
     const buyDisabled = bot.isBuyDisabled();
     const disableBuyButton = {
@@ -2480,9 +2527,13 @@ async function main(): Promise<void> {
           )
         : ["  • <i>none yet</i>"];
 
-    const funderFirstStartButton = funderFirstRunning
-      ? null
-      : { text: "Start Funder-First", callback_data: "funderfirst:start" };
+    const funderFirstStartButton =
+      !funderFirstRunning && funderAddress
+        ? { text: "Start Funder-First", callback_data: "funderfirst:start" }
+        : null;
+    const funderFirstPauseButton = funderFirstRunning
+      ? { text: "Pause Funder-First", callback_data: "funderfirst:pause" }
+      : null;
 
     const followTokenStartButton = followTokenRunning
       ? null
@@ -2515,7 +2566,7 @@ async function main(): Promise<void> {
         "<b>Insider Bot</b>",
         "",
         `Status: <b>${status}</b>`,
-        `<b>Follow wallets</b> (max ${MAX_FOLLOW_WALLETS}):`,
+        `<b>Follow wallets</b> (max ${MAX_FOLLOW_WALLETS})${followWalletMonitoringActive ? " — <b>monitoring</b>" : followedWallets.length > 0 ? " — <b>paused</b>" : ""}:`,
         ...followWalletLines,
         monitoredWallet
           ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
@@ -2535,7 +2586,7 @@ async function main(): Promise<void> {
         "<b>Flows (run in parallel)</b>",
         "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
         "<b>B) Funder-first</b> — watch a feePayer funder; detect potential feePayers funding bundlers.",
-        "<b>C) Follow-token</b> — listen for Pump.fun migrate/migrate_v2; filter + first-four bundler logic → shared feePayer monitoring.",
+        "<b>C) Follow-token</b> — PumpPortal migration events → filters → bundler-funder monitoring.",
         insiderBots.length > 1
           ? `Parallel tokens: up to <b>${insiderBots.length}</b> insider bot key(s) — follow-wallet, funder-first, and follow-token can each hold a different token when keys are free.`
           : "Parallel tokens: configure <b>INSIDER_HELIUS_API_KEY_2</b> (+ GMGN/RPC/WS) to run multiple discovery flows on two tokens at once.",
@@ -2555,9 +2606,14 @@ async function main(): Promise<void> {
         "",
         "<b>Follow-token steps</b>",
         "1. <b>Start Follow-Token</b> (or set <code>INSIDER_FOLLOW_TOKEN_ENABLED=true</code>).",
-        "2. Listen for Pump.fun <b>migrate / migrate_v2</b> via Enhanced WS.",
-        `3. Filters: mint ends <b>pump</b>, dev created exactly 1 token, migrate ≤ <b>${config.insiderFollowTokenMaxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b> (Helius funded-by).`,
-        "4. Must have four first unique SWAP buys → same bundler-funder monitoring as follow-wallet (no follow wallet required).",
+        "2. PumpPortal <b>subscribeMigration</b> via <code>PUMPPORTAL_API_KEY</code>.",
+        `3. Filters: mint ends <b>pump</b>, dev created exactly 1 Pump.fun token (Bitquery), migrate ≤ <b>${config.insiderFollowTokenMaxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>.`,
+        "4. First-four unique SWAP buys → same bundler-funder monitoring as follow-wallet.",
+        "",
+        "<b>Env auto-start flags</b>",
+        `Follow-wallet: <b>${config.insiderFollowWalletEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FOLLOW_WALLET_ENABLED</code>)`,
+        `Funder-first: <b>${config.insiderFunderFirstEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FUNDER_FIRST_ENABLED</code>)`,
+        `Follow-token TG alerts: <b>${config.insiderFollowTokenEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FOLLOW_TOKEN_ENABLED</code>)`,
       ].join("\n"),
       replyMarkup: {
         inline_keyboard: [
@@ -2569,7 +2625,10 @@ async function main(): Promise<void> {
           [
             { text: "Fast-track feePayer", callback_data: "funderfirst:fasttrack" },
           ],
+          ...(followWalletPauseButton ? [[followWalletPauseButton]] : []),
+          ...(followWalletResumeButton ? [[followWalletResumeButton]] : []),
           ...(funderFirstStartButton ? [[funderFirstStartButton]] : []),
+          ...(funderFirstPauseButton ? [[funderFirstPauseButton]] : []),
           ...(followTokenStartButton ? [[followTokenStartButton]] : []),
           ...(followTokenStopButton ? [[followTokenStopButton]] : []),
           ...feePayerRemoveRows,
@@ -2586,7 +2645,7 @@ async function main(): Promise<void> {
             { text: "Status", callback_data: "menu:status" },
             { text: "Refresh", callback_data: "menu:refresh" },
           ],
-          [stopResumeButton],
+          ...(stopButton ? [[stopButton]] : []),
         ],
       },
       editCurrent,

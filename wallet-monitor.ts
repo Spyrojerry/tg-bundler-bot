@@ -133,6 +133,9 @@ export class WalletMonitor extends EventEmitter {
     if (this.enhancedWs) {
       this.startEnhancedWsSubscription();
     } else {
+      this.log.warn(
+        'INSIDER_HELIUS_API_KEY not configured — falling back to logsSubscribe + RPC parse (slower, more credits). Prefer transactionSubscribe via Enhanced WSS.',
+      );
       this.startLogsSubscription();
     }
   }

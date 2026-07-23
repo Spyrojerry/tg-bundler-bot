@@ -88,6 +88,7 @@ export function loadConfig(): ServiceConfig {
   const jupiterPriceApiKey = optional('JUPITER_PRICE_API_KEY', jupiterApiKey);
   const pumpPortalApiKey = optionalNullable('PUMPPORTAL_API_KEY');
   const pumpPortalWalletAddress = optionalNullable('PUMPPORTAL_WALLET_ADDRESS');
+  const bitqueryAccessToken = optionalNullable('BITQUERY_ACCESS_TOKEN');
   const heliusApiKey     = optional('HELIUS_API_KEY', '');
   const receiverHeliusApiKey = optional('RECEIVER_HELIUS_API_KEY', '');
   const receiverSolanaRpcUrl = optional(
@@ -155,6 +156,8 @@ export function loadConfig(): ServiceConfig {
   const insiderFeePayerFunderAddress = optionalNullable(
     'INSIDER_FEEPAYER_FUNDER_ADDRESS',
   );
+  const insiderFollowWalletEnabled = optionalBoolean('INSIDER_FOLLOW_WALLET_ENABLED', false);
+  const insiderFunderFirstEnabled = optionalBoolean('INSIDER_FUNDER_FIRST_ENABLED', false);
   const insiderFollowTokenEnabled = optionalBoolean('INSIDER_FOLLOW_TOKEN_ENABLED', false);
   const insiderFollowTokenMaxMigrationAgeSec = optionalInt(
     'INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC',
@@ -227,6 +230,7 @@ export function loadConfig(): ServiceConfig {
     jupiterPriceApiKey,
     pumpPortalApiKey,
     pumpPortalWalletAddress,
+    bitqueryAccessToken,
     monitorInterval,
     monitoringWindowMs,
     rateLimitMinTime,
@@ -270,6 +274,8 @@ export function loadConfig(): ServiceConfig {
     insiderFollowWallet3,
     insiderFollowWallet4,
     insiderFeePayerFunderAddress,
+    insiderFollowWalletEnabled,
+    insiderFunderFirstEnabled,
     insiderFollowTokenEnabled,
     insiderFollowTokenMaxMigrationAgeSec,
     logLevel: rawLogLevel,

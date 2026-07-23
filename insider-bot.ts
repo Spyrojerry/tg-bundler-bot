@@ -289,6 +289,9 @@ export interface InsiderBot {
   stopForHeliusCredits(): Promise<void>;
   isStoppedForHeliusCredits(): boolean;
   isRunning(): boolean;
+  isFollowWalletMonitoringActive(): boolean;
+  pauseFollowWalletMonitoring(): Promise<void>;
+  resumeFollowWalletMonitoring(): Promise<void>;
   isBuyInProgress(): boolean;
   setBuyExecuting(executing: boolean): void;
   resetBuyAttempt(): void;
@@ -1367,6 +1370,21 @@ export class InsiderBot extends EventEmitter {
     for (const address of [...this.followMonitors.keys()]) {
       this.stopFollowWalletMonitor(address);
     }
+  }
+
+  isFollowWalletMonitoringActive(): boolean {
+    return this.followMonitors.size > 0;
+  }
+
+  async pauseFollowWalletMonitoring(): Promise<void> {
+    this.stopAllFollowMonitors();
+    this.log.info('Follow-wallet monitoring paused', {
+      followWallets: this.followedWallets,
+    });
+  }
+
+  async resumeFollowWalletMonitoring(): Promise<void> {
+    await this.followAllWallets();
   }
 
   async removeFollowWallet(address: string): Promise<void> {

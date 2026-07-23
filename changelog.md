@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-07-23 (62)
+
+### Follow-token: Bitquery Pump.fun creator count
+
+- Replaced Helius CREATE-tx history scan with **Bitquery** aggregate query (`Program.Name = pump`, `Method in [create, create_v2]`, `Transaction.Signer = dev`) — accurate total create count, not limited to first N txs.
+- Requires **`BITQUERY_ACCESS_TOKEN`** in `.env` for follow-token start.
+- Removed `HeliusClient.countDevCreatedTokenMints`.
+
+## 2026-07-23 (61)
+
+### Follow-token: PumpPortal migration WebSocket + pause/env controls
+
+- Replaced Helius `parsedTransactionSubscribe` with **PumpPortal** `subscribeMigration` (`wss://pumpportal.fun/api/data?api-key=PUMPPORTAL_API_KEY`).
+- New `pump-portal-ws.ts` client with reconnect + migration event parsing.
+- **Pause Follow-Wallet** / **Resume Follow-Wallet** Telegram buttons (pause monitors only; active token flows unchanged).
+- **Pause Funder-First** button (separate from Start).
+- Env auto-start flags: **`INSIDER_FOLLOW_WALLET_ENABLED`**, **`INSIDER_FUNDER_FIRST_ENABLED`**, **`INSIDER_FOLLOW_TOKEN_ENABLED`** (follow-token TG alerts still require the last).
+- General wallet monitors now pass shared Enhanced WSS for `transactionSubscribe` when `INSIDER_HELIUS_API_KEY` is set.
+
 ## 2026-07-23 (60)
 
 ### Follow-token: funded-by requires `Centralized Exchange`

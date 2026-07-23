@@ -143,6 +143,8 @@ export interface ServiceConfig {
   jupiterPriceApiKey: string;
   pumpPortalApiKey: string | null;
   pumpPortalWalletAddress: string | null;
+  /** Bitquery OAuth access token for Pump.fun creator aggregates (follow-token filter). */
+  bitqueryAccessToken: string | null;
   monitorInterval: number;
   monitoringWindowMs: number;  // legacy env setting; linked tokens use apply-sample decisions
   rateLimitMinTime: number;
@@ -187,6 +189,10 @@ export interface ServiceConfig {
   insiderFollowWallet4: string | null;
   /** Top-level feePayer funder wallet for the parallel funder-first discovery flow. */
   insiderFeePayerFunderAddress: string | null;
+  /** Auto-start follow-wallet monitoring on boot when true. */
+  insiderFollowWalletEnabled: boolean;
+  /** Auto-start funder-first on boot when true (still requires funder address). */
+  insiderFunderFirstEnabled: boolean;
   /** Enable follow-token Pump.fun migration listener on startup (still requires Start in Telegram unless auto-resumed). */
   insiderFollowTokenEnabled: boolean;
   /** Max seconds between token CREATE and migrate for follow-token filter (default 60). */

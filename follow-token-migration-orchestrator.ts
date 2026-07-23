@@ -1,25 +1,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  follow-token-migration-orchestrator.ts — Listen for Pump.fun migrate events,
-//  apply migration filters, validate first-four bundler logic, then hand off
-//  to InsiderBot (follow-token flow — no follow wallet required).
+//  follow-token-migration-orchestrator.ts — Listen for Pump.fun migrate events
+//  via PumpPortal WebSocket, apply filters, validate first-four bundler logic,
+//  then hand off to InsiderBot (follow-token flow — no follow wallet required).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { EventEmitter } from 'events';
 import { createLogger } from './logger';
-import { HeliusClient, HeliusTransaction } from './helius-client';
-import { HeliusEnhancedWsClient } from './helius-enhanced-ws';
+import { HeliusClient } from './helius-client';
 import { InsiderBot } from './insider-bot';
 import type { ServiceConfig } from './types';
 import { TelegramBot } from './telegram-bot';
-import {
-  extractPumpMigrateMintFromRaw,
-  isExchangeFundedBy,
-  isPumpMigrateRawTransaction,
-  PUMP_FUN_PROGRAM,
-  PUMP_MIGRATE_INSTRUCTIONS,
-} from './pump-migrate-detector';
+import { isExchangeFundedBy } from './pump-migrate-detector';
 import { extractFirstUniqueEarlyBundlerBuys } from './wallet-swap-detector';
-import type { RawEnhancedWsTransactionResult } from './wallet-swap-detector';
+import { PumpPortalWsClient } from './pump-portal-ws';
+import { BitqueryClient } from './bitquery-client';
 
 const log = createLogger('FOLLOW-TOKEN');
 
@@ -36,11 +30,12 @@ interface CoreMigrationFilterContext {
 
 export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private readonly heliusClient: HeliusClient;
+  private readonly bitqueryClient: BitqueryClient | null;
   private readonly insiderBots: InsiderBot[];
   private readonly maxMigrationAgeSec: number;
+  private pumpPortalWs: PumpPortalWsClient | null = null;
   private isEnabled = false;
   private isShuttingDown = false;
-  private parsedWatchId: number | null = null;
   private readonly seenMigrationMints = new Set<string>();
   private readonly seenMigrationSignatures = new Set<string>();
   private readonly inFlightMints = new Set<string>();
@@ -48,7 +43,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
   constructor(
     private readonly config: ServiceConfig,
     insiderBots: InsiderBot[],
-    private readonly enhancedWs: HeliusEnhancedWsClient | null,
     private readonly telegramBot: TelegramBot | null = null,
   ) {
     super();
@@ -58,6 +52,9 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       label: 'Follow-Token Helius',
       projectId: config.insiderHeliusProjectId || undefined,
     });
+    this.bitqueryClient = config.bitqueryAccessToken
+      ? new BitqueryClient(config.bitqueryAccessToken)
+      : null;
     this.maxMigrationAgeSec =
       config.insiderFollowTokenMaxMigrationAgeSec > 0
         ? config.insiderFollowTokenMaxMigrationAgeSec
@@ -70,30 +67,41 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
 
   async start(): Promise<void> {
     if (this.isEnabled || this.isShuttingDown) return;
-    if (!this.enhancedWs) {
-      throw new Error(
-        'Follow-token requires INSIDER_HELIUS_API_KEY (Developer plan Enhanced WebSocket)',
-      );
+    if (!this.config.pumpPortalApiKey) {
+      throw new Error('Follow-token requires PUMPPORTAL_API_KEY in .env');
     }
+    if (!this.bitqueryClient) {
+      throw new Error('Follow-token requires BITQUERY_ACCESS_TOKEN in .env');
+    }
+    this.pumpPortalWs?.close();
+    this.pumpPortalWs = new PumpPortalWsClient(
+      this.config.pumpPortalApiKey,
+      'Follow-Token PumpPortal',
+    );
     this.isEnabled = true;
-    this.subscribeMigrationEvents();
+    this.pumpPortalWs.onMigration((event) => {
+      void this.processMigrationCandidate(
+        event.mint,
+        event.signature,
+        event.timestamp,
+      );
+    });
+    this.pumpPortalWs.connect();
     log.info('Follow-token migration listener started', {
-      program: PUMP_FUN_PROGRAM,
-      instructions: [...PUMP_MIGRATE_INSTRUCTIONS],
+      source: 'PumpPortal subscribeMigration',
       maxMigrationAgeSec: this.maxMigrationAgeSec,
     });
     void this.sendTelegram([
       '<b>▶️ Follow-Token: Pump Migration Listener Started</b>',
-      `Program: <code>${PUMP_FUN_PROGRAM}</code>`,
-      `Instructions: <b>migrate, migrate_v2</b>`,
-      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, dev created exactly 1 token, migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
+      'Source: <b>PumpPortal subscribeMigration</b>',
+      `Filters: mint ends <b>${PUMP_MINT_SUFFIX}</b>, dev created exactly 1 Pump.fun token (Bitquery), migrate ≤ <b>${this.maxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
     ]);
   }
 
   stop(reason = 'Stopped'): void {
     if (!this.isEnabled) return;
     this.isEnabled = false;
-    this.unsubscribeMigrationEvents();
+    this.pumpPortalWs?.close();
     log.info('Follow-token migration listener stopped', { reason });
     void this.sendTelegram([
       `<b>⏹️ Follow-Token: Migration Listener Stopped</b>`,
@@ -106,46 +114,12 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.stop('Process shutdown');
   }
 
-  private subscribeMigrationEvents(): void {
-    if (!this.enhancedWs) return;
-    this.parsedWatchId = this.enhancedWs.watchParsedProgramInstructions(
-      [PUMP_FUN_PROGRAM],
-      [...PUMP_MIGRATE_INSTRUCTIONS],
-      (tx, raw) => {
-        void this.handleMigrationNotification(tx, raw);
-      },
-    );
-  }
-
-  private unsubscribeMigrationEvents(): void {
-    if (!this.enhancedWs) return;
-    if (this.parsedWatchId !== null) {
-      void this.enhancedWs
-        .unwatchParsedProgramInstructions(this.parsedWatchId)
-        .catch(() => undefined);
-      this.parsedWatchId = null;
-    }
-  }
-
-  private async handleMigrationNotification(
-    tx: HeliusTransaction,
-    raw: RawEnhancedWsTransactionResult,
-  ): Promise<void> {
-    if (!this.isEnabled) return;
-    if (!isPumpMigrateRawTransaction(raw)) return;
-    const mint = extractPumpMigrateMintFromRaw(raw);
-    if (!mint) {
-      log.debug('Pump migrate tx missing mint; skipping', { signature: tx.signature });
-      return;
-    }
-    await this.processMigrationCandidate(mint, tx.signature, tx.timestamp);
-  }
-
   private async processMigrationCandidate(
     mint: string,
     signature: string,
     migrationTimestamp: number,
   ): Promise<void> {
+    if (!this.isEnabled) return;
     if (this.seenMigrationSignatures.has(signature)) return;
     this.seenMigrationSignatures.add(signature);
     if (this.seenMigrationMints.has(mint) || this.inFlightMints.has(mint)) return;
@@ -242,9 +216,10 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return `migration ${migrationAgeSec.toFixed(0)}s after create (max ${this.maxMigrationAgeSec}s)`;
     }
 
-    const devCreateCount = await this.heliusClient.countDevCreatedTokenMints(devWallet);
+    const devCreateCount =
+      await this.bitqueryClient!.countPumpFunTokensCreatedByWallet(devWallet);
     if (devCreateCount !== 1) {
-      return `dev created ${devCreateCount} tokens (expected exactly 1)`;
+      return `dev created ${devCreateCount} Pump.fun tokens (expected exactly 1)`;
     }
 
     const funding = await this.heliusClient.getWalletFundedBy(devWallet);
