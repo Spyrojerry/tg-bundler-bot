@@ -5,6 +5,7 @@
 ### Follow-token: fail-fast second group, 1s GMGN poll, API key rotation
 
 - **Second group:** after initial bundler group is latched, wait for the **next** same-second GMGN group. If it appears with **&lt;5** wallets, stop polling and **reset** (sell if holding, else resume PumpPortal). If **≥5**, continue tag plan / buy as before.
+- **Initial group:** once GMGN shows the earliest same-second group containing **any** expected initial bundler, **all** expected bundlers must appear in that group; otherwise **reset** (do not keep polling for missing bundlers).
 - **Poll interval:** GMGN bundler poll every **1s** (was 2s).
 - **Rate limits:** follow-token GMGN bundler fetches (poll + third-group one-shot) **round-robin** across all configured insider `GmgnClient` instances (`GMGN_API_KEY` … `GMGN_API_KEY_4`).
 

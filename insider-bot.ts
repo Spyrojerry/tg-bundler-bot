@@ -182,6 +182,30 @@ function findFollowTokenGmgnInitialBundlerGroup(
   );
 }
 
+/** Earliest same-second GMGN group that includes at least one expected initial bundler. */
+function findFollowTokenGmgnEarliestGroupWithAnyInitialBundler(
+  groups: GmgnBundlerTimestampGroup[],
+  initialBundlers: Set<string>,
+): GmgnBundlerTimestampGroup | null {
+  for (const group of groups) {
+    if (
+      [...initialBundlers].some((wallet) => group.wallets.includes(wallet))
+    ) {
+      return group;
+    }
+  }
+  return null;
+}
+
+function followTokenGmgnInitialGroupIncludesAllExpectedBundlers(
+  group: GmgnBundlerTimestampGroup,
+  initialBundlers: Set<string>,
+): boolean {
+  return [...initialBundlers].every((wallet) =>
+    group.wallets.includes(wallet),
+  );
+}
+
 function findFollowTokenGmgnSecondBundlerGroupAfterFirst(
   groups: GmgnBundlerTimestampGroup[],
   firstGroup: GmgnBundlerTimestampGroup,
@@ -4298,6 +4322,35 @@ export class InsiderBot extends EventEmitter {
           state.bundlerWallets,
         );
         if (!initialGroup) {
+          const partialInitialGroup =
+            findFollowTokenGmgnEarliestGroupWithAnyInitialBundler(
+              groups,
+              state.bundlerWallets,
+            );
+          if (
+            partialInitialGroup &&
+            !followTokenGmgnInitialGroupIncludesAllExpectedBundlers(
+              partialInitialGroup,
+              state.bundlerWallets,
+            )
+          ) {
+            const missingBundlers = [...state.bundlerWallets].filter(
+              (wallet) => !partialInitialGroup.wallets.includes(wallet),
+            );
+            await this.resetFollowTokenAfterGmgnFilterFailed(
+              state.mint,
+              `initial_group_missing_expected_bundlers_${missingBundlers.length}`,
+              {
+                anchorTimestamp: partialInitialGroup.anchorTimestamp,
+                groupWalletCount: partialInitialGroup.wallets.length,
+                groupWallets: partialInitialGroup.wallets,
+                expectedInitialBundlers: [...state.bundlerWallets],
+                missingBundlers,
+                groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+              },
+            );
+            return;
+          }
           return;
         }
 
