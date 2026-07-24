@@ -25,7 +25,7 @@ import {
 const log = createLogger('FOLLOW-TOKEN');
 
 const PUMP_MINT_SUFFIX = 'pump';
-const DEFAULT_MAX_MIGRATION_AGE_SEC = 60;
+const DEFAULT_MAX_MIGRATION_AGE_SEC = 5;
 const REQUIRED_BUNDLER_COUNT = 4;
 /** Accepted dev CREATE history counts (Helius fee-payer CREATE txs). */
 const FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN = 1;

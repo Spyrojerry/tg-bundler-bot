@@ -184,7 +184,7 @@ export interface ServiceConfig {
   insiderFunderFirstEnabled: boolean;
   /** Enable follow-token Pump.fun migration listener on startup (still requires Start in Telegram unless auto-resumed). */
   insiderFollowTokenEnabled: boolean;
-  /** Max seconds between token CREATE and migrate for follow-token filter (default 60). */
+  /** Max seconds between token CREATE and migrate for follow-token filter (default 5). */
   insiderFollowTokenMaxMigrationAgeSec: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;

@@ -817,8 +817,6 @@ export class InsiderBot extends EventEmitter {
   private devFullExitHandled = false;
   /** Highest market cap observed for the current token across all pre-buy MC fetches — used to skip normal-mode buys that would already be past their own exit target. */
   private highestObservedMarketCapUsd: number | null = null;
-  /** Market cap captured at the very start of the current token's flow (the follow-wallet/initial-bundler buy MC). A buy is only allowed if the market cap at buy time is still at or above this — i.e. the token hasn't round-tripped back below where the earliest bundler bought. Null if unknown (fetch failed at flow start), in which case the check is skipped entirely. */
-  private initialBundlerMarketCapUsd: number | null = null;
   private preBuyStopped = false;
   private positionSellTriggered = false;
   private profitExitDisabled = false;
@@ -1337,16 +1335,6 @@ export class InsiderBot extends EventEmitter {
       "Follow-token GMGN filter failed — resetting flow",
       { mint, reason, ...logData },
     );
-    void this.sendTelegramSafe(
-      [
-        `<b>⏹️ ${this.label} Follow-Token GMGN Filter Failed</b>`,
-        `Token: <code>${mint}</code>`,
-        `Reason: <code>${reason}</code>`,
-        "",
-        "Resetting flow — resuming PumpPortal migration feed.",
-      ].join("\n"),
-      "follow-token gmgn filter failed notification",
-    );
     await this.stopFollowTokenTopBuyerWatch(reason);
     if (
       this.activePosition?.mint === mint &&
@@ -1367,7 +1355,7 @@ export class InsiderBot extends EventEmitter {
       );
       return;
     }
-    await this.resetForNewToken(!!this.activePosition);
+    await this.resetForNewToken(!!this.activePosition, { reason });
   }
 
   private summarizeGmgnBundlerGroupsForLog(
@@ -1879,7 +1867,10 @@ export class InsiderBot extends EventEmitter {
           ].join("\n"),
           "high-MC skip notification",
         );
-        await this.resetForNewToken(true);
+        await this.resetForNewToken(true, {
+          reason: "follow_wallet_buy_mc_above_ceiling",
+          skipTelegram: true,
+        });
         return false;
       }
       if (followWalletBuyMc === null) {
@@ -1907,7 +1898,6 @@ export class InsiderBot extends EventEmitter {
           followWalletBuyMc,
         });
       }
-      this.initialBundlerMarketCapUsd = followWalletBuyMc;
       await this.startInsiderFlowWithIndexingLagRetry(mint, followedWallet);
       return true;
     } catch (err) {
@@ -1976,10 +1966,12 @@ export class InsiderBot extends EventEmitter {
           ].join("\n"),
           "follow-token high-MC skip notification",
         );
-        await this.resetForNewToken(true);
+        await this.resetForNewToken(true, {
+          reason: "migration_mc_above_ceiling",
+          skipTelegram: true,
+        });
         return false;
       }
-      this.initialBundlerMarketCapUsd = migrationMc;
       const flowActive = await this.startInsiderFlowFromMigrationWithIndexingLagRetry(
         mint,
         migrationSignature,
@@ -4463,19 +4455,9 @@ export class InsiderBot extends EventEmitter {
             rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
           },
         );
-        await this.resetForNewToken(true);
-        return;
-      }
-      if (this.isBelowInitialBundlerMarketCap(currentMc)) {
-        this.log.warn(
-          "Follow-token GMGN second bundler group found, but current market cap is below the token's initial bundler-buy MC; resetting instead of buying",
-          {
-            mint: state.mint,
-            currentMc,
-            initialBundlerMarketCapUsd: this.initialBundlerMarketCapUsd,
-          },
-        );
-        await this.resetForNewToken(true);
+        await this.resetForNewToken(true, {
+          reason: `below_rug_threshold_${INSIDER_RUG_MARKET_CAP_USD}`,
+        });
         return;
       }
 
@@ -4491,19 +4473,8 @@ export class InsiderBot extends EventEmitter {
           secondGroupTimestamp: secondGroup.anchorTimestamp,
           secondGroupWallets: secondGroup.wallets,
         });
-        void this.sendTelegramSafe(
-          [
-            `<b>⏭️ ${this.label} Follow-Token GMGN Buy Skipped</b>`,
-            `Token: <code>${state.mint}</code>`,
-            `Second group: <b>${secondGroup.wallets.length}</b> wallet(s) at <b>${secondGroup.anchorTimestamp}</b>`,
-            `Reason: <code>${watchPlan.reason}</code>`,
-            "",
-            "Resetting flow — resuming PumpPortal migration feed.",
-          ].join("\n"),
-          "follow-token gmgn buy skipped notification",
-        );
         await this.stopFollowTokenTopBuyerWatch("second group tag plan rejected buy");
-        await this.resetForNewToken(false);
+        await this.resetForNewToken(false, { reason: watchPlan.reason });
         return;
       }
 
@@ -7755,20 +7726,9 @@ export class InsiderBot extends EventEmitter {
             rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
           },
         );
-        await this.resetForNewToken(true);
-        return;
-      }
-      if (this.isBelowInitialBundlerMarketCap(currentMc)) {
-        this.log.warn(
-          "Low-funding shared feePayer condition passed, but current market cap is below the token's initial bundler-buy MC; resetting instead of buying",
-          {
-            mint: state.mint,
-            sharedFeePayer: state.funderWallet,
-            currentMc,
-            initialBundlerMarketCapUsd: this.initialBundlerMarketCapUsd,
-          },
-        );
-        await this.resetForNewToken(true);
+        await this.resetForNewToken(true, {
+          reason: `below_rug_threshold_${INSIDER_RUG_MARKET_CAP_USD}`,
+        });
         return;
       }
 
@@ -7843,20 +7803,9 @@ export class InsiderBot extends EventEmitter {
             rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
           },
         );
-        await this.resetForNewToken(true);
-        return;
-      }
-      if (this.isBelowInitialBundlerMarketCap(currentMc)) {
-        this.log.warn(
-          "Low-funding recipient bought token, but current market cap is below the token's initial bundler-buy MC; resetting instead of buying",
-          {
-            mint: state.mint,
-            recipient: watch.wallet,
-            currentMc,
-            initialBundlerMarketCapUsd: this.initialBundlerMarketCapUsd,
-          },
-        );
-        await this.resetForNewToken(true);
+        await this.resetForNewToken(true, {
+          reason: `below_rug_threshold_${INSIDER_RUG_MARKET_CAP_USD}`,
+        });
         return;
       }
       if (
@@ -7944,20 +7893,9 @@ export class InsiderBot extends EventEmitter {
             rugThresholdUsd: INSIDER_RUG_MARKET_CAP_USD,
           },
         );
-        await this.resetForNewToken(true);
-        return;
-      }
-      if (this.isBelowInitialBundlerMarketCap(currentMc)) {
-        this.log.warn(
-          "Shared feePayer recipient bought token, but current market cap is below the token's initial bundler-buy MC; resetting instead of buying",
-          {
-            mint: state.mint,
-            recipient: watch.wallet,
-            currentMc,
-            initialBundlerMarketCapUsd: this.initialBundlerMarketCapUsd,
-          },
-        );
-        await this.resetForNewToken(true);
+        await this.resetForNewToken(true, {
+          reason: `below_rug_threshold_${INSIDER_RUG_MARKET_CAP_USD}`,
+        });
         return;
       }
       if (
@@ -9345,20 +9283,6 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  /**
-   * Buy filter: the market cap at actual buy time must not be below the
-   * market cap captured at the very start of this token's flow (the
-   * follow-wallet/initial-bundler buy MC) — i.e. don't buy into a token
-   * that's already round-tripped back below where the earliest bundler
-   * bought. Returns false (no gate) if the initial MC is unknown.
-   */
-  private isBelowInitialBundlerMarketCap(currentMc: number): boolean {
-    return (
-      this.initialBundlerMarketCapUsd !== null &&
-      currentMc < this.initialBundlerMarketCapUsd
-    );
-  }
-
   private parseBuyVolumeUsd(entry: Record<string, unknown>): number | null {
     const raw = entry.buy_volume_cur ?? entry.history_bought_cost;
     const n = typeof raw === "number" ? raw : Number(raw);
@@ -9522,7 +9446,6 @@ export class InsiderBot extends EventEmitter {
     this.devFullExitHandled = false;
     this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
-    this.initialBundlerMarketCapUsd = null;
     this.preBuyStopped = false;
     this.insiderSellsReady = false;
     this.bundlerMatchesReady = false;
@@ -9550,12 +9473,38 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async resetForNewToken(clearPosition: boolean): Promise<void> {
+  private async resetForNewToken(
+    clearPosition: boolean,
+    options?: { reason?: string; skipTelegram?: boolean },
+  ): Promise<void> {
     const endedMint = this.watchingMint ?? this.activePosition?.mint ?? null;
     const endedFeePayer =
       this.funderFirstFeePayer ?? this.bundlerFunderWatch?.funderWallet ?? null;
     const endedSource = this.flowSource;
     const hadPosition = clearPosition && !!this.activePosition;
+    const resetReason = options?.reason ?? "flow_reset";
+
+    if (!options?.skipTelegram && endedMint) {
+      const flowLabel =
+        endedSource === "follow-token"
+          ? "Follow-Token"
+          : endedSource === "funder-first"
+            ? "Funder-First"
+            : endedSource === "follow"
+              ? "Follow-Wallet"
+              : (endedSource ?? "Insider");
+      await this.sendTelegramSafe(
+        [
+          `<b>🔄 ${this.label} ${flowLabel} Reset</b>`,
+          `Token: <code>${endedMint}</code>`,
+          `Reason: <code>${resetReason}</code>`,
+          hadPosition ? "Had open position: cleared." : "No position held.",
+          "",
+          "Flow reset — resuming PumpPortal / idle monitoring.",
+        ].join("\n"),
+        "token flow reset notification",
+      );
+    }
 
     if (this.claimedMint) {
       this.releaseMint?.(this.claimedMint);
@@ -9581,7 +9530,6 @@ export class InsiderBot extends EventEmitter {
     this.devFullExitHandled = false;
     this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
-    this.initialBundlerMarketCapUsd = null;
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.profitExitDisabled = false;

@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-24 (91)
+
+### Remove initial-bundler MC buy gate; Telegram on every flow reset
+
+- **Removed** `initialBundlerMarketCapUsd` / `isBelowInitialBundlerMarketCap` — follow-token (and funder-first) buys no longer skip when current MC is below migration / follow-wallet start MC.
+- **`resetForNewToken`** sends a **Telegram reset notification** for every skip/reset (token, reason, flow type) unless `skipTelegram: true` (e.g. migration MC ceiling already has a dedicated message).
+- **Migration age filter:** `INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC` default **5s** (was 60s). Migrate more than **5s** after CREATE → token skipped (unchanged filter logic, tighter window).
+
 ## 2026-07-24 (90)
 
 ### Follow-token: fail-fast second group, 1s GMGN poll, API key rotation
