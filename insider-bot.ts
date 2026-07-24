@@ -261,6 +261,22 @@ function pickFollowTokenFreshTopBuyerInGroup(
   return pickFollowTokenTopBuyerWallet(freshWallets, snapshots);
 }
 
+function followTokenSecondGroupWalletHasFreshTag(
+  wallet: string,
+  snapshots: GmgnBundlerTraderSnapshot[],
+): boolean {
+  const snapshot = getGmgnSnapshotForWallet(wallet, snapshots);
+  return !!snapshot && gmgnSnapshotHasTag(snapshot, "fresh_wallet");
+}
+
+function followTokenSecondGroupWalletHasTopHolderTag(
+  wallet: string,
+  snapshots: GmgnBundlerTraderSnapshot[],
+): boolean {
+  const snapshot = getGmgnSnapshotForWallet(wallet, snapshots);
+  return !!snapshot && gmgnSnapshotHasMakerTag(snapshot, "top_holder");
+}
+
 function resolveFollowTokenSecondGroupPlan(
   secondGroup: GmgnBundlerTimestampGroup,
   snapshots: GmgnBundlerTraderSnapshot[],
@@ -316,6 +332,42 @@ function resolveFollowTokenSecondGroupPlan(
   }
 
   if (freshWallets.length === 1) {
+    const topHolderTagged = wallets.filter((wallet) =>
+      followTokenSecondGroupWalletHasTopHolderTag(wallet, snapshots),
+    );
+    if (topHolderTagged.length === 1) {
+      const freshWallet = freshWallets[0]!;
+      const topHolderWallet = topHolderTagged[0]!;
+      if (freshWallet !== topHolderWallet) {
+        const otherWallets = wallets.filter(
+          (wallet) => wallet !== freshWallet && wallet !== topHolderWallet,
+        );
+        const othersUntagged = otherWallets.every(
+          (wallet) =>
+            !followTokenSecondGroupWalletHasFreshTag(wallet, snapshots) &&
+            !followTokenSecondGroupWalletHasTopHolderTag(wallet, snapshots),
+        );
+        if (othersUntagged) {
+          const wallet = pickFollowTokenTopBuyerWallet(
+            [freshWallet, topHolderWallet],
+            snapshots,
+          );
+          if (!wallet) {
+            return {
+              kind: "no_buy",
+              reason: "one_fresh_one_top_holder_missing_top_buyer",
+            };
+          }
+          return {
+            kind: "watch_buy",
+            wallet,
+            watchMode: "standard",
+            reason: "one_fresh_one_top_holder_higher_buyer",
+          };
+        }
+      }
+    }
+
     return {
       kind: "watch_buy",
       wallet: freshWallets[0]!,
@@ -1757,20 +1809,15 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (watchMode === "odd_minority") {
-      if (action === "sell") {
-        await this.triggerFollowTokenWatchExitSell(
-          mint,
-          wallet,
-          "sell",
-          tx,
-          "odd minority top buyer sell",
-        );
-        return;
-      }
-
-      if (action === "buy") {
-        await this.tryFollowTokenThirdGroupFreshWatch(mint, tx);
-      }
+      await this.triggerFollowTokenWatchExitSell(
+        mint,
+        wallet,
+        action,
+        tx,
+        action === "sell"
+          ? "odd minority top buyer sell"
+          : "odd minority top buyer buy",
+      );
       return;
     }
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-07-24 (92)
+
+### Follow-token second-group watch: one fresh + one top_holder; odd minority buy exit
+
+- **Second group:** exactly **one** `fresh_wallet` and **one** `top_holder` (different wallets); every **other** wallet in the group has **neither** `fresh_wallet` **nor** `top_holder` → watch whichever of the fresh vs top_holder pair **bought more**; full exit on their next **buy** or **sell** (standard watch).
+- **Odd minority (no fresh):** minority top buyer’s next **buy** or **sell** → **sell full position** (removed third-group GMGN fetch / `third_group_fresh` handoff on minority **buy**).
+
 ## 2026-07-24 (91)
 
 ### Remove initial-bundler MC buy gate; Telegram on every flow reset
