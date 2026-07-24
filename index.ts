@@ -2055,13 +2055,6 @@ async function main(): Promise<void> {
           return;
         }
 
-        if (await bot.tryTriggerFollowTokenTopBuyerFullExitSell()) {
-          log.warn(
-            `[INSIDER ${botNumber} FOLLOW-TOKEN TOP BUYER EXIT] Top buyer fully exited for ${activePos.mint}. Triggering SELL.`,
-          );
-          return;
-        }
-
         const exitMc = bot.getExitMc();
         if (bot.isProfitExitDisabled()) {
           log.info(

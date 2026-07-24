@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-07-24 (89)
+
+### Follow-token: GMGN tag-based watch selection, no re-entry, poll until second group
+
+- **Grouping:** same `start_holding_at` **second only** (grace **0**). Second group minimum **≥5** wallets. GMGN poll every **2s** until that second group appears (no 60s CREATE cap).
+- **Removed:** all re-entry / handoff / +90% re-entry TP / +50% copy-sell re-entry block logic.
+- **GMGN tags:** reads `tags` (`fresh_wallet`) and `maker_token_tags` (`top_holder`) on bundler traders to pick the watched wallet from the second group (multi-fresh, single-fresh, non-fresh fallback, or odd `top_holder` minority). Skips buy when tag split is unanimous or tied.
+- **Exit:** sell full position on watched wallet **sell** or **buy** tx while holding (+90% MC TP disabled; **-50% SL** / dev rug unchanged). **Odd minority** path: sell on minority top buyer **sell** only; on minority **buy**, one-shot GMGN fetch for **third group** → watch fresh top buyer there → sell on their **sell** (no sell on minority buy). If third group / fresh top buyer missing while holding after minority buy → sell; if not holding → reset + PumpPortal.
+
+## 2026-07-24 (88)
+
+### Follow-token: re-entry +90% TP exit and +50% copy-sell re-entry block
+
+- **Re-entry exit (same top buyer or second-group handoff):** sell when position P/L reaches **+90%** take-profit vs re-entry MC (standard MC checker). Stop-loss **-50% P/L** remains. Removed on-chain top-buyer full-exit sell trigger for re-entry.
+- **Re-entry gate:** after first-entry **copy-sell** on top-buyer sell tx, if position P/L was already above **+50%**, all re-entry is blocked (same top buyer rebuy and second-group handoff).
+
 ## 2026-07-23 (87)
 
 ### Follow-token: second-group rebuy only after top buyer sell tx
