@@ -161,13 +161,9 @@ async function main(): Promise<void> {
     () =>
       new RateLimiter(config.rateLimitMinTime, config.rateLimitMaxConcurrent),
   );
-  const gmgnFallbackLimiter = new RateLimiter(
-    config.rateLimitMinTime,
-    config.rateLimitMaxConcurrent,
-  );
-  /** Follow-token GMGN poll: dedicated clients + minimal spacing (keys 1–3 only). */
+  /** Follow-token GMGN poll: dedicated clients (GMGN_API_KEY + GMGN_API_KEY_2). */
   const followTokenGmgnPollRateMinMs = Math.min(config.rateLimitMinTime, 100);
-  const followTokenGmgnPollLimiters = [0, 1, 2].map(
+  const followTokenGmgnPollLimiters = [0, 1].map(
     () =>
       new RateLimiter(
         followTokenGmgnPollRateMinMs,
@@ -180,16 +176,12 @@ async function main(): Promise<void> {
         { ...config, gmgnApiKey: definition.gmgnApiKey },
         gmgnLimiters[index],
         definition.rpcUrl,
-        config.gmgnFallbackApiKey ?? undefined,
-        gmgnFallbackLimiter,
       ),
   );
   const followTokenGmgnPollClients: GmgnClient[] = [];
   const followTokenGmgnPollKeysSeen = new Set<string>();
-  for (let slot = 0; slot < 3; slot += 1) {
-    const gmgnApiKey = [config.gmgnApiKey, config.gmgnApiKey2, config.gmgnApiKey3][
-      slot
-    ]?.trim();
+  for (let slot = 0; slot < 2; slot += 1) {
+    const gmgnApiKey = [config.gmgnApiKey, config.gmgnApiKey2][slot]?.trim();
     if (!gmgnApiKey || followTokenGmgnPollKeysSeen.has(gmgnApiKey)) continue;
     followTokenGmgnPollKeysSeen.add(gmgnApiKey);
     followTokenGmgnPollClients.push(
@@ -197,8 +189,6 @@ async function main(): Promise<void> {
         { ...config, gmgnApiKey },
         followTokenGmgnPollLimiters[slot] ?? followTokenGmgnPollLimiters[0]!,
         insiderBotDefinitions[0]?.rpcUrl ?? config.insiderSolanaRpcUrl,
-        config.gmgnFallbackApiKey ?? undefined,
-        gmgnFallbackLimiter,
       ),
     );
   }
@@ -3020,14 +3010,14 @@ async function main(): Promise<void> {
     sharedEnhancedWs?.close();
 
     await Promise.all(
-      [...gmgnLimiters, gmgnFallbackLimiter].map((limiter, index) =>
+      [...gmgnLimiters, ...followTokenGmgnPollLimiters].map((limiter, index) =>
         limiter
           .drain()
           .catch((e) =>
             log.warn(
               index < gmgnLimiters.length
                 ? `GMGN limiter ${index + 1} drain error`
-                : "GMGN fallback limiter drain error",
+                : `Follow-token GMGN poll limiter ${index - gmgnLimiters.length + 1} drain error`,
               e,
             ),
           ),

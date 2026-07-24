@@ -98,8 +98,6 @@ export class GmgnClient {
   private readonly rpcEndpoint: string;
   private readonly chain = "sol";
   private readonly limiter: RateLimiter;
-  private readonly fallbackApiKey: string | null;
-  private readonly fallbackLimiter: RateLimiter | null;
   private readonly baselineMinTime: number;
   private readonly fetchMode: "auto" | "direct" | "cli";
   private readonly pumpSdk: OnlinePumpSdk;
@@ -110,8 +108,6 @@ export class GmgnClient {
     config: ServiceConfig,
     limiter: RateLimiter,
     rpcUrlOverride?: string,
-    fallbackApiKey?: string,
-    fallbackLimiter?: RateLimiter,
   ) {
     this.baseUrl = config.gmgnApiBaseUrl.replace(/\/$/, "");
     this.apiKey = config.gmgnApiKey;
@@ -125,11 +121,6 @@ export class GmgnClient {
     this.pumpSdk = new OnlinePumpSdk(this.connection);
     this.pumpAmmSdk = new OnlinePumpAmmSdk(this.connection);
     this.limiter = limiter;
-    this.fallbackApiKey =
-      fallbackApiKey && fallbackApiKey !== this.apiKey ? fallbackApiKey : null;
-    this.fallbackLimiter = this.fallbackApiKey
-      ? (fallbackLimiter ?? limiter)
-      : null;
     this.baselineMinTime = config.rateLimitMinTime;
     this.fetchMode = config.gmgnFetchMode;
   }
@@ -435,41 +426,27 @@ export class GmgnClient {
     this.validateSolAddress(mint, "mint");
 
     try {
+      if (this.fetchMode !== "direct") {
+        const cliData = await this.fetchCliData("traders", mint, {
+          limit,
+          orderBy: "buy_volume_cur",
+          tag: "bundler",
+        });
+        if (cliData && this.hasTraderEntries(cliData)) return cliData;
+        if (cliData) {
+          log.info(
+            `GMGN CLI bundler traders returned no trader rows for ${mint}, falling back to API`,
+            { shape: this.describeResponseShape(cliData) },
+          );
+        } else {
+          log.debug(
+            `GMGN CLI bundler traders returned no data for ${mint}, falling back to API`,
+          );
+        }
+      }
+
       const apiData = await this.fetchBundlerTradersViaApi(mint, limit);
-      if (apiData && this.hasTraderEntries(apiData)) {
-        return apiData;
-      }
-      if (apiData) {
-        log.debug(
-          `GMGN API bundler traders returned no trader rows for ${mint}, trying CLI fallback`,
-          { shape: this.describeResponseShape(apiData) },
-        );
-      } else {
-        log.debug(
-          `GMGN API bundler traders returned no data for ${mint}, trying CLI fallback`,
-        );
-      }
-
-      if (this.fetchMode === "direct") {
-        return apiData;
-      }
-
-      const cliData = await this.fetchCliData("traders", mint, {
-        limit,
-        orderBy: "buy_volume_cur",
-        tag: "bundler",
-      });
-      if (cliData && this.hasTraderEntries(cliData)) {
-        log.debug(`GMGN bundler traders CLI fallback succeeded for ${mint}`);
-        return cliData;
-      }
-      if (cliData) {
-        log.info(
-          `GMGN CLI bundler traders fallback returned no trader rows for ${mint}`,
-          { shape: this.describeResponseShape(cliData) },
-        );
-      }
-      return null;
+      return apiData;
     } catch (err) {
       log.error(`Failed to fetch bundler traders for ${mint}`, err);
       return null;
@@ -623,6 +600,7 @@ export class GmgnClient {
       log.debug(`Executing CLI: ${cmd}`);
       const { stdout, stderr } = await execAsync(cmd, {
         timeout: REQUEST_TIMEOUT,
+        env: { ...process.env, GMGN_API_KEY: this.apiKey },
       });
       if (stderr) {
         log.debug(`GMGN CLI ${type} stderr for ${mint}: ${stderr}`);
@@ -672,41 +650,16 @@ export class GmgnClient {
       url,
       this.apiKey,
       this.limiter,
-      "primary",
     );
-    if (primary.data || !primary.shouldFallback) {
-      return primary.data;
-    }
-
-    if (!this.fallbackApiKey || !this.fallbackLimiter) {
-      return null;
-    }
-
-    log.warn(`GMGN primary request failed; trying GMGN_FALLBACK_API_KEY`, {
-      mint,
-      endpoint,
-      reason: primary.reason,
-    });
-
-    const fallback = await this.fallbackLimiter.schedule(() =>
-      this.fetchRawTokenDataWithKey(
-        url,
-        this.fallbackApiKey!,
-        this.fallbackLimiter!,
-        "fallback",
-      ),
-    );
-    return fallback.data;
+    return primary.data;
   }
 
   private async fetchRawTokenDataWithKey(
     url: string,
     apiKey: string,
     limiter: RateLimiter,
-    keyRole: "primary" | "fallback",
   ): Promise<{
     data: Record<string, unknown> | null;
-    shouldFallback: boolean;
     reason: string;
   }> {
     let lastReason = "unknown GMGN request failure";
@@ -731,7 +684,6 @@ export class GmgnClient {
           limiter.onRateLimited(retryMs);
           return {
             data: null,
-            shouldFallback: keyRole === "primary",
             reason: "HTTP 429 rate limited",
           };
         }
@@ -739,7 +691,6 @@ export class GmgnClient {
         if (resp.status === 401 || resp.status === 403) {
           return {
             data: null,
-            shouldFallback: keyRole === "primary",
             reason: `HTTP ${resp.status}`,
           };
         }
@@ -747,7 +698,7 @@ export class GmgnClient {
         if (!resp.ok) {
           lastReason = `HTTP ${resp.status}`;
           if (resp.status >= 500 && attempt < MAX_RETRIES) {
-            log.warn(`GMGN ${keyRole} transient HTTP failure; retrying`, {
+            log.warn(`GMGN transient HTTP failure; retrying`, {
               status: resp.status,
               attempt,
               maxAttempts: MAX_RETRIES,
@@ -757,7 +708,6 @@ export class GmgnClient {
           }
           return {
             data: null,
-            shouldFallback: keyRole === "primary" && resp.status >= 500,
             reason: lastReason,
           };
         }
@@ -774,20 +724,16 @@ export class GmgnClient {
         if (looksLikeHtml) {
           lastReason = `HTML response instead of JSON${contentType ? ` (${contentType})` : ""}`;
           if (attempt < MAX_RETRIES) {
-            log.warn(
-              `GMGN ${keyRole} returned HTML instead of JSON; retrying`,
-              {
-                attempt,
-                maxAttempts: MAX_RETRIES,
-                responsePreview: trimmedBody.slice(0, 120),
-              },
-            );
+            log.warn(`GMGN returned HTML instead of JSON; retrying`, {
+              attempt,
+              maxAttempts: MAX_RETRIES,
+              responsePreview: trimmedBody.slice(0, 120),
+            });
             await sleep(BASE_RETRY_MS * attempt);
             continue;
           }
           return {
             data: null,
-            shouldFallback: keyRole === "primary",
             reason: lastReason,
           };
         }
@@ -798,7 +744,7 @@ export class GmgnClient {
         } catch {
           lastReason = `Non-JSON response (${contentType || "unknown content-type"})`;
           if (attempt < MAX_RETRIES) {
-            log.warn(`GMGN ${keyRole} returned malformed JSON; retrying`, {
+            log.warn(`GMGN returned malformed JSON; retrying`, {
               attempt,
               maxAttempts: MAX_RETRIES,
               responsePreview: trimmedBody.slice(0, 120),
@@ -808,7 +754,6 @@ export class GmgnClient {
           }
           return {
             data: null,
-            shouldFallback: keyRole === "primary",
             reason: lastReason,
           };
         }
@@ -816,7 +761,6 @@ export class GmgnClient {
         if (json.code !== undefined && json.code !== 0) {
           return {
             data: null,
-            shouldFallback: false,
             reason: `GMGN response code ${json.code}`,
           };
         }
@@ -824,11 +768,10 @@ export class GmgnClient {
         limiter.onSuccess(this.baselineMinTime);
         const unwrapped = this.unwrapResponseData(json);
         if (unwrapped) {
-          unwrapped.source = keyRole === "primary" ? "api" : "api-fallback";
+          unwrapped.source = "api";
         }
         return {
           data: unwrapped,
-          shouldFallback: false,
           reason: unwrapped ? "success" : "empty response",
         };
       } catch (err) {
@@ -837,7 +780,7 @@ export class GmgnClient {
           lastReason.includes("AbortError") ||
           lastReason.includes("fetch failed");
         if (retryable && attempt < MAX_RETRIES) {
-          log.warn(`GMGN ${keyRole} network request failed; retrying`, {
+          log.warn(`GMGN network request failed; retrying`, {
             attempt,
             maxAttempts: MAX_RETRIES,
             reason: lastReason,
@@ -847,7 +790,6 @@ export class GmgnClient {
         }
         return {
           data: null,
-          shouldFallback: keyRole === "primary",
           reason: lastReason,
         };
       } finally {
@@ -857,7 +799,6 @@ export class GmgnClient {
 
     return {
       data: null,
-      shouldFallback: keyRole === "primary",
       reason: lastReason,
     };
   }

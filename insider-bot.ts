@@ -849,7 +849,6 @@ export class InsiderBot extends EventEmitter {
   private followTokenGmgnBundlerPollTimer: ReturnType<typeof setInterval> | null =
     null;
   private followTokenGmgnBundlerPollInFlight = false;
-  private followTokenGmgnPollClientSeq = 0;
   private readonly followTokenGmgnPollClients: GmgnClient[];
   /** Latched once GMGN shows a same-second + 1s grace group containing all four initial bundlers. */
   private followTokenGmgnInitialBundlerGroup: GmgnBundlerTimestampGroup | null =
@@ -1322,9 +1321,10 @@ export class InsiderBot extends EventEmitter {
 
   private pickFollowTokenGmgnPollClient(): GmgnClient {
     const pool = this.followTokenGmgnPollClients;
-    const client = pool[this.followTokenGmgnPollClientSeq % pool.length]!;
-    this.followTokenGmgnPollClientSeq += 1;
-    return client;
+    if (pool.length === 0) return this.gmgnClient;
+    if (pool.length === 1) return pool[0]!;
+    const slot = Math.floor(Date.now() / 1_000) % pool.length;
+    return pool[slot]!;
   }
 
   private async resetFollowTokenAfterGmgnFilterFailed(

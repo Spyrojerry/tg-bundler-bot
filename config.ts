@@ -77,7 +77,6 @@ export function loadConfig(): ServiceConfig {
   const gmgnApiKey2      = optional('GMGN_API_KEY_2', gmgnApiKey);
   const gmgnApiKey3      = optional('GMGN_API_KEY_3', gmgnApiKey2);
   const gmgnApiKey4      = optional('GMGN_API_KEY_4', gmgnApiKey3);
-  const gmgnFallbackApiKey = optionalNullable('GMGN_FALLBACK_API_KEY');
   const solanaRpcUrl     = optional('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com');
   const solanaWsUrl      = optional('SOLANA_WS_URL', deriveWsUrl(solanaRpcUrl));
   const gmgnApiBaseUrl   = optional('GMGN_API_BASE_URL', 'https://gmgn.ai');
@@ -195,7 +194,6 @@ export function loadConfig(): ServiceConfig {
     gmgnApiKey2,
     gmgnApiKey3,
     gmgnApiKey4,
-    gmgnFallbackApiKey,
     gmgnApiBaseUrl,
     gmgnFetchMode,
     jupiterSwapBaseUrl,

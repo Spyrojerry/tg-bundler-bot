@@ -134,7 +134,6 @@ export interface ServiceConfig {
   gmgnApiKey2: string;
   gmgnApiKey3: string;
   gmgnApiKey4: string;
-  gmgnFallbackApiKey: string | null;
   gmgnApiBaseUrl: string;
   gmgnFetchMode: 'auto' | 'direct' | 'cli';
   jupiterSwapBaseUrl: string;

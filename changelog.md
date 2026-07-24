@@ -7,7 +7,7 @@
 - **Second group:** after initial bundler group is latched, wait for the **next** same-second GMGN group. If it appears with **&lt;5** wallets, stop polling and **reset** (sell if holding, else resume PumpPortal). If **≥5**, continue tag plan / buy as before.
 - **Initial group:** once GMGN shows the earliest same-second group containing **any** expected initial bundler, **all** expected bundlers must appear in that group; otherwise **reset** (do not keep polling for missing bundlers).
 - **Poll interval:** GMGN bundler poll every **1s** (was 2s).
-- **Rate limits:** follow-token GMGN bundler fetches (poll + third-group one-shot) **round-robin** across **`GMGN_API_KEY`**, **`GMGN_API_KEY_2`**, and **`GMGN_API_KEY_3`** only, each on a **dedicated poll client** with **100ms** min spacing (or lower if `RATE_LIMIT_MIN_TIME` is already below 100). **`fetchBundlerTraders`:** **REST API first**; **`gmgn-cli` fallback** only when API returns no bundler rows (`GMGN_FETCH_MODE=direct` skips CLI).
+- **Follow-token poll:** **`gmgn-cli` first** (API fallback on empty CLI); **`GMGN_API_KEY`** and **`GMGN_API_KEY_2`** alternate by **calendar second** (even → key 1, odd → key 2). CLI subprocess uses that client’s key via `GMGN_API_KEY` env. **`GMGN_FALLBACK_API_KEY` removed** (no secondary REST key retry).
 
 ## 2026-07-24 (89)
 
