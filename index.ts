@@ -1427,6 +1427,7 @@ async function main(): Promise<void> {
       () => undefined,
       `Insider ${definition.botNumber}`,
       sharedEnhancedWs,
+      gmgnClients,
     );
     bot.on("heliusCreditsExhausted", (info) => {
       void (async () => {
