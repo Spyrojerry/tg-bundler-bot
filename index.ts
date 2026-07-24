@@ -165,6 +165,15 @@ async function main(): Promise<void> {
     config.rateLimitMinTime,
     config.rateLimitMaxConcurrent,
   );
+  /** Follow-token GMGN poll: dedicated clients + minimal spacing (keys 1–3 only). */
+  const followTokenGmgnPollRateMinMs = Math.min(config.rateLimitMinTime, 100);
+  const followTokenGmgnPollLimiters = [0, 1, 2].map(
+    () =>
+      new RateLimiter(
+        followTokenGmgnPollRateMinMs,
+        config.rateLimitMaxConcurrent,
+      ),
+  );
   const gmgnClients = insiderBotDefinitions.map(
     (definition, index) =>
       new GmgnClient(
@@ -175,6 +184,24 @@ async function main(): Promise<void> {
         gmgnFallbackLimiter,
       ),
   );
+  const followTokenGmgnPollClients: GmgnClient[] = [];
+  const followTokenGmgnPollKeysSeen = new Set<string>();
+  for (let slot = 0; slot < 3; slot += 1) {
+    const gmgnApiKey = [config.gmgnApiKey, config.gmgnApiKey2, config.gmgnApiKey3][
+      slot
+    ]?.trim();
+    if (!gmgnApiKey || followTokenGmgnPollKeysSeen.has(gmgnApiKey)) continue;
+    followTokenGmgnPollKeysSeen.add(gmgnApiKey);
+    followTokenGmgnPollClients.push(
+      new GmgnClient(
+        { ...config, gmgnApiKey },
+        followTokenGmgnPollLimiters[slot] ?? followTokenGmgnPollLimiters[0]!,
+        insiderBotDefinitions[0]?.rpcUrl ?? config.insiderSolanaRpcUrl,
+        config.gmgnFallbackApiKey ?? undefined,
+        gmgnFallbackLimiter,
+      ),
+    );
+  }
   const insiderDasMarketCapClient = new HeliusDasMarketCapClient(
     config.insiderHeliusApiKey3 ||
       insiderBotDefinitions[2]?.heliusApiKey ||
@@ -1427,7 +1454,7 @@ async function main(): Promise<void> {
       () => undefined,
       `Insider ${definition.botNumber}`,
       sharedEnhancedWs,
-      gmgnClients,
+      followTokenGmgnPollClients,
     );
     bot.on("heliusCreditsExhausted", (info) => {
       void (async () => {

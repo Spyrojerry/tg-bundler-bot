@@ -435,36 +435,53 @@ export class GmgnClient {
     this.validateSolAddress(mint, "mint");
 
     try {
-      if (this.fetchMode !== "direct") {
-        const data = await this.fetchCliData("traders", mint, {
-          limit,
-          orderBy: "buy_volume_cur",
-          tag: "bundler",
-        });
-        if (data && this.hasTraderEntries(data)) return data;
-        if (data) {
-          log.info(
-            `GMGN CLI bundler traders returned no trader rows for ${mint}, falling back to API`,
-            {
-              shape: this.describeResponseShape(data),
-            },
-          );
-        } else {
-          log.debug(
-            `GMGN CLI bundler traders returned no data for ${mint}, falling back to API`,
-          );
-        }
+      const apiData = await this.fetchBundlerTradersViaApi(mint, limit);
+      if (apiData && this.hasTraderEntries(apiData)) {
+        return apiData;
+      }
+      if (apiData) {
+        log.debug(
+          `GMGN API bundler traders returned no trader rows for ${mint}, trying CLI fallback`,
+          { shape: this.describeResponseShape(apiData) },
+        );
+      } else {
+        log.debug(
+          `GMGN API bundler traders returned no data for ${mint}, trying CLI fallback`,
+        );
       }
 
-      const endpoint = `v1/token/traders/sol/${mint}?limit=${limit}&tag=bundler&orderby=buy_volume_cur&direction=desc`;
-      const data = await this.limiter.schedule(() =>
-        this.fetchRawTokenData(endpoint, mint),
-      );
-      return data;
+      if (this.fetchMode === "direct") {
+        return apiData;
+      }
+
+      const cliData = await this.fetchCliData("traders", mint, {
+        limit,
+        orderBy: "buy_volume_cur",
+        tag: "bundler",
+      });
+      if (cliData && this.hasTraderEntries(cliData)) {
+        log.debug(`GMGN bundler traders CLI fallback succeeded for ${mint}`);
+        return cliData;
+      }
+      if (cliData) {
+        log.info(
+          `GMGN CLI bundler traders fallback returned no trader rows for ${mint}`,
+          { shape: this.describeResponseShape(cliData) },
+        );
+      }
+      return null;
     } catch (err) {
       log.error(`Failed to fetch bundler traders for ${mint}`, err);
       return null;
     }
+  }
+
+  private async fetchBundlerTradersViaApi(
+    mint: string,
+    limit: number,
+  ): Promise<Record<string, unknown> | null> {
+    const endpoint = `v1/token/traders/sol/${mint}?limit=${limit}&tag=bundler&orderby=buy_volume_cur&direction=desc`;
+    return this.limiter.schedule(() => this.fetchRawTokenData(endpoint, mint));
   }
 
   async fetchTokenTraders(
