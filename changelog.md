@@ -1,10 +1,17 @@
 # Changelog
 
+## 2026-07-25 (94)
+
+### Follow-token: late 4-wallet odd top_holder buy (+90% MC TP)
+
+- Second group **&gt;60s** after initial anchor, **4** wallets, **no** `fresh_wallet`, **1-vs-3** `top_holder` odd split → buy without waiting for 5 wallets; **+90% MC take-profit** enabled (+ watched-wallet buy/sell exit, **-50% SL** unchanged).
+- **10s grace** still runs for **&lt;5** wallet second groups before `second_group_insufficient_wallets_*` reset (including counts like 2–4 that do not match the late odd trigger).
+
 ## 2026-07-25 (93)
 
 ### Follow-token: 10s grace before second-group wallet-count fail
 
-- When the **second** GMGN same-second group first appears with **&lt;5** wallets, poll every **1s** for **10s** on that **same anchor timestamp** (GMGN may add bundlers to that second). If count reaches **≥5** during grace → continue tag plan / buy. After **10s** still **&lt;5** → `second_group_insufficient_wallets_*` reset + Telegram (no instant fail on first snapshot).
+- When the **second** GMGN same-second group first appears with **<5** wallets, poll every **1s** for **10s** on that **same anchor timestamp** (GMGN may add bundlers to that second). If count reaches **≥5** during grace → continue tag plan / buy. After **10s** still **<5** → `second_group_insufficient_wallets_`* reset + Telegram (no instant fail on first snapshot).
 
 ## 2026-07-24 (92)
 
@@ -18,17 +25,17 @@
 ### Remove initial-bundler MC buy gate; Telegram on every flow reset
 
 - **Removed** `initialBundlerMarketCapUsd` / `isBelowInitialBundlerMarketCap` — follow-token (and funder-first) buys no longer skip when current MC is below migration / follow-wallet start MC.
-- **`resetForNewToken`** sends a **Telegram reset notification** for every skip/reset (token, reason, flow type) unless `skipTelegram: true` (e.g. migration MC ceiling already has a dedicated message).
+- `**resetForNewToken**` sends a **Telegram reset notification** for every skip/reset (token, reason, flow type) unless `skipTelegram: true` (e.g. migration MC ceiling already has a dedicated message).
 - **Migration age filter:** `INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC` default **5s** (was 60s). Migrate more than **5s** after CREATE → token skipped (unchanged filter logic, tighter window).
 
 ## 2026-07-24 (90)
 
 ### Follow-token: fail-fast second group, 1s GMGN poll, API key rotation
 
-- **Second group:** after initial bundler group is latched, wait for the **next** same-second GMGN group. If it appears with **&lt;5** wallets, **10s grace** on that second (1s polls) for GMGN to reach **≥5**; if still **&lt;5** after grace, stop polling and **reset**. If **≥5** (during or after grace window), continue tag plan / buy as before.
+- **Second group:** after initial bundler group is latched, wait for the **next** same-second GMGN group. If it appears with **<5** wallets, **10s grace** on that second (1s polls) for GMGN to reach **≥5**; if still **<5** after grace, stop polling and **reset**. If **≥5** (during or after grace window), continue tag plan / buy as before.
 - **Initial group:** once GMGN shows the earliest same-second group containing **any** expected initial bundler, **all** expected bundlers must appear in that group; otherwise **reset** (do not keep polling for missing bundlers).
 - **Poll interval:** GMGN bundler poll every **1s** (was 2s).
-- **Follow-token poll:** **`gmgn-cli` first** (API fallback on empty CLI); **`GMGN_API_KEY`** and **`GMGN_API_KEY_2`** alternate by **calendar second** (even → key 1, odd → key 2). CLI subprocess uses that client’s key via `GMGN_API_KEY` env. **`GMGN_FALLBACK_API_KEY` removed** (no secondary REST key retry).
+- **Follow-token poll:** `**gmgn-cli` first** (API fallback on empty CLI); `**GMGN_API_KEY`** and `**GMGN_API_KEY_2**` alternate by **calendar second** (even → key 1, odd → key 2). CLI subprocess uses that client’s key via `GMGN_API_KEY` env. `**GMGN_FALLBACK_API_KEY` removed** (no secondary REST key retry).
 
 ## 2026-07-24 (89)
 
@@ -82,7 +89,7 @@
 - Bundlers are grouped by `start_holding_at` using the anchor second plus **1s grace** (same timestamp second and the next second only — not +2s). Polling is two-phase: keep polling until GMGN shows a first group containing all **4** initial bundlers (may not appear on the first request), then wait for the **next** group with **≥4 wallets** within the first minute from CREATE to trigger buy and stop polling.
 - Round-group and cumulative-dust buy gates are **disabled** for follow-token (feePayer watch continues).
 - Buy exit: **+90% MC**; stop-loss remains **-50% P/L**.
-- Backend logs: each poll emits **`[FOLLOW-TOKEN-GMGN]`** info lines with trader snapshots, same-second + 1s grace groups, and poll phase (`waiting_initial_group` / `waiting_second_group`).
+- Backend logs: each poll emits `**[FOLLOW-TOKEN-GMGN]**` info lines with trader snapshots, same-second + 1s grace groups, and poll phase (`waiting_initial_group` / `waiting_second_group`).
 - **Post-buy sell trigger:** while holding a follow-token position, batched on-chain `getTokenAccountsByOwner` checks (SPL + Token-2022, one JSON-RPC batch per tick) run on the **top buyer wallet** during **re-entry** only. When that wallet has zero token balance, the bot sells the full position.
 - **Top buyer watch:** after the GMGN second-group buy, the wallet with the highest GMGN `buy_volume_cur` in that group is watched via Enhanced WSS. **First entry:** copy-sell on any top-buyer sell tx (+90% TP disabled, -50% SL kept). **After sell:** PumpPortal migration resumes but the top-buyer watch stays active. **Re-entry:** if the top buyer buys again before rug, migration feed suspends and the bot re-buys; **second entry** exits when the top buyer fully exits on-chain.
 
@@ -115,7 +122,7 @@
 
 ### Insider: startup handoff when shared feePayer is already at zero SOL
 
-- On **Shared FeePayer Locked**, if live balance is **0**, scan recent feePayer txs (since earliest bundler funding) for the **latest transfer-out &gt; 100 SOL** that drained the wallet.
+- On **Shared FeePayer Locked**, if live balance is **0**, scan recent feePayer txs (since earliest bundler funding) for the **latest transfer-out > 100 SOL** that drained the wallet.
 - Hand off monitoring to that recipient automatically (same migration path as live large-drain), up to **5** chained hops if intermediates are also empty.
 - Skips handoff when the drain returned to the **original** feePayer or the recipient is also at zero.
 
@@ -137,15 +144,15 @@
 
 ### Normal mode: expand round SOL sizes; tiered MC exit
 
-- Round group sizes: **~0.02 / ~0.05** (&lt; $10 cap) and **~0.1–0.5 SOL** in **0.05 steps** (USD-exempt, may exceed $10).
+- Round group sizes: **~0.02 / ~0.05** (< $10 cap) and **~0.1–0.5 SOL** in **0.05 steps** (USD-exempt, may exceed $10).
 - Exit bands: **+90% MC** for ~0.02 / ~0.05 SOL; **+180% MC** for ~0.1–0.5 SOL (see **2026-07-23 (77)** for stop-loss update).
 
 ## 2026-07-23 (75)
 
 ### Follow-token: resubscribe PumpPortal on skip/reset, not only after rug
 
-- **`startFromFollowTokenMigration`** now returns **`true` only when the bundler-funder flow is still active** after startup (fixes PumpPortal staying suspended when startup skip/reset fired `tokenFlowEnded` before unsubscribe).
-- PumpPortal **resubscribes on `tokenFlowEnded`** (`reset` or `cycle_complete`) once **`resetForNewToken` / `completeFlowCycle`** tear down feePayer, recipients, and other token watches — no need to wait for on-chain dev rug while the bot has already skipped/reset.
+- `**startFromFollowTokenMigration**` now returns `**true` only when the bundler-funder flow is still active** after startup (fixes PumpPortal staying suspended when startup skip/reset fired `tokenFlowEnded` before unsubscribe).
+- PumpPortal **resubscribes on `tokenFlowEnded`** (`reset` or `cycle_complete`) once `**resetForNewToken` / `completeFlowCycle**` tear down feePayer, recipients, and other token watches — no need to wait for on-chain dev rug while the bot has already skipped/reset.
 
 ## 2026-07-23 (74)
 
@@ -158,7 +165,7 @@
 
 ### Follow-token: always log filters 1–2 at info (pass or fail)
 
-- **Filter 1** (mint suffix) and **filter 2** (Helius DAS metadata URI) now emit **`info`** logs on both pass and fail; later filters unchanged.
+- **Filter 1** (mint suffix) and **filter 2** (Helius DAS metadata URI) now emit `**info`** logs on both pass and fail; later filters unchanged.
 
 ## 2026-07-23 (72)
 
@@ -179,67 +186,67 @@
 
 - Backend **info** logs for a migration start only after **pump suffix + metadata URI** pass; earlier skips stay **debug**.
 - **PumpPortal migration feed unsubscribes** (`unsubscribeMigration` + WebSocket disconnect, no reconnect) when follow-token bundler-funder flow starts; **resubscribes** (`connect` + `subscribeMigration`) on `tokenFlowEnded` for that follow-token mint (rug/reset or cycle complete).
-- Removed **`INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS`** (behavior is now fixed, not env-gated).
+- Removed `**INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS**` (behavior is now fixed, not env-gated).
 
 ## 2026-07-23 (69)
 
 ### Follow-token: Metaplex metadata URI filter (`https://ipfs.io/ipfs/baf…`)
 
-- New core filter after **mint ends in pump**: derive Metaplex metadata PDA, read URI via Helius RPC `getAccountInfo`, normalize to **ipfs.io**, require prefix **`https://ipfs.io/ipfs/baf`** before CREATE-tx / migrate-age checks.
+- New core filter after **mint ends in pump**: derive Metaplex metadata PDA, read URI via Helius RPC `getAccountInfo`, normalize to **ipfs.io**, require prefix `**https://ipfs.io/ipfs/baf`** before CREATE-tx / migrate-age checks.
 - Retries metadata lookup on indexing lag (4s / 8s) when the metadata account is missing; wrong URI prefix fails immediately.
-- Added **`token-metaplex-metadata.ts`** (PDA + on-chain decode — same flow as `findMetadataPda` + `fetchMetadata`, no extra npm deps).
+- Added `**token-metaplex-metadata.ts**` (PDA + on-chain decode — same flow as `findMetadataPda` + `fetchMetadata`, no extra npm deps).
 
 ## 2026-07-23 (68)
 
 ### Follow-token: retry Helius mint CREATE lookup on indexing lag
 
-- When **`mint create transaction not found`**, retries **`getMintCreateTransaction`** after **4s** and **8s** (same delays as first-four bundler fetch) before skipping the migration.
+- When `**mint create transaction not found**`, retries `**getMintCreateTransaction**` after **4s** and **8s** (same delays as first-four bundler fetch) before skipping the migration.
 
 ## 2026-07-23 (67)
 
 ### Follow-token: verbose backend logs for every PumpPortal migration
 
-- New **`INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS`** (default **`true`**) — `[FOLLOW-TOKEN]` info logs for every migration received, evaluation start, duplicate skips, core filter failures (with reason), and bundler indexing retries.
-- When **`false`**, core/bundler skip details stay at **debug** (prior behavior); passes/failures at info/warn unchanged.
+- New `**INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS**` (default `**true**`) — `[FOLLOW-TOKEN]` info logs for every migration received, evaluation start, duplicate skips, core filter failures (with reason), and bundler indexing retries.
+- When `**false**`, core/bundler skip details stay at **debug** (prior behavior); passes/failures at info/warn unchanged.
 
 ## 2026-07-23 (66)
 
 ### Follow-token: revert dev create count to Helius CREATE history
 
-- Restored **`HeliusClient.countDevCreatedTokenMints`** (dev fee-payer CREATE txs, first N results) for the “exactly 1 create” filter.
-- Removed Bitquery dependency from follow-token start — no **`BITQUERY_*`** env vars required.
-- Deleted **`bitquery-client.ts`**.
+- Restored `**HeliusClient.countDevCreatedTokenMints**` (dev fee-payer CREATE txs, first N results) for the “exactly 1 create” filter.
+- Removed Bitquery dependency from follow-token start — no `**BITQUERY_***` env vars required.
+- Deleted `**bitquery-client.ts**`.
 
 ## 2026-07-23 (65)
 
 ### Follow-token: Bitquery OAuth client-credentials + startup auth check
 
-- **`BITQUERY_CLIENT_ID`** + **`BITQUERY_CLIENT_SECRET`** — auto-fetch/refresh V2 tokens from `https://oauth2.bitquery.io/oauth2/token` (avoids expired 12h IDE tokens on servers).
-- Follow-token **startup** runs **`verifyAuth()`** — fails immediately with a clear error if Bitquery returns 403, instead of failing on the first migration.
-- Bitquery HTTP GraphQL auth uses **`?token=ory_at_...`** on `https://streaming.bitquery.io/graphql` (same URL-token pattern as WSS); **`Authorization: Bearer`** is fallback only.
+- `**BITQUERY_CLIENT_ID**` + `**BITQUERY_CLIENT_SECRET**` — auto-fetch/refresh V2 tokens from `https://oauth2.bitquery.io/oauth2/token` (avoids expired 12h IDE tokens on servers).
+- Follow-token **startup** runs `**verifyAuth()`** — fails immediately with a clear error if Bitquery returns 403, instead of failing on the first migration.
+- Bitquery HTTP GraphQL auth uses `**?token=ory_at_...**` on `https://streaming.bitquery.io/graphql` (same URL-token pattern as WSS); `**Authorization: Bearer**` is fallback only.
 - Strips accidental quotes/`Bearer` prefix from `BITQUERY_ACCESS_TOKEN`.
 
 ## 2026-07-23 (64)
 
 ### Follow-wallet: verbose backend logs for testing
 
-- New **`INSIDER_FOLLOW_WALLET_VERBOSE_LOGS`** (default **`true`**) — emits **`[FOLLOW-WALLET]`** info logs for monitoring start/pause/resume, buy detection, flow start, and every Enhanced WSS wallet tx (not just buys).
-- Follow-wallet monitors use the **`FOLLOW-WALLET`** log label when verbose (easier to filter in backend logs). Set **`INSIDER_FOLLOW_WALLET_VERBOSE_LOGS=false`** when done testing.
+- New `**INSIDER_FOLLOW_WALLET_VERBOSE_LOGS**` (default `**true**`) — emits `**[FOLLOW-WALLET]**` info logs for monitoring start/pause/resume, buy detection, flow start, and every Enhanced WSS wallet tx (not just buys).
+- Follow-wallet monitors use the `**FOLLOW-WALLET**` log label when verbose (easier to filter in backend logs). Set `**INSIDER_FOLLOW_WALLET_VERBOSE_LOGS=false**` when done testing.
 
 ## 2026-07-23 (63)
 
 ### Follow-token: Bitquery V2 auth + creator count query
 
-- Bitquery client uses **`https://streaming.bitquery.io/graphql`** with **`Authorization: Bearer <BITQUERY_ACCESS_TOKEN>`** (V2 OAuth `ory_at_...`, not v1 API key).
-- Strips accidental `Bearer ` prefix from env; clearer **403** hint when token/endpoint mismatch.
-- Creator count query uses **`dataset: combined`** and Pump.fun program address filter for full historical create count.
+- Bitquery client uses `**https://streaming.bitquery.io/graphql**` with `**Authorization: Bearer <BITQUERY_ACCESS_TOKEN>**` (V2 OAuth `ory_at_...`, not v1 API key).
+- Strips accidental `Bearer`  prefix from env; clearer **403** hint when token/endpoint mismatch.
+- Creator count query uses `**dataset: combined**` and Pump.fun program address filter for full historical create count.
 
 ## 2026-07-23 (62)
 
 ### Follow-token: Bitquery Pump.fun creator count
 
 - Replaced Helius CREATE-tx history scan with **Bitquery** aggregate query (`Program.Name = pump`, `Method in [create, create_v2]`, `Transaction.Signer = dev`) — accurate total create count, not limited to first N txs.
-- Requires **`BITQUERY_ACCESS_TOKEN`** in `.env` for follow-token start.
+- Requires `**BITQUERY_ACCESS_TOKEN**` in `.env` for follow-token start.
 - Removed `HeliusClient.countDevCreatedTokenMints`.
 
 ## 2026-07-23 (61)
@@ -250,28 +257,28 @@
 - New `pump-portal-ws.ts` client with reconnect + migration event parsing.
 - **Pause Follow-Wallet** / **Resume Follow-Wallet** Telegram buttons (pause monitors only; active token flows unchanged).
 - **Pause Funder-First** button (separate from Start).
-- Env auto-start flags: **`INSIDER_FOLLOW_WALLET_ENABLED`**, **`INSIDER_FUNDER_FIRST_ENABLED`**, **`INSIDER_FOLLOW_TOKEN_ENABLED`** (follow-token TG alerts still require the last).
+- Env auto-start flags: `**INSIDER_FOLLOW_WALLET_ENABLED**`, `**INSIDER_FUNDER_FIRST_ENABLED**`, `**INSIDER_FOLLOW_TOKEN_ENABLED**` (follow-token TG alerts still require the last).
 - General wallet monitors now pass shared Enhanced WSS for `transactionSubscribe` when `INSIDER_HELIUS_API_KEY` is set.
 
 ## 2026-07-23 (60)
 
 ### Follow-token: funded-by requires `Centralized Exchange`
 
-- Dev funder filter now requires Helius funded-by `funderType` **`Centralized Exchange`** (case-insensitive), matching the Wallet API response (e.g. Bybit Hot Wallet). Removed legacy `exchange` / name-heuristic fallback.
+- Dev funder filter now requires Helius funded-by `funderType` `**Centralized Exchange**` (case-insensitive), matching the Wallet API response (e.g. Bybit Hot Wallet). Removed legacy `exchange` / name-heuristic fallback.
 
 ## 2026-07-23 (59)
 
 ### Follow-token: tiered logging and Telegram gates
 
 - **Backend info logs** include the token only after core migration filters pass (pump suffix, dev single create, migrate age, exchange funder). Earlier skips are **debug-only** without mint spam.
-- **Telegram** token alerts (filters passed, handoff delayed/skipped) fire only after **first-four bundlers** confirm and only when **`INSIDER_FOLLOW_TOKEN_ENABLED=true`**. Start/stop listener TG unchanged.
+- **Telegram** token alerts (filters passed, handoff delayed/skipped) fire only after **first-four bundlers** confirm and only when `**INSIDER_FOLLOW_TOKEN_ENABLED=true`**. Start/stop listener TG unchanged.
 
 ## 2026-07-23 (58)
 
 ### Follow-token: Pump.fun migration listener
 
-- New **follow-token** flow listens for Pump.fun **`migrate` / `migrate_v2`** on program `6EF8…` via Helius **`parsedTransactionSubscribe`**.
-- Migration filters: mint ends **`pump`**, dev created **exactly 1** token, migrate within **`INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC`** (default 60s) of create, dev **funded by Centralized Exchange** (Helius `/v1/wallet/{wallet}/funded-by`, `funderType=Centralized Exchange`).
+- New **follow-token** flow listens for Pump.fun `**migrate` / `migrate_v2`** on program `6EF8…` via Helius `**parsedTransactionSubscribe**`.
+- Migration filters: mint ends `**pump**`, dev created **exactly 1** token, migrate within `**INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC`** (default 60s) of create, dev **funded by Centralized Exchange** (Helius `/v1/wallet/{wallet}/funded-by`, `funderType=Centralized Exchange`).
 - After filters pass, validates **first-four unique SWAP buys** and starts the same **bundler-funder monitoring** as follow-wallet (`startFromFollowTokenMigration` — no follow wallet required).
 - Telegram: **Start / Stop Follow-Token**; optional auto-start via `INSIDER_FOLLOW_TOKEN_ENABLED=true`.
 - Added `getWalletFundedBy`, `countDevCreatedTokenMints` on `HeliusClient`; `pump-migrate-detector.ts`; `FollowTokenMigrationOrchestrator`.
@@ -309,7 +316,7 @@
 ### Normal mode: add ~0.15 / ~0.2 SOL round buy triggers
 
 - Round group sizes expanded: **~0.02 / ~0.05 / ~0.1 / ~0.15 / ~0.2 SOL** (±0.004 SOL), same 10s / ≥17 txs / $100 first-buy gates.
-- **~0.02 / ~0.05 / ~0.1** still require transfer-out **&lt; $10** USD.
+- **~0.02 / ~0.05 / ~0.1** still require transfer-out **< $10** USD.
 - **~0.15 / ~0.2** are **exempt** from the $10 cap (may exceed $10 at current SOL price).
 - **~0.15 / ~0.2 / ~0.1** use the +180% MC exit band; **~0.02 / ~0.05** stay at +90%.
 
@@ -376,7 +383,7 @@
 
 ### Follow-wallet vs funder-first normal-mode funding threshold
 
-- **Follow-wallet**: normal-mode **funding** threshold lowered from **20 SOL** to **>3 SOL**. Buy signals unchanged — tiny round groups on transfer-outs **&lt; $10**, cumulative dust race-to-20, and the **$100** first-buy gate on the first two unique recipients.
+- **Follow-wallet**: normal-mode **funding** threshold lowered from **20 SOL** to **>3 SOL**. Buy signals unchanged — tiny round groups on transfer-outs **< $10**, cumulative dust race-to-20, and the **$100** first-buy gate on the first two unique recipients.
 - **Funder-first**: normal-mode **funding** threshold stays **≥20 SOL**. Uses the **same** tiny round-group buy path as follow-wallet (not the old large 20 SOL+ transfer-out → wait-for-recipient-buy path).
 
 ### Follow-wallet Telegram: show responsible follow wallet
@@ -389,7 +396,7 @@
 
 ## 2026-07-19 (43)
 
-### Normal mode: round-group buy requires selected recipient first buy &gt; $100
+### Normal mode: round-group buy requires selected recipient first buy > $100
 
 - Before a normal-mode ~0.02 / ~0.05 / ~0.1 SOL round buy, the bot picks the **first two unique recipients** in the 10s group (not the first two txs), syncs each wallet's history, and finds its **first buy on the current token**.
 - Buy proceeds if **either** recipient's first buy exceeds **$100 USD**; the qualifying wallet triggers the buy. Otherwise the token is skipped and reset.
@@ -410,7 +417,7 @@
 
 ## 2026-07-17 (39)
 
-###  
+
 
 ### Follow-wallet: watch up to 2 wallets on bot 1
 
