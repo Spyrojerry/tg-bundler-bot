@@ -28,8 +28,6 @@ const REQUIRED_BUNDLER_MATCHES = 2;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
 const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
-/** Sell when position MC P/L falls to this % vs entry MC (e.g. -50 = 50% drawdown). */
-const INSIDER_STOP_LOSS_MC_PERCENT = -50;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
 const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
@@ -1253,33 +1251,12 @@ export class InsiderBot extends EventEmitter {
     return this.exitMc;
   }
 
-  getStopLossMcPercent() {
-    return INSIDER_STOP_LOSS_MC_PERCENT;
+  getStopLossMcPercent(): number {
+    return 0;
   }
 
-  async tryTriggerStopLossSell(currentMc: number): Promise<boolean> {
-    if (!this.activePosition || this.positionSellTriggered) return false;
-    const entryMc = this.entryMc;
-    if (!entryMc || entryMc <= 0) return false;
-
-    const stopLossMc = entryMc * (1 + INSIDER_STOP_LOSS_MC_PERCENT / 100);
-    if (currentMc > stopLossMc) return false;
-
-    const plPercent = ((currentMc - entryMc) / entryMc) * 100;
-    await this.triggerPositionSell(
-      this.activePosition.mint,
-      `Position P/L reached ${plPercent.toFixed(1)}% (stop-loss at ${INSIDER_STOP_LOSS_MC_PERCENT}%)`,
-      [
-        `<b>🛑 ${this.label} Stop-Loss Triggered</b>`,
-        `Token: <code>${this.activePosition.mint}</code>`,
-        `Entry MC: <b>$${entryMc.toLocaleString()}</b>`,
-        `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-        `P/L: <b>${plPercent.toFixed(1)}%</b>`,
-        `Stop-loss threshold: <b>${INSIDER_STOP_LOSS_MC_PERCENT}%</b>`,
-      ],
-      "STOP_LOSS_MC_TRIGGER",
-    );
-    return true;
+  async tryTriggerStopLossSell(_currentMc: number): Promise<boolean> {
+    return false;
   }
 
   async tryTriggerRugMarketCapReset(currentMc: number): Promise<boolean> {
@@ -2847,7 +2824,7 @@ export class InsiderBot extends EventEmitter {
         `Initial bundlers: <b>${firstFour.length}</b>`,
         "",
         `Polling GMGN every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset.`,
-        `Exit: watched-wallet buy/sell tx (+90% TP disabled). ${INSIDER_STOP_LOSS_MC_PERCENT}% SL active.`,
+        `Exit: watched-wallet buy/sell tx (+90% MC TP when enabled for trigger).`,
       ].join("\n"),
       "follow-token gmgn watch started notification",
     );
@@ -3659,7 +3636,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy trigger: GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset. Watched-wallet buy/sell exit; ${INSIDER_STOP_LOSS_MC_PERCENT}% stop-loss. Round/dust gates disabled.`
+            ? `Follow-token buy trigger: GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset. Watched-wallet buy/sell exit (+90% MC TP on late odd trigger). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -4721,8 +4698,8 @@ export class InsiderBot extends EventEmitter {
 
       const exitRuleLine =
         profitExitPercent !== undefined
-          ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell · Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b>`
-          : `Exit: watched-wallet buy/sell tx (+90% TP disabled) · Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b>`;
+          ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell`
+          : `Exit: watched-wallet buy/sell tx (+90% MC TP disabled)`;
       const secondGroupSizeLine =
         secondGroup.wallets.length >=
         FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS
@@ -4788,9 +4765,8 @@ export class InsiderBot extends EventEmitter {
           `Initial bundlers validated in first GMGN group: <b>${state.bundlerWallets.size}</b>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
           profitExitPercent !== undefined
-            ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell · SL ${INSIDER_STOP_LOSS_MC_PERCENT}% P/L`
-            : `Exit: sell on watched wallet buy/sell tx (+90% TP disabled)`,
-          `Stop-loss: <b>${INSIDER_STOP_LOSS_MC_PERCENT}% P/L</b>`,
+            ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell`
+            : `Exit: sell on watched wallet buy/sell tx (+90% MC TP disabled)`,
           "",
           ...secondGroup.wallets.map(
             (wallet, index) => `${index + 1}. <code>${wallet}</code>`,

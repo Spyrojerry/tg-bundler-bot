@@ -1,10 +1,16 @@
 # Changelog
 
+## 2026-07-25 (95)
+
+### Insider: remove -50% P/L stop-loss
+
+- **`tryTriggerStopLossSell`** is disabled (no MC stop-loss sell). Rug MC floor, watched-wallet exits, and configured MC take-profit paths unchanged.
+
 ## 2026-07-25 (94)
 
 ### Follow-token: late 4-wallet odd top_holder buy (+90% MC TP)
 
-- Second group **&gt;60s** after initial anchor, **4** wallets, **no** `fresh_wallet`, **1-vs-3** `top_holder` odd split → buy without waiting for 5 wallets; **+90% MC take-profit** enabled (+ watched-wallet buy/sell exit, **-50% SL** unchanged).
+- Second group **&gt;60s** after initial anchor, **4** wallets, **no** `fresh_wallet`, **1-vs-3** `top_holder` odd split → buy without waiting for 5 wallets; **+90% MC take-profit** enabled (+ watched-wallet buy/sell exit).
 - **10s grace** still runs for **&lt;5** wallet second groups before `second_group_insufficient_wallets_*` reset (including counts like 2–4 that do not match the late odd trigger).
 
 ## 2026-07-25 (93)

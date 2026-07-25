@@ -1668,7 +1668,6 @@ async function main(): Promise<void> {
                 "",
                 "<b>Strategy: Current MC Exit</b>",
                 `Exit when current MC reaches: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
-                `Stop-loss: <b>${html(String(bot.getStopLossMcPercent()))}% P/L</b>`,
               ]
                 .filter(Boolean)
                 .join("\n"),
@@ -2066,13 +2065,6 @@ async function main(): Promise<void> {
       }
 
       if (activePos) {
-        if (await bot.tryTriggerStopLossSell(currentMc)) {
-          log.warn(
-            `[INSIDER ${botNumber} STOP-LOSS] Current MC $${currentMc.toLocaleString()} hit ${bot.getStopLossMcPercent()}% P/L floor for ${activePos.mint}. Triggering SELL.`,
-          );
-          return;
-        }
-
         const exitMc = bot.getExitMc();
         if (bot.isProfitExitDisabled()) {
           log.info(
@@ -2612,7 +2604,6 @@ async function main(): Promise<void> {
         `Normal Funding Buy SOL: <b>${html(String(bot.getNormalFundingBuySol()))}</b>`,
         `Low-Funding Buy SOL: <b>${html(String(bot.getLowFundingBuySol()))}</b>`,
         `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% Current MC from Entry</b>`,
-        `Stop-Loss: <b>${html(String(bot.getStopLossMcPercent()))}% P/L</b>`,
         `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
         "",
         "<b>Flows (run in parallel)</b>",
