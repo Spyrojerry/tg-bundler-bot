@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-25 (93)
+
+### Follow-token: 10s grace before second-group wallet-count fail
+
+- When the **second** GMGN same-second group first appears with **&lt;5** wallets, poll every **1s** for **10s** on that **same anchor timestamp** (GMGN may add bundlers to that second). If count reaches **≥5** during grace → continue tag plan / buy. After **10s** still **&lt;5** → `second_group_insufficient_wallets_*` reset + Telegram (no instant fail on first snapshot).
+
 ## 2026-07-24 (92)
 
 ### Follow-token second-group watch: one fresh + one top_holder; odd minority buy exit
@@ -19,7 +25,7 @@
 
 ### Follow-token: fail-fast second group, 1s GMGN poll, API key rotation
 
-- **Second group:** after initial bundler group is latched, wait for the **next** same-second GMGN group. If it appears with **&lt;5** wallets, stop polling and **reset** (sell if holding, else resume PumpPortal). If **≥5**, continue tag plan / buy as before.
+- **Second group:** after initial bundler group is latched, wait for the **next** same-second GMGN group. If it appears with **&lt;5** wallets, **10s grace** on that second (1s polls) for GMGN to reach **≥5**; if still **&lt;5** after grace, stop polling and **reset**. If **≥5** (during or after grace window), continue tag plan / buy as before.
 - **Initial group:** once GMGN shows the earliest same-second group containing **any** expected initial bundler, **all** expected bundlers must appear in that group; otherwise **reset** (do not keep polling for missing bundlers).
 - **Poll interval:** GMGN bundler poll every **1s** (was 2s).
 - **Follow-token poll:** **`gmgn-cli` first** (API fallback on empty CLI); **`GMGN_API_KEY`** and **`GMGN_API_KEY_2`** alternate by **calendar second** (even → key 1, odd → key 2). CLI subprocess uses that client’s key via `GMGN_API_KEY` env. **`GMGN_FALLBACK_API_KEY` removed** (no secondary REST key retry).

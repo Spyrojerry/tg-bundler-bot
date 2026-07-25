@@ -249,6 +249,15 @@ function findFollowTokenGmgnThirdBundlerGroupAfterSecond(
   return null;
 }
 
+function findFollowTokenGmgnGroupByAnchor(
+  groups: GmgnBundlerTimestampGroup[],
+  anchorTimestamp: number,
+): GmgnBundlerTimestampGroup | null {
+  return (
+    groups.find((group) => group.anchorTimestamp === anchorTimestamp) ?? null
+  );
+}
+
 function pickFollowTokenFreshTopBuyerInGroup(
   group: GmgnBundlerTimestampGroup,
   snapshots: GmgnBundlerTraderSnapshot[],
@@ -461,6 +470,8 @@ const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS = 1_000;
 const FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC = 0;
 /** Follow-token buy trigger: second bundler group must have at least this many wallets. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS = 5;
+/** After second group first appears with fewer than min wallets, keep polling this long for GMGN to fill the same second. */
+const FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC = 10;
 /** REST backfill lookback before Enhanced WSS subscribe (covers connect / reconnect lag). */
 const FOLLOW_TOKEN_TOP_BUYER_WATCH_BACKFILL_BUFFER_SEC = 20;
 /** Recent tx page size for follow-token top-buyer / second-group watch backfill. */
@@ -903,6 +914,11 @@ export class InsiderBot extends EventEmitter {
   /** Latched once GMGN shows a same-second + 1s grace group containing all four initial bundlers. */
   private followTokenGmgnInitialBundlerGroup: GmgnBundlerTimestampGroup | null =
     null;
+  /** Second group seen below min wallets — poll same anchor until grace expires or count reaches min. */
+  private followTokenGmgnSecondGroupGrace: {
+    anchorTimestamp: number;
+    startedAtMs: number;
+  } | null = null;
   /** Wallets from the GMGN second bundler group that triggered the follow-token buy. */
   private followTokenGmgnBuySecondGroupWallets: string[] | null = null;
   private followTokenGmgnSecondGroup: GmgnBundlerTimestampGroup | null = null;
@@ -2663,7 +2679,7 @@ export class InsiderBot extends EventEmitter {
         `Migration tx: <code>${migrationSignature}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
-        `Buy trigger: GMGN bundler second-group poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next same-second group after initial must have ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets or flow resets.`,
+        `Buy trigger: GMGN bundler second-group poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next same-second group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace on same second if below min, then reset).`,
         "Bundler feePayer backtrack skipped for follow-token (GMGN-only path).",
       ].join("\n"),
       "follow-token flow-start notification",
@@ -2775,7 +2791,7 @@ export class InsiderBot extends EventEmitter {
         `Dev CREATE: <b>${this.devCreateTimestamp}</b>`,
         `Initial bundlers: <b>${firstFour.length}</b>`,
         "",
-        `Polling GMGN every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (same second) or reset.`,
+        `Polling GMGN every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset.`,
         `Exit: watched-wallet buy/sell tx (+90% TP disabled). ${INSIDER_STOP_LOSS_MC_PERCENT}% SL active.`,
       ].join("\n"),
       "follow-token gmgn watch started notification",
@@ -3588,7 +3604,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy trigger: GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} (same second) or reset. Watched-wallet buy/sell exit; ${INSIDER_STOP_LOSS_MC_PERCENT}% stop-loss. Round/dust gates disabled.`
+            ? `Follow-token buy trigger: GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset. Watched-wallet buy/sell exit; ${INSIDER_STOP_LOSS_MC_PERCENT}% stop-loss. Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -4180,6 +4196,7 @@ export class InsiderBot extends EventEmitter {
     }
     this.followTokenGmgnBundlerPollInFlight = false;
     this.followTokenGmgnInitialBundlerGroup = null;
+    this.followTokenGmgnSecondGroupGrace = null;
     if (reason !== "poll loop stopped") {
       this.followTokenGmgnBundlerBackend("GMGN bundler poll stopped", { reason });
     }
@@ -4207,6 +4224,8 @@ export class InsiderBot extends EventEmitter {
       pollIntervalMs: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS,
       groupGraceSec: FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC,
       secondGroupMinWallets: FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
+      secondGroupMinWalletsGraceSec:
+        FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC,
       expectedInitialBundlers: [...state.bundlerWallets],
     });
 
@@ -4330,7 +4349,9 @@ export class InsiderBot extends EventEmitter {
       );
       const pollPhase = !this.followTokenGmgnInitialBundlerGroup
         ? "waiting_initial_group"
-        : "waiting_second_group";
+        : this.followTokenGmgnSecondGroupGrace
+          ? "waiting_second_group_grace"
+          : "waiting_second_group";
 
       this.followTokenGmgnBundlerBackend("GMGN bundler poll tick", {
         mint: state.mint,
@@ -4341,6 +4362,18 @@ export class InsiderBot extends EventEmitter {
         traderCount: snapshots.length,
         traders: snapshots,
         groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+        secondGroupGrace: this.followTokenGmgnSecondGroupGrace
+          ? {
+              anchorTimestamp:
+                this.followTokenGmgnSecondGroupGrace.anchorTimestamp,
+              elapsedSec: Math.floor(
+                (Date.now() -
+                  this.followTokenGmgnSecondGroupGrace.startedAtMs) /
+                  1_000,
+              ),
+              graceSec: FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC,
+            }
+          : null,
         initialGroupConfirmed: this.followTokenGmgnInitialBundlerGroup
           ? {
               anchorTimestamp:
@@ -4409,48 +4442,88 @@ export class InsiderBot extends EventEmitter {
         this.followTokenGmgnInitialBundlerGroup,
       );
       if (!nextGroup) {
+        this.followTokenGmgnSecondGroupGrace = null;
         return;
       }
 
+      const graceAnchor = this.followTokenGmgnSecondGroupGrace?.anchorTimestamp;
+      const secondGroupCandidate = this.followTokenGmgnSecondGroupGrace
+        ? (findFollowTokenGmgnGroupByAnchor(groups, graceAnchor!) ?? {
+            anchorTimestamp: graceAnchor!,
+            wallets: [] as string[],
+          })
+        : nextGroup;
+
       if (
-        nextGroup.wallets.length <
+        secondGroupCandidate.wallets.length >=
         FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS
       ) {
-        await this.resetFollowTokenAfterGmgnFilterFailed(
-          state.mint,
-          `second_group_insufficient_wallets_${nextGroup.wallets.length}`,
+        this.followTokenGmgnSecondGroupGrace = null;
+        const secondGroup = secondGroupCandidate;
+
+        this.followTokenGmgnBundlerBackend("GMGN second bundler group detected", {
+          mint: state.mint,
+          firstGroupTimestamp:
+            this.followTokenGmgnInitialBundlerGroup.anchorTimestamp,
+          secondGroupTimestamp: secondGroup.anchorTimestamp,
+          secondGroupWalletCount: secondGroup.wallets.length,
+          secondGroupWallets: secondGroup.wallets,
+          groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+        });
+
+        await this.emitFollowTokenGmgnBundlerBuy(
+          state,
+          secondGroup,
+          groups,
+          this.followTokenGmgnInitialBundlerGroup,
+          snapshots,
+        );
+        return;
+      }
+
+      const nowMs = Date.now();
+      if (!this.followTokenGmgnSecondGroupGrace) {
+        this.followTokenGmgnSecondGroupGrace = {
+          anchorTimestamp: nextGroup.anchorTimestamp,
+          startedAtMs: nowMs,
+        };
+        this.followTokenGmgnBundlerBackend(
+          "GMGN second group below min wallets — grace period started",
           {
-            firstGroupTimestamp:
-              this.followTokenGmgnInitialBundlerGroup.anchorTimestamp,
-            nextGroupTimestamp: nextGroup.anchorTimestamp,
-            nextGroupWalletCount: nextGroup.wallets.length,
-            nextGroupWallets: nextGroup.wallets,
+            mint: state.mint,
+            anchorTimestamp: nextGroup.anchorTimestamp,
+            walletCount: secondGroupCandidate.wallets.length,
             minSecondGroupWallets:
               FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
-            groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+            graceSec: FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC,
           },
         );
         return;
       }
 
-      const secondGroup = nextGroup;
+      const graceElapsedSec =
+        (nowMs - this.followTokenGmgnSecondGroupGrace.startedAtMs) / 1_000;
+      if (graceElapsedSec < FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC) {
+        return;
+      }
 
-      this.followTokenGmgnBundlerBackend("GMGN second bundler group detected", {
-        mint: state.mint,
-        firstGroupTimestamp: this.followTokenGmgnInitialBundlerGroup.anchorTimestamp,
-        secondGroupTimestamp: secondGroup.anchorTimestamp,
-        secondGroupWalletCount: secondGroup.wallets.length,
-        secondGroupWallets: secondGroup.wallets,
-        groups: this.summarizeGmgnBundlerGroupsForLog(groups),
-      });
-
-      await this.emitFollowTokenGmgnBundlerBuy(
-        state,
-        secondGroup,
-        groups,
-        this.followTokenGmgnInitialBundlerGroup,
-        snapshots,
+      await this.resetFollowTokenAfterGmgnFilterFailed(
+        state.mint,
+        `second_group_insufficient_wallets_${secondGroupCandidate.wallets.length}`,
+        {
+          firstGroupTimestamp:
+            this.followTokenGmgnInitialBundlerGroup.anchorTimestamp,
+          nextGroupTimestamp: secondGroupCandidate.anchorTimestamp,
+          nextGroupWalletCount: secondGroupCandidate.wallets.length,
+          nextGroupWallets: secondGroupCandidate.wallets,
+          minSecondGroupWallets:
+            FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
+          graceSec: FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC,
+          graceElapsedSec: Math.floor(graceElapsedSec),
+          groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+        },
       );
+      return;
     } catch (err) {
       this.followTokenGmgnLog.warn("GMGN bundler poll failed", {
         mint: state.mint,
