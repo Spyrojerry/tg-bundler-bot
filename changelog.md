@@ -1,10 +1,23 @@
 # Changelog
 
+## 2026-07-26 (98)
+
+### Follow-token: multi-fresh handoff exit if non-fresh already sold
+
+- On **multi-fresh handoff**, after picking the non-fresh top buyer, if that wallet already has a **sell after its first buy** on the token (GMGN `sell_tx_count_cur` / `sell_volume_cur`, or Helius tx order), **full exit immediately** instead of re-subscribing the watch.
+
+## 2026-07-26 (97)
+
+### Follow-token: multi-fresh handoff on fresh top buyer buy
+
+- **`multi_fresh_top_fresh_buyer`:** full exit on the watched fresh top buyer’s next **sell** unchanged. On next **buy**, re-fetch GMGN tags and **hand off** the watch to the **top buyer among non-fresh wallets** in that second group; standard exit on that wallet’s next buy or sell. Handoff failure (GMGN error, no non-fresh top buyer) falls back to full exit on the fresh buy.
+
 ## 2026-07-26 (96)
 
-### Follow-token: `multi_fresh_non_fresh_pool` fresh buy-size gate
+### Follow-token: multi-fresh second group watches top fresh buyer
 
-- When the watched wallet is the top **non-fresh** buyer among **multi-fresh** second groups, skip buy if **any** `fresh_wallet` in that group has a **larger** GMGN buy score (`history_bought_cost` when present, else `buy_volume_cur` / `buy_amount_cur`). Reason: `multi_fresh_non_fresh_fresh_bought_more`.
+- **≥2 `fresh_wallet` in second group:** if **every** wallet in the group is fresh (no non-fresh wallets), **no buy** (`multi_fresh_no_fresh_top_holder_and_no_non_fresh`). Otherwise watch the **top GMGN buyer among fresh wallets** (`multi_fresh_top_fresh_buyer`); full exit on that wallet’s next **buy** or **sell**.
+- **Removed:** dual fresh+`top_holder` subset, non-fresh pool watch, and fresh-vs-non-fresh buy-size skip (`multi_fresh_non_fresh_*`).
 
 ## 2026-07-25 (95)
 

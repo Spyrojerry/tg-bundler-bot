@@ -81,6 +81,8 @@ interface GmgnBundlerTraderSnapshot {
   buyAmountCur: number;
   /** GMGN cumulative buy cost (often SOL spent); used for fresh vs non-fresh comparisons. */
   historyBoughtCost: number;
+  sellTxCountCur: number;
+  sellVolumeCur: number;
   tags: string[];
   makerTokenTags: string[];
 }
@@ -153,6 +155,12 @@ function followTokenGmgnTraderBuyScore(
   if (snapshot.historyBoughtCost > 0) return snapshot.historyBoughtCost;
   if (snapshot.buyVolumeCur > 0) return snapshot.buyVolumeCur;
   return snapshot.buyAmountCur;
+}
+
+function gmgnBundlerTraderHasSellAfterInitialBuy(
+  snapshot: GmgnBundlerTraderSnapshot,
+): boolean {
+  return snapshot.sellTxCountCur > 0 || snapshot.sellVolumeCur > 0;
 }
 
 function groupGmgnBundlersByStartHoldingAt(
@@ -308,27 +316,6 @@ function resolveFollowTokenSecondGroupPlan(
   });
 
   if (freshWallets.length > 1) {
-    const freshAndTopHolder = wallets.filter((wallet) => {
-      const snapshot = getGmgnSnapshotForWallet(wallet, snapshots);
-      return (
-        snapshot &&
-        gmgnSnapshotHasTag(snapshot, "fresh_wallet") &&
-        gmgnSnapshotHasMakerTag(snapshot, "top_holder")
-      );
-    });
-    if (freshAndTopHolder.length > 0) {
-      const wallet = pickFollowTokenTopBuyerWallet(freshAndTopHolder, snapshots);
-      if (!wallet) {
-        return { kind: "no_buy", reason: "multi_fresh_missing_top_buyer" };
-      }
-      return {
-        kind: "watch_buy",
-        wallet,
-        watchMode: "standard",
-        reason: "multi_fresh_fresh_wallet_and_top_holder",
-      };
-    }
-
     const nonFreshWallets = wallets.filter((wallet) => {
       const snapshot = getGmgnSnapshotForWallet(wallet, snapshots);
       return snapshot && !gmgnSnapshotHasTag(snapshot, "fresh_wallet");
@@ -339,34 +326,15 @@ function resolveFollowTokenSecondGroupPlan(
         reason: "multi_fresh_no_fresh_top_holder_and_no_non_fresh",
       };
     }
-    const wallet = pickFollowTokenTopBuyerWallet(nonFreshWallets, snapshots);
+    const wallet = pickFollowTokenTopBuyerWallet(freshWallets, snapshots);
     if (!wallet) {
-      return { kind: "no_buy", reason: "multi_fresh_non_fresh_missing_top_buyer" };
-    }
-    const watchedSnapshot = getGmgnSnapshotForWallet(wallet, snapshots);
-    const watchedBuyScore = watchedSnapshot
-      ? followTokenGmgnTraderBuyScore(watchedSnapshot)
-      : 0;
-    let maxFreshBuyScore = 0;
-    for (const freshWallet of freshWallets) {
-      const freshSnapshot = getGmgnSnapshotForWallet(freshWallet, snapshots);
-      if (!freshSnapshot) continue;
-      maxFreshBuyScore = Math.max(
-        maxFreshBuyScore,
-        followTokenGmgnTraderBuyScore(freshSnapshot),
-      );
-    }
-    if (maxFreshBuyScore > watchedBuyScore) {
-      return {
-        kind: "no_buy",
-        reason: "multi_fresh_non_fresh_fresh_bought_more",
-      };
+      return { kind: "no_buy", reason: "multi_fresh_missing_top_buyer" };
     }
     return {
       kind: "watch_buy",
       wallet,
       watchMode: "standard",
-      reason: "multi_fresh_non_fresh_pool",
+      reason: "multi_fresh_top_fresh_buyer",
     };
   }
 
@@ -1009,6 +977,8 @@ export class InsiderBot extends EventEmitter {
   private followTokenTopBuyerWallet: string | null = null;
   private followTokenTopBuyerMint: string | null = null;
   private followTokenWatchMode: FollowTokenGmgnWatchMode | null = null;
+  /** Tag-plan reason from GMGN second-group buy (e.g. multi_fresh_top_fresh_buyer). */
+  private followTokenGmgnSecondGroupWatchReason: string | null = null;
   private followTokenTopBuyerEnhancedWatchId: number | null = null;
   private followTokenTopBuyerSeenSignatures = new Set<string>();
   private followTokenTopBuyerWatchConnectStartedAtSec: number | null = null;
@@ -1701,6 +1671,7 @@ export class InsiderBot extends EventEmitter {
     this.followTokenTopBuyerWallet = null;
     this.followTokenTopBuyerMint = null;
     this.followTokenWatchMode = null;
+    this.followTokenGmgnSecondGroupWatchReason = null;
     this.followTokenGmgnSecondGroup = null;
     this.followTokenTopBuyerWatchConnectStartedAtSec = null;
     this.followTokenTopBuyerWatchLastBackfillAtSec = null;
@@ -1837,6 +1808,186 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  /** True if wallet has a mint sell after its first classified mint buy in recent history. */
+  private async followTokenWalletHasSellAfterFirstBuyOnMint(
+    wallet: string,
+    mint: string,
+  ): Promise<boolean | null> {
+    let txs: HeliusTransaction[];
+    try {
+      txs = await this.withHeliusFallback((client) =>
+        client.getWalletTransactionsDesc(
+          wallet,
+          FOLLOW_TOKEN_TOP_BUYER_WATCH_BACKFILL_LIMIT,
+        ),
+      );
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.followTokenGmgnLog.warn(
+        "Follow-token handoff sell-after-buy Helius fetch failed",
+        {
+          mint,
+          wallet,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      return null;
+    }
+
+    const events = txs
+      .filter((tx) => this.isRelevantMintTx(tx, mint))
+      .map((tx) => ({
+        tx,
+        action: this.classifyTx(tx, wallet, mint),
+      }))
+      .filter(
+        (
+          entry,
+        ): entry is {
+          tx: HeliusTransaction;
+          action: "buy" | "sell";
+        } => entry.action === "buy" || entry.action === "sell",
+      )
+      .sort(
+        (left, right) =>
+          left.tx.timestamp - right.tx.timestamp ||
+          left.tx.signature.localeCompare(right.tx.signature),
+      );
+
+    let sawBuy = false;
+    for (const { action } of events) {
+      if (action === "buy") {
+        sawBuy = true;
+        continue;
+      }
+      if (action === "sell" && sawBuy) return true;
+    }
+    return false;
+  }
+
+  private async tryFollowTokenMultiFreshHandoffToNonFreshTopBuyer(
+    mint: string,
+    triggerTx: HeliusTransaction,
+  ): Promise<void> {
+    const wallet = this.followTokenTopBuyerWallet;
+    const secondGroup = this.followTokenGmgnSecondGroup;
+    if (!wallet || !secondGroup) {
+      if (wallet) {
+        await this.triggerFollowTokenWatchExitSell(
+          mint,
+          wallet,
+          "buy",
+          triggerTx,
+          "multi_fresh handoff missing second group",
+        );
+      }
+      return;
+    }
+
+    let snapshots: GmgnBundlerTraderSnapshot[];
+    try {
+      const traders = await this.pickFollowTokenGmgnPollClient().fetchBundlerTraders(
+        mint,
+        50,
+      );
+      snapshots = this.extractGmgnBundlerTraderSnapshots(traders);
+    } catch (err) {
+      this.followTokenGmgnLog.warn(
+        "Follow-token multi-fresh handoff GMGN fetch failed; exiting on fresh buy",
+        {
+          mint,
+          wallet,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      await this.triggerFollowTokenWatchExitSell(
+        mint,
+        wallet,
+        "buy",
+        triggerTx,
+        "multi_fresh handoff GMGN fetch failed",
+      );
+      return;
+    }
+
+    const nonFreshWallets = secondGroup.wallets.filter((w) => {
+      const snapshot = getGmgnSnapshotForWallet(w, snapshots);
+      return snapshot && !gmgnSnapshotHasTag(snapshot, "fresh_wallet");
+    });
+    if (nonFreshWallets.length === 0) {
+      await this.triggerFollowTokenWatchExitSell(
+        mint,
+        wallet,
+        "buy",
+        triggerTx,
+        "multi_fresh handoff no non-fresh wallets",
+      );
+      return;
+    }
+
+    const nextWallet = pickFollowTokenTopBuyerWallet(nonFreshWallets, snapshots);
+    if (!nextWallet) {
+      await this.triggerFollowTokenWatchExitSell(
+        mint,
+        wallet,
+        "buy",
+        triggerTx,
+        "multi_fresh handoff missing non-fresh top buyer",
+      );
+      return;
+    }
+
+    const nextSnapshot = getGmgnSnapshotForWallet(nextWallet, snapshots);
+    const gmgnAlreadySold =
+      nextSnapshot !== undefined &&
+      gmgnBundlerTraderHasSellAfterInitialBuy(nextSnapshot);
+    const heliusAlreadySold =
+      await this.followTokenWalletHasSellAfterFirstBuyOnMint(
+        nextWallet,
+        mint,
+      );
+    if (gmgnAlreadySold || heliusAlreadySold === true) {
+      this.followTokenGmgnBundlerBackend(
+        "Follow-token multi-fresh handoff: non-fresh top buyer already sold",
+        {
+          mint,
+          nextWallet,
+          gmgnAlreadySold,
+          heliusAlreadySold,
+          freshTopBuyer: wallet,
+          triggerSignature: triggerTx.signature,
+        },
+      );
+      await this.triggerFollowTokenWatchExitSell(
+        mint,
+        nextWallet,
+        "sell",
+        triggerTx,
+        "multi_fresh handoff non-fresh top buyer already sold after initial buy",
+      );
+      return;
+    }
+
+    this.followTokenGmgnSecondGroupWatchReason =
+      "multi_fresh_non_fresh_after_handoff";
+    await this.resubscribeFollowTokenTopBuyerWatch(
+      nextWallet,
+      mint,
+      "standard",
+      "multi_fresh_fresh_buy_handoff_non_fresh_top_buyer",
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>🔁 ${this.label} Follow-Token Multi-Fresh Handoff</b>`,
+        `Token: <code>${mint}</code>`,
+        `Fresh top buyer <code>${wallet}</code> bought — now watching non-fresh top buyer <code>${nextWallet}</code>`,
+        `Trigger tx: <code>${triggerTx.signature}</code>`,
+        `Exit: watched-wallet buy/sell on non-fresh top buyer`,
+      ].join("\n"),
+      "follow-token multi-fresh handoff notification",
+    );
+  }
+
   private async handleFollowTokenTopBuyerTransaction(
     tx: HeliusTransaction,
     watchWallet?: string,
@@ -1907,6 +2058,14 @@ export class InsiderBot extends EventEmitter {
         tx,
         "watched wallet sell",
       );
+      return;
+    }
+
+    if (
+      this.followTokenGmgnSecondGroupWatchReason ===
+      "multi_fresh_top_fresh_buyer"
+    ) {
+      await this.tryFollowTokenMultiFreshHandoffToNonFreshTopBuyer(mint, tx);
       return;
     }
 
@@ -4356,6 +4515,12 @@ export class InsiderBot extends EventEmitter {
           entry.buy_cost ??
           entry.buyCost,
       );
+      const sellTxCountCur = this.readGmgnNumericField(
+        entry.sell_tx_count_cur ?? entry.sellTxCountCur,
+      );
+      const sellVolumeCur = this.readGmgnNumericField(
+        entry.sell_volume_cur ?? entry.sellVolumeCur,
+      );
       if (seen.has(address)) continue;
       seen.add(address);
       snapshots.push({
@@ -4364,6 +4529,8 @@ export class InsiderBot extends EventEmitter {
         buyVolumeCur,
         buyAmountCur,
         historyBoughtCost,
+        sellTxCountCur,
+        sellVolumeCur,
         tags: readGmgnStringTagArray(entry.tags),
         makerTokenTags: readGmgnStringTagArray(
           entry.maker_token_tags ?? entry.makerTokenTags,
@@ -4722,6 +4889,7 @@ export class InsiderBot extends EventEmitter {
       this.followTokenTopBuyerWallet = watchedWallet;
       this.followTokenTopBuyerMint = state.mint;
       this.followTokenWatchMode = watchPlan.watchMode;
+      this.followTokenGmgnSecondGroupWatchReason = watchPlan.reason;
       this.followTokenGmgnSecondGroup = secondGroup;
       this.ensureFollowTokenTopBuyerWatchSubscribed();
 
