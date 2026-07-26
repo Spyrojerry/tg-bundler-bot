@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-26 (96)
+
+### Follow-token: `multi_fresh_non_fresh_pool` fresh buy-size gate
+
+- When the watched wallet is the top **non-fresh** buyer among **multi-fresh** second groups, skip buy if **any** `fresh_wallet` in that group has a **larger** GMGN buy score (`history_bought_cost` when present, else `buy_volume_cur` / `buy_amount_cur`). Reason: `multi_fresh_non_fresh_fresh_bought_more`.
+
 ## 2026-07-25 (95)
 
 ### Insider: remove -50% P/L stop-loss

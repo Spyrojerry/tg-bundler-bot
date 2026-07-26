@@ -79,6 +79,8 @@ interface GmgnBundlerTraderSnapshot {
   startHoldingAt: number;
   buyVolumeCur: number;
   buyAmountCur: number;
+  /** GMGN cumulative buy cost (often SOL spent); used for fresh vs non-fresh comparisons. */
+  historyBoughtCost: number;
   tags: string[];
   makerTokenTags: string[];
 }
@@ -135,13 +137,22 @@ function pickFollowTokenTopBuyerWallet(
   let bestScore = -1;
   for (const wallet of wallets) {
     const snapshot = getGmgnSnapshotForWallet(wallet, snapshots);
-    const score = snapshot?.buyVolumeCur ?? snapshot?.buyAmountCur ?? 0;
+    const score = snapshot ? followTokenGmgnTraderBuyScore(snapshot) : 0;
     if (score > bestScore) {
       bestScore = score;
       bestWallet = wallet;
     }
   }
   return bestWallet ?? wallets[0] ?? null;
+}
+
+/** Comparable buy size for tag gates (prefers GMGN history buy cost, then USD volume). */
+function followTokenGmgnTraderBuyScore(
+  snapshot: GmgnBundlerTraderSnapshot,
+): number {
+  if (snapshot.historyBoughtCost > 0) return snapshot.historyBoughtCost;
+  if (snapshot.buyVolumeCur > 0) return snapshot.buyVolumeCur;
+  return snapshot.buyAmountCur;
 }
 
 function groupGmgnBundlersByStartHoldingAt(
@@ -331,6 +342,25 @@ function resolveFollowTokenSecondGroupPlan(
     const wallet = pickFollowTokenTopBuyerWallet(nonFreshWallets, snapshots);
     if (!wallet) {
       return { kind: "no_buy", reason: "multi_fresh_non_fresh_missing_top_buyer" };
+    }
+    const watchedSnapshot = getGmgnSnapshotForWallet(wallet, snapshots);
+    const watchedBuyScore = watchedSnapshot
+      ? followTokenGmgnTraderBuyScore(watchedSnapshot)
+      : 0;
+    let maxFreshBuyScore = 0;
+    for (const freshWallet of freshWallets) {
+      const freshSnapshot = getGmgnSnapshotForWallet(freshWallet, snapshots);
+      if (!freshSnapshot) continue;
+      maxFreshBuyScore = Math.max(
+        maxFreshBuyScore,
+        followTokenGmgnTraderBuyScore(freshSnapshot),
+      );
+    }
+    if (maxFreshBuyScore > watchedBuyScore) {
+      return {
+        kind: "no_buy",
+        reason: "multi_fresh_non_fresh_fresh_bought_more",
+      };
     }
     return {
       kind: "watch_buy",
@@ -4320,6 +4350,12 @@ export class InsiderBot extends EventEmitter {
       const buyAmountCur = this.readGmgnNumericField(
         entry.buy_amount_cur ?? entry.buyAmountCur ?? entry.accu_amount,
       );
+      const historyBoughtCost = this.readGmgnNumericField(
+        entry.history_bought_cost ??
+          entry.historyBoughtCost ??
+          entry.buy_cost ??
+          entry.buyCost,
+      );
       if (seen.has(address)) continue;
       seen.add(address);
       snapshots.push({
@@ -4327,6 +4363,7 @@ export class InsiderBot extends EventEmitter {
         startHoldingAt,
         buyVolumeCur,
         buyAmountCur,
+        historyBoughtCost,
         tags: readGmgnStringTagArray(entry.tags),
         makerTokenTags: readGmgnStringTagArray(
           entry.maker_token_tags ?? entry.makerTokenTags,
