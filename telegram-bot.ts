@@ -60,15 +60,51 @@ export class TelegramBot {
       throw new Error('TELEGRAM_BOT_TOKEN is required to start TelegramBot');
     }
     this.token = config.telegramBotToken;
-    this.defaultChatId = config.telegramChatId;
+    this.defaultChatId = config.telegramChatId?.trim() || null;
     this.commandHandler = commandHandler;
   }
 
-  start(): void {
+  async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    log.info('Telegram bot polling started');
-    void this.bootstrapAndPoll();
+    log.info('Telegram bot polling starting', {
+      authorizedChatId: this.defaultChatId ?? '(any chat — TELEGRAM_CHAT_ID unset)',
+    });
+    void this.logTelegramConnectivity();
+    void this.pollLoop();
+    void this.ensureWebhookCleared();
+  }
+
+  private isAuthorizedChat(chatIdString: string): boolean {
+    if (!this.defaultChatId) return true;
+    return chatIdString === this.defaultChatId;
+  }
+
+  private async logTelegramConnectivity(): Promise<void> {
+    try {
+      const me = await this.api<{ id: number; username?: string }>('getMe', {}, 30_000);
+      log.info('Telegram bot identity OK', {
+        id: me.id,
+        username: me.username ?? null,
+      });
+      const webhook = await this.api<{
+        url?: string;
+        pending_update_count?: number;
+      }>('getWebhookInfo', {}, 30_000);
+      const webhookUrl = webhook.url?.trim() ?? '';
+      log.info('Telegram webhook status', {
+        url: webhookUrl || '(none — polling OK)',
+        pendingUpdateCount: webhook.pending_update_count ?? 0,
+      });
+      if (webhookUrl) {
+        log.warn(
+          'Telegram webhook is still set; deleteWebhook running — polling may miss updates until cleared',
+          { url: webhookUrl },
+        );
+      }
+    } catch (err) {
+      log.warn('Telegram connectivity check failed', this.describeError(err));
+    }
   }
 
   stop(): void {
@@ -119,13 +155,32 @@ export class TelegramBot {
     await this.sendMessage(chatId, text, replyMarkup);
   }
 
-  private async bootstrapAndPoll(): Promise<void> {
-    try {
-      await this.api('deleteWebhook', { drop_pending_updates: false });
-    } catch (err) {
-      log.warn('Telegram deleteWebhook failed', this.describeError(err));
+  private async ensureWebhookCleared(): Promise<void> {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      try {
+        await this.api('deleteWebhook', { drop_pending_updates: false }, 60_000);
+        return;
+      } catch (err) {
+        if (!this.isTelegramTransientError(err) || attempt === 5) {
+          log.warn('Telegram deleteWebhook failed', this.describeError(err));
+          return;
+        }
+        log.warn(`Telegram deleteWebhook transient failure; retrying (${attempt}/5)`, {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+      }
     }
-    await this.pollLoop();
+  }
+
+  private isTelegramTransientError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    if (err.name === 'AbortError') return true;
+    const message = err.message;
+    if (message.toLowerCase().includes('aborted')) return true;
+    if (message.includes('fetch failed')) return true;
+    if (message.includes('failed (429)')) return true;
+    return /\bfailed \(5\d\d\)/.test(message);
   }
 
   private async pollLoop(): Promise<void> {
@@ -138,8 +193,15 @@ export class TelegramBot {
             timeout: 25,
             allowed_updates: ['message', 'callback_query'],
           },
-          50_000,
+          90_000,
         );
+
+        if (updates.length > 0) {
+          log.info('Telegram updates received', {
+            count: updates.length,
+            nextOffset: this.offset,
+          });
+        }
 
         for (const update of updates) {
           this.offset = update.update_id + 1;
@@ -150,7 +212,11 @@ export class TelegramBot {
             if (!data || chatId === undefined) continue;
 
             const chatIdString = String(chatId);
-            if (this.defaultChatId && chatIdString !== this.defaultChatId) {
+            if (!this.isAuthorizedChat(chatIdString)) {
+              log.warn('Telegram callback from unauthorized chat', {
+                chatId: chatIdString,
+                expectedChatId: this.defaultChatId,
+              });
               await this.answerCallbackQuery(callbackQuery.id, 'Unauthorized chat.');
               continue;
             }
@@ -177,10 +243,19 @@ export class TelegramBot {
           if (!text || chatId === undefined) continue;
 
           const chatIdString = String(chatId);
-          if (this.defaultChatId && chatIdString !== this.defaultChatId) {
-            await this.sendMessage(chatIdString, 'Unauthorized chat.');
+          if (!this.isAuthorizedChat(chatIdString)) {
+            log.warn('Telegram message from unauthorized chat (no reply sent)', {
+              chatId: chatIdString,
+              expectedChatId: this.defaultChatId,
+              preview: text.slice(0, 80),
+            });
             continue;
           }
+
+          log.info('Telegram command received', {
+            chatId: chatIdString,
+            preview: text.slice(0, 80),
+          });
 
           const promptMessageId = this.promptMessagesByChat.get(chatIdString);
           if (promptMessageId !== undefined) {
@@ -217,6 +292,15 @@ export class TelegramBot {
         if (desc.message === 'fetch failed') {
           log.warn('Telegram polling: network connection failed, retrying in 5s...');
           await new Promise((resolve) => setTimeout(resolve, 5_000));
+        } else if (
+          typeof desc.message === 'string' &&
+          desc.message.includes('failed (409)')
+        ) {
+          log.warn(
+            'Telegram getUpdates conflict (409) — another process may be polling this bot token; retrying in 10s',
+            desc,
+          );
+          await new Promise((resolve) => setTimeout(resolve, 10_000));
         } else {
           log.warn('Telegram polling error', desc);
           await new Promise((resolve) => setTimeout(resolve, 2_000));
@@ -255,28 +339,26 @@ export class TelegramBot {
     replyMarkup?: InlineKeyboardMarkup
   ): Promise<TelegramMessageResponse> {
     let lastError: unknown = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 5; attempt++) {
       try {
-        return await this.api<TelegramMessageResponse>('sendMessage', {
-          chat_id: chatId,
-          text,
-          parse_mode: 'HTML',
-          disable_web_page_preview: true,
-          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        });
+        return await this.api<TelegramMessageResponse>(
+          'sendMessage',
+          {
+            chat_id: chatId,
+            text,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+            ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+          },
+          60_000,
+        );
       } catch (err) {
         lastError = err;
-        const message = err instanceof Error ? err.message : String(err);
-        const retryable =
-          message.includes('fetch failed') ||
-          message.includes('AbortError') ||
-          message.includes('failed (429)') ||
-          /\bfailed \(5\d\d\)/.test(message);
-        if (!retryable || attempt === 3) throw err;
-        log.warn(`Telegram sendMessage transient failure; retrying (${attempt}/3)`, {
-          error: message,
+        if (!this.isTelegramTransientError(err) || attempt === 5) throw err;
+        log.warn(`Telegram sendMessage transient failure; retrying (${attempt}/5)`, {
+          error: err instanceof Error ? err.message : String(err),
         });
-        await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
       }
     }
     throw lastError;
@@ -332,7 +414,7 @@ export class TelegramBot {
   private async api<T = unknown>(
     method: string,
     body: Record<string, unknown>,
-    clientTimeoutMs = 35_000,
+    clientTimeoutMs = 60_000,
   ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), clientTimeoutMs);
@@ -352,10 +434,13 @@ export class TelegramBot {
         error_code?: number;
       };
       if (!json.ok) {
-        throw new Error(
+        const errMsg =
           `Telegram ${method} failed (${json.error_code ?? resp.status}): ` +
-          `${json.description ?? 'unknown error'}`
-        );
+          `${json.description ?? 'unknown error'}`;
+        if (json.error_code === 409) {
+          log.warn(errMsg);
+        }
+        throw new Error(errMsg);
       }
       return json.result as T;
     } finally {
