@@ -9,6 +9,16 @@ import {
 
 const log = createLogger('TG');
 
+function isTelegramPollingAbortError(err: unknown): boolean {
+  if (err instanceof Error) {
+    return (
+      err.name === 'AbortError' ||
+      err.message === 'This operation was aborted'
+    );
+  }
+  return false;
+}
+
 export interface TelegramReply {
   text: string;
   replyMarkup?: InlineKeyboardMarkup;
@@ -183,6 +193,11 @@ export class TelegramBot {
           await this.sendReply(chatIdString, reply);
         }
       } catch (err) {
+        if (!this.running) break;
+        if (isTelegramPollingAbortError(err)) {
+          log.debug('Telegram getUpdates aborted (client timeout), retrying');
+          continue;
+        }
         const desc = this.describeError(err);
         if (desc.message === 'fetch failed') {
           log.warn('Telegram polling: network connection failed, retrying in 5s...');
@@ -301,7 +316,7 @@ export class TelegramBot {
 
   private async api<T = unknown>(method: string, body: Record<string, unknown>): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 35_000); // 35s timeout (must be > getUpdates timeout of 25s)
+    const timer = setTimeout(() => controller.abort(), 45_000); // > getUpdates long-poll timeout (25s)
 
     try {
       const resp = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
