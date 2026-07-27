@@ -463,6 +463,13 @@ function resolveFollowTokenSecondGroupPlan(
     return { kind: "no_buy", reason: "no_fresh_equal_top_holder_split" };
   }
 
+  if (withTopHolder.length > 0 && withTopHolder.length < 2) {
+    return {
+      kind: "no_buy",
+      reason: "no_fresh_requires_at_least_two_top_holder_wallets",
+    };
+  }
+
   const minority =
     withTopHolder.length < withoutTopHolder.length
       ? withTopHolder

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-07-27 (107)
+
+### Follow-token: no-fresh groups need ≥2 top_holder wallets
+
+- **No `fresh_wallet`** and any `top_holder` in the second group: **no buy** unless **at least two** wallets have the `top_holder` maker tag (`no_fresh_requires_at_least_two_top_holder_wallets`). Late **4-wallet odd** trigger unchanged (separate plan).
+
 ## 2026-07-27 (106)
 
 ### Follow-token: fresh+top_holder priority over all multi-fresh plans
