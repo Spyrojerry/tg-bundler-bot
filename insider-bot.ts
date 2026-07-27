@@ -102,8 +102,18 @@ type FollowTokenSecondGroupPlan =
       reason: string;
       /** When set, MC take-profit at entry × (1 + percent/100) instead of watch-only exit. */
       profitExitPercent?: number;
+      /** When set, MC take-profit at this absolute USD market cap. */
+      exitMcUsd?: number;
     }
   | { kind: "no_buy"; reason: string };
+
+const FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON =
+  "late_second_group_four_wallet_odd_top_holder";
+const FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_MIN_WALLETS = 9;
+const FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_WALLETS = 3;
+const FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_EXIT_MC_USD = 250_000;
+const FOLLOW_TOKEN_SECOND_GROUP_BUY_FEE_MISMATCH_MAX = 2;
+const FOLLOW_TOKEN_SECOND_GROUP_BUY_TX_TIMESTAMP_TOLERANCE_SEC = 2;
 
 function readGmgnStringTagArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -411,6 +421,12 @@ function resolveFollowTokenSecondGroupPlan(
   if (!wallet) {
     return { kind: "no_buy", reason: "no_fresh_odd_minority_missing_top_buyer" };
   }
+  if (minorityLabel === "top_holder_minority" && withTopHolder.length <= 1) {
+    return {
+      kind: "no_buy",
+      reason: "no_fresh_top_holder_minority_insufficient_top_holders",
+    };
+  }
   return {
     kind: "watch_buy",
     wallet,
@@ -463,9 +479,64 @@ function resolveFollowTokenLateFourWalletOddSecondGroupPlan(
     kind: "watch_buy",
     wallet,
     watchMode: "standard",
-    reason: "late_second_group_four_wallet_odd_top_holder",
+    reason: FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON,
     profitExitPercent: FOLLOW_TOKEN_GMGN_LATE_ODD_PROFIT_EXIT_PERCENT,
   };
+}
+
+function readHeliusTxFeeLamports(tx: HeliusTransaction): number | null {
+  const raw = tx.fee;
+  if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) return raw;
+  return null;
+}
+
+function countFollowTokenSecondGroupWalletsNotMatchingMajorityFee(
+  wallets: readonly string[],
+  feesByWallet: ReadonlyMap<string, number | null>,
+): number {
+  const feeCounts = new Map<number, number>();
+  for (const wallet of wallets) {
+    const fee = feesByWallet.get(wallet);
+    if (fee === null || fee === undefined) continue;
+    feeCounts.set(fee, (feeCounts.get(fee) ?? 0) + 1);
+  }
+
+  let majorityFee: number | null = null;
+  let majorityCount = 0;
+  for (const [fee, count] of feeCounts) {
+    if (count > majorityCount) {
+      majorityCount = count;
+      majorityFee = fee;
+    }
+  }
+
+  if (majorityFee === null) return wallets.length;
+
+  let mismatchCount = 0;
+  for (const wallet of wallets) {
+    const fee = feesByWallet.get(wallet);
+    if (fee === null || fee === undefined || fee !== majorityFee) {
+      mismatchCount += 1;
+    }
+  }
+  return mismatchCount;
+}
+
+function largestFollowTokenFreshWalletSameFeeClusterSize(
+  freshWallets: readonly string[],
+  feesByWallet: ReadonlyMap<string, number | null>,
+): number {
+  const feeCounts = new Map<number, number>();
+  for (const wallet of freshWallets) {
+    const fee = feesByWallet.get(wallet);
+    if (fee === null || fee === undefined) continue;
+    feeCounts.set(fee, (feeCounts.get(fee) ?? 0) + 1);
+  }
+  let largest = 0;
+  for (const count of feeCounts.values()) {
+    if (count > largest) largest = count;
+  }
+  return largest;
 }
 
 function formatNormalTinyRoundSolWatchDescription(): string {
@@ -1808,6 +1879,129 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  private findFollowTokenSecondGroupWalletBuyTx(
+    txs: HeliusTransaction[],
+    wallet: string,
+    mint: string,
+    anchorTimestamp: number,
+  ): HeliusTransaction | null {
+    const buys = txs
+      .filter((tx) => this.isRelevantMintTx(tx, mint))
+      .filter((tx) => this.classifyTx(tx, wallet, mint) === "buy")
+      .sort(
+        (left, right) =>
+          Math.abs(left.timestamp - anchorTimestamp) -
+            Math.abs(right.timestamp - anchorTimestamp) ||
+          right.timestamp - left.timestamp ||
+          left.signature.localeCompare(right.signature),
+      );
+
+    const nearAnchor = buys.find(
+      (tx) =>
+        Math.abs(tx.timestamp - anchorTimestamp) <=
+        FOLLOW_TOKEN_SECOND_GROUP_BUY_TX_TIMESTAMP_TOLERANCE_SEC,
+    );
+    return nearAnchor ?? buys[0] ?? null;
+  }
+
+  private async resolveFollowTokenSecondGroupWalletBuyFees(
+    mint: string,
+    secondGroup: GmgnBundlerTimestampGroup,
+  ): Promise<Map<string, number | null>> {
+    const fees = new Map<string, number | null>();
+    for (const wallet of secondGroup.wallets) {
+      let txs: HeliusTransaction[];
+      try {
+        txs = await this.withHeliusFallback((client) =>
+          client.getWalletTransactionsDesc(
+            wallet,
+            FOLLOW_TOKEN_TOP_BUYER_WATCH_BACKFILL_LIMIT,
+          ),
+        );
+      } catch (err) {
+        void this.heliusClient.handlePossibleRateLimitError(err);
+        this.followTokenGmgnLog.warn(
+          "Follow-token second-group buy fee Helius fetch failed",
+          {
+            mint,
+            wallet,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+        fees.set(wallet, null);
+        continue;
+      }
+
+      const buyTx = this.findFollowTokenSecondGroupWalletBuyTx(
+        txs,
+        wallet,
+        mint,
+        secondGroup.anchorTimestamp,
+      );
+      fees.set(wallet, buyTx ? readHeliusTxFeeLamports(buyTx) : null);
+    }
+    return fees;
+  }
+
+  private async evaluateFollowTokenMultiFreshFeeGate(
+    mint: string,
+    secondGroup: GmgnBundlerTimestampGroup,
+    snapshots: GmgnBundlerTraderSnapshot[],
+    basePlan: Extract<FollowTokenSecondGroupPlan, { kind: "watch_buy" }>,
+  ): Promise<FollowTokenSecondGroupPlan> {
+    const freshWallets = secondGroup.wallets.filter((wallet) =>
+      followTokenSecondGroupWalletHasFreshTag(wallet, snapshots),
+    );
+    if (freshWallets.length <= 1) return basePlan;
+
+    const feesByWallet = await this.resolveFollowTokenSecondGroupWalletBuyFees(
+      mint,
+      secondGroup,
+    );
+    const mismatchCount = countFollowTokenSecondGroupWalletsNotMatchingMajorityFee(
+      secondGroup.wallets,
+      feesByWallet,
+    );
+    if (mismatchCount >= FOLLOW_TOKEN_SECOND_GROUP_BUY_FEE_MISMATCH_MAX) {
+      this.followTokenGmgnBundlerBackend(
+        "Follow-token multi-fresh fee gate rejected buy",
+        {
+          mint,
+          mismatchCount,
+          walletCount: secondGroup.wallets.length,
+          fees: Object.fromEntries(feesByWallet),
+        },
+      );
+      return { kind: "no_buy", reason: "multi_fresh_fee_mismatch" };
+    }
+
+    if (
+      secondGroup.wallets.length >= FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_MIN_WALLETS
+    ) {
+      const sameFeeFreshCluster =
+        largestFollowTokenFreshWalletSameFeeClusterSize(
+          freshWallets,
+          feesByWallet,
+        );
+      if (
+        sameFeeFreshCluster <
+        FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_WALLETS
+      ) {
+        return {
+          kind: "no_buy",
+          reason: "multi_fresh_large_group_insufficient_same_fee_fresh",
+        };
+      }
+      return {
+        ...basePlan,
+        reason: "multi_fresh_large_group_same_fee_fresh_tp_250k",
+        exitMcUsd: FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_EXIT_MC_USD,
+      };
+    }
+
+    return basePlan;
+  }
+
   /** True if wallet has a mint sell after its first classified mint buy in recent history. */
   private async followTokenWalletHasSellAfterFirstBuyOnMint(
     wallet: string,
@@ -2050,31 +2244,34 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    if (action === "sell") {
+    if (action === "buy") {
+      const watchReason = this.followTokenGmgnSecondGroupWatchReason;
+      if (
+        watchReason === "multi_fresh_top_fresh_buyer" ||
+        watchReason === "multi_fresh_large_group_same_fee_fresh_tp_250k"
+      ) {
+        await this.tryFollowTokenMultiFreshHandoffToNonFreshTopBuyer(mint, tx);
+        return;
+      }
+      if (watchReason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON) {
+        return;
+      }
       await this.triggerFollowTokenWatchExitSell(
         mint,
         wallet,
-        "sell",
+        "buy",
         tx,
-        "watched wallet sell",
+        "watched wallet buy",
       );
-      return;
-    }
-
-    if (
-      this.followTokenGmgnSecondGroupWatchReason ===
-      "multi_fresh_top_fresh_buyer"
-    ) {
-      await this.tryFollowTokenMultiFreshHandoffToNonFreshTopBuyer(mint, tx);
       return;
     }
 
     await this.triggerFollowTokenWatchExitSell(
       mint,
       wallet,
-      "buy",
+      "sell",
       tx,
-      "watched wallet buy",
+      "watched wallet sell",
     );
   }
 
@@ -3013,7 +3210,7 @@ export class InsiderBot extends EventEmitter {
         `Initial bundlers: <b>${firstFour.length}</b>`,
         "",
         `Polling GMGN every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset.`,
-        `Exit: watched-wallet buy/sell tx (+90% MC TP when enabled for trigger).`,
+        `Exit: watched-wallet sell tx (+90% MC TP when enabled for trigger).`,
       ].join("\n"),
       "follow-token gmgn watch started notification",
     );
@@ -3825,7 +4022,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy trigger: GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset. Watched-wallet buy/sell exit (+90% MC TP on late odd trigger). Round/dust gates disabled.`
+            ? `Follow-token buy trigger: GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset. Watched-wallet sell exit (+90% MC TP on late odd trigger). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -4851,11 +5048,24 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
-      const watchPlan =
+      let watchPlan =
         watchPlanOverride ?? resolveFollowTokenSecondGroupPlan(
           secondGroup,
           snapshots,
         );
+      if (watchPlan.kind === "watch_buy") {
+        const freshCount = secondGroup.wallets.filter((wallet) =>
+          followTokenSecondGroupWalletHasFreshTag(wallet, snapshots),
+        ).length;
+        if (freshCount > 1) {
+          watchPlan = await this.evaluateFollowTokenMultiFreshFeeGate(
+            state.mint,
+            secondGroup,
+            snapshots,
+            watchPlan,
+          );
+        }
+      }
       if (watchPlan.kind === "no_buy") {
         this.stopFollowTokenGmgnBundlerPoll("second group tag plan rejected buy");
         this.followTokenGmgnBundlerBackend("GMGN second group buy skipped by tag plan", {
@@ -4877,7 +5087,11 @@ export class InsiderBot extends EventEmitter {
 
       this.setEntryMc(currentMc);
       const profitExitPercent = watchPlan.profitExitPercent;
-      if (profitExitPercent !== undefined) {
+      const exitMcUsd = watchPlan.exitMcUsd;
+      if (exitMcUsd !== undefined) {
+        this.setExitMc(exitMcUsd);
+        this.disableProfitExitAfterBuy = false;
+      } else if (profitExitPercent !== undefined) {
         this.setExitMc(currentMc * (1 + profitExitPercent / 100));
         this.disableProfitExitAfterBuy = false;
       } else {
@@ -4902,9 +5116,15 @@ export class InsiderBot extends EventEmitter {
         .join("\n");
 
       const exitRuleLine =
-        profitExitPercent !== undefined
-          ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell`
-          : `Exit: watched-wallet buy/sell tx (+90% MC TP disabled)`;
+        exitMcUsd !== undefined
+          ? `Exit: <b>$${exitMcUsd.toLocaleString()} MC TP</b> · watched-wallet buy/sell`
+          : profitExitPercent !== undefined
+            ? watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+              ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet sell`
+              : `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell`
+            : watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+              ? `Exit: watched-wallet sell tx (+90% MC TP disabled)`
+              : `Exit: watched-wallet buy/sell tx (+90% MC TP disabled)`;
       const secondGroupSizeLine =
         secondGroup.wallets.length >=
         FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS
@@ -4946,7 +5166,9 @@ export class InsiderBot extends EventEmitter {
         groupCount: allGroups.length,
         currentMc,
         profitExitPercent: profitExitPercent ?? null,
-        profitExitDisabled: profitExitPercent === undefined,
+        exitMcUsd: exitMcUsd ?? null,
+        profitExitDisabled:
+          profitExitPercent === undefined && exitMcUsd === undefined,
       });
 
       this.stopFollowTokenGmgnBundlerPoll("buy triggered");
@@ -4969,9 +5191,15 @@ export class InsiderBot extends EventEmitter {
           `Second group wallets: <b>${secondGroup.wallets.length}</b>`,
           `Initial bundlers validated in first GMGN group: <b>${state.bundlerWallets.size}</b>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-          profitExitPercent !== undefined
-            ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell`
-            : `Exit: sell on watched wallet buy/sell tx (+90% MC TP disabled)`,
+          exitMcUsd !== undefined
+            ? `Exit: <b>$${exitMcUsd.toLocaleString()} MC TP</b> · watched-wallet buy/sell`
+            : profitExitPercent !== undefined
+              ? watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+                ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet sell`
+                : `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell`
+              : watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+                ? `Exit: sell on watched wallet sell tx (+90% MC TP disabled)`
+                : `Exit: sell on watched wallet buy/sell tx (+90% MC TP disabled)`,
           "",
           ...secondGroup.wallets.map(
             (wallet, index) => `${index + 1}. <code>${wallet}</code>`,

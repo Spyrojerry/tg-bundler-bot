@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-07-27 (101)
+
+### Follow-token: no-fresh top_holder minority needs 2+ top holders
+
+- **`no_fresh_top_holder_minority`:** no buy when the group has only **one** `top_holder` wallet; requires **&gt;1** top_holder-tagged wallets before odd-minority buy.
+
+## 2026-07-27 (100)
+
+### Follow-token: multi-fresh fee gate, 250k TP, late-odd buy skip only
+
+- **Multi-fresh (≥2 fresh):** Helius buy txs for each second-group wallet; **`fee` (lamports)** must match — **no buy** if **≥2** wallets are off the majority fee (`multi_fresh_fee_mismatch`).
+- **&lt;9** wallets: buy + watch top fresh buyer (existing handoff rules).
+- **≥9** wallets + **≥3** fresh wallets sharing the same buy fee: buy + **$250k MC TP** (`multi_fresh_large_group_same_fee_fresh_tp_250k`); otherwise **no buy** (`multi_fresh_large_group_insufficient_same_fee_fresh`).
+- **`late_second_group_four_wallet_odd_top_holder`:** still **+90% MC TP**; **only** this tag plan skips full exit on watched-wallet **buy** (sell-only exit + MC TP).
+- Other tag plans: watched-wallet **buy/sell** full exit restored (except multi-fresh handoff on fresh buy).
+
+## 2026-07-27 (99)
+
+### Follow-token: watched-wallet exit on sell only (tag plans)
+
+- GMGN tag-plan watches (including **`late_second_group_four_wallet_odd_top_holder`**, **`odd_minority`**, **`standard`** / single-fresh, post-handoff non-fresh) no longer **full-exit on watched-wallet buy**; **sell tx only** (+ MC TP where enabled). **`multi_fresh_top_fresh_buyer`** still runs **handoff** on fresh buy (not a sell). Multi-fresh handoff failures log and **hold** instead of exiting on the fresh buy.
+
 ## 2026-07-26 (98)
 
 ### Follow-token: multi-fresh handoff exit if non-fresh already sold

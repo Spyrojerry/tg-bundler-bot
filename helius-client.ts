@@ -12,6 +12,8 @@ export interface HeliusTransaction {
   timestamp: number;
   type?: string;
   source?: string;
+  /** Transaction fee in lamports (Helius enhanced tx). */
+  fee?: number;
   feePayer?: string;
   description?: string;
   tokenTransfers?: Array<{
