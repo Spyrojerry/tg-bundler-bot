@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-07-27 (106)
+
+### Follow-token: fresh+top_holder priority over all multi-fresh plans
+
+- With **≥2 fresh** and a **`fresh_wallet` + `top_holder`** wallet, **`multi_fresh_fresh_top_holder_fee_mismatch_watch`** runs **before** any other tag plan or fee gate (including **`multi_fresh_top_fresh_buyer`**, **`$250k`**, fee mismatch, large-group rejects). **Sell-only** watch; no Helius fee fetch on that path.
+
+## 2026-07-27 (105)
+
+### Follow-token: fresh+top_holder watch overrides large-group fee cluster
+
+- **`multi_fresh_fresh_top_holder_fee_mismatch_watch`** also applies when **≥9** wallets but **&lt;3** fresh share the same buy fee (would be `multi_fresh_large_group_insufficient_same_fee_fresh`): buy and **sell-only** watch on dual-tagged fresh top buyer instead of no-buy.
+
+## 2026-07-27 (104)
+
+### Follow-token: multi-fresh fee mismatch fresh+top_holder override
+
+- With **≥2 fresh** and a **`fresh_wallet` + `top_holder`** wallet, **priority buy** + **sell-only** watch (`multi_fresh_fresh_top_holder_fee_mismatch_watch`) overrides **any** other multi-fresh tag/fee outcome (including fee mismatch, **$250k** path, and default top-fresh handoff).
+
+## 2026-07-27 (103)
+
+### Follow-token: multi-fresh large-group threshold back to 9 wallets
+
+- **≥9** second-group wallets + **≥3** fresh with same buy fee → **$250k MC TP**; **&lt;9** → top fresh buyer watch + handoff.
+
+## 2026-07-27 (102)
+
+### Follow-token: multi-fresh large-group threshold 7 wallets
+
+- **≥7** second-group wallets + **≥3** fresh with same buy fee → **$250k MC TP**; else no buy on that path.
+- **&lt;7** wallets: top fresh buyer watch + handoff unchanged.
+
 ## 2026-07-27 (101)
 
 ### Follow-token: no-fresh top_holder minority needs 2+ top holders

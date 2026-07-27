@@ -131,11 +131,15 @@ export class TelegramBot {
   private async pollLoop(): Promise<void> {
     while (this.running) {
       try {
-        const updates = await this.api<TelegramUpdate[]>('getUpdates', {
-          offset: this.offset,
-          timeout: 25,
-          allowed_updates: ['message', 'callback_query'],
-        });
+        const updates = await this.api<TelegramUpdate[]>(
+          'getUpdates',
+          {
+            offset: this.offset,
+            timeout: 25,
+            allowed_updates: ['message', 'callback_query'],
+          },
+          50_000,
+        );
 
         for (const update of updates) {
           this.offset = update.update_id + 1;
@@ -151,13 +155,20 @@ export class TelegramBot {
               continue;
             }
 
-            const reply = await this.commandHandler(chatIdString, `/callback ${data}`);
-            const feedback = await this.sendReply(
-              chatIdString,
-              reply,
-              callbackQuery.message?.message_id,
-            );
-            await this.answerCallbackQuery(callbackQuery.id, feedback);
+            try {
+              const reply = await this.commandHandler(chatIdString, `/callback ${data}`);
+              const feedback = await this.sendReply(
+                chatIdString,
+                reply,
+                callbackQuery.message?.message_id,
+              );
+              await this.answerCallbackQuery(callbackQuery.id, feedback);
+            } catch (err) {
+              log.warn('Telegram callback handler failed', this.describeError(err));
+              await this.answerCallbackQuery(callbackQuery.id, 'Command failed. Try again.').catch(
+                () => undefined,
+              );
+            }
             continue;
           }
 
@@ -179,11 +190,30 @@ export class TelegramBot {
             );
           }
 
-          const reply = await this.commandHandler(chatIdString, text);
-          await this.sendReply(chatIdString, reply);
+          try {
+            const reply = await this.commandHandler(chatIdString, text);
+            await this.sendReply(chatIdString, reply);
+          } catch (err) {
+            log.warn('Telegram command handler failed', {
+              ...this.describeError(err),
+              command: text.split(/\s+/)[0],
+            });
+            await this.sendMessage(
+              chatIdString,
+              'Something went wrong handling that command. Try /start again.',
+            ).catch(() => undefined);
+          }
         }
       } catch (err) {
         const desc = this.describeError(err);
+        const aborted =
+          desc.name === 'AbortError' ||
+          (typeof desc.message === 'string' &&
+            desc.message.toLowerCase().includes('aborted'));
+        if (aborted) {
+          log.debug('Telegram long-poll timed out; reconnecting');
+          continue;
+        }
         if (desc.message === 'fetch failed') {
           log.warn('Telegram polling: network connection failed, retrying in 5s...');
           await new Promise((resolve) => setTimeout(resolve, 5_000));
@@ -299,9 +329,13 @@ export class TelegramBot {
     });
   }
 
-  private async api<T = unknown>(method: string, body: Record<string, unknown>): Promise<T> {
+  private async api<T = unknown>(
+    method: string,
+    body: Record<string, unknown>,
+    clientTimeoutMs = 35_000,
+  ): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 35_000); // 35s timeout (must be > getUpdates timeout of 25s)
+    const timer = setTimeout(() => controller.abort(), clientTimeoutMs);
 
     try {
       const resp = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {

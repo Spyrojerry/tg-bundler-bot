@@ -109,6 +109,8 @@ type FollowTokenSecondGroupPlan =
 
 const FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON =
   "late_second_group_four_wallet_odd_top_holder";
+const FOLLOW_TOKEN_MULTI_FRESH_FRESH_TOP_HOLDER_FEE_MISMATCH_REASON =
+  "multi_fresh_fresh_top_holder_fee_mismatch_watch";
 const FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_MIN_WALLETS = 9;
 const FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_WALLETS = 3;
 const FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_EXIT_MC_USD = 250_000;
@@ -313,6 +315,58 @@ function followTokenSecondGroupWalletHasTopHolderTag(
 ): boolean {
   const snapshot = getGmgnSnapshotForWallet(wallet, snapshots);
   return !!snapshot && gmgnSnapshotHasMakerTag(snapshot, "top_holder");
+}
+
+function followTokenSecondGroupWalletHasFreshAndTopHolderTag(
+  wallet: string,
+  snapshots: GmgnBundlerTraderSnapshot[],
+): boolean {
+  return (
+    followTokenSecondGroupWalletHasFreshTag(wallet, snapshots) &&
+    followTokenSecondGroupWalletHasTopHolderTag(wallet, snapshots)
+  );
+}
+
+function pickFollowTokenFreshTopHolderDualTagWallet(
+  freshWallets: readonly string[],
+  snapshots: GmgnBundlerTraderSnapshot[],
+): string | null {
+  const dualTagged = freshWallets.filter((wallet) =>
+    followTokenSecondGroupWalletHasFreshAndTopHolderTag(wallet, snapshots),
+  );
+  if (dualTagged.length === 0) return null;
+  return pickFollowTokenTopBuyerWallet([...dualTagged], snapshots);
+}
+
+/** Multi-fresh (≥2 fresh): fresh+top_holder watch overrides any other second-group tag plan. */
+function resolveFollowTokenMultiFreshFreshTopHolderPriorityPlan(
+  secondGroup: GmgnBundlerTimestampGroup,
+  snapshots: GmgnBundlerTraderSnapshot[],
+): Extract<FollowTokenSecondGroupPlan, { kind: "watch_buy" }> | null {
+  const freshWallets = secondGroup.wallets.filter((wallet) =>
+    followTokenSecondGroupWalletHasFreshTag(wallet, snapshots),
+  );
+  if (freshWallets.length <= 1) return null;
+  const wallet = pickFollowTokenFreshTopHolderDualTagWallet(
+    freshWallets,
+    snapshots,
+  );
+  if (!wallet) return null;
+  return {
+    kind: "watch_buy",
+    wallet,
+    watchMode: "standard",
+    reason: FOLLOW_TOKEN_MULTI_FRESH_FRESH_TOP_HOLDER_FEE_MISMATCH_REASON,
+  };
+}
+
+function followTokenWatchReasonSkipsExitOnWatchedBuy(
+  reason: string | null | undefined,
+): boolean {
+  return (
+    reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON ||
+    reason === FOLLOW_TOKEN_MULTI_FRESH_FRESH_TOP_HOLDER_FEE_MISMATCH_REASON
+  );
 }
 
 function resolveFollowTokenSecondGroupPlan(
@@ -2254,6 +2308,12 @@ export class InsiderBot extends EventEmitter {
         return;
       }
       if (watchReason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON) {
+        return;
+      }
+      if (
+        watchReason ===
+        FOLLOW_TOKEN_MULTI_FRESH_FRESH_TOP_HOLDER_FEE_MISMATCH_REASON
+      ) {
         return;
       }
       await this.triggerFollowTokenWatchExitSell(
@@ -5053,7 +5113,25 @@ export class InsiderBot extends EventEmitter {
           secondGroup,
           snapshots,
         );
-      if (watchPlan.kind === "watch_buy") {
+
+      const freshTopHolderPriority =
+        resolveFollowTokenMultiFreshFreshTopHolderPriorityPlan(
+          secondGroup,
+          snapshots,
+        );
+      if (freshTopHolderPriority) {
+        this.followTokenGmgnBundlerBackend(
+          "Follow-token multi-fresh fresh+top_holder priority overrides tag plan",
+          {
+            mint: state.mint,
+            priorPlanKind: watchPlan.kind,
+            priorPlanReason: watchPlan.reason,
+            watchedWallet: freshTopHolderPriority.wallet,
+            secondGroupWallets: secondGroup.wallets,
+          },
+        );
+        watchPlan = freshTopHolderPriority;
+      } else if (watchPlan.kind === "watch_buy") {
         const freshCount = secondGroup.wallets.filter((wallet) =>
           followTokenSecondGroupWalletHasFreshTag(wallet, snapshots),
         ).length;
@@ -5119,10 +5197,12 @@ export class InsiderBot extends EventEmitter {
         exitMcUsd !== undefined
           ? `Exit: <b>$${exitMcUsd.toLocaleString()} MC TP</b> · watched-wallet buy/sell`
           : profitExitPercent !== undefined
-            ? watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+            ? watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON ||
+                watchPlan.reason ===
+                  FOLLOW_TOKEN_MULTI_FRESH_FRESH_TOP_HOLDER_FEE_MISMATCH_REASON
               ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet sell`
               : `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell`
-            : watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+            : followTokenWatchReasonSkipsExitOnWatchedBuy(watchPlan.reason)
               ? `Exit: watched-wallet sell tx (+90% MC TP disabled)`
               : `Exit: watched-wallet buy/sell tx (+90% MC TP disabled)`;
       const secondGroupSizeLine =
@@ -5194,10 +5274,12 @@ export class InsiderBot extends EventEmitter {
           exitMcUsd !== undefined
             ? `Exit: <b>$${exitMcUsd.toLocaleString()} MC TP</b> · watched-wallet buy/sell`
             : profitExitPercent !== undefined
-              ? watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+              ? watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON ||
+                  watchPlan.reason ===
+                    FOLLOW_TOKEN_MULTI_FRESH_FRESH_TOP_HOLDER_FEE_MISMATCH_REASON
                 ? `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet sell`
                 : `Exit: <b>+${profitExitPercent}% MC TP</b> · watched-wallet buy/sell`
-              : watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+              : followTokenWatchReasonSkipsExitOnWatchedBuy(watchPlan.reason)
                 ? `Exit: sell on watched wallet sell tx (+90% MC TP disabled)`
                 : `Exit: sell on watched wallet buy/sell tx (+90% MC TP disabled)`,
           "",
