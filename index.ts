@@ -2937,9 +2937,7 @@ async function main(): Promise<void> {
   // `funderFirstOrchestrator`'s construction for why this was moved down
   // from right after `new TelegramBot(...)`.
   if (telegramBot) {
-    void telegramBot.start();
-    // Brief pause so polling begins before startup summary (avoids API stampede).
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    telegramBot.start();
   }
   startMarketCapChecker();
 
@@ -2978,14 +2976,7 @@ async function main(): Promise<void> {
         "Send /start or /status any time for a live status card.",
       ].join("\n"),
     )
-    .catch((err) =>
-      log.warn("Telegram startup summary failed to send", {
-        ...((err instanceof Error && {
-          name: err.name,
-          message: err.message,
-        }) || { error: String(err) }),
-      }),
-    );
+    .catch((err) => log.warn("Telegram startup summary failed to send", err));
 
   // ── 7. Graceful shutdown ──────────────────────────────────────────────────
   let shutting_down = false;
