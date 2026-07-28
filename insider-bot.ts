@@ -447,53 +447,7 @@ function resolveFollowTokenSecondGroupPlan(
     };
   }
 
-  const withTopHolder = wallets.filter((wallet) => {
-    const snapshot = getGmgnSnapshotForWallet(wallet, snapshots);
-    return snapshot && gmgnSnapshotHasMakerTag(snapshot, "top_holder");
-  });
-  const withoutTopHolder = wallets.filter((wallet) => {
-    const snapshot = getGmgnSnapshotForWallet(wallet, snapshots);
-    return snapshot && !gmgnSnapshotHasMakerTag(snapshot, "top_holder");
-  });
-
-  if (withTopHolder.length === 0 || withoutTopHolder.length === 0) {
-    return { kind: "no_buy", reason: "no_fresh_unanimous_top_holder_tag" };
-  }
-  if (withTopHolder.length === withoutTopHolder.length) {
-    return { kind: "no_buy", reason: "no_fresh_equal_top_holder_split" };
-  }
-
-  if (withTopHolder.length > 0 && withTopHolder.length < 2) {
-    return {
-      kind: "no_buy",
-      reason: "no_fresh_requires_at_least_two_top_holder_wallets",
-    };
-  }
-
-  const minority =
-    withTopHolder.length < withoutTopHolder.length
-      ? withTopHolder
-      : withoutTopHolder;
-  const minorityLabel =
-    withTopHolder.length < withoutTopHolder.length
-      ? "top_holder_minority"
-      : "non_top_holder_minority";
-  const wallet = pickFollowTokenTopBuyerWallet(minority, snapshots);
-  if (!wallet) {
-    return { kind: "no_buy", reason: "no_fresh_odd_minority_missing_top_buyer" };
-  }
-  if (minorityLabel === "top_holder_minority" && withTopHolder.length <= 1) {
-    return {
-      kind: "no_buy",
-      reason: "no_fresh_top_holder_minority_insufficient_top_holders",
-    };
-  }
-  return {
-    kind: "watch_buy",
-    wallet,
-    watchMode: "odd_minority",
-    reason: `no_fresh_${minorityLabel}`,
-  };
+  return { kind: "no_buy", reason: "no_fresh_second_group" };
 }
 
 /** Second group &gt;60s after first, exactly 4 wallets, no fresh, 1-vs-3 top_holder split → buy + 90% MC TP. */
@@ -4089,7 +4043,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy trigger: GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset. Watched-wallet sell exit (+90% MC TP on late odd trigger). Round/dust gates disabled.`
+            ? `Follow-token buy trigger: GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset. No buy on zero-fresh second group except late 4-wallet odd top_holder (+90% MC TP). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`

@@ -1,10 +1,22 @@
 # Changelog
 
+## 2026-07-28 (109)
+
+### Follow-token: restore late 4-wallet odd top_holder buy
+
+- **`late_second_group_four_wallet_odd_top_holder`** (+90% MC TP, watched-wallet sell exit) runs again before the ≥5-wallet path. Other zero-fresh second groups still **`no_fresh_second_group`**.
+
+## 2026-07-28 (108)
+
+### Follow-token: no buy when second group has no fresh wallets
+
+- Second group with **zero** `fresh_wallet` tags → **`no_fresh_second_group`**, reset (no buy). Removed **`no_fresh_*` odd-minority** tag-plan buys (not the late 4-wallet odd trigger; see **109**).
+
 ## 2026-07-27 (107)
 
-### Follow-token: no-fresh groups need ≥2 top_holder wallets
+### Follow-token: no-fresh groups need ≥2 top_holder wallets *(removed in 108)*
 
-- **No `fresh_wallet`** and any `top_holder` in the second group: **no buy** unless **at least two** wallets have the `top_holder` maker tag (`no_fresh_requires_at_least_two_top_holder_wallets`). Late **4-wallet odd** trigger unchanged (separate plan).
+- Short-lived rule; superseded by **`no_fresh_second_group`** (no buy on any zero-fresh second group).
 
 ## 2026-07-27 (106)
 
@@ -39,9 +51,9 @@
 
 ## 2026-07-27 (101)
 
-### Follow-token: no-fresh top_holder minority needs 2+ top holders
+### Follow-token: no-fresh top_holder minority needs 2+ top holders *(removed in 108)*
 
-- **`no_fresh_top_holder_minority`:** no buy when the group has only **one** `top_holder` wallet; requires **&gt;1** top_holder-tagged wallets before odd-minority buy.
+- Superseded by **`no_fresh_second_group`** (no buy when second group has no fresh wallets).
 
 ## 2026-07-27 (100)
 
