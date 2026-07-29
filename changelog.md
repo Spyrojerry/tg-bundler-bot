@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-07-29 (111)
+
+### Follow-token: only multi-fresh same-fee cluster + late odd buy
+
+- **≥2 `fresh_wallet`** in the second group: Helius buy **fee** must match for at least **2** fresh wallets (largest same-fee cluster). **Watch** the **top GMGN buyer** among that cluster (can be more than 2 fresh on the same fee).
+- **&lt;9** wallets in the second group → **`multi_fresh_same_fee_fresh_top_buyer`**: watched-wallet **buy/sell** + **handoff** to non-fresh top buyer on fresh **buy**; no +90% MC TP at entry.
+- **≥9** wallets and **≥3** fresh in the largest same-fee cluster → **`multi_fresh_large_group_same_fee_fresh_tp_250k`**: **$250k MC TP** + same watch/handoff.
+- **Removed** as buy paths: dual fresh+`top_holder` priority, **`multi_fresh_top_fresh_buyer`**, fee-mismatch watch, all-wallet fee gates, single-fresh / standard no-fresh odd-minority buys (unchanged **no_buy**: **`single_fresh_second_group`**, **`no_fresh_second_group`**).
+- **`late_second_group_four_wallet_odd_top_holder`** unchanged: poll before ≥5 path; 4 wallets, no fresh, &gt;60s after first, 1-vs-3 **`top_holder`**, minority top buyer, **+90% MC TP**, **sell-only** on watched wallet.
+
+## 2026-07-28 (110)
+
+### Follow-token: no buy on single-fresh second group
+
+- **`single_fresh_wallet`** and **`one_fresh_one_top_holder_higher_buyer`** removed; exactly **one** `fresh_wallet` in the second group → **`single_fresh_second_group`**, reset (no buy).
+
 ## 2026-07-28 (109)
 
 ### Follow-token: restore late 4-wallet odd top_holder buy
