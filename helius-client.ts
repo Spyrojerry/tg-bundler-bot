@@ -151,7 +151,7 @@ export class HeliusClient {
 
   constructor(apiKey: string, options: HeliusClientOptions = {}) {
     this.apiKey = apiKey;
-    this.baseUrl = 'https://api-mainnet.helius-rpc.com';
+    this.baseUrl = 'https://mainnet.helius-rpc.com';
     this.projectId = options.projectId?.trim() || null;
     this.label = options.label?.trim() || 'Helius';
     this.onCreditsExhausted = options.onCreditsExhausted ?? null;
@@ -636,7 +636,7 @@ export class HeliusClient {
     mintAddress: string,
     gteTime: number,
     lteTime: number,
-    pageLimit: number = 100,
+    pageLimit: number = 0,
     maxPages: number = 20,
   ): Promise<HeliusTransaction[]> {
     const fixedGteTime = gteTime;
@@ -650,12 +650,14 @@ export class HeliusClient {
         'token-accounts': 'none',
         'sort-order': 'asc',
         'api-key': this.apiKey,
-        limit: String(pageLimit),
-        type: 'SWAP',
-        source: 'PUMP_FUN',
         'gte-time': String(fixedGteTime),
         'lte-time': String(fixedLteTime),
+        type: 'SWAP',
+        source: 'PUMP_FUN',
       });
+      if (pageLimit > 0) {
+        params.set('limit', String(pageLimit));
+      }
       if (afterSignature) {
         params.set('after-signature', afterSignature);
       }
@@ -682,7 +684,8 @@ export class HeliusClient {
         added += 1;
       }
 
-      if (batch.length < pageLimit || added === 0) break;
+      if (pageLimit > 0 && batch.length < pageLimit) break;
+      if (added === 0) break;
 
       const pageCursor = batch[batch.length - 1];
       if (!pageCursor?.signature) break;

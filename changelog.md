@@ -7,6 +7,7 @@
 - Replaced the **10s GMGN grace** on **&lt;5** wallet second groups with **Helius PUMP_FUN SWAP** confirmation.
 - When GMGN’s next group is below **≥5**, fetch mint txs from **`initial + 1`** through **`now`**. **`gte-time`** and **`lte-time`** are captured **once** when confirm starts and sent unchanged on **every** paginated Helius request until confirm ends.
 - Pagination uses **`sort-order=asc`** + **`after-signature`** (forward in time from gte); not desc/before-signature.
+- Helius host **`mainnet.helius-rpc.com`** (enhanced tx API); query matches `token-accounts=none&sort-order=asc&gte-time&lte-time&type=SWAP&source=PUMP_FUN` (+ `after-signature` on later pages).
 - For each non-initial GMGN bundler wallet, take the **first buy** in that window; if **≥5** share the same Helius tx timestamp → confirmed second group → continue tag plan / buy.
 - Retries each poll until confirmed or **120s** max confirm window, then `second_group_insufficient_wallets_*` reset.
 
