@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-07-30 (116)
+
+### Follow-token: Large Insider exit on valid wallet 2nd sell
+
+- Large Insider normal exit triggers on the valid wallet’s **2nd sell tx** (any sell), not sell-all.
+
+## 2026-07-30 (115)
+
+### Follow-token: Large Insider for single-fresh second group
+
+- Exactly **one** `fresh_wallet` in the second group (**`single_fresh_second_group`**) → **no reset**; **Large Insider** flow starts (same as multi-fresh insufficient same-fee path).
+- **Zero** fresh still **`no_fresh_second_group`** reset (late 4-wallet odd unchanged).
+
 ## 2026-07-30 (114)
 
 ### Follow-token: Large Insider parallel flow for multi-fresh second groups
@@ -7,9 +20,9 @@
 - When the second group has **≥2 fresh** wallets, a **Large Insider** side flow runs alongside tag-plan logic (feePayer backtrack + monitor like follow-wallet).
 - **FeePayer window:** first **10 minutes** after initial bundler funding · track **≥15 SOL** transfer-outs → tier1 scrape wallets (100SOL+ included) · feePayer **migration** allowed within the same 10m window.
 - **Chain:** tier1 sends **≥8 SOL** to up to **2** downstream wallets each · first **non-tier1** wallet to **buy** the token is valid · tier1’s own buy is ignored · any scrape wallet drops on **0 SOL** balance (children not required; already-spawned children stay watched).
-- **Deferred tag plan:** **`multi_fresh_insufficient_same_fee_fresh`** (incl. 2 fresh / &lt;3 same fee on ≥5-wallet groups) → **no reset**; Large Insider continues until valid wallet, rug, or tag-plan cycle without valid wallet.
-- **Tag-plan buy + multi-fresh:** buy via tag plan **and** start Large Insider; when valid wallet found → **override** tag-plan exit (including **$250k MC TP** / +90% MC TP) · sell when valid wallet **sells all**.
-- **Large Insider-only buy:** if no tag-plan buy yet, buy alongside valid wallet · **50% SOL deploy** within **3m** of first buy or early exit · normal exit = valid wallet sell-all.
+- When the second group has **≥1 fresh** wallet but no tag-plan buy (**`single_fresh_second_group`**, **`multi_fresh_insufficient_same_fee_fresh`**, etc.) → **no reset**; Large Insider continues until valid wallet, rug, or tag-plan cycle without valid wallet.
+- **Tag-plan buy + multi-fresh:** buy via tag plan **and** start Large Insider; when valid wallet found → **override** tag-plan exit (including **$250k MC TP** / +90% MC TP) · sell on valid wallet **2nd sell tx**.
+- **Large Insider-only buy:** if no tag-plan buy yet, buy alongside valid wallet · **50% SOL deploy** within **3m** of first buy or early exit · normal exit = valid wallet **2nd sell tx**.
 
 ## 2026-07-30 (113)
 

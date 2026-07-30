@@ -126,6 +126,7 @@ const FOLLOW_TOKEN_LARGE_INSIDER_MIN_BUY_SOL_FRACTION = 0.5;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON =
   "follow_token_large_insider_valid_wallet";
+const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SELL_TX_COUNT = 2;
 
 interface FollowTokenLargeInsiderScrapeWatch {
   wallet: string;
@@ -162,6 +163,7 @@ interface FollowTokenLargeInsiderState {
   validWalletQualifiedSol: number | null;
   validWalletFirstBuyAt: number | null;
   validWalletSolSpent: number;
+  validWalletSellSignatures: Set<string>;
   earlySellTimer: ReturnType<typeof setTimeout> | null;
   bundlerFundingAnchorTimestamp: number;
   feePayerWindowEndsAt: number;
@@ -1991,8 +1993,9 @@ export class InsiderBot extends EventEmitter {
     watchPlan: FollowTokenSecondGroupPlan,
     freshCount: number,
   ): boolean {
-    if (watchPlan.kind !== "no_buy" || freshCount < 2) return false;
+    if (watchPlan.kind !== "no_buy" || freshCount < 1) return false;
     return (
+      watchPlan.reason === "single_fresh_second_group" ||
       watchPlan.reason === "multi_fresh_insufficient_same_fee_fresh" ||
       watchPlan.reason === "multi_fresh_same_fee_fresh_missing_top_buyer"
     );
@@ -2079,6 +2082,7 @@ export class InsiderBot extends EventEmitter {
       validWalletQualifiedSol: null,
       validWalletFirstBuyAt: null,
       validWalletSolSpent: 0,
+      validWalletSellSignatures: new Set<string>(),
       earlySellTimer: null,
       bundlerFundingAnchorTimestamp: anchorTimestamp,
       feePayerWindowEndsAt:
@@ -2489,54 +2493,54 @@ export class InsiderBot extends EventEmitter {
     );
     watch.tokenActions.push({ kind: "sell", signature: tx.signature, amount: sellAmount });
     watch.soldAmount += sellAmount;
+    await this.handleFollowTokenLargeInsiderValidWalletSell(wallet, tx);
+  }
 
-    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
-      funderState,
-      {
-        wallet,
-        fundingSignature: watch.fundingSignature ?? "",
-        fundingTimestamp: watch.fundingTimestamp,
-        outAmountSol: watch.qualifiedReceivedSol,
-        heliusPreferredIndex: 0,
-        tokenActions: watch.tokenActions,
-        observedTxSignatures: watch.observedTxSignatures,
-        tokenBuyObserved: true,
-        zeroSolBalanceSignatures: new Set<string>(),
-        buyTriggersEntry: false,
-        boughtAmount: watch.boughtAmount,
-        soldAmount: watch.soldAmount,
-        firstBuySignature: watch.firstBuySignature,
-        firstBuyTimestamp: watch.firstBuyTimestamp,
-        normalTinyTransferMode: false,
-        normalTinyExitPercent: null,
-        lowFundingCopySellOnSellAll: false,
-        lowFundingTinyUsdBand: null,
-        lowFundingLargeTransferMode: false,
-        postEntrySwapSignature: null,
-        postEntrySwapBaselineSignatures: new Set<string>(),
-        soldAllSignature: watch.soldAllSignature,
-      },
-      tx,
-    );
-    const soldAll =
-      (remainingAmount !== null && remainingAmount <= 0) ||
-      (watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount);
-    if (soldAll && this.phase === "holding" && !this.positionSellTriggered) {
-      watch.soldAllSignature = tx.signature;
-      await this.triggerPositionSell(
-        funderState.mint,
-        "follow-token large insider valid wallet sold all",
-        [
-          `<b>🚨 ${this.label} Follow-Token Large Insider Exit</b>`,
-          `Token: <code>${funderState.mint}</code>`,
-          `Valid wallet: <code>${wallet}</code>`,
-          `Tx: <code>${tx.signature}</code>`,
-          "",
-          "Valid wallet sold all — selling full position.",
-        ],
-        tx.signature,
+  private async handleFollowTokenLargeInsiderValidWalletSell(
+    wallet: string,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    const li = this.followTokenLargeInsiderState;
+    const funderState = this.bundlerFunderWatch;
+    if (!li?.active || li.validWallet !== wallet || !funderState) return;
+    if (li.validWalletSellSignatures.has(tx.signature)) return;
+    li.validWalletSellSignatures.add(tx.signature);
+
+    const sellCount = li.validWalletSellSignatures.size;
+    if (sellCount < FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SELL_TX_COUNT) {
+      this.followTokenLargeInsiderLog(
+        "valid wallet sell observed — waiting for 2nd sell tx",
+        {
+          mint: li.mint,
+          wallet,
+          sellCount,
+          signature: tx.signature,
+        },
       );
+      return;
     }
+
+    if (this.phase !== "holding" || this.positionSellTriggered) return;
+
+    this.followTokenLargeInsiderLog("valid wallet 2nd sell — exiting", {
+      mint: li.mint,
+      wallet,
+      signature: tx.signature,
+    });
+
+    await this.triggerPositionSell(
+      funderState.mint,
+      "follow-token large insider valid wallet 2nd sell",
+      [
+        `<b>🚨 ${this.label} Follow-Token Large Insider Exit</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        `Valid wallet: <code>${wallet}</code>`,
+        `2nd sell tx: <code>${tx.signature}</code>`,
+        "",
+        "Valid wallet 2nd sell — selling full position.",
+      ],
+      tx.signature,
+    );
   }
 
   private extractWalletSolOutflowOnTx(
@@ -2583,7 +2587,7 @@ export class InsiderBot extends EventEmitter {
         `Qualified SOL: <b>${watch.qualifiedReceivedSol.toFixed(4)}</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
         li.tagPlanBuyActive
-          ? "Exit override: tag-plan MC TP (+90% / $250k) disabled — sell when this wallet sells all."
+          ? "Exit override: tag-plan MC TP disabled — sell on valid wallet 2nd sell tx."
           : "Buying alongside this wallet.",
       ].join("\n"),
       "follow-token large insider valid wallet",
@@ -2720,7 +2724,7 @@ export class InsiderBot extends EventEmitter {
           `Token: <code>${state.mint}</code>`,
           `Valid wallet: <code>${watchedWallet}</code>`,
           `Trigger tx: <code>${signature}</code>`,
-          "Exit: sell when valid wallet sells all · early exit if &lt;50% SOL deployed within 3m",
+          "Exit: sell on valid wallet 2nd sell tx · early exit if &lt;50% SOL deployed within 3m",
         ].join("\n"),
         "follow-token large insider buy",
       );
@@ -2974,13 +2978,7 @@ export class InsiderBot extends EventEmitter {
         }
         return;
       }
-      await this.triggerFollowTokenWatchExitSell(
-        mint,
-        wallet,
-        "sell",
-        tx,
-        "large insider valid wallet sell",
-      );
+      await this.handleFollowTokenLargeInsiderValidWalletSell(wallet, tx);
       return;
     }
 
@@ -4789,7 +4787,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) ≥2 fresh but insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder. Large Insider: feePayer ≥15SOL outs (10m) → 8SOL+ chain → valid downstream buyer. 0–1 fresh → no buy. Round/dust gates disabled.`
+            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) 1 fresh or ≥2 fresh insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder. Large Insider: feePayer ≥15SOL outs (10m) → 8SOL+ chain → valid downstream buyer. 0 fresh → no buy (except late odd). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -5844,7 +5842,7 @@ export class InsiderBot extends EventEmitter {
             false,
           );
           this.stopFollowTokenGmgnBundlerPoll(
-            "large insider flow — multi-fresh tag plan deferred",
+            "large insider flow — tag plan deferred",
           );
           this.followTokenGmgnBundlerBackend(
             "GMGN second group deferred to large insider flow",
