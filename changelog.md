@@ -1,12 +1,26 @@
 # Changelog
 
+## 2026-07-30 (113)
+
+### Follow-token: &lt;9 multi-fresh watches all-fresh top buyer
+
+- **&lt;9** second group still requires **≥3** same-fee fresh (gate unchanged). After buy, **watch** the **top GMGN buyer among all `fresh_wallet` tags** in the group — not limited to the same-fee cluster.
+- **≥9** path unchanged: watch top buyer in the **same-fee fresh cluster** + **$250k MC TP**.
+
+## 2026-07-30 (112)
+
+### Follow-token: multi-fresh buy needs ≥3 same-fee fresh (all group sizes)
+
+- **&lt;9** and **≥9** second-group wallets now both require **≥3** `fresh_wallet` tags sharing the same Helius buy **fee** (largest same-fee cluster) before buy. **2** same-fee fresh → **`multi_fresh_insufficient_same_fee_fresh`**, reset.
+- **&lt;9** with **≥3** same-fee fresh → **`multi_fresh_same_fee_fresh_top_buyer`** (handoff watch). **≥9** → **`multi_fresh_large_group_same_fee_fresh_tp_250k`** ($250k MC TP).
+
 ## 2026-07-29 (111)
 
 ### Follow-token: only multi-fresh same-fee cluster + late odd buy
 
-- **≥2 `fresh_wallet`** in the second group: Helius buy **fee** must match for at least **2** fresh wallets (largest same-fee cluster). **Watch** the **top GMGN buyer** among that cluster (can be more than 2 fresh on the same fee).
-- **&lt;9** wallets in the second group → **`multi_fresh_same_fee_fresh_top_buyer`**: watched-wallet **buy/sell** + **handoff** to non-fresh top buyer on fresh **buy**; no +90% MC TP at entry.
-- **≥9** wallets and **≥3** fresh in the largest same-fee cluster → **`multi_fresh_large_group_same_fee_fresh_tp_250k`**: **$250k MC TP** + same watch/handoff.
+- **≥2 `fresh_wallet`** in the second group enters multi-fresh evaluation; Helius buy **fee** must match for at least **3** fresh wallets in the largest same-fee cluster before buy.
+- **&lt;9** wallets in the second group → **`multi_fresh_same_fee_fresh_top_buyer`**: same-fee gate, then watch **top buyer among all fresh**; **buy/sell** + **handoff** on fresh **buy**; no +90% MC TP at entry.
+- **≥9** wallets with **≥3** same-fee fresh in that cluster → **`multi_fresh_large_group_same_fee_fresh_tp_250k`**: watch **top buyer in same-fee cluster** + **$250k MC TP** + handoff.
 - **Removed** as buy paths: dual fresh+`top_holder` priority, **`multi_fresh_top_fresh_buyer`**, fee-mismatch watch, all-wallet fee gates, single-fresh / standard no-fresh odd-minority buys (unchanged **no_buy**: **`single_fresh_second_group`**, **`no_fresh_second_group`**).
 - **`late_second_group_four_wallet_odd_top_holder`** unchanged: poll before ≥5 path; 4 wallets, no fresh, &gt;60s after first, 1-vs-3 **`top_holder`**, minority top buyer, **+90% MC TP**, **sell-only** on watched wallet.
 

@@ -1847,10 +1847,10 @@ export class InsiderBot extends EventEmitter {
     );
     if (
       !cluster ||
-      cluster.wallets.length < FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_FOR_BUY
+      cluster.wallets.length < FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_WALLETS
     ) {
       this.followTokenGmgnBundlerBackend(
-        "Follow-token multi-fresh rejected: need ≥2 fresh with same buy fee",
+        "Follow-token multi-fresh rejected: need ≥3 fresh with same buy fee",
         {
           mint,
           freshWalletCount: freshWallets.length,
@@ -1864,30 +1864,17 @@ export class InsiderBot extends EventEmitter {
       };
     }
 
-    const wallet = pickFollowTokenTopBuyerWallet(cluster.wallets, snapshots);
-    if (!wallet) {
-      return {
-        kind: "no_buy",
-        reason: "multi_fresh_same_fee_fresh_missing_top_buyer",
-      };
-    }
-
-    const baseWatch = {
-      kind: "watch_buy" as const,
-      wallet,
-      watchMode: "standard" as const,
-    };
-
     if (
       secondGroup.wallets.length >= FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_MIN_WALLETS
     ) {
-      if (
-        cluster.wallets.length <
-        FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_WALLETS
-      ) {
+      const clusterTopBuyer = pickFollowTokenTopBuyerWallet(
+        cluster.wallets,
+        snapshots,
+      );
+      if (!clusterTopBuyer) {
         return {
           kind: "no_buy",
-          reason: "multi_fresh_large_group_insufficient_same_fee_fresh",
+          reason: "multi_fresh_same_fee_fresh_missing_top_buyer",
         };
       }
       this.followTokenGmgnBundlerBackend(
@@ -1897,28 +1884,41 @@ export class InsiderBot extends EventEmitter {
           walletCount: secondGroup.wallets.length,
           sameFeeFreshCount: cluster.wallets.length,
           feeLamports: cluster.fee,
-          watchedWallet: wallet,
+          watchedWallet: clusterTopBuyer,
         },
       );
       return {
-        ...baseWatch,
+        kind: "watch_buy",
+        wallet: clusterTopBuyer,
+        watchMode: "standard",
         reason: FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_SAME_FEE_TP_REASON,
         exitMcUsd: FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_EXIT_MC_USD,
       };
     }
 
+    const wallet = pickFollowTokenTopBuyerWallet(freshWallets, snapshots);
+    if (!wallet) {
+      return {
+        kind: "no_buy",
+        reason: "multi_fresh_same_fee_fresh_missing_top_buyer",
+      };
+    }
+
     this.followTokenGmgnBundlerBackend(
-      "Follow-token multi-fresh same-fee fresh top buyer buy",
+      "Follow-token multi-fresh same-fee gate: watch all-fresh top buyer",
       {
         mint,
         walletCount: secondGroup.wallets.length,
+        freshWalletCount: freshWallets.length,
         sameFeeFreshCount: cluster.wallets.length,
         feeLamports: cluster.fee,
         watchedWallet: wallet,
       },
     );
     return {
-      ...baseWatch,
+      kind: "watch_buy",
+      wallet,
+      watchMode: "standard",
       reason: FOLLOW_TOKEN_MULTI_FRESH_SAME_FEE_FRESH_TOP_BUYER_REASON,
     };
   }
@@ -3943,7 +3943,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace): (1) ≥2 fresh with same buy fee → watch top buyer in that cluster (<9 wallets: buy/sell + handoff; ≥9 wallets + ≥3 same-fee fresh: $250k MC TP); (2) late 4-wallet odd top_holder (>60s, no fresh, +90% MC TP, sell-only). 0–1 fresh → no buy. Round/dust gates disabled.`
+            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace): (1) ≥3 fresh with same buy fee (gate) → <9 wallets: watch top buyer among all fresh (buy/sell + handoff); ≥9 wallets: watch top buyer in same-fee cluster ($250k MC TP); (2) late 4-wallet odd top_holder (>60s, no fresh, +90% MC TP, sell-only). 0–1 fresh → no buy. Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
