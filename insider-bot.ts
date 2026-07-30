@@ -341,6 +341,94 @@ function findFollowTokenGmgnGroupByAnchor(
   );
 }
 
+interface FollowTokenHeliusFirstBuy {
+  wallet: string;
+  timestamp: number;
+  signature: string;
+}
+
+function extractFollowTokenGmgnCandidateWallets(
+  snapshots: GmgnBundlerTraderSnapshot[],
+  initialGroup: GmgnBundlerTimestampGroup,
+): string[] {
+  const initialWallets = new Set(initialGroup.wallets);
+  const wallets: string[] = [];
+  const seen = new Set<string>();
+  for (const snapshot of snapshots) {
+    if (initialWallets.has(snapshot.address)) continue;
+    if (seen.has(snapshot.address)) continue;
+    seen.add(snapshot.address);
+    wallets.push(snapshot.address);
+  }
+  return wallets;
+}
+
+function resolveFollowTokenHeliusFirstBuysForWallets(
+  swaps: HeliusTransaction[],
+  mint: string,
+  wallets: string[],
+): FollowTokenHeliusFirstBuy[] {
+  const walletSet = new Set(wallets);
+  const firstByWallet = new Map<string, FollowTokenHeliusFirstBuy>();
+  const sorted = [...swaps].sort(
+    (left, right) =>
+      left.timestamp - right.timestamp || left.slot - right.slot,
+  );
+
+  for (const tx of sorted) {
+    if (tx.type !== "SWAP") continue;
+    for (const transfer of tx.tokenTransfers ?? []) {
+      if (transfer.mint !== mint) continue;
+      const wallet = transfer.toUserAccount;
+      if (!wallet || !walletSet.has(wallet)) continue;
+      if (firstByWallet.has(wallet)) continue;
+      firstByWallet.set(wallet, {
+        wallet,
+        timestamp: tx.timestamp,
+        signature: tx.signature,
+      });
+    }
+  }
+
+  return wallets
+    .filter((wallet) => firstByWallet.has(wallet))
+    .map((wallet) => firstByWallet.get(wallet)!);
+}
+
+function groupFollowTokenHeliusFirstBuysByTimestamp(
+  firstBuys: FollowTokenHeliusFirstBuy[],
+): Map<number, FollowTokenHeliusFirstBuy[]> {
+  const groups = new Map<number, FollowTokenHeliusFirstBuy[]>();
+  for (const buy of firstBuys) {
+    const bucket = groups.get(buy.timestamp) ?? [];
+    bucket.push(buy);
+    groups.set(buy.timestamp, bucket);
+  }
+  return groups;
+}
+
+function findFollowTokenHeliusConfirmedSecondGroup(
+  firstGroup: GmgnBundlerTimestampGroup,
+  firstBuys: FollowTokenHeliusFirstBuy[],
+  minWallets: number,
+): GmgnBundlerTimestampGroup | null {
+  const byTimestamp = groupFollowTokenHeliusFirstBuysByTimestamp(firstBuys);
+  const candidates = [...byTimestamp.entries()]
+    .filter(
+      ([timestamp, buys]) =>
+        timestamp > firstGroup.anchorTimestamp && buys.length >= minWallets,
+    )
+    .sort((left, right) => left[0] - right[0]);
+
+  if (candidates.length === 0) return null;
+
+  const [anchorTimestamp, buys] = candidates[0]!;
+  return {
+    anchorTimestamp,
+    wallets: buys.map((buy) => buy.wallet),
+  };
+}
+
 function pickFollowTokenFreshTopBuyerInGroup(
   group: GmgnBundlerTimestampGroup,
   snapshots: GmgnBundlerTraderSnapshot[],
@@ -519,8 +607,8 @@ const FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT = 100;
 const FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC = 0;
 /** Follow-token buy trigger: second bundler group must have at least this many wallets. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS = 5;
-/** After second group first appears with fewer than min wallets, keep polling this long for GMGN to fill the same second. */
-const FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC = 10;
+/** Max wait from first insufficient second group before Helius confirm resets the token. */
+const FOLLOW_TOKEN_GMGN_SECOND_GROUP_HELIUS_CONFIRM_MAX_WAIT_SEC = 120;
 /** Late second group: min seconds after first group anchor (must be &gt; this value). */
 const FOLLOW_TOKEN_GMGN_LATE_SECOND_GROUP_MIN_GAP_SEC = 60;
 const FOLLOW_TOKEN_GMGN_LATE_ODD_GROUP_WALLET_COUNT = 4;
@@ -967,10 +1055,12 @@ export class InsiderBot extends EventEmitter {
   /** Latched once GMGN shows a same-second + 1s grace group containing all four initial bundlers. */
   private followTokenGmgnInitialBundlerGroup: GmgnBundlerTimestampGroup | null =
     null;
-  /** Second group seen below min wallets — poll same anchor until grace expires or count reaches min. */
-  private followTokenGmgnSecondGroupGrace: {
-    anchorTimestamp: number;
+  /** Second group below min wallets — Helius tx confirm in progress. */
+  private followTokenGmgnSecondGroupHeliusConfirm: {
     startedAtMs: number;
+    /** Unix second captured once at confirm start — reused for every paginated fetch. */
+    gteTime: number;
+    lteTime: number;
   } | null = null;
   /** Wallets from the GMGN second bundler group that triggered the follow-token buy. */
   private followTokenGmgnBuySecondGroupWallets: string[] | null = null;
@@ -3967,7 +4057,7 @@ export class InsiderBot extends EventEmitter {
         `Migration tx: <code>${migrationSignature}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
-        `Buy trigger: GMGN bundler second-group poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next same-second group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace on same second if below min, then reset).`,
+        `Buy trigger: GMGN bundler second-group poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next same-second group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (Helius tx confirm if below min).`,
         "Bundler feePayer backtrack skipped for follow-token (GMGN-only path).",
       ].join("\n"),
       "follow-token flow-start notification",
@@ -4080,7 +4170,7 @@ export class InsiderBot extends EventEmitter {
         `Dev CREATE: <b>${this.devCreateTimestamp}</b>`,
         `Initial bundlers: <b>${firstFour.length}</b>`,
         "",
-        `Polling GMGN every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (same second); ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace if below min, then reset.`,
+        `Polling GMGN every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial needs ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS} wallets (Helius confirm if below min).`,
         `Exit: watched-wallet sell tx (+90% MC TP when enabled for trigger).`,
       ].join("\n"),
       "follow-token gmgn watch started notification",
@@ -4893,7 +4983,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, ${FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC}s grace): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) 1 fresh or ≥2 fresh insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder. Large Insider: feePayer ≥15SOL outs (10m) → 8SOL+ chain → valid downstream buyer. 0 fresh → no buy (except late odd). Round/dust gates disabled.`
+            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, Helius confirm if below min): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) 1 fresh or ≥2 fresh insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder. Large Insider: feePayer ≥15SOL outs (10m) → 8SOL+ chain → valid downstream buyer. 0 fresh → no buy (except late odd). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -5485,7 +5575,7 @@ export class InsiderBot extends EventEmitter {
     }
     this.followTokenGmgnBundlerPollInFlight = false;
     this.followTokenGmgnInitialBundlerGroup = null;
-    this.followTokenGmgnSecondGroupGrace = null;
+    this.followTokenGmgnSecondGroupHeliusConfirm = null;
     if (reason !== "poll loop stopped") {
       this.followTokenGmgnBundlerBackend("GMGN bundler poll stopped", { reason });
     }
@@ -5513,8 +5603,8 @@ export class InsiderBot extends EventEmitter {
       pollIntervalMs: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS,
       groupGraceSec: FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC,
       secondGroupMinWallets: FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
-      secondGroupMinWalletsGraceSec:
-        FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC,
+      secondGroupHeliusConfirmMaxWaitSec:
+        FOLLOW_TOKEN_GMGN_SECOND_GROUP_HELIUS_CONFIRM_MAX_WAIT_SEC,
       expectedInitialBundlers: [...state.bundlerWallets],
     });
 
@@ -5617,6 +5707,107 @@ export class InsiderBot extends EventEmitter {
     return 0;
   }
 
+  private async confirmFollowTokenSecondGroupViaHelius(
+    mint: string,
+    initialGroup: GmgnBundlerTimestampGroup,
+    snapshots: GmgnBundlerTraderSnapshot[],
+    gteTime: number,
+    lteTime: number,
+  ): Promise<{
+    confirmed: boolean;
+    group: GmgnBundlerTimestampGroup | null;
+    summary: Record<string, unknown>;
+  }> {
+    const candidateWallets = extractFollowTokenGmgnCandidateWallets(
+      snapshots,
+      initialGroup,
+    );
+    if (lteTime < gteTime) {
+      return {
+        confirmed: false,
+        group: null,
+        summary: {
+          reason: "lte_not_after_initial",
+          gteTime,
+          lteTime,
+          candidateWalletCount: candidateWallets.length,
+        },
+      };
+    }
+    if (candidateWallets.length === 0) {
+      return {
+        confirmed: false,
+        group: null,
+        summary: {
+          reason: "no_candidate_wallets",
+          gteTime,
+          lteTime,
+        },
+      };
+    }
+
+    let swaps: HeliusTransaction[];
+    try {
+      swaps = await this.withHeliusFallback((client) =>
+        client.getMintPumpFunSwapsInTimeRange(mint, gteTime, lteTime),
+      );
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.followTokenGmgnLog.warn("Helius second-group confirm fetch failed", {
+        mint,
+        gteTime,
+        lteTime,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return {
+        confirmed: false,
+        group: null,
+        summary: {
+          reason: "helius_fetch_failed",
+          gteTime,
+          lteTime,
+          candidateWalletCount: candidateWallets.length,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      };
+    }
+
+    const firstBuys = resolveFollowTokenHeliusFirstBuysForWallets(
+      swaps,
+      mint,
+      candidateWallets,
+    );
+    const group = findFollowTokenHeliusConfirmedSecondGroup(
+      initialGroup,
+      firstBuys,
+      FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
+    );
+    const clusterSizes = [...groupFollowTokenHeliusFirstBuysByTimestamp(firstBuys).entries()]
+      .filter(([timestamp]) => timestamp > initialGroup.anchorTimestamp)
+      .map(([timestamp, buys]) => ({
+        timestamp,
+        walletCount: buys.length,
+        wallets: buys.map((buy) => buy.wallet),
+      }))
+      .sort((left, right) => left.timestamp - right.timestamp);
+
+    return {
+      confirmed: group !== null,
+      group,
+      summary: {
+        gteTime,
+        lteTime,
+        swapCount: swaps.length,
+        candidateWalletCount: candidateWallets.length,
+        firstBuyCount: firstBuys.length,
+        clusterSizes,
+        confirmedTimestamp: group?.anchorTimestamp ?? null,
+        confirmedWalletCount: group?.wallets.length ?? null,
+        confirmedWallets: group?.wallets ?? null,
+      },
+    };
+  }
+
   private async pollFollowTokenGmgnBundlerBuy(): Promise<void> {
     if (this.followTokenGmgnBundlerPollInFlight) return;
     const state = this.bundlerFunderWatch;
@@ -5653,8 +5844,8 @@ export class InsiderBot extends EventEmitter {
       );
       const pollPhase = !this.followTokenGmgnInitialBundlerGroup
         ? "waiting_initial_group"
-        : this.followTokenGmgnSecondGroupGrace
-          ? "waiting_second_group_grace"
+        : this.followTokenGmgnSecondGroupHeliusConfirm
+          ? "waiting_second_group_helius_confirm"
           : "waiting_second_group";
 
       this.followTokenGmgnBundlerBackend("GMGN bundler poll tick", {
@@ -5666,16 +5857,17 @@ export class InsiderBot extends EventEmitter {
         traderCount: snapshots.length,
         traders: snapshots,
         groups: this.summarizeGmgnBundlerGroupsForLog(groups),
-        secondGroupGrace: this.followTokenGmgnSecondGroupGrace
+        secondGroupHeliusConfirm: this.followTokenGmgnSecondGroupHeliusConfirm
           ? {
-              anchorTimestamp:
-                this.followTokenGmgnSecondGroupGrace.anchorTimestamp,
               elapsedSec: Math.floor(
                 (Date.now() -
-                  this.followTokenGmgnSecondGroupGrace.startedAtMs) /
+                  this.followTokenGmgnSecondGroupHeliusConfirm.startedAtMs) /
                   1_000,
               ),
-              graceSec: FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC,
+              lteTime: this.followTokenGmgnSecondGroupHeliusConfirm.lteTime,
+              gteTime: this.followTokenGmgnSecondGroupHeliusConfirm.gteTime,
+              maxWaitSec:
+                FOLLOW_TOKEN_GMGN_SECOND_GROUP_HELIUS_CONFIRM_MAX_WAIT_SEC,
             }
           : null,
         initialGroupConfirmed: this.followTokenGmgnInitialBundlerGroup
@@ -5746,17 +5938,11 @@ export class InsiderBot extends EventEmitter {
         this.followTokenGmgnInitialBundlerGroup,
       );
       if (!nextGroup) {
-        this.followTokenGmgnSecondGroupGrace = null;
+        this.followTokenGmgnSecondGroupHeliusConfirm = null;
         return;
       }
 
-      const graceAnchor = this.followTokenGmgnSecondGroupGrace?.anchorTimestamp;
-      const secondGroupCandidate = this.followTokenGmgnSecondGroupGrace
-        ? (findFollowTokenGmgnGroupByAnchor(groups, graceAnchor!) ?? {
-            anchorTimestamp: graceAnchor!,
-            wallets: [] as string[],
-          })
-        : nextGroup;
+      const secondGroupCandidate = nextGroup;
 
       const lateOddPlan = resolveFollowTokenLateFourWalletOddSecondGroupPlan(
         this.followTokenGmgnInitialBundlerGroup,
@@ -5764,7 +5950,7 @@ export class InsiderBot extends EventEmitter {
         snapshots,
       );
       if (lateOddPlan?.kind === "watch_buy") {
-        this.followTokenGmgnSecondGroupGrace = null;
+        this.followTokenGmgnSecondGroupHeliusConfirm = null;
         this.followTokenGmgnBundlerBackend(
           "GMGN late second group (4-wallet odd top_holder) buy trigger",
           {
@@ -5795,7 +5981,7 @@ export class InsiderBot extends EventEmitter {
         secondGroupCandidate.wallets.length >=
         FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS
       ) {
-        this.followTokenGmgnSecondGroupGrace = null;
+        this.followTokenGmgnSecondGroupHeliusConfirm = null;
         const secondGroup = secondGroupCandidate;
 
         this.followTokenGmgnBundlerBackend("GMGN second bundler group detected", {
@@ -5819,28 +6005,72 @@ export class InsiderBot extends EventEmitter {
       }
 
       const nowMs = Date.now();
-      if (!this.followTokenGmgnSecondGroupGrace) {
-        this.followTokenGmgnSecondGroupGrace = {
-          anchorTimestamp: nextGroup.anchorTimestamp,
+      const initialGroup = this.followTokenGmgnInitialBundlerGroup;
+      if (!this.followTokenGmgnSecondGroupHeliusConfirm) {
+        const gteTime = initialGroup.anchorTimestamp + 1;
+        const lteTime = Math.floor(nowMs / 1_000);
+        this.followTokenGmgnSecondGroupHeliusConfirm = {
           startedAtMs: nowMs,
+          gteTime,
+          lteTime,
         };
         this.followTokenGmgnBundlerBackend(
-          "GMGN second group below min wallets — grace period started",
+          "GMGN second group below min wallets — Helius confirm started",
           {
             mint: state.mint,
-            anchorTimestamp: nextGroup.anchorTimestamp,
-            walletCount: secondGroupCandidate.wallets.length,
+            gmgnNextGroupTimestamp: nextGroup.anchorTimestamp,
+            gmgnNextGroupWalletCount: secondGroupCandidate.wallets.length,
             minSecondGroupWallets:
               FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
-            graceSec: FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC,
+            gteTime,
+            lteTime,
           },
+        );
+      }
+
+      const { gteTime, lteTime } = this.followTokenGmgnSecondGroupHeliusConfirm;
+      const heliusConfirm =
+        await this.confirmFollowTokenSecondGroupViaHelius(
+          state.mint,
+          initialGroup,
+          snapshots,
+          gteTime,
+          lteTime,
+        );
+
+      if (heliusConfirm.confirmed && heliusConfirm.group) {
+        this.followTokenGmgnSecondGroupHeliusConfirm = null;
+        const secondGroup = heliusConfirm.group;
+        this.followTokenGmgnBundlerBackend(
+          "Helius confirmed second bundler group",
+          {
+            mint: state.mint,
+            firstGroupTimestamp: initialGroup.anchorTimestamp,
+            secondGroupTimestamp: secondGroup.anchorTimestamp,
+            secondGroupWalletCount: secondGroup.wallets.length,
+            secondGroupWallets: secondGroup.wallets,
+            gmgnNextGroupTimestamp: nextGroup.anchorTimestamp,
+            gmgnNextGroupWalletCount: secondGroupCandidate.wallets.length,
+            heliusConfirm: heliusConfirm.summary,
+            groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+          },
+        );
+        await this.emitFollowTokenGmgnBundlerBuy(
+          state,
+          secondGroup,
+          groups,
+          initialGroup,
+          snapshots,
         );
         return;
       }
 
-      const graceElapsedSec =
-        (nowMs - this.followTokenGmgnSecondGroupGrace.startedAtMs) / 1_000;
-      if (graceElapsedSec < FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC) {
+      const confirmState = this.followTokenGmgnSecondGroupHeliusConfirm;
+      const confirmElapsedSec = (nowMs - confirmState.startedAtMs) / 1_000;
+      if (
+        confirmElapsedSec <
+        FOLLOW_TOKEN_GMGN_SECOND_GROUP_HELIUS_CONFIRM_MAX_WAIT_SEC
+      ) {
         return;
       }
 
@@ -5848,15 +6078,16 @@ export class InsiderBot extends EventEmitter {
         state.mint,
         `second_group_insufficient_wallets_${secondGroupCandidate.wallets.length}`,
         {
-          firstGroupTimestamp:
-            this.followTokenGmgnInitialBundlerGroup.anchorTimestamp,
+          firstGroupTimestamp: initialGroup.anchorTimestamp,
           nextGroupTimestamp: secondGroupCandidate.anchorTimestamp,
           nextGroupWalletCount: secondGroupCandidate.wallets.length,
           nextGroupWallets: secondGroupCandidate.wallets,
           minSecondGroupWallets:
             FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
-          graceSec: FOLLOW_TOKEN_GMGN_SECOND_GROUP_MIN_WALLETS_GRACE_SEC,
-          graceElapsedSec: Math.floor(graceElapsedSec),
+          gteTime: confirmState.gteTime,
+          lteTime: confirmState.lteTime,
+          confirmElapsedSec: Math.floor(confirmElapsedSec),
+          heliusConfirm: heliusConfirm.summary,
           groups: this.summarizeGmgnBundlerGroupsForLog(groups),
         },
       );

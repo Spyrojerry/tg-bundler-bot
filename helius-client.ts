@@ -627,6 +627,71 @@ export class HeliusClient {
     return await response.json() as HeliusTransaction[];
   }
 
+  /**
+   * Fetches PUMP_FUN SWAP txs for a mint within an inclusive unix-second window.
+   * Uses sort-order=asc and after-signature pagination: each page walks forward in
+   * time from gteTime; the same lteTime is sent on every page request.
+   */
+  async getMintPumpFunSwapsInTimeRange(
+    mintAddress: string,
+    gteTime: number,
+    lteTime: number,
+    pageLimit: number = 100,
+    maxPages: number = 20,
+  ): Promise<HeliusTransaction[]> {
+    const fixedGteTime = gteTime;
+    const fixedLteTime = lteTime;
+    const collected: HeliusTransaction[] = [];
+    const seenSignatures = new Set<string>();
+    let afterSignature: string | undefined;
+
+    for (let page = 0; page < maxPages; page += 1) {
+      const params = new URLSearchParams({
+        'token-accounts': 'none',
+        'sort-order': 'asc',
+        'api-key': this.apiKey,
+        limit: String(pageLimit),
+        type: 'SWAP',
+        source: 'PUMP_FUN',
+        'gte-time': String(fixedGteTime),
+        'lte-time': String(fixedLteTime),
+      });
+      if (afterSignature) {
+        params.set('after-signature', afterSignature);
+      }
+
+      const url = `${this.baseUrl}/v0/addresses/${mintAddress}/transactions?${params.toString()}`;
+      const response = await this.fetchWithCreditCheck(url);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(
+          `Helius API error: ${response.status} ${response.statusText} - ${text}`,
+        );
+      }
+
+      const batch = await response.json() as HeliusTransaction[];
+      if (batch.length === 0) break;
+
+      let added = 0;
+      for (const tx of batch) {
+        if (!tx.signature || seenSignatures.has(tx.signature)) continue;
+        if (typeof tx.timestamp === 'number' && tx.timestamp > fixedLteTime) continue;
+        if (typeof tx.timestamp === 'number' && tx.timestamp < fixedGteTime) continue;
+        seenSignatures.add(tx.signature);
+        collected.push(tx);
+        added += 1;
+      }
+
+      if (batch.length < pageLimit || added === 0) break;
+
+      const pageCursor = batch[batch.length - 1];
+      if (!pageCursor?.signature) break;
+      afterSignature = pageCursor.signature;
+    }
+
+    return collected;
+  }
+
   async getTransactionsBySignatures(signatures: string[]): Promise<HeliusTransaction[]> {
     if (signatures.length === 0) return [];
     const url = `${this.baseUrl}/v0/transactions?api-key=${this.apiKey}`;
