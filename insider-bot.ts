@@ -121,12 +121,11 @@ const FOLLOW_TOKEN_SECOND_GROUP_BUY_TX_TIMESTAMP_TOLERANCE_SEC = 2;
 const FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL = 15;
 const FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL = 8;
 const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC = 10 * 60;
-const FOLLOW_TOKEN_LARGE_INSIDER_EARLY_SELL_WINDOW_SEC = 3 * 60;
-const FOLLOW_TOKEN_LARGE_INSIDER_MIN_BUY_SOL_FRACTION = 0.5;
+const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS = 2;
+const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION = 0.25;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON =
   "follow_token_large_insider_valid_wallet";
-const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SELL_TX_COUNT = 2;
 
 interface FollowTokenLargeInsiderScrapeWatch {
   wallet: string;
@@ -139,7 +138,6 @@ interface FollowTokenLargeInsiderScrapeWatch {
   childWallets: string[];
   firstBuyTimestamp: number | null;
   firstBuySignature: string | null;
-  solSpentOnTokenBuys: number;
   boughtAmount: number;
   soldAmount: number;
   tokenActions: Array<{
@@ -159,12 +157,10 @@ interface FollowTokenLargeInsiderState {
   tagPlanBuyActive: boolean;
   tier1FeePayerRecipients: Set<string>;
   scrapeWatches: Map<string, FollowTokenLargeInsiderScrapeWatch>;
-  validWallet: string | null;
-  validWalletQualifiedSol: number | null;
-  validWalletFirstBuyAt: number | null;
-  validWalletSolSpent: number;
-  validWalletSellSignatures: Set<string>;
-  earlySellTimer: ReturnType<typeof setTimeout> | null;
+  /** First non-tier1 buyers found (max 2), in discovery order. */
+  validWallets: string[];
+  validWalletSearchComplete: boolean;
+  exitTriggerSignature: string | null;
   bundlerFundingAnchorTimestamp: number;
   feePayerWindowEndsAt: number;
   exitOverrideActive: boolean;
@@ -1725,7 +1721,7 @@ export class InsiderBot extends EventEmitter {
     );
     if (
       this.followTokenLargeInsiderState?.active &&
-      !this.followTokenLargeInsiderState.validWallet
+      !this.followTokenLargeInsiderState.validWallets.length
     ) {
       await this.stopFollowTokenLargeInsiderFlow(
         "tag plan exit before valid large insider wallet",
@@ -2005,18 +2001,13 @@ export class InsiderBot extends EventEmitter {
     const state = this.followTokenLargeInsiderState;
     if (!state?.active) return;
 
-    if (state.earlySellTimer) {
-      clearTimeout(state.earlySellTimer);
-      state.earlySellTimer = null;
-    }
-
     for (const wallet of [...state.scrapeEnhancedWatchIds.keys()]) {
       this.unsubscribeFollowTokenLargeInsiderScrapeWallet(wallet);
     }
 
     this.followTokenLargeInsiderLog(reason, {
       mint: state.mint,
-      validWallet: state.validWallet,
+      validWallets: state.validWallets,
       tagPlanBuyActive: state.tagPlanBuyActive,
       exitOverrideActive: state.exitOverrideActive,
     });
@@ -2078,12 +2069,9 @@ export class InsiderBot extends EventEmitter {
       tagPlanBuyActive,
       tier1FeePayerRecipients: new Set<string>(),
       scrapeWatches: new Map<string, FollowTokenLargeInsiderScrapeWatch>(),
-      validWallet: null,
-      validWalletQualifiedSol: null,
-      validWalletFirstBuyAt: null,
-      validWalletSolSpent: 0,
-      validWalletSellSignatures: new Set<string>(),
-      earlySellTimer: null,
+      validWallets: [],
+      validWalletSearchComplete: false,
+      exitTriggerSignature: null,
       bundlerFundingAnchorTimestamp: anchorTimestamp,
       feePayerWindowEndsAt:
         anchorTimestamp + FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC,
@@ -2268,7 +2256,6 @@ export class InsiderBot extends EventEmitter {
       childWallets: [],
       firstBuyTimestamp: null,
       firstBuySignature: null,
-      solSpentOnTokenBuys: 0,
       boughtAmount: 0,
       soldAmount: 0,
       tokenActions: [],
@@ -2294,7 +2281,6 @@ export class InsiderBot extends EventEmitter {
   ): FollowTokenLargeInsiderScrapeWatch | null {
     const li = this.followTokenLargeInsiderState;
     if (!li?.active) return null;
-    if (li.validWallet) return null;
     if (li.scrapeWatches.has(wallet)) return li.scrapeWatches.get(wallet)!;
 
     const parent = li.scrapeWatches.get(fundedBy);
@@ -2316,7 +2302,6 @@ export class InsiderBot extends EventEmitter {
       childWallets: [],
       firstBuyTimestamp: null,
       firstBuySignature: null,
-      solSpentOnTokenBuys: 0,
       boughtAmount: 0,
       soldAmount: 0,
       tokenActions: [],
@@ -2385,15 +2370,40 @@ export class InsiderBot extends EventEmitter {
   }
 
   private pruneFollowTokenLargeInsiderScrapeWalletsExcept(
-    keepWallet: string,
+    keepWallets: readonly string[],
   ): void {
     const li = this.followTokenLargeInsiderState;
     if (!li) return;
+    const keep = new Set(keepWallets);
     for (const wallet of [...li.scrapeWatches.keys()]) {
-      if (wallet !== keepWallet) {
+      if (!keep.has(wallet)) {
         this.unsubscribeFollowTokenLargeInsiderScrapeWallet(wallet);
       }
     }
+  }
+
+  private isFollowTokenLargeInsiderTrackedValidWallet(wallet: string): boolean {
+    return (
+      this.followTokenLargeInsiderState?.validWallets.includes(wallet) ?? false
+    );
+  }
+
+  private followTokenLargeInsiderWatchReachedExitSoldThreshold(
+    watch: FollowTokenLargeInsiderScrapeWatch,
+    remainingAmount: number | null,
+  ): boolean {
+    if (watch.boughtAmount <= 0) return false;
+    if (
+      watch.soldAmount / watch.boughtAmount >=
+      FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION
+    ) {
+      return true;
+    }
+    if (remainingAmount === null) return false;
+    return (
+      remainingAmount <=
+      watch.boughtAmount * (1 - FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION)
+    );
   }
 
   private async handleFollowTokenLargeInsiderScrapeZeroBalance(
@@ -2402,7 +2412,7 @@ export class InsiderBot extends EventEmitter {
   ): Promise<void> {
     const li = this.followTokenLargeInsiderState;
     if (!li?.active || lamports > 0n) return;
-    if (li.validWallet === wallet) return;
+    if (li.validWallets.includes(wallet)) return;
     if (!li.scrapeWatches.has(wallet)) return;
 
     this.followTokenLargeInsiderLog(
@@ -2460,7 +2470,12 @@ export class InsiderBot extends EventEmitter {
         });
         return;
       }
-      if (li.validWallet && li.validWallet !== wallet) return;
+      if (
+        li.validWalletSearchComplete &&
+        !this.isFollowTokenLargeInsiderTrackedValidWallet(wallet)
+      ) {
+        return;
+      }
 
       const amount = this.extractTokenAmountForWallet(
         tx,
@@ -2468,23 +2483,34 @@ export class InsiderBot extends EventEmitter {
         funderState.mint,
         "buy",
       );
-      const solSpent = this.extractWalletSolOutflowOnTx(wallet, tx);
       watch.tokenActions.push({ kind: "buy", signature: tx.signature, amount });
-      watch.solSpentOnTokenBuys += solSpent;
       watch.boughtAmount += amount;
 
       if (!watch.firstBuySignature) {
         watch.firstBuySignature = tx.signature;
         watch.firstBuyTimestamp = tx.timestamp;
-        await this.onFollowTokenLargeInsiderValidWalletFound(wallet, watch, tx);
-      } else if (li.validWallet === wallet) {
-        li.validWalletSolSpent += solSpent;
-        this.scheduleFollowTokenLargeInsiderEarlySellCheck();
+        if (!this.isFollowTokenLargeInsiderTrackedValidWallet(wallet)) {
+          if (
+            li.validWallets.length >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
+          ) {
+            return;
+          }
+          await this.onFollowTokenLargeInsiderValidWalletFound(
+            wallet,
+            watch,
+            tx,
+          );
+        }
       }
       return;
     }
 
-    if (!watch.firstBuySignature || li.validWallet !== wallet) return;
+    if (
+      !watch.firstBuySignature ||
+      !this.isFollowTokenLargeInsiderTrackedValidWallet(wallet)
+    ) {
+      return;
+    }
     const sellAmount = this.extractTokenAmountForWallet(
       tx,
       wallet,
@@ -2494,9 +2520,10 @@ export class InsiderBot extends EventEmitter {
     watch.tokenActions.push({ kind: "sell", signature: tx.signature, amount: sellAmount });
     watch.soldAmount += sellAmount;
     if (this.isFollowTokenLargeInsiderBuyExitMode()) {
-      await this.handleFollowTokenLargeInsiderValidWalletSecondSellExit(
+      await this.handleFollowTokenLargeInsiderValidWalletTwentyFivePercentSoldExit(
         wallet,
         tx,
+        watch,
       );
     } else if (li.exitOverrideActive) {
       await this.handleFollowTokenLargeInsiderValidWalletSellAllExit(
@@ -2514,51 +2541,95 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private async handleFollowTokenLargeInsiderValidWalletSecondSellExit(
+  private async handleFollowTokenLargeInsiderValidWalletTwentyFivePercentSoldExit(
     wallet: string,
     tx: HeliusTransaction,
+    watch: FollowTokenLargeInsiderScrapeWatch,
   ): Promise<void> {
     const li = this.followTokenLargeInsiderState;
     const funderState = this.bundlerFunderWatch;
-    if (!li?.active || li.validWallet !== wallet || !funderState) return;
-    if (li.validWalletSellSignatures.has(tx.signature)) return;
-    li.validWalletSellSignatures.add(tx.signature);
+    if (
+      !li?.active ||
+      !this.isFollowTokenLargeInsiderTrackedValidWallet(wallet) ||
+      !funderState
+    ) {
+      return;
+    }
+    if (li.exitTriggerSignature) return;
 
-    const sellCount = li.validWalletSellSignatures.size;
-    if (sellCount < FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SELL_TX_COUNT) {
-      this.followTokenLargeInsiderLog(
-        "valid wallet sell observed — waiting for 2nd sell tx",
-        {
-          mint: li.mint,
-          wallet,
-          sellCount,
-          signature: tx.signature,
-        },
-      );
+    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
+      funderState,
+      this.buildFollowTokenLargeInsiderRecipientWatchStub(watch),
+      tx,
+    );
+    if (
+      !this.followTokenLargeInsiderWatchReachedExitSoldThreshold(
+        watch,
+        remainingAmount,
+      )
+    ) {
       return;
     }
 
     if (this.phase !== "holding" || this.positionSellTriggered) return;
 
-    this.followTokenLargeInsiderLog("valid wallet 2nd sell — exiting", {
+    li.exitTriggerSignature = tx.signature;
+    const soldPercent =
+      watch.boughtAmount > 0
+        ? ((watch.soldAmount / watch.boughtAmount) * 100).toFixed(1)
+        : "?";
+
+    this.followTokenLargeInsiderLog("valid wallet ≥25% sold — exiting", {
       mint: li.mint,
       wallet,
       signature: tx.signature,
+      soldPercent,
+      validWallets: li.validWallets,
     });
 
     await this.triggerPositionSell(
       funderState.mint,
-      "follow-token large insider valid wallet 2nd sell",
+      "follow-token large insider valid wallet 25% sold",
       [
         `<b>🚨 ${this.label} Follow-Token Large Insider Exit</b>`,
         `Token: <code>${funderState.mint}</code>`,
         `Valid wallet: <code>${wallet}</code>`,
-        `2nd sell tx: <code>${tx.signature}</code>`,
+        `Sold: <b>≥25%</b> (${soldPercent}% tracked)`,
+        `Tx: <code>${tx.signature}</code>`,
         "",
-        "Valid wallet 2nd sell — selling full position.",
+        "Valid wallet holdings below 75% — selling full position.",
       ],
       tx.signature,
     );
+  }
+
+  private buildFollowTokenLargeInsiderRecipientWatchStub(
+    watch: FollowTokenLargeInsiderScrapeWatch,
+  ): FunderRecipientWatch {
+    return {
+      wallet: watch.wallet,
+      fundingSignature: watch.fundingSignature,
+      fundingTimestamp: watch.fundingTimestamp,
+      outAmountSol: watch.qualifiedReceivedSol,
+      heliusPreferredIndex: 0,
+      tokenActions: watch.tokenActions,
+      observedTxSignatures: watch.observedTxSignatures,
+      tokenBuyObserved: true,
+      zeroSolBalanceSignatures: new Set<string>(),
+      buyTriggersEntry: false,
+      boughtAmount: watch.boughtAmount,
+      soldAmount: watch.soldAmount,
+      firstBuySignature: watch.firstBuySignature,
+      firstBuyTimestamp: watch.firstBuyTimestamp,
+      normalTinyTransferMode: false,
+      normalTinyExitPercent: null,
+      lowFundingCopySellOnSellAll: false,
+      lowFundingTinyUsdBand: null,
+      lowFundingLargeTransferMode: false,
+      postEntrySwapSignature: null,
+      postEntrySwapBaselineSignatures: new Set<string>(),
+      soldAllSignature: watch.soldAllSignature,
+    };
   }
 
   private async handleFollowTokenLargeInsiderValidWalletSellAllExit(
@@ -2568,35 +2639,18 @@ export class InsiderBot extends EventEmitter {
   ): Promise<void> {
     const li = this.followTokenLargeInsiderState;
     const funderState = this.bundlerFunderWatch;
-    if (!li?.active || li.validWallet !== wallet || !funderState) return;
-    if (watch.soldAllSignature) return;
+    if (
+      !li?.active ||
+      !this.isFollowTokenLargeInsiderTrackedValidWallet(wallet) ||
+      !funderState
+    ) {
+      return;
+    }
+    if (watch.soldAllSignature || li.exitTriggerSignature) return;
 
     const remainingAmount = await this.getRecipientTokenBalanceAtTx(
       funderState,
-      {
-        wallet,
-        fundingSignature: watch.fundingSignature,
-        fundingTimestamp: watch.fundingTimestamp,
-        outAmountSol: watch.qualifiedReceivedSol,
-        heliusPreferredIndex: 0,
-        tokenActions: watch.tokenActions,
-        observedTxSignatures: watch.observedTxSignatures,
-        tokenBuyObserved: true,
-        zeroSolBalanceSignatures: new Set<string>(),
-        buyTriggersEntry: false,
-        boughtAmount: watch.boughtAmount,
-        soldAmount: watch.soldAmount,
-        firstBuySignature: watch.firstBuySignature,
-        firstBuyTimestamp: watch.firstBuyTimestamp,
-        normalTinyTransferMode: false,
-        normalTinyExitPercent: null,
-        lowFundingCopySellOnSellAll: false,
-        lowFundingTinyUsdBand: null,
-        lowFundingLargeTransferMode: false,
-        postEntrySwapSignature: null,
-        postEntrySwapBaselineSignatures: new Set<string>(),
-        soldAllSignature: watch.soldAllSignature,
-      },
+      this.buildFollowTokenLargeInsiderRecipientWatchStub(watch),
       tx,
     );
     const soldAll =
@@ -2607,6 +2661,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     watch.soldAllSignature = tx.signature;
+    li.exitTriggerSignature = tx.signature;
     this.followTokenLargeInsiderLog("valid wallet sold all — exiting (tag-plan override)", {
       mint: li.mint,
       wallet,
@@ -2648,17 +2703,24 @@ export class InsiderBot extends EventEmitter {
   ): Promise<void> {
     const li = this.followTokenLargeInsiderState;
     const funderState = this.bundlerFunderWatch;
-    if (!li?.active || !funderState) return;
+    if (!li?.active || !funderState || li.validWalletSearchComplete) return;
+    if (li.validWallets.includes(wallet)) return;
+    if (li.validWallets.length >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS) {
+      return;
+    }
 
-    li.validWallet = wallet;
-    li.validWalletQualifiedSol = watch.qualifiedReceivedSol;
-    li.validWalletFirstBuyAt = tx.timestamp;
-    li.validWalletSolSpent = watch.solSpentOnTokenBuys;
-    this.pruneFollowTokenLargeInsiderScrapeWalletsExcept(wallet);
+    li.validWallets.push(wallet);
+    const validIndex = li.validWallets.length;
+    if (validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS) {
+      li.validWalletSearchComplete = true;
+      this.pruneFollowTokenLargeInsiderScrapeWalletsExcept(li.validWallets);
+    }
 
     this.followTokenLargeInsiderLog("valid wallet found", {
       mint: li.mint,
       wallet,
+      validIndex,
+      validWalletCount: li.validWallets.length,
       qualifiedSol: watch.qualifiedReceivedSol,
       tagPlanBuyActive: li.tagPlanBuyActive,
       signature: tx.signature,
@@ -2666,99 +2728,35 @@ export class InsiderBot extends EventEmitter {
 
     void this.sendTelegramSafe(
       [
-        `<b>🎯 ${this.label} Follow-Token Large Insider Valid Wallet</b>`,
+        `<b>🎯 ${this.label} Follow-Token Large Insider Valid Wallet #${validIndex}</b>`,
         `Token: <code>${li.mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
         `Qualified SOL: <b>${watch.qualifiedReceivedSol.toFixed(4)}</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
+        validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
+          ? `Watching <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> valid wallets — search complete.`
+          : `Watching up to <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> first buyers.`,
         li.tagPlanBuyActive
-          ? "Exit override: tag-plan MC TP disabled — sell when this wallet sells all."
-          : "Buying alongside this wallet.",
+          ? "Exit override: tag-plan MC TP disabled — sell when a watched valid wallet sells all."
+          : validIndex === 1
+            ? "Buying alongside first valid wallet · exit on ≥25% sold by either watched wallet."
+            : "Second valid wallet added · exit on ≥25% sold by either watched wallet.",
       ].join("\n"),
       "follow-token large insider valid wallet",
     );
 
     if (li.tagPlanBuyActive || this.buySubmitted) {
-      li.exitOverrideActive = true;
-      this.profitExitDisabled = true;
-      this.disableProfitExitAfterBuy = true;
-      this.scheduleFollowTokenLargeInsiderEarlySellCheck();
+      if (validIndex === 1) {
+        li.exitOverrideActive = true;
+        this.profitExitDisabled = true;
+        this.disableProfitExitAfterBuy = true;
+      }
       return;
     }
 
-    await this.emitFollowTokenLargeInsiderBuy(funderState, wallet, tx.signature, tx);
-    this.scheduleFollowTokenLargeInsiderEarlySellCheck();
-  }
-
-  private scheduleFollowTokenLargeInsiderEarlySellCheck(): void {
-    const li = this.followTokenLargeInsiderState;
-    if (!li?.active || !li.validWalletFirstBuyAt) return;
-    if (li.earlySellTimer) clearTimeout(li.earlySellTimer);
-
-    const elapsedMs =
-      Date.now() - li.validWalletFirstBuyAt * 1_000;
-    const remainingMs = Math.max(
-      0,
-      FOLLOW_TOKEN_LARGE_INSIDER_EARLY_SELL_WINDOW_SEC * 1_000 - elapsedMs,
-    );
-
-    li.earlySellTimer = setTimeout(() => {
-      void this.checkFollowTokenLargeInsiderEarlySell("timer");
-    }, remainingMs);
-  }
-
-  private async checkFollowTokenLargeInsiderEarlySell(
-    source: string,
-  ): Promise<void> {
-    const li = this.followTokenLargeInsiderState;
-    const funderState = this.bundlerFunderWatch;
-    if (
-      !li?.active ||
-      !li.validWallet ||
-      !li.validWalletQualifiedSol ||
-      !funderState ||
-      this.phase !== "holding" ||
-      this.positionSellTriggered
-    ) {
-      return;
+    if (validIndex === 1) {
+      await this.emitFollowTokenLargeInsiderBuy(funderState, wallet, tx.signature, tx);
     }
-
-    const required =
-      li.validWalletQualifiedSol *
-      FOLLOW_TOKEN_LARGE_INSIDER_MIN_BUY_SOL_FRACTION;
-    if (li.validWalletSolSpent >= required) {
-      this.followTokenLargeInsiderLog("early-sell gate passed", {
-        mint: li.mint,
-        wallet: li.validWallet,
-        spent: li.validWalletSolSpent,
-        required,
-        source,
-      });
-      return;
-    }
-
-    this.followTokenLargeInsiderLog("early-sell triggered — insufficient buy size", {
-      mint: li.mint,
-      wallet: li.validWallet,
-      spent: li.validWalletSolSpent,
-      required,
-      source,
-    });
-
-    await this.triggerPositionSell(
-      funderState.mint,
-      "follow-token large insider 50% SOL buy gate failed within 3m",
-      [
-        `<b>🚨 ${this.label} Follow-Token Large Insider Early Exit</b>`,
-        `Token: <code>${funderState.mint}</code>`,
-        `Valid wallet: <code>${li.validWallet}</code>`,
-        `Spent: <b>${li.validWalletSolSpent.toFixed(4)} SOL</b>`,
-        `Required: <b>${required.toFixed(4)} SOL</b> (50% of ${li.validWalletQualifiedSol!.toFixed(4)} SOL received)`,
-        "",
-        "Early exit — valid wallet did not deploy enough SOL within 3 minutes.",
-      ],
-      `large-insider-early-sell-${source}`,
-    );
   }
 
   private async emitFollowTokenLargeInsiderBuy(
@@ -2809,7 +2807,7 @@ export class InsiderBot extends EventEmitter {
           `Token: <code>${state.mint}</code>`,
           `Valid wallet: <code>${watchedWallet}</code>`,
           `Trigger tx: <code>${signature}</code>`,
-          "Exit: sell on valid wallet 2nd sell tx · early exit if &lt;50% SOL deployed within 3m",
+          "Exit: sell on ≥25% sold by either watched valid wallet",
         ].join("\n"),
         "follow-token large insider buy",
       );
@@ -3056,16 +3054,34 @@ export class InsiderBot extends EventEmitter {
     const watchReason = this.followTokenGmgnSecondGroupWatchReason;
     if (watchReason === FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON) {
       if (action === "buy") {
-        const li = this.followTokenLargeInsiderState;
-        if (li?.validWallet === wallet) {
-          li.validWalletSolSpent += this.extractWalletSolOutflowOnTx(wallet, tx);
-          this.scheduleFollowTokenLargeInsiderEarlySellCheck();
-        }
         return;
       }
-      await this.handleFollowTokenLargeInsiderValidWalletSecondSellExit(
+      const li = this.followTokenLargeInsiderState;
+      const scrapeWatch = li?.scrapeWatches.get(wallet);
+      if (
+        !scrapeWatch ||
+        !this.isFollowTokenLargeInsiderTrackedValidWallet(wallet) ||
+        scrapeWatch.observedTxSignatures.has(tx.signature)
+      ) {
+        return;
+      }
+      scrapeWatch.observedTxSignatures.add(tx.signature);
+      const sellAmount = this.extractTokenAmountForWallet(
+        tx,
+        wallet,
+        mint,
+        "sell",
+      );
+      scrapeWatch.tokenActions.push({
+        kind: "sell",
+        signature: tx.signature,
+        amount: sellAmount,
+      });
+      scrapeWatch.soldAmount += sellAmount;
+      await this.handleFollowTokenLargeInsiderValidWalletTwentyFivePercentSoldExit(
         wallet,
         tx,
+        scrapeWatch,
       );
       return;
     }

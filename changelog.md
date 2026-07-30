@@ -1,11 +1,20 @@
 # Changelog
 
+## 2026-07-30 (117)
+
+### Follow-token: Large Insider — 2 valid wallets, 25% sold exit, no early SOL gate
+
+- Watch up to **2** first non-tier1 buyers (search stops after 2); tier1 may fund more wallets but only the **first 2 buyers** are valid watches.
+- **Large Insider buy** exit: **≥25% sold** (holdings below 75%) on **either** watched valid wallet.
+- **Tag-plan override** exit: unchanged — **sell-all** on either watched valid wallet (scrape only).
+- **Removed:** 50% SOL deploy / 3-minute early-exit gate.
+
 ## 2026-07-30 (116)
 
-### Follow-token: Large Insider exit modes split
+### Follow-token: Large Insider exit modes split *(superseded by 117 for exit rules)*
 
-- **Large Insider buy** (bot bought alongside valid wallet): exit on valid wallet **2nd sell tx** (scrape + top-buyer watch, deduped).
-- **Tag-plan override** (tag-plan buy + valid wallet found): exit on valid wallet **sell-all** (scrape watch only).
+- **Large Insider buy:** was 2nd sell tx → now **≥25% sold** (117).
+- **Tag-plan override:** sell-all on watched valid wallet(s).
 
 ## 2026-07-30 (115)
 
@@ -20,10 +29,9 @@
 
 - When the second group has **≥2 fresh** wallets, a **Large Insider** side flow runs alongside tag-plan logic (feePayer backtrack + monitor like follow-wallet).
 - **FeePayer window:** first **10 minutes** after initial bundler funding · track **≥15 SOL** transfer-outs → tier1 scrape wallets (100SOL+ included) · feePayer **migration** allowed within the same 10m window.
-- **Chain:** tier1 sends **≥8 SOL** to up to **2** downstream wallets each · first **non-tier1** wallet to **buy** the token is valid · tier1’s own buy is ignored · any scrape wallet drops on **0 SOL** balance (children not required; already-spawned children stay watched).
-- When the second group has **≥1 fresh** wallet but no tag-plan buy (**`single_fresh_second_group`**, **`multi_fresh_insufficient_same_fee_fresh`**, etc.) → **no reset**; Large Insider continues until valid wallet, rug, or tag-plan cycle without valid wallet.
-- **Tag-plan buy + multi-fresh:** buy via tag plan **and** start Large Insider; when valid wallet found → **override** tag-plan exit (including **$250k MC TP** / +90% MC TP) · sell when valid wallet **sells all**.
-- **Large Insider-only buy:** if no tag-plan buy yet, buy alongside valid wallet · **50% SOL deploy** within **3m** of first buy or early exit · normal exit = valid wallet **2nd sell tx**.
+- **Chain:** tier1 sends **≥8 SOL** to downstream wallets · watch up to **2** first non-tier1 buyers (see **117** for exit rules).
+- When the second group has **≥1 fresh** wallet but no tag-plan buy → **no reset**; Large Insider continues.
+- Exit rules refined in **116–117** (25% sold / sell-all / 2 valid wallets / no early SOL gate).
 
 ## 2026-07-30 (113)
 
