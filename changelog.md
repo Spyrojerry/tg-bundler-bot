@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-07-30 (119)
+
+### Follow-token: GMGN bundler trader fetch limit 100
+
+- `fetchBundlerTraders` default and follow-token poll / handoff / third-group refreshes now use limit **100** (GMGN max; was **50**) via `FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT`.
+
+## 2026-07-30 (118)
+
+### Follow-token: GMGN bundler trader fetch limit 50
+
+- `fetchBundlerTraders` default and follow-token poll / handoff / third-group refreshes now use limit **50** (was **20**) via `FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT`.
+
 ## 2026-07-30 (117)
 
 ### Follow-token: Large Insider — 2 valid wallets, 25% sold exit, no early SOL gate

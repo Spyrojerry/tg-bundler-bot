@@ -422,7 +422,7 @@ export class GmgnClient {
     }
   }
 
-  async fetchBundlerTraders(mint: string, limit: number = 20): Promise<any> {
+  async fetchBundlerTraders(mint: string, limit: number = 100): Promise<any> {
     this.validateSolAddress(mint, "mint");
 
     try {

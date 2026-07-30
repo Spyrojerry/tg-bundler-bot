@@ -513,6 +513,8 @@ const ZERO_BALANCE_EPSILON_SOL = 1e-6;
 const FOLLOW_TOKEN_FEEPAYER_FUNDER_MAX_AGE_SEC = 6 * 60 * 60;
 /** Follow-token buy trigger: poll GMGN bundler traders on this interval after shared feePayer lock. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS = 1_000;
+/** Follow-token GMGN bundler trader fetch limit per poll / handoff refresh. */
+const FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT = 100;
 /** Follow-token buy trigger: bundlers must share the exact same start_holding_at second (no grace). */
 const FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC = 0;
 /** Follow-token buy trigger: second bundler group must have at least this many wallets. */
@@ -1771,7 +1773,7 @@ export class InsiderBot extends EventEmitter {
     try {
       const traders = await this.pickFollowTokenGmgnPollClient().fetchBundlerTraders(
         mint,
-        50,
+        FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT,
       );
       snapshots = this.extractGmgnBundlerTraderSnapshots(traders);
     } catch (err) {
@@ -2911,7 +2913,7 @@ export class InsiderBot extends EventEmitter {
     try {
       const traders = await this.pickFollowTokenGmgnPollClient().fetchBundlerTraders(
         mint,
-        50,
+        FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT,
       );
       snapshots = this.extractGmgnBundlerTraderSnapshots(traders);
     } catch (err) {
@@ -5642,7 +5644,7 @@ export class InsiderBot extends EventEmitter {
     try {
       const traders = await this.pickFollowTokenGmgnPollClient().fetchBundlerTraders(
         state.mint,
-        50,
+        FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT,
       );
       const snapshots = this.extractGmgnBundlerTraderSnapshots(traders);
       const groups = groupGmgnBundlersByStartHoldingAt(
