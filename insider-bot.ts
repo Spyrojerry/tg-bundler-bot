@@ -2493,10 +2493,28 @@ export class InsiderBot extends EventEmitter {
     );
     watch.tokenActions.push({ kind: "sell", signature: tx.signature, amount: sellAmount });
     watch.soldAmount += sellAmount;
-    await this.handleFollowTokenLargeInsiderValidWalletSell(wallet, tx);
+    if (this.isFollowTokenLargeInsiderBuyExitMode()) {
+      await this.handleFollowTokenLargeInsiderValidWalletSecondSellExit(
+        wallet,
+        tx,
+      );
+    } else if (li.exitOverrideActive) {
+      await this.handleFollowTokenLargeInsiderValidWalletSellAllExit(
+        wallet,
+        tx,
+        watch,
+      );
+    }
   }
 
-  private async handleFollowTokenLargeInsiderValidWalletSell(
+  private isFollowTokenLargeInsiderBuyExitMode(): boolean {
+    return (
+      this.followTokenGmgnSecondGroupWatchReason ===
+      FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON
+    );
+  }
+
+  private async handleFollowTokenLargeInsiderValidWalletSecondSellExit(
     wallet: string,
     tx: HeliusTransaction,
   ): Promise<void> {
@@ -2538,6 +2556,73 @@ export class InsiderBot extends EventEmitter {
         `2nd sell tx: <code>${tx.signature}</code>`,
         "",
         "Valid wallet 2nd sell — selling full position.",
+      ],
+      tx.signature,
+    );
+  }
+
+  private async handleFollowTokenLargeInsiderValidWalletSellAllExit(
+    wallet: string,
+    tx: HeliusTransaction,
+    watch: FollowTokenLargeInsiderScrapeWatch,
+  ): Promise<void> {
+    const li = this.followTokenLargeInsiderState;
+    const funderState = this.bundlerFunderWatch;
+    if (!li?.active || li.validWallet !== wallet || !funderState) return;
+    if (watch.soldAllSignature) return;
+
+    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
+      funderState,
+      {
+        wallet,
+        fundingSignature: watch.fundingSignature,
+        fundingTimestamp: watch.fundingTimestamp,
+        outAmountSol: watch.qualifiedReceivedSol,
+        heliusPreferredIndex: 0,
+        tokenActions: watch.tokenActions,
+        observedTxSignatures: watch.observedTxSignatures,
+        tokenBuyObserved: true,
+        zeroSolBalanceSignatures: new Set<string>(),
+        buyTriggersEntry: false,
+        boughtAmount: watch.boughtAmount,
+        soldAmount: watch.soldAmount,
+        firstBuySignature: watch.firstBuySignature,
+        firstBuyTimestamp: watch.firstBuyTimestamp,
+        normalTinyTransferMode: false,
+        normalTinyExitPercent: null,
+        lowFundingCopySellOnSellAll: false,
+        lowFundingTinyUsdBand: null,
+        lowFundingLargeTransferMode: false,
+        postEntrySwapSignature: null,
+        postEntrySwapBaselineSignatures: new Set<string>(),
+        soldAllSignature: watch.soldAllSignature,
+      },
+      tx,
+    );
+    const soldAll =
+      (remainingAmount !== null && remainingAmount <= 0) ||
+      (watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount);
+    if (!soldAll || this.phase !== "holding" || this.positionSellTriggered) {
+      return;
+    }
+
+    watch.soldAllSignature = tx.signature;
+    this.followTokenLargeInsiderLog("valid wallet sold all — exiting (tag-plan override)", {
+      mint: li.mint,
+      wallet,
+      signature: tx.signature,
+    });
+
+    await this.triggerPositionSell(
+      funderState.mint,
+      "follow-token large insider valid wallet sold all (tag-plan override)",
+      [
+        `<b>🚨 ${this.label} Follow-Token Large Insider Exit</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        `Valid wallet: <code>${wallet}</code>`,
+        `Tx: <code>${tx.signature}</code>`,
+        "",
+        "Tag-plan override: valid wallet sold all — selling full position.",
       ],
       tx.signature,
     );
@@ -2587,7 +2672,7 @@ export class InsiderBot extends EventEmitter {
         `Qualified SOL: <b>${watch.qualifiedReceivedSol.toFixed(4)}</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
         li.tagPlanBuyActive
-          ? "Exit override: tag-plan MC TP disabled — sell on valid wallet 2nd sell tx."
+          ? "Exit override: tag-plan MC TP disabled — sell when this wallet sells all."
           : "Buying alongside this wallet.",
       ].join("\n"),
       "follow-token large insider valid wallet",
@@ -2978,7 +3063,10 @@ export class InsiderBot extends EventEmitter {
         }
         return;
       }
-      await this.handleFollowTokenLargeInsiderValidWalletSell(wallet, tx);
+      await this.handleFollowTokenLargeInsiderValidWalletSecondSellExit(
+        wallet,
+        tx,
+      );
       return;
     }
 
