@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-07-31 (121)
+
+### Follow-token: Large Insider — tier1 buys, 5 valid wallets, first-buy window
+
+- **Tier1** scrape wallets (15SOL+ feePayer outs) can be **valid buyers** — same buy / sell rules as chain wallets (25% sold / sell-all override).
+- Watch up to **5** valid buyers (tier1 or non-tier1); search stops after 5; **any** watched wallet hitting exit rules triggers sell.
+- FeePayer **10m window** starts at **earliest initial-bundler first buy** (Helius early insider buys), not bundler funding receive time.
+
 ## 2026-07-30 (120)
 
 ### Follow-token: Helius confirm for insufficient second group
