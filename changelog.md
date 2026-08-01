@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-08-01 (125)
+
+### Follow-token: Large Insider — ignore SOL returns to feePayer
+
+- Scrape-wallet SOL outs **to the shared feePayer** do not spawn chain watches (no duplicate feePayer scrape subscription).
+- Tracks each scrape wallet's **last SOL transfer-out**; on **zero balance** when that final out was to the feePayer, the scrape watch is removed and the feePayer remains on the **primary** bundler-funder watch only.
+- Large-drain handoffs and tier1 adds also skip **returns to the original shared feePayer** (no re-subscribe after migration).
+
+## 2026-08-01 (124)
+
+### Follow-token: Large Insider after insufficient second group (except 4-wallet)
+
+- When Helius confirm times out on **&lt;5** wallet second groups, **`second_group_insufficient_wallets_*`** now starts **Large Insider** instead of reset — **except** **`second_group_insufficient_wallets_4`** (late-odd candidate still resets).
+
+## 2026-08-01 (123)
+
+### Follow-token: Large Insider chain watches require ≥8 SOL from scrape parent
+
+- Downstream wallets are only scrape-watched when a **tier1 or chain scrape wallet** sends **≥8 SOL** to them; parent must already be on the scrape watch list (rejects orphans / sub-threshold outs). Chain continues tier1 → chain → chain (≤2 children per wallet).
+
+## 2026-08-01 (122)
+
+### Follow-token: Large Insider feePayer sync — 100 txs after last bundler funding
+
+- Large Insider flow start uses a dedicated feePayer REST sync (not the normal 20-tx sync): **`after-signature`** = last shared-feePayer → bundler funding tx, up to **100** txs.
+
 ## 2026-07-31 (121)
 
 ### Follow-token: Large Insider — tier1 buys, 5 valid wallets, first-buy window

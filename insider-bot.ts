@@ -121,6 +121,7 @@ const FOLLOW_TOKEN_SECOND_GROUP_BUY_TX_TIMESTAMP_TOLERANCE_SEC = 2;
 const FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL = 15;
 const FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL = 8;
 const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC = 10 * 60;
+const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_SYNC_LIMIT = 100;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS = 5;
 const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION = 0.25;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
@@ -147,6 +148,8 @@ interface FollowTokenLargeInsiderScrapeWatch {
   }>;
   observedTxSignatures: Set<string>;
   soldAllSignature: string | null;
+  /** Last SOL transfer-out recipient on this scrape wallet (for feePayer return detection). */
+  lastSolTransferOutTo: string | null;
 }
 
 interface FollowTokenLargeInsiderState {
@@ -2090,6 +2093,40 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  /** Helius confirm exhausted — defer to Large Insider except 4-wallet (late-odd candidate). */
+  private shouldStartLargeInsiderForInsufficientSecondGroup(
+    walletCount: number,
+  ): boolean {
+    return walletCount !== FOLLOW_TOKEN_GMGN_LATE_ODD_GROUP_WALLET_COUNT;
+  }
+
+  private async deferFollowTokenToLargeInsiderAfterInsufficientSecondGroup(
+    state: BundlerFunderWatchState,
+    secondGroup: GmgnBundlerTimestampGroup,
+    reason: string,
+    logData: Record<string, unknown>,
+  ): Promise<void> {
+    this.followTokenGmgnSecondGroupHeliusConfirm = null;
+    this.followTokenGmgnSecondGroup = secondGroup;
+    await this.startFollowTokenLargeInsiderFlow(
+      state,
+      secondGroup,
+      reason,
+      false,
+    );
+    this.stopFollowTokenGmgnBundlerPoll(
+      "large insider flow — insufficient second group",
+    );
+    this.followTokenGmgnBundlerBackend(
+      "GMGN second group insufficient — deferred to large insider flow",
+      {
+        mint: state.mint,
+        reason,
+        ...logData,
+      },
+    );
+  }
+
   private async stopFollowTokenLargeInsiderFlow(reason: string): Promise<void> {
     const state = this.followTokenLargeInsiderState;
     if (!state?.active) return;
@@ -2195,7 +2232,7 @@ export class InsiderBot extends EventEmitter {
 
     watchState.discoveryStopped = false;
     this.subscribeBundlerFunder(watchState.funderWallet);
-    await this.syncBundlerFunderTransactions(true);
+    await this.syncFollowTokenLargeInsiderFeePayerTransactions();
 
     this.followTokenLargeInsiderLog("flow started", {
       mint: funderState.mint,
@@ -2213,7 +2250,7 @@ export class InsiderBot extends EventEmitter {
         `Trigger: <code>${triggerReason}</code>`,
         `FeePayer: <code>${watchState.funderWallet}</code>`,
         `Window: first <b>${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m</b> after initial bundler first buy · ≥<b>${FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL} SOL</b> outs`,
-        `Chain: ≥<b>${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL</b> downstream → watch up to <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> buyers (tier1 or chain)`,
+        `Chain: each scrape wallet may spawn ≤${FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET} downstream watches only on **≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL** outs (tier1 → chain → chain…)`,
         tagPlanBuyActive
           ? "Tag-plan buy already active — valid wallet will override exit."
           : "Waiting for valid wallet to buy alongside.",
@@ -2310,6 +2347,87 @@ export class InsiderBot extends EventEmitter {
     return true;
   }
 
+  private async resolveFollowTokenLargeInsiderLastBundlerFundingSignature(
+    state: BundlerFunderWatchState,
+  ): Promise<string | null> {
+    const earlyBuys = this.followTokenEarlyInsiderBuys;
+    if (earlyBuys && earlyBuys.length >= BUNDLER_FUNDER_REQUIRED_COUNT) {
+      const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
+      const resolved = await this.resolveBundlerFundingRecordsSequential(
+        state.mint,
+        firstFour,
+      );
+      if (resolved) {
+        const records = resolved.filter(
+          (record): record is BundlerFundingRecord => record !== null,
+        );
+        if (records.length > 0) {
+          const latest = records.reduce((best, record) =>
+            record.timestamp > best.timestamp ? record : best,
+          );
+          return latest.fundingSignature;
+        }
+      }
+    }
+    if (state.cursorSignature) return state.cursorSignature;
+    return state.earliestFundingSignature || null;
+  }
+
+  /** Large Insider start only: REST backfill from last bundler-funding tx (after-signature), up to 100 txs. */
+  private async syncFollowTokenLargeInsiderFeePayerTransactions(): Promise<void> {
+    const state = this.bundlerFunderWatch;
+    if (!state || !this.followTokenLargeInsiderState?.active) return;
+    if (state.discoveryStopped) return;
+
+    const afterSignature =
+      await this.resolveFollowTokenLargeInsiderLastBundlerFundingSignature(state);
+    if (!afterSignature) {
+      this.followTokenLargeInsiderLog(
+        "feePayer sync skipped — no bundler funding anchor signature",
+        { mint: state.mint },
+      );
+      return;
+    }
+
+    const syncingWallet = state.funderWallet;
+    try {
+      const txs = await this.withHeliusFallback((client) =>
+        client.getAddressTransactionsAsc(
+          syncingWallet,
+          afterSignature,
+          FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_SYNC_LIMIT,
+        ),
+      );
+      let inspected = 0;
+      for (const tx of txs) {
+        if (state.funderWallet !== syncingWallet) break;
+        if (state.processedSignatures.has(tx.signature)) continue;
+        state.processedSignatures.add(tx.signature);
+        state.cursorSignature = tx.signature;
+        const migrated = await this.inspectBundlerFunderTransaction(state, tx);
+        inspected += 1;
+        if (migrated) break;
+        if (state.discoveryStopped || !this.bundlerFunderWatch) break;
+      }
+      this.followTokenLargeInsiderLog("feePayer REST sync completed", {
+        mint: state.mint,
+        funderWallet: syncingWallet,
+        afterSignature,
+        fetchedTxCount: txs.length,
+        inspectedTxCount: inspected,
+        syncLimit: FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_SYNC_LIMIT,
+      });
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.followTokenLargeInsiderLog("feePayer REST sync failed", {
+        mint: state.mint,
+        funderWallet: syncingWallet,
+        afterSignature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   private isFollowTokenLargeInsiderFeePayerWindowOpen(
     txTimestamp: number,
   ): boolean {
@@ -2319,6 +2437,39 @@ export class InsiderBot extends EventEmitter {
       txTimestamp >= li.bundlerFirstBuyAnchorTimestamp &&
       txTimestamp <= li.feePayerWindowEndsAt
     );
+  }
+
+  private isFollowTokenLargeInsiderSharedFeePayer(wallet: string): boolean {
+    const state = this.bundlerFunderWatch;
+    if (!state) return false;
+    return wallet === state.originalFunderWallet;
+  }
+
+  private recordFollowTokenLargeInsiderScrapeSolTransferOut(
+    watch: FollowTokenLargeInsiderScrapeWatch,
+    tx: HeliusTransaction,
+    wallet: string,
+    funderState: BundlerFunderWatchState,
+  ): { to: string; amountSol: number } | null {
+    const transferOut = this.extractSolTransferOutFromWallet(tx, wallet, 0);
+    if (!transferOut || this.hasSolIncomingToWallet(tx, wallet)) return null;
+
+    watch.lastSolTransferOutTo = transferOut.to;
+
+    if (this.isFollowTokenLargeInsiderSharedFeePayer(transferOut.to)) {
+      this.followTokenLargeInsiderLog(
+        "scrape wallet SOL return to feePayer — ignored for chain spawn",
+        {
+          mint: funderState.mint,
+          wallet,
+          feePayer: transferOut.to,
+          amountSol: transferOut.amountSol,
+          signature: tx.signature,
+        },
+      );
+    }
+
+    return transferOut;
   }
 
   private async handleFollowTokenLargeInsiderFeePayerTransferOut(
@@ -2337,6 +2488,7 @@ export class InsiderBot extends EventEmitter {
     }
     if (state.bundlerWallets.has(transferOut.to)) return;
     if (this.hasSolIncomingToWallet(tx, state.funderWallet)) return;
+    if (this.isFollowTokenLargeInsiderSharedFeePayer(transferOut.to)) return;
 
     this.addFollowTokenLargeInsiderTier1Wallet(
       transferOut.to,
@@ -2373,6 +2525,7 @@ export class InsiderBot extends EventEmitter {
       tokenActions: [],
       observedTxSignatures: new Set<string>(),
       soldAllSignature: null,
+      lastSolTransferOutTo: null,
     };
     li.scrapeWatches.set(wallet, watch);
     this.subscribeFollowTokenLargeInsiderScrapeWallet(wallet);
@@ -2393,14 +2546,50 @@ export class InsiderBot extends EventEmitter {
   ): FollowTokenLargeInsiderScrapeWatch | null {
     const li = this.followTokenLargeInsiderState;
     if (!li?.active) return null;
-    if (li.scrapeWatches.has(wallet)) return li.scrapeWatches.get(wallet)!;
+    if (this.isFollowTokenLargeInsiderSharedFeePayer(wallet)) {
+      this.followTokenLargeInsiderLog(
+        "chain recipient rejected — target is shared feePayer",
+        { mint: li.mint, wallet, fundedBy, receivedSol },
+      );
+      return null;
+    }
+    if (receivedSol < FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL) {
+      this.followTokenLargeInsiderLog("chain recipient rejected — below min SOL", {
+        mint: li.mint,
+        wallet,
+        fundedBy,
+        receivedSol,
+        minChainOutSol: FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL,
+      });
+      return null;
+    }
 
     const parent = li.scrapeWatches.get(fundedBy);
+    if (!parent) {
+      this.followTokenLargeInsiderLog(
+        "chain recipient rejected — funder not on scrape watch list",
+        {
+          mint: li.mint,
+          wallet,
+          fundedBy,
+          receivedSol,
+        },
+      );
+      return null;
+    }
+    if (li.scrapeWatches.has(wallet)) return li.scrapeWatches.get(wallet)!;
+
     if (
-      parent &&
       parent.childWallets.length >=
-        FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET
+      FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET
     ) {
+      this.followTokenLargeInsiderLog("chain recipient rejected — parent child cap", {
+        mint: li.mint,
+        wallet,
+        fundedBy,
+        receivedSol,
+        maxChildrenPerWallet: FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET,
+      });
       return null;
     }
 
@@ -2419,9 +2608,10 @@ export class InsiderBot extends EventEmitter {
       tokenActions: [],
       observedTxSignatures: new Set<string>(),
       soldAllSignature: null,
+      lastSolTransferOutTo: null,
     };
     li.scrapeWatches.set(wallet, watch);
-    if (parent) parent.childWallets.push(wallet);
+    parent.childWallets.push(wallet);
     this.subscribeFollowTokenLargeInsiderScrapeWallet(wallet);
 
     this.followTokenLargeInsiderLog("chain 8SOL+ recipient added", {
@@ -2523,16 +2713,27 @@ export class InsiderBot extends EventEmitter {
     lamports: bigint,
   ): Promise<void> {
     const li = this.followTokenLargeInsiderState;
+    const funderState = this.bundlerFunderWatch;
     if (!li?.active || lamports > 0n) return;
     if (li.validWallets.includes(wallet)) return;
-    if (!li.scrapeWatches.has(wallet)) return;
+    const watch = li.scrapeWatches.get(wallet);
+    if (!watch) return;
+
+    const returnedToFeePayer =
+      !!funderState &&
+      !!watch.lastSolTransferOutTo &&
+      watch.lastSolTransferOutTo === funderState.originalFunderWallet;
 
     this.followTokenLargeInsiderLog(
-      "scrape wallet zero balance — removing (no child spawn required)",
+      returnedToFeePayer
+        ? "scrape wallet zero balance after SOL return to feePayer — removing watch (feePayer stays on primary watch only)"
+        : "scrape wallet zero balance — removing (no child spawn required)",
       {
         mint: li.mint,
         wallet,
-        hadChildren: li.scrapeWatches.get(wallet)?.childWallets.length ?? 0,
+        feePayer: funderState?.originalFunderWallet ?? null,
+        lastSolTransferOutTo: watch.lastSolTransferOutTo,
+        hadChildren: watch.childWallets.length,
       },
     );
     this.unsubscribeFollowTokenLargeInsiderScrapeWallet(wallet);
@@ -2551,15 +2752,21 @@ export class InsiderBot extends EventEmitter {
     if (watch.observedTxSignatures.has(tx.signature)) return;
     watch.observedTxSignatures.add(tx.signature);
 
-    const chainOut = this.extractSolTransferOutFromWallet(
+    const solTransferOut = this.recordFollowTokenLargeInsiderScrapeSolTransferOut(
+      watch,
       tx,
       wallet,
-      FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL,
+      funderState,
     );
+    const chainOut =
+      solTransferOut &&
+      solTransferOut.amountSol >= FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL
+        ? solTransferOut
+        : null;
     if (
       chainOut &&
       !funderState.bundlerWallets.has(chainOut.to) &&
-      !this.hasSolIncomingToWallet(tx, wallet)
+      !this.isFollowTokenLargeInsiderSharedFeePayer(chainOut.to)
     ) {
       this.addFollowTokenLargeInsiderChainWallet(
         chainOut.to,
@@ -4995,7 +5202,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, Helius confirm if below min): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) 1 fresh or ≥2 fresh insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder. Large Insider: feePayer ≥15SOL outs (10m after initial bundler first buy) → 8SOL+ chain → up to 5 valid buyers (tier1 or chain). 0 fresh → no buy (except late odd). Round/dust gates disabled.`
+            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, Helius confirm if below min): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) 1 fresh or ≥2 fresh insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder. Large Insider: feePayer ≥15SOL outs (10m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs from scrape wallets (tier1→chain→…). 0 fresh → no buy (except late odd). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -6086,22 +6293,39 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
+      const insufficientReason = `second_group_insufficient_wallets_${secondGroupCandidate.wallets.length}`;
+      const insufficientLogData = {
+        firstGroupTimestamp: initialGroup.anchorTimestamp,
+        nextGroupTimestamp: secondGroupCandidate.anchorTimestamp,
+        nextGroupWalletCount: secondGroupCandidate.wallets.length,
+        nextGroupWallets: secondGroupCandidate.wallets,
+        minSecondGroupWallets:
+          FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
+        gteTime: confirmState.gteTime,
+        lteTime: confirmState.lteTime,
+        confirmElapsedSec: Math.floor(confirmElapsedSec),
+        heliusConfirm: heliusConfirm.summary,
+        groups: this.summarizeGmgnBundlerGroupsForLog(groups),
+      };
+
+      if (
+        this.shouldStartLargeInsiderForInsufficientSecondGroup(
+          secondGroupCandidate.wallets.length,
+        )
+      ) {
+        await this.deferFollowTokenToLargeInsiderAfterInsufficientSecondGroup(
+          state,
+          secondGroupCandidate,
+          insufficientReason,
+          insufficientLogData,
+        );
+        return;
+      }
+
       await this.resetFollowTokenAfterGmgnFilterFailed(
         state.mint,
-        `second_group_insufficient_wallets_${secondGroupCandidate.wallets.length}`,
-        {
-          firstGroupTimestamp: initialGroup.anchorTimestamp,
-          nextGroupTimestamp: secondGroupCandidate.anchorTimestamp,
-          nextGroupWalletCount: secondGroupCandidate.wallets.length,
-          nextGroupWallets: secondGroupCandidate.wallets,
-          minSecondGroupWallets:
-            FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
-          gteTime: confirmState.gteTime,
-          lteTime: confirmState.lteTime,
-          confirmElapsedSec: Math.floor(confirmElapsedSec),
-          heliusConfirm: heliusConfirm.summary,
-          groups: this.summarizeGmgnBundlerGroupsForLog(groups),
-        },
+        insufficientReason,
+        insufficientLogData,
       );
       return;
     } catch (err) {
@@ -8393,6 +8617,24 @@ export class InsiderBot extends EventEmitter {
   ): Promise<boolean> {
     if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return false;
     if (!transferOut.to || transferOut.to === state.funderWallet) return false;
+    if (
+      this.followTokenLargeInsiderState?.active &&
+      this.flowSource === "follow-token" &&
+      this.isFollowTokenLargeInsiderSharedFeePayer(transferOut.to)
+    ) {
+      this.log.info(
+        "Follow-token large insider feePayer handoff skipped — drain returned to original shared feePayer",
+        {
+          mint: state.mint,
+          watchedWallet: state.funderWallet,
+          originalFunderWallet: state.originalFunderWallet,
+          signature: tx.signature,
+          amountSol: transferOut.amountSol,
+          recipient: transferOut.to,
+        },
+      );
+      return false;
+    }
     try {
       const drained = await this.isFunderWalletDrainedAfterTx(
         state.funderWallet,
