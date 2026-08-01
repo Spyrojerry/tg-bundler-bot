@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-08-01 (132)
+
+### Follow-token: reset when Large Insider fails to start
+
+- Tag-plan defer and insufficient-second-group defer now call **`resetForNewToken`** when shared feePayer lock fails (`large_insider_feePayer_lock_failed`), instead of leaving the token in zombie pre-buy MC monitoring.
+
+## 2026-08-01 (131)
+
+### Follow-token: Large Insider — skip any valid wallet when first buy &gt;10 SOL
+
+- **Tier1 and chain** scrape wallets are not promoted to valid Large Insider buyers when their **first token buy** spends **&gt;10 SOL** (was tier1-only).
+
 ## 2026-08-01 (130)
 
 ### Follow-token: Telegram on insufficient second group pass / fail
@@ -17,7 +29,7 @@
 
 ### Follow-token: Large Insider — skip tier1 valid wallet when first buy &gt;10 SOL
 
-- **Tier1** scrape wallets (direct feePayer ≥15 SOL outs) are not promoted to valid Large Insider buyers when their **first token buy** spends **&gt;10 SOL**.
+- **Tier1** scrape wallets (direct feePayer ≥15 SOL outs) are not promoted to valid Large Insider buyers when their **first token buy** spends **&gt;10 SOL**. Superseded by **131** (all scrape tiers).
 
 ## 2026-08-01 (127)
 

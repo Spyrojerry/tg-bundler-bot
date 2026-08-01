@@ -127,8 +127,8 @@ const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_SYNC_LIMIT = 100;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS = 5;
 const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION = 0.25;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
-/** Tier1 scrape wallets with first buy above this SOL are not valid Large Insider buyers. */
-const FOLLOW_TOKEN_LARGE_INSIDER_MAX_TIER1_FIRST_BUY_SOL = 10;
+/** Scrape wallets (tier1 or chain) with first buy above this SOL are not valid Large Insider buyers. */
+const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL = 10;
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON =
   "follow_token_large_insider_valid_wallet";
 
@@ -2074,6 +2074,24 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  private async resetFollowTokenAfterLargeInsiderStartFailed(
+    mint: string,
+    triggerReason: string,
+    pollStopReason: string,
+    options?: { skipTelegram?: boolean },
+  ): Promise<void> {
+    this.stopFollowTokenGmgnBundlerPoll(pollStopReason);
+    this.followTokenGmgnBundlerBackend(
+      "Large Insider failed to start — resetting follow-token flow",
+      { mint, triggerReason },
+    );
+    await this.stopFollowTokenTopBuyerWatch("large insider flow failed to start");
+    await this.resetForNewToken(false, {
+      reason: "large_insider_feePayer_lock_failed",
+      skipTelegram: options?.skipTelegram,
+    });
+  }
+
   private async deferFollowTokenToLargeInsiderAfterInsufficientSecondGroup(
     state: BundlerFunderWatchState,
     secondGroup: GmgnBundlerTimestampGroup,
@@ -2099,6 +2117,15 @@ export class InsiderBot extends EventEmitter {
         feePayer: largeInsiderStarted ? state.funderWallet : null,
       },
     );
+    if (!largeInsiderStarted) {
+      await this.resetFollowTokenAfterLargeInsiderStartFailed(
+        state.mint,
+        reason,
+        "large insider flow — insufficient second group failed",
+        { skipTelegram: true },
+      );
+      return;
+    }
     this.stopFollowTokenGmgnBundlerPoll(
       "large insider flow — insufficient second group",
     );
@@ -2846,7 +2873,7 @@ export class InsiderBot extends EventEmitter {
         watch.firstBuySignature = tx.signature;
         watch.firstBuyTimestamp = tx.timestamp;
         if (
-          this.shouldSkipFollowTokenLargeInsiderTier1ValidWalletBuy(
+          this.shouldSkipFollowTokenLargeInsiderValidWalletBuy(
             watch,
             tx,
             wallet,
@@ -2906,27 +2933,28 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private shouldSkipFollowTokenLargeInsiderTier1ValidWalletBuy(
+  private shouldSkipFollowTokenLargeInsiderValidWalletBuy(
     watch: FollowTokenLargeInsiderScrapeWatch,
     tx: HeliusTransaction,
     wallet: string,
   ): boolean {
-    if (!watch.tier1DirectFromFeePayer) return false;
     const buySol = this.estimateEarlyBuySol(tx, wallet);
     if (
       buySol === null ||
-      buySol <= FOLLOW_TOKEN_LARGE_INSIDER_MAX_TIER1_FIRST_BUY_SOL
+      buySol <= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL
     ) {
       return false;
     }
     const li = this.followTokenLargeInsiderState;
     this.followTokenLargeInsiderLog(
-      "tier1 first buy skipped — above max SOL for valid wallet",
+      "scrape wallet first buy skipped — above max SOL for valid wallet",
       {
         mint: li?.mint ?? null,
         wallet,
         buySol,
-        maxTier1FirstBuySol: FOLLOW_TOKEN_LARGE_INSIDER_MAX_TIER1_FIRST_BUY_SOL,
+        tier1DirectFromFeePayer: watch.tier1DirectFromFeePayer,
+        maxValidWalletFirstBuySol:
+          FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL,
         signature: tx.signature,
       },
     );
@@ -6345,12 +6373,21 @@ export class InsiderBot extends EventEmitter {
           this.shouldDeferFollowTokenResetForLargeInsider(watchPlan, freshCount)
         ) {
           this.followTokenGmgnSecondGroup = secondGroup;
-          await this.startFollowTokenLargeInsiderFlow(
+          const largeInsiderStarted = await this.startFollowTokenLargeInsiderFlow(
             state,
             secondGroup,
             watchPlan.reason,
             false,
           );
+          if (!largeInsiderStarted) {
+            await this.resetFollowTokenAfterLargeInsiderStartFailed(
+              state.mint,
+              watchPlan.reason,
+              "large insider flow — tag plan defer failed",
+              { skipTelegram: true },
+            );
+            return;
+          }
           this.stopFollowTokenGmgnBundlerPoll(
             "large insider flow — tag plan deferred",
           );
