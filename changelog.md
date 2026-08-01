@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-08-01 (127)
+
+### Bundler feePayer funding selection — require &gt;15 SOL
+
+- Post-zero funding window now picks the **most recent transfer with effective funding &gt;15 SOL** (not merely the latest incoming transfer). Bundlers with no qualifying transfer fail funding record resolution.
+
+## 2026-08-01 (126)
+
+### Follow-token: Telegram on every Large Insider start attempt
+
+- **Large Insider Flow Started** Telegram on successful start (all entry paths: tag-plan defer, insufficient second group, parallel with tag-plan buy).
+- **Large Insider Flow Failed To Start** Telegram when shared feePayer lock fails (e.g. split bundler funding).
+
 ## 2026-08-01 (125)
 
 ### Follow-token: Large Insider — ignore SOL returns to feePayer

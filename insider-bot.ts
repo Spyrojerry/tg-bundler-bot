@@ -31,6 +31,8 @@ const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
 const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
+/** Post-zero bundler funding window: selected tx must exceed this SOL (most recent qualifying transfer wins). */
+const BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL = 15;
 /** Of the BUNDLER_FUNDER_REQUIRED_COUNT (4) early bundler funding records, at least this many must share the exact same feePayer for the shared-feePayer watch to start. Relaxed from requiring all 4 to match, since a single outlier (e.g. one bundler additionally/separately funded from an unrelated wallet) shouldn't block an otherwise-clear shared-feePayer pattern. The majority feePayer's records are used for the watch; any non-matching outlier record is ignored (its bundler wallet is still tracked as an early buyer, just not as a funding source). */
 const BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS = 3;
@@ -2161,6 +2163,57 @@ export class InsiderBot extends EventEmitter {
     this.log.warn(`Follow-token large insider: ${message}`, meta ?? {});
   }
 
+  private sendFollowTokenLargeInsiderFlowTelegram(
+    outcome: "started" | "feePayer_lock_failed",
+    mint: string,
+    triggerReason: string,
+    options: {
+      feePayer?: string | null;
+      tagPlanBuyActive?: boolean;
+      bundlerFirstBuyAnchorTimestamp?: number;
+      feePayerWindowEndsAt?: number;
+      secondGroupWalletCount?: number;
+    } = {},
+  ): void {
+    if (outcome === "started") {
+      void this.sendTelegramSafe(
+        [
+          `<b>🔎 ${this.label} Follow-Token Large Insider Flow Started</b>`,
+          `Token: <code>${mint}</code>`,
+          `Trigger: <code>${triggerReason}</code>`,
+          options.feePayer
+            ? `FeePayer: <code>${options.feePayer}</code>`
+            : "",
+          options.bundlerFirstBuyAnchorTimestamp !== undefined &&
+          options.feePayerWindowEndsAt !== undefined
+            ? `Window: first <b>${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m</b> after initial bundler first buy · ≥<b>${FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL} SOL</b> outs`
+            : "",
+          `Chain: each scrape wallet may spawn ≤${FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET} downstream watches only on **≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL** outs (tier1 → chain → chain…)`,
+          options.secondGroupWalletCount !== undefined
+            ? `Second group wallets: <b>${options.secondGroupWalletCount}</b>`
+            : "",
+          options.tagPlanBuyActive
+            ? "Tag-plan buy already active — valid wallet will override exit."
+            : "Waiting for valid wallet to buy alongside.",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        "follow-token large insider flow started",
+      );
+      return;
+    }
+
+    void this.sendTelegramSafe(
+      [
+        `<b>⚠️ ${this.label} Follow-Token Large Insider Flow Failed To Start</b>`,
+        `Token: <code>${mint}</code>`,
+        `Trigger: <code>${triggerReason}</code>`,
+        "Reason: <b>shared feePayer lock failed</b> (need ≥3/4 bundlers funded by same feePayer).",
+      ].join("\n"),
+      "follow-token large insider flow failed to start",
+    );
+  }
+
   private resolveFollowTokenLargeInsiderBundlerFirstBuyAnchorTimestamp(): number {
     const earlyBuys = this.followTokenEarlyInsiderBuys;
     if (earlyBuys?.length) {
@@ -2201,6 +2254,11 @@ export class InsiderBot extends EventEmitter {
       this.followTokenLargeInsiderLog(
         "feePayer lock failed — large insider flow not started",
         { mint: funderState.mint, triggerReason },
+      );
+      this.sendFollowTokenLargeInsiderFlowTelegram(
+        "feePayer_lock_failed",
+        funderState.mint,
+        triggerReason,
       );
       return;
     }
@@ -2243,19 +2301,18 @@ export class InsiderBot extends EventEmitter {
       secondGroupWallets: secondGroup.wallets.length,
     });
 
-    void this.sendTelegramSafe(
-      [
-        `<b>🔎 ${this.label} Follow-Token Large Insider Flow Started</b>`,
-        `Token: <code>${funderState.mint}</code>`,
-        `Trigger: <code>${triggerReason}</code>`,
-        `FeePayer: <code>${watchState.funderWallet}</code>`,
-        `Window: first <b>${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m</b> after initial bundler first buy · ≥<b>${FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL} SOL</b> outs`,
-        `Chain: each scrape wallet may spawn ≤${FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET} downstream watches only on **≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL** outs (tier1 → chain → chain…)`,
-        tagPlanBuyActive
-          ? "Tag-plan buy already active — valid wallet will override exit."
-          : "Waiting for valid wallet to buy alongside.",
-      ].join("\n"),
-      "follow-token large insider flow started",
+    this.sendFollowTokenLargeInsiderFlowTelegram(
+      "started",
+      funderState.mint,
+      triggerReason,
+      {
+        feePayer: watchState.funderWallet,
+        tagPlanBuyActive,
+        bundlerFirstBuyAnchorTimestamp: anchorTimestamp,
+        feePayerWindowEndsAt:
+          anchorTimestamp + FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC,
+        secondGroupWalletCount: secondGroup.wallets.length,
+      },
     );
   }
 
@@ -4463,7 +4520,7 @@ export class InsiderBot extends EventEmitter {
           `Follow wallet: <code>${followedWallet}</code>`,
         `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
         "",
-        "Finding each bundler's zero-balance funding window, selecting the latest valid funding transfer in that window, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs for recipient buy confirmation.",
+        "Finding each bundler's zero-balance funding window, selecting the latest post-zero funding transfer above 15 SOL, requiring those funding txs to share one feePayer, then watching that feePayer's transfer-outs for recipient buy confirmation.",
       ].filter(Boolean).join("\n"),
       "flow-start notification",
     );
@@ -5629,7 +5686,32 @@ export class InsiderBot extends EventEmitter {
       return null;
     }
 
-    const selected = candidates[0];
+    const qualifiedCandidates = candidates.filter(
+      (candidate) =>
+        candidate.effectiveFundingSol > BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL,
+    );
+    if (!qualifiedCandidates.length) {
+      this.log.warn(
+        "No post-zero funding transfer above min selected SOL for bundler",
+        {
+          mint,
+          bundlerWallet: buy.wallet,
+          bundlerBuySignature: buy.signature,
+          zeroBoundary,
+          transferCount: txs.length,
+          candidateCount: candidates.length,
+          minSelectedFundingSol: BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL,
+          candidates: candidates.map((candidate) => ({
+            signature: candidate.tx.signature,
+            amountSol: candidate.effectiveFundingSol,
+            timestamp: candidate.tx.timestamp,
+          })),
+        },
+      );
+      return null;
+    }
+
+    const selected = qualifiedCandidates[0];
     const latestWindowFunding = candidates[0];
     this.log.warn("Bundler funding transfer selected from post-zero window", {
       mint,
@@ -5646,8 +5728,10 @@ export class InsiderBot extends EventEmitter {
       currentBalance: selected.currentBalance,
       zeroBoundary,
       candidateCount: candidates.length,
+      qualifiedCandidateCount: qualifiedCandidates.length,
+      minSelectedFundingSol: BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL,
       selectionRule:
-        "latest funding transfer above zero-balance boundary; effective funding uses wallet balance at that timestamp when higher than incoming amount",
+        "latest post-zero funding transfer with effectiveFundingSol > minSelectedFundingSol; effective funding uses wallet balance at that timestamp when higher than incoming amount",
       candidates: candidates.map((candidate) => ({
         signature: candidate.tx.signature,
         fundingFeePayer: candidate.tx.feePayer,
