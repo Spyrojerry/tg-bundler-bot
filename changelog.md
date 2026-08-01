@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-08-01 (130)
+
+### Follow-token: Telegram on insufficient second group pass / fail
+
+- **`second_group_insufficient_wallets_*`**: **Passed** Telegram when Large Insider starts; **Failed** when feePayer lock fails or **4-wallet** late-odd path resets (replaces duplicate generic reset / Large Insider telegrams for this trigger).
+
+## 2026-08-01 (129)
+
+### Follow-token: remove Helius second-group confirm; bundler funding uses incoming SOL
+
+- **&lt;5** wallet second groups no longer wait **120s** for Helius PUMP_FUN swap confirm — immediate **`second_group_insufficient_wallets_*`** → **Large Insider** (except **4-wallet** late-odd reset) or reset.
+- Shared feePayer funding selection: most recent post-zero transfer with **incoming SOL received &gt;15** (not wallet balance at tx timestamp). When the newest tx shows **dust incoming + high balance** (drain/re-wrap), skip it and pick the latest older tx in the fetched batch that qualifies. `BundlerFundingRecord.amountSol` is the incoming amount.
+
+## 2026-08-01 (128)
+
+### Follow-token: Large Insider — skip tier1 valid wallet when first buy &gt;10 SOL
+
+- **Tier1** scrape wallets (direct feePayer ≥15 SOL outs) are not promoted to valid Large Insider buyers when their **first token buy** spends **&gt;10 SOL**.
+
 ## 2026-08-01 (127)
 
 ### Bundler feePayer funding selection — require &gt;15 SOL
