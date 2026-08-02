@@ -541,6 +541,8 @@ const FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS = 1_000;
 const FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT = 100;
 /** Follow-token buy trigger: bundlers must share the exact same start_holding_at second (no grace). */
 const FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC = 0;
+/** Reset when GMGN returns no bundler traders this long while waiting for the initial group. */
+const FOLLOW_TOKEN_GMGN_INITIAL_GROUP_EMPTY_MAX_WAIT_SEC = 60;
 /** Follow-token buy trigger: second bundler group must have at least this many wallets. */
 const FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS = 5;
 /** Late second group: min seconds after first group anchor (must be &gt; this value). */
@@ -985,6 +987,7 @@ export class InsiderBot extends EventEmitter {
   private followTokenGmgnBundlerPollTimer: ReturnType<typeof setInterval> | null =
     null;
   private followTokenGmgnBundlerPollInFlight = false;
+  private followTokenGmgnBundlerPollStartedAtSec: number | null = null;
   private readonly followTokenGmgnPollClients: GmgnClient[];
   /** Latched once GMGN shows a same-second + 1s grace group containing all four initial bundlers. */
   private followTokenGmgnInitialBundlerGroup: GmgnBundlerTimestampGroup | null =
@@ -5943,6 +5946,7 @@ export class InsiderBot extends EventEmitter {
       this.followTokenGmgnBundlerPollTimer = null;
     }
     this.followTokenGmgnBundlerPollInFlight = false;
+    this.followTokenGmgnBundlerPollStartedAtSec = null;
     this.followTokenGmgnInitialBundlerGroup = null;
     if (reason !== "poll loop stopped") {
       this.followTokenGmgnBundlerBackend("GMGN bundler poll stopped", { reason });
@@ -5965,11 +5969,14 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
+    this.followTokenGmgnBundlerPollStartedAtSec = Math.floor(Date.now() / 1_000);
     this.followTokenGmgnBundlerBackend("GMGN bundler poll started", {
       mint: state.mint,
       devCreateTimestamp,
       pollIntervalMs: FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS,
       groupGraceSec: FOLLOW_TOKEN_GMGN_BUNDLER_GROUP_GRACE_SEC,
+      initialGroupEmptyMaxWaitSec:
+        FOLLOW_TOKEN_GMGN_INITIAL_GROUP_EMPTY_MAX_WAIT_SEC,
       secondGroupMinWallets: FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS,
       expectedInitialBundlers: [...state.bundlerWallets],
     });
@@ -6131,6 +6138,26 @@ export class InsiderBot extends EventEmitter {
       });
 
       if (snapshots.length === 0) {
+        if (!this.followTokenGmgnInitialBundlerGroup) {
+          const pollStartedAtSec =
+            this.followTokenGmgnBundlerPollStartedAtSec ?? nowSec;
+          const pollElapsedSec = nowSec - pollStartedAtSec;
+          if (
+            pollElapsedSec >= FOLLOW_TOKEN_GMGN_INITIAL_GROUP_EMPTY_MAX_WAIT_SEC
+          ) {
+            await this.resetFollowTokenAfterGmgnFilterFailed(
+              state.mint,
+              "initial_group_gmgn_empty_traders",
+              {
+                pollElapsedSec,
+                maxWaitSec: FOLLOW_TOKEN_GMGN_INITIAL_GROUP_EMPTY_MAX_WAIT_SEC,
+                devCreateTimestamp,
+                elapsedSinceCreateSec: nowSec - devCreateTimestamp,
+                expectedInitialBundlers: [...state.bundlerWallets],
+              },
+            );
+          }
+        }
         return;
       }
 
