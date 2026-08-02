@@ -5717,6 +5717,33 @@ export class InsiderBot extends EventEmitter {
       });
     }
 
+    if (!zeroBoundary && txs.length > 0) {
+      const oldestPreBuyTx = txs[txs.length - 1]!;
+      const freshWallet = await this.isWalletFirstTransaction(
+        buy.wallet,
+        oldestPreBuyTx.signature,
+        preferredClientIndex,
+      );
+      if (freshWallet) {
+        zeroBoundary = {
+          signature: oldestPreBuyTx.signature,
+          timestamp: oldestPreBuyTx.timestamp,
+          balance: 0,
+        };
+        this.log.info(
+          "Bundler funding fresh-wallet window — oldest pre-buy tx is wallet first tx (no zero boundary)",
+          {
+            mint,
+            bundlerWallet: buy.wallet,
+            bundlerBuySignature: buy.signature,
+            oldestPreBuySignature: oldestPreBuyTx.signature,
+            transferCount: txs.length,
+            candidateCount: candidates.length,
+          },
+        );
+      }
+    }
+
     if (!zeroBoundary) {
       this.log.warn("No zero-balance boundary found for bundler funding window", {
         mint,
@@ -5823,6 +5850,18 @@ export class InsiderBot extends EventEmitter {
       latestWindowFundingSignature: latestWindowFunding.tx.signature,
       latestWindowFundingTimestamp: latestWindowFunding.tx.timestamp,
     };
+  }
+
+  private async isWalletFirstTransaction(
+    wallet: string,
+    signature: string,
+    preferredClientIndex: number,
+  ): Promise<boolean> {
+    const firstTxs = await this.withHeliusFallback(
+      (client) => client.getAddressTransactionsAsc(wallet, undefined, 1),
+      preferredClientIndex,
+    );
+    return firstTxs[0]?.signature === signature;
   }
 
   private async fetchSolBalanceAt(

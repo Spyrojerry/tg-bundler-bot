@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-02 (134)
+
+### Bundler funding: fresh-wallet fallback when no zero-balance boundary
+
+- When pre-buy Helius history has **no zero-balance boundary**, if the **oldest tx in the fetched batch** is the wallet’s **first-ever tx**, treat the whole batch as the funding window and select the **latest incoming transfer &gt;15 SOL** (same drain-skip rules as post-zero path). Fixes Large Insider feePayer lock on new bundler wallets with no prior on-chain history.
+
 ## 2026-08-01 (132)
 
 ### Follow-token: reset when Large Insider fails to start
