@@ -2013,10 +2013,18 @@ export class InsiderBot extends EventEmitter {
     };
   }
 
-  private shouldDeferFollowTokenResetForLargeInsider(
+  private shouldDeferFollowTokenBuyToLargeInsider(
     watchPlan: FollowTokenSecondGroupPlan,
     freshCount: number,
   ): boolean {
+    if (watchPlan.kind === "watch_buy") {
+      return (
+        watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON ||
+        watchPlan.reason ===
+          FOLLOW_TOKEN_MULTI_FRESH_SAME_FEE_FRESH_TOP_BUYER_REASON ||
+        watchPlan.reason === FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_SAME_FEE_TP_REASON
+      );
+    }
     if (watchPlan.kind !== "no_buy") return false;
     if (watchPlan.reason === "no_fresh_second_group") return true;
     if (freshCount < 1) return false;
@@ -2027,78 +2035,37 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private isFollowTokenLateOddTagPlanWatch(): boolean {
-    return (
-      this.followTokenGmgnSecondGroupWatchReason ===
-      FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
-    );
-  }
-
-  private isFollowTokenLargeInsiderLateOddSideFlow(
-    li: FollowTokenLargeInsiderState,
-  ): boolean {
-    return (
-      li.tagPlanBuyActive &&
-      li.triggerReason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
-    );
-  }
-
-  private shouldStartFollowTokenLargeInsiderSideFlowOnTagPlanBuy(
-    watchPlan: FollowTokenSecondGroupPlan,
-    freshCount: number,
-  ): boolean {
-    return (
-      freshCount >= FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_FOR_BUY ||
-      watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
-    );
-  }
-
-  private async maybeFallbackFollowTokenLateOddFromLargeInsider(
-    reason: string,
+  private async deferFollowTokenToLargeInsiderFromTagPlan(
+    state: BundlerFunderWatchState,
+    secondGroup: GmgnBundlerTimestampGroup,
+    triggerReason: string,
+    pollStopReason: string,
   ): Promise<boolean> {
-    const li = this.followTokenLargeInsiderState;
-    if (!li?.active || !this.isFollowTokenLargeInsiderLateOddSideFlow(li)) {
+    this.followTokenGmgnSecondGroup = secondGroup;
+    const largeInsiderStarted = await this.startFollowTokenLargeInsiderFlow(
+      state,
+      secondGroup,
+      triggerReason,
+      false,
+    );
+    if (!largeInsiderStarted) {
+      await this.resetFollowTokenAfterLargeInsiderStartFailed(
+        state.mint,
+        triggerReason,
+        "large insider flow — tag plan defer failed",
+        { skipTelegram: true },
+      );
       return false;
     }
-    if (li.validWallets.length > 0) return false;
-    if (!this.isFollowTokenLateOddTagPlanWatch()) return false;
-    if (!this.buySubmitted && !this.activePosition) return false;
-
-    this.followTokenLargeInsiderLog(
-      "late odd tag plan — no LI valid wallet; falling back to normal late-odd watch exit",
+    this.stopFollowTokenGmgnBundlerPoll(pollStopReason);
+    this.followTokenGmgnBundlerBackend(
+      "GMGN second group deferred to large insider flow",
       {
-        mint: li.mint,
-        reason,
-        watchedWallet: this.followTokenTopBuyerWallet,
-        feePayerWindowEndsAt: li.feePayerWindowEndsAt,
+        mint: state.mint,
+        reason: triggerReason,
+        secondGroupTimestamp: secondGroup.anchorTimestamp,
+        secondGroupWallets: secondGroup.wallets,
       },
-    );
-    await this.stopFollowTokenLargeInsiderFlow(reason);
-    this.profitExitDisabled = false;
-    this.disableProfitExitAfterBuy = false;
-    const entryMc = this.getEntryMc();
-    if (
-      entryMc !== null &&
-      entryMc > 0 &&
-      (this.getExitMc() === null || this.getExitMc() <= 0)
-    ) {
-      this.setExitMc(
-        entryMc * (1 + FOLLOW_TOKEN_GMGN_LATE_ODD_PROFIT_EXIT_PERCENT / 100),
-      );
-    }
-    void this.sendTelegramSafe(
-      [
-        `<b>↩️ ${this.label} Follow-Token Late Odd — LI Fallback</b>`,
-        `Token: <code>${li.mint}</code>`,
-        `No Large Insider valid wallet found.`,
-        `Resuming normal <code>${FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON}</code> exit: <b>+${FOLLOW_TOKEN_GMGN_LATE_ODD_PROFIT_EXIT_PERCENT}% MC TP</b> · watched-wallet sell.`,
-        this.followTokenTopBuyerWallet
-          ? `Watched wallet: <code>${this.followTokenTopBuyerWallet}</code>`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      "follow-token late odd large insider fallback",
     );
     return true;
   }
@@ -2257,10 +2224,7 @@ export class InsiderBot extends EventEmitter {
     if (!li?.active || this.flowSource !== "follow-token") return;
     if (!this.isFollowTokenLargeInsiderFeePayerWindowClosed()) return;
     if (li.scrapeWatches.size > 0) return;
-    if (this.buySubmitted || this.activePosition) {
-      await this.maybeFallbackFollowTokenLateOddFromLargeInsider(reason);
-      return;
-    }
+    if (this.buySubmitted || this.activePosition) return;
 
     this.followTokenLargeInsiderLog(
       "feePayer window closed with no scrape wallets — resetting follow-token flow",
@@ -2339,9 +2303,7 @@ export class InsiderBot extends EventEmitter {
           options.secondGroupWalletCount !== undefined
             ? `Second group wallets: <b>${options.secondGroupWalletCount}</b>`
             : "",
-          options.tagPlanBuyActive
-            ? "Tag-plan buy already active — valid wallet will override exit."
-            : "Waiting for valid wallet to buy alongside.",
+          "Waiting for valid wallet to buy alongside.",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -3302,23 +3264,14 @@ export class InsiderBot extends EventEmitter {
         validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
           ? `Watching <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> valid wallets — search complete.`
           : `Watching up to <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> first buyers.`,
-        li.tagPlanBuyActive
-          ? "Exit override: tag-plan MC TP disabled — sell when a watched valid wallet sells all."
-          : validIndex === 1
-            ? `Buying alongside first valid wallet · exit on ≥25% sold by any of up to ${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS} watched wallets.`
-            : `Valid wallet #${validIndex} added · exit on ≥25% sold by any watched wallet.`,
+        validIndex === 1
+          ? `Buying alongside first valid wallet · exit on ≥25% sold by any of up to ${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS} watched wallets.`
+          : `Valid wallet #${validIndex} added · exit on ≥25% sold by any watched wallet.`,
       ].join("\n"),
       "follow-token large insider valid wallet",
     );
 
-    if (li.tagPlanBuyActive || this.buySubmitted) {
-      if (validIndex === 1) {
-        li.exitOverrideActive = true;
-        this.profitExitDisabled = true;
-        this.disableProfitExitAfterBuy = true;
-      }
-      return;
-    }
+    if (this.buySubmitted) return;
 
     if (validIndex === 1) {
       await this.emitFollowTokenLargeInsiderBuy(funderState, wallet, tx.signature, tx);
@@ -6409,7 +6362,7 @@ export class InsiderBot extends EventEmitter {
       );
       if (lateOddPlan?.kind === "watch_buy") {
         this.followTokenGmgnBundlerBackend(
-          "GMGN late second group (4-wallet odd top_holder) buy trigger",
+          "GMGN late second group (4-wallet odd top_holder) — defer to large insider",
           {
             mint: state.mint,
             firstGroupTimestamp:
@@ -6577,40 +6530,17 @@ export class InsiderBot extends EventEmitter {
         watchPlan = resolveFollowTokenSecondGroupPlan(secondGroup, snapshots);
       }
 
+      if (this.shouldDeferFollowTokenBuyToLargeInsider(watchPlan, freshCount)) {
+        await this.deferFollowTokenToLargeInsiderFromTagPlan(
+          state,
+          secondGroup,
+          watchPlan.reason,
+          "large insider flow — tag plan deferred",
+        );
+        return;
+      }
+
       if (watchPlan.kind === "no_buy") {
-        if (
-          this.shouldDeferFollowTokenResetForLargeInsider(watchPlan, freshCount)
-        ) {
-          this.followTokenGmgnSecondGroup = secondGroup;
-          const largeInsiderStarted = await this.startFollowTokenLargeInsiderFlow(
-            state,
-            secondGroup,
-            watchPlan.reason,
-            false,
-          );
-          if (!largeInsiderStarted) {
-            await this.resetFollowTokenAfterLargeInsiderStartFailed(
-              state.mint,
-              watchPlan.reason,
-              "large insider flow — tag plan defer failed",
-              { skipTelegram: true },
-            );
-            return;
-          }
-          this.stopFollowTokenGmgnBundlerPoll(
-            "large insider flow — tag plan deferred",
-          );
-          this.followTokenGmgnBundlerBackend(
-            "GMGN second group deferred to large insider flow",
-            {
-              mint: state.mint,
-              reason: watchPlan.reason,
-              secondGroupTimestamp: secondGroup.anchorTimestamp,
-              secondGroupWallets: secondGroup.wallets,
-            },
-          );
-          return;
-        }
         this.stopFollowTokenGmgnBundlerPoll("second group tag plan rejected buy");
         this.followTokenGmgnBundlerBackend("GMGN second group buy skipped by tag plan", {
           mint: state.mint,
@@ -6716,19 +6646,6 @@ export class InsiderBot extends EventEmitter {
       });
 
       this.stopFollowTokenGmgnBundlerPoll("buy triggered");
-      if (
-        this.shouldStartFollowTokenLargeInsiderSideFlowOnTagPlanBuy(
-          watchPlan,
-          freshCount,
-        )
-      ) {
-        void this.startFollowTokenLargeInsiderFlow(
-          state,
-          secondGroup,
-          watchPlan.reason,
-          true,
-        );
-      }
       this.followTokenGmgnBuySecondGroupWallets = [...secondGroup.wallets];
       this.emit("buyTrigger", {
         followedWallet: this.getBuyTriggerFollowedWallet(state),

@@ -1,11 +1,18 @@
 # Changelog
 
+## 2026-08-02 (137)
+
+### Follow-token: buy only from Large Insider — no tag-plan GMGN buys
+
+- **Multi-fresh** (`multi_fresh_same_fee_fresh_top_buyer`, `multi_fresh_large_group_same_fee_fresh_tp_250k`) and **late-odd** (`late_second_group_four_wallet_odd_top_holder`) tag plans no longer trigger a GMGN tag-plan buy. They **defer to Large Insider** like single-fresh / no-fresh / insufficient paths; the bot buys only when LI finds the first valid wallet (`emitFollowTokenLargeInsiderBuy`).
+- Removed parallel tag-plan buy + LI side flow (`tagPlanBuyActive`) and late-odd LI fallback to tag-plan MC TP (no upfront tag buy to fall back from).
+
 ## 2026-08-02 (136)
 
 ### Follow-token: Large Insider for no-fresh and late-odd tag plans
 
 - **`no_fresh_second_group`**: defer to **Large Insider** instead of reset (same as single-fresh insufficient paths).
-- **`late_second_group_four_wallet_odd_top_holder`**: tag-plan **buy** (+90% MC TP, watched-wallet sell) now also starts **Large Insider** side flow. If no LI valid wallet is found after the feePayer window with no scrape watches left, **fall back** to normal late-odd watch exit (do not reset while holding).
+- **`late_second_group_four_wallet_odd_top_holder`**: defer to **Large Insider** (superseded by **137** — no tag-plan buy; buy from LI valid wallet only).
 
 ## 2026-08-02 (135)
 
