@@ -122,7 +122,7 @@ const FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_EXIT_MC_USD = 250_000;
 const FOLLOW_TOKEN_SECOND_GROUP_BUY_TX_TIMESTAMP_TOLERANCE_SEC = 2;
 const FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL = 15;
 const FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL = 8;
-const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC = 10 * 60;
+const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC = 15 * 60;
 const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_SYNC_LIMIT = 100;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS = 5;
 const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION = 0.25;
@@ -1010,6 +1010,8 @@ export class InsiderBot extends EventEmitter {
   /** Early bundler buys retained for follow-token large-insider feePayer backtrack. */
   private followTokenEarlyInsiderBuys: EarlyInsiderBuy[] | null = null;
   private followTokenLargeInsiderState: FollowTokenLargeInsiderState | null =
+    null;
+  private followTokenLargeInsiderWindowTimer: ReturnType<typeof setTimeout> | null =
     null;
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
   private bundlerFunderLogsSubId: number | null = null;
@@ -2015,12 +2017,90 @@ export class InsiderBot extends EventEmitter {
     watchPlan: FollowTokenSecondGroupPlan,
     freshCount: number,
   ): boolean {
-    if (watchPlan.kind !== "no_buy" || freshCount < 1) return false;
+    if (watchPlan.kind !== "no_buy") return false;
+    if (watchPlan.reason === "no_fresh_second_group") return true;
+    if (freshCount < 1) return false;
     return (
       watchPlan.reason === "single_fresh_second_group" ||
       watchPlan.reason === "multi_fresh_insufficient_same_fee_fresh" ||
       watchPlan.reason === "multi_fresh_same_fee_fresh_missing_top_buyer"
     );
+  }
+
+  private isFollowTokenLateOddTagPlanWatch(): boolean {
+    return (
+      this.followTokenGmgnSecondGroupWatchReason ===
+      FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+    );
+  }
+
+  private isFollowTokenLargeInsiderLateOddSideFlow(
+    li: FollowTokenLargeInsiderState,
+  ): boolean {
+    return (
+      li.tagPlanBuyActive &&
+      li.triggerReason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+    );
+  }
+
+  private shouldStartFollowTokenLargeInsiderSideFlowOnTagPlanBuy(
+    watchPlan: FollowTokenSecondGroupPlan,
+    freshCount: number,
+  ): boolean {
+    return (
+      freshCount >= FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_FOR_BUY ||
+      watchPlan.reason === FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON
+    );
+  }
+
+  private async maybeFallbackFollowTokenLateOddFromLargeInsider(
+    reason: string,
+  ): Promise<boolean> {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active || !this.isFollowTokenLargeInsiderLateOddSideFlow(li)) {
+      return false;
+    }
+    if (li.validWallets.length > 0) return false;
+    if (!this.isFollowTokenLateOddTagPlanWatch()) return false;
+    if (!this.buySubmitted && !this.activePosition) return false;
+
+    this.followTokenLargeInsiderLog(
+      "late odd tag plan — no LI valid wallet; falling back to normal late-odd watch exit",
+      {
+        mint: li.mint,
+        reason,
+        watchedWallet: this.followTokenTopBuyerWallet,
+        feePayerWindowEndsAt: li.feePayerWindowEndsAt,
+      },
+    );
+    await this.stopFollowTokenLargeInsiderFlow(reason);
+    this.profitExitDisabled = false;
+    this.disableProfitExitAfterBuy = false;
+    const entryMc = this.getEntryMc();
+    if (
+      entryMc !== null &&
+      entryMc > 0 &&
+      (this.getExitMc() === null || this.getExitMc() <= 0)
+    ) {
+      this.setExitMc(
+        entryMc * (1 + FOLLOW_TOKEN_GMGN_LATE_ODD_PROFIT_EXIT_PERCENT / 100),
+      );
+    }
+    void this.sendTelegramSafe(
+      [
+        `<b>↩️ ${this.label} Follow-Token Late Odd — LI Fallback</b>`,
+        `Token: <code>${li.mint}</code>`,
+        `No Large Insider valid wallet found.`,
+        `Resuming normal <code>${FOLLOW_TOKEN_LATE_ODD_TOP_HOLDER_REASON}</code> exit: <b>+${FOLLOW_TOKEN_GMGN_LATE_ODD_PROFIT_EXIT_PERCENT}% MC TP</b> · watched-wallet sell.`,
+        this.followTokenTopBuyerWallet
+          ? `Watched wallet: <code>${this.followTokenTopBuyerWallet}</code>`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "follow-token late odd large insider fallback",
+    );
+    return true;
   }
 
   /** Insufficient second group — defer to Large Insider except 4-wallet (late-odd candidate). */
@@ -2142,9 +2222,63 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  private clearFollowTokenLargeInsiderWindowTimer(): void {
+    if (this.followTokenLargeInsiderWindowTimer) {
+      clearTimeout(this.followTokenLargeInsiderWindowTimer);
+      this.followTokenLargeInsiderWindowTimer = null;
+    }
+  }
+
+  private scheduleFollowTokenLargeInsiderWindowCloseCheck(): void {
+    this.clearFollowTokenLargeInsiderWindowTimer();
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active) return;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const delayMs = Math.max(0, (li.feePayerWindowEndsAt - nowSec) * 1_000);
+    this.followTokenLargeInsiderWindowTimer = setTimeout(() => {
+      this.followTokenLargeInsiderWindowTimer = null;
+      void this.maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
+        "large_insider_feePayer_window_closed_no_monitored_wallets",
+      );
+    }, delayMs);
+  }
+
+  private isFollowTokenLargeInsiderFeePayerWindowClosed(): boolean {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active) return false;
+    return Math.floor(Date.now() / 1000) > li.feePayerWindowEndsAt;
+  }
+
+  private async maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
+    reason: string,
+  ): Promise<void> {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active || this.flowSource !== "follow-token") return;
+    if (!this.isFollowTokenLargeInsiderFeePayerWindowClosed()) return;
+    if (li.scrapeWatches.size > 0) return;
+    if (this.buySubmitted || this.activePosition) {
+      await this.maybeFallbackFollowTokenLateOddFromLargeInsider(reason);
+      return;
+    }
+
+    this.followTokenLargeInsiderLog(
+      "feePayer window closed with no scrape wallets — resetting follow-token flow",
+      {
+        mint: li.mint,
+        reason,
+        bundlerFirstBuyAnchorTimestamp: li.bundlerFirstBuyAnchorTimestamp,
+        feePayerWindowEndsAt: li.feePayerWindowEndsAt,
+      },
+    );
+    await this.resetForNewToken(false, { reason });
+  }
+
   private async stopFollowTokenLargeInsiderFlow(reason: string): Promise<void> {
     const state = this.followTokenLargeInsiderState;
     if (!state?.active) return;
+
+    this.clearFollowTokenLargeInsiderWindowTimer();
 
     for (const wallet of [...state.scrapeEnhancedWatchIds.keys()]) {
       this.unsubscribeFollowTokenLargeInsiderScrapeWallet(wallet);
@@ -2331,6 +2465,7 @@ export class InsiderBot extends EventEmitter {
         },
       );
     }
+    this.scheduleFollowTokenLargeInsiderWindowCloseCheck();
     return true;
   }
 
@@ -2557,7 +2692,12 @@ export class InsiderBot extends EventEmitter {
     if (li.seenFeePayerOutSignatures.has(tx.signature)) return;
     li.seenFeePayerOutSignatures.add(tx.signature);
 
-    if (!this.isFollowTokenLargeInsiderFeePayerWindowOpen(tx.timestamp)) return;
+    if (!this.isFollowTokenLargeInsiderFeePayerWindowOpen(tx.timestamp)) {
+      void this.maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
+        "large_insider_feePayer_window_closed_no_monitored_wallets",
+      );
+      return;
+    }
     if (transferOut.amountSol < FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL) {
       return;
     }
@@ -2812,6 +2952,9 @@ export class InsiderBot extends EventEmitter {
       },
     );
     this.unsubscribeFollowTokenLargeInsiderScrapeWallet(wallet);
+    void this.maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
+      "large_insider_no_scrape_wallets_after_watch_removed",
+    );
   }
 
   private async applyFollowTokenLargeInsiderScrapeNotificationTx(
@@ -5314,7 +5457,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, <5 → Large Insider or reset): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) 1 fresh or ≥2 fresh insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder. Large Insider: feePayer ≥15SOL outs (10m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs from scrape wallets (tier1→chain→…). 0 fresh → no buy (except late odd). Round/dust gates disabled.`
+            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, <5 → Large Insider or reset): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) 1 fresh or ≥2 fresh insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder → buy + Large Insider side flow (fallback to normal late-odd exit if no LI valid wallet); (4) no fresh → Large Insider only. Large Insider: feePayer ≥15SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…); reset if window closed with no scrape watches. Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -6573,7 +6716,12 @@ export class InsiderBot extends EventEmitter {
       });
 
       this.stopFollowTokenGmgnBundlerPoll("buy triggered");
-      if (freshCount >= FOLLOW_TOKEN_MULTI_FRESH_MIN_SAME_FEE_FRESH_FOR_BUY) {
+      if (
+        this.shouldStartFollowTokenLargeInsiderSideFlowOnTagPlanBuy(
+          watchPlan,
+          freshCount,
+        )
+      ) {
         void this.startFollowTokenLargeInsiderFlow(
           state,
           secondGroup,

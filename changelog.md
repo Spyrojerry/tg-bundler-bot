@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-08-02 (136)
+
+### Follow-token: Large Insider for no-fresh and late-odd tag plans
+
+- **`no_fresh_second_group`**: defer to **Large Insider** instead of reset (same as single-fresh insufficient paths).
+- **`late_second_group_four_wallet_odd_top_holder`**: tag-plan **buy** (+90% MC TP, watched-wallet sell) now also starts **Large Insider** side flow. If no LI valid wallet is found after the feePayer window with no scrape watches left, **fall back** to normal late-odd watch exit (do not reset while holding).
+
+## 2026-08-02 (135)
+
+### Follow-token: Large Insider — 15m feePayer window; reset when no scrape watches
+
+- Tier1 feePayer-out discovery window increased from **10m → 15m** after earliest initial-bundler first buy.
+- When the window closes and **no tier1/chain scrape wallets** remain monitored, tear down connections and **`resetForNewToken`** (`large_insider_feePayer_window_closed_no_monitored_wallets`). Same reset if the last scrape watch is removed after the window closes.
+
 ## 2026-08-02 (134)
 
 ### Bundler funding: fresh-wallet fallback when no zero-balance boundary
