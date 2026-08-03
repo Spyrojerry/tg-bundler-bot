@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-08-03 (146)
+
+### Follow-token: restore Large Insider feePayer window — 20m
+
+- Restored tier1 feePayer-out discovery window (**20 minutes** after initial-bundler first buy; was 15m before removal). Pre-buy reset when window closes before 4 valid wallets (`large_insider_window_closed_before_fourth_valid_wallet`). Pre-anchor feePayer txs still skipped without reset.
+
+## 2026-08-03 (145)
+
+### Follow-token: remove Large Insider 15m feePayer window
+
+- Removed the **15-minute** tier1 feePayer-out window and its timer reset. LI now runs until other exit points: **no scrape watches** before 4 valid wallets (pre-buy), **qualified-SOL buy gate** fail, rug/dev reset, or normal post-buy exits (+80% MC TP / ≥25% sold). FeePayer outs before initial-bundler first buy are still ignored.
+
 ## 2026-08-03 (144)
 
 ### Follow-token: Large Insider Qualified SOL buy gate at wallet #4

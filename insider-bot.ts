@@ -122,7 +122,7 @@ const FOLLOW_TOKEN_MULTI_FRESH_LARGE_GROUP_EXIT_MC_USD = 250_000;
 const FOLLOW_TOKEN_SECOND_GROUP_BUY_TX_TIMESTAMP_TOLERANCE_SEC = 2;
 const FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL = 15;
 const FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL = 8;
-const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC = 15 * 60;
+const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC = 20 * 60;
 const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_SYNC_LIMIT = 100;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS = 5;
 const FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT = 4;
@@ -172,7 +172,7 @@ interface FollowTokenLargeInsiderState {
   validWallets: string[];
   validWalletSearchComplete: boolean;
   exitTriggerSignature: string | null;
-  /** Earliest initial-bundler token buy unix second — feePayer window starts here. */
+  /** Earliest initial-bundler token buy unix second — feePayer tier1 window starts here. */
   bundlerFirstBuyAnchorTimestamp: number;
   feePayerWindowEndsAt: number;
   exitOverrideActive: boolean;
@@ -2505,7 +2505,8 @@ export class InsiderBot extends EventEmitter {
       triggerReason,
       tagPlanBuyActive,
       bundlerFirstBuyAnchorTimestamp: anchorTimestamp,
-      feePayerWindowEndsAt: anchorTimestamp + FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC,
+      feePayerWindowEndsAt:
+        anchorTimestamp + FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC,
       secondGroupWallets: secondGroup.wallets.length,
     });
 
@@ -5576,7 +5577,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, <5 → Large Insider): tag plans defer to Large Insider — buy on valid wallet <b>#4</b> if ≥1 of first 4 has Qualified SOL &lt;${FOLLOW_TOKEN_LARGE_INSIDER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} (still watch for #5 · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit). Reset if gate fails or window closes before 4 valid wallets. Large Insider: feePayer ≥15SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…). Round/dust gates disabled.`
+            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, <5 → Large Insider): tag plans defer to Large Insider — buy on valid wallet <b>#4</b> if ≥1 of first 4 has Qualified SOL &lt;${FOLLOW_TOKEN_LARGE_INSIDER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} (still watch for #5 · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit). Reset on qualified-SOL gate fail, 20m window closes, or no scrape watches before buy. Large Insider: feePayer ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL} SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
