@@ -2073,6 +2073,13 @@ async function main(): Promise<void> {
           return;
         }
         if (currentMc >= exitMc) {
+          if (bot.shouldDeferFollowTokenEarlyBundlerMcTp()) {
+            bot.notifyFollowTokenEarlyBundlerMcTpReached(currentMc);
+            log.info(
+              `[INSIDER ${botNumber} MC EXIT DEFER] Early bundler exit watch active for ${activePos.mint}; MC TP (+80%) deferred until all bundlers/recipients sell all. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+            );
+            return;
+          }
           if (await bot.deferProfitExitUntilDevSwap(currentMc)) {
             log.warn(
               `[INSIDER ${botNumber} MC EXIT PENDING] Current MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}, waiting for dev swap confirmation.`,

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-03 (147)
+
+### Follow-token: Large Insider — early bundler exit watch after buy
+
+- On LI buy, monitor **initial early bundlers** (first 4): paginated Helius sync from each **initial buy tx** as `afterSignature`, then live watch.
+- **Token transfer-out** chains a new watch on the recipient (sync + monitor) and **drops the sender** from monitoring (unsubscribed; counts as sold-all for exit gate). Recipient sync uses the **inbound transfer tx** as Helius `after-signature` (not the bundler's initial buy). No immediate sell on transfer.
+- **MC TP (+80%)** deferred until **every** bundler / transfer recipient has **sold all** holdings.
+- After all sold all: if any wallet has **>150** cumulative sell txs, **drop MC TP**; sell when **≥25%** was reached during the wait (deferred) or on all-sold-all completion.
+
 ## 2026-08-03 (146)
 
 ### Follow-token: restore Large Insider feePayer window — 20m
