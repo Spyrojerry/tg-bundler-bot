@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-03 (143)
+
+### Follow-token: Large Insider — no reset on pre-anchor feePayer txs
+
+- FeePayer outs **before** the initial-bundler first-buy anchor are **skipped** instead of calling `maybeReset`. Fixes instant reset at LI start when REST sync sees older feePayer activity while scrape watches are still empty.
+
 ## 2026-08-03 (142)
 
 ### Follow-token: Large Insider MC TP 90% → 80%

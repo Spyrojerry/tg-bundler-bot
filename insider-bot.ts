@@ -2678,7 +2678,10 @@ export class InsiderBot extends EventEmitter {
     if (li.seenFeePayerOutSignatures.has(tx.signature)) return;
     li.seenFeePayerOutSignatures.add(tx.signature);
 
-    if (!this.isFollowTokenLargeInsiderFeePayerWindowOpen(tx.timestamp)) {
+    if (tx.timestamp < li.bundlerFirstBuyAnchorTimestamp) {
+      return;
+    }
+    if (tx.timestamp > li.feePayerWindowEndsAt) {
       void this.maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
         "large_insider_feePayer_window_closed_no_monitored_wallets",
       );
