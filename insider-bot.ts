@@ -2070,15 +2070,21 @@ export class InsiderBot extends EventEmitter {
     return true;
   }
 
-  /** Insufficient second group — defer to Large Insider except 4-wallet (late-odd candidate). */
-  private shouldStartLargeInsiderForInsufficientSecondGroup(
-    walletCount: number,
-  ): boolean {
-    return walletCount !== FOLLOW_TOKEN_GMGN_LATE_ODD_GROUP_WALLET_COUNT;
-  }
-
   private isFollowTokenInsufficientSecondGroupReason(reason: string): boolean {
     return reason.startsWith("second_group_insufficient_wallets_");
+  }
+
+  /** Locked shared feePayer after Large Insider backtrack (not GMGN stub dev placeholder). */
+  private getFollowTokenLockedSharedFeePayer(): string | null {
+    const watch = this.bundlerFunderWatch;
+    if (!watch || watch.earliestFundingTimestamp <= 0) return null;
+    if (
+      watch.funderWallet === watch.mint ||
+      watch.bundlerWallets.has(watch.funderWallet)
+    ) {
+      return null;
+    }
+    return watch.originalFunderWallet || watch.funderWallet;
   }
 
   private sendFollowTokenInsufficientSecondGroupTelegram(
@@ -2087,7 +2093,7 @@ export class InsiderBot extends EventEmitter {
     reason: string,
     options: {
       walletCount: number;
-      failReason?: "large_insider_feePayer_lock_failed" | "late_odd_four_wallet_reset";
+      failReason?: "large_insider_feePayer_lock_failed";
       feePayer?: string | null;
     },
   ): void {
@@ -2109,9 +2115,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     const outcomeLine =
-      options.failReason === "late_odd_four_wallet_reset"
-        ? "Outcome: <b>reset</b> (4-wallet late-odd candidate — no Large Insider defer)."
-        : "Outcome: <b>Large Insider failed to start</b> (shared feePayer lock failed).";
+      "Outcome: <b>Large Insider failed to start</b> (shared feePayer lock failed).";
     void this.sendTelegramSafe(
       [
         `<b>⚠️ ${this.label} Follow-Token Insufficient Second Group — Failed</b>`,
@@ -2164,7 +2168,9 @@ export class InsiderBot extends EventEmitter {
         failReason: largeInsiderStarted
           ? undefined
           : "large_insider_feePayer_lock_failed",
-        feePayer: largeInsiderStarted ? state.funderWallet : null,
+        feePayer: largeInsiderStarted
+          ? this.getFollowTokenLockedSharedFeePayer()
+          : null,
       },
     );
     if (!largeInsiderStarted) {
@@ -2800,6 +2806,38 @@ export class InsiderBot extends EventEmitter {
     return watch;
   }
 
+  private resolveFollowTokenLargeInsiderScrapeWatchChainDepth(
+    watch: FollowTokenLargeInsiderScrapeWatch,
+  ): number {
+    const li = this.followTokenLargeInsiderState;
+    if (!li || watch.tier1DirectFromFeePayer) return 0;
+
+    let depth = 0;
+    let current: FollowTokenLargeInsiderScrapeWatch | undefined = watch;
+    const seen = new Set<string>();
+    while (current && !current.tier1DirectFromFeePayer) {
+      if (seen.has(current.wallet)) break;
+      seen.add(current.wallet);
+      depth += 1;
+      const parent = li.scrapeWatches.get(current.fundedBy);
+      if (!parent) break;
+      current = parent;
+    }
+    return Math.max(1, depth);
+  }
+
+  private formatFollowTokenLargeInsiderScrapeWatchTierLine(
+    watch: FollowTokenLargeInsiderScrapeWatch,
+  ): string {
+    if (watch.tier1DirectFromFeePayer) {
+      return `Large Insider tier: <b>tier1</b> · direct feePayer ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL} SOL out`;
+    }
+    const depth = this.resolveFollowTokenLargeInsiderScrapeWatchChainDepth(watch);
+    const parentLabel =
+      depth === 1 ? "tier1" : `chain-${depth - 1}`;
+    return `Large Insider tier: <b>chain-${depth}</b> · ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL downstream from ${parentLabel}`;
+  }
+
   private subscribeFollowTokenLargeInsiderScrapeWallet(wallet: string): void {
     const li = this.followTokenLargeInsiderState;
     if (!li?.active || li.scrapeEnhancedWatchIds.has(wallet)) return;
@@ -3250,6 +3288,9 @@ export class InsiderBot extends EventEmitter {
       validIndex,
       validWalletCount: li.validWallets.length,
       qualifiedSol: watch.qualifiedReceivedSol,
+      tier: watch.tier1DirectFromFeePayer
+        ? "tier1"
+        : `chain-${this.resolveFollowTokenLargeInsiderScrapeWatchChainDepth(watch)}`,
       tagPlanBuyActive: li.tagPlanBuyActive,
       signature: tx.signature,
     });
@@ -3259,6 +3300,7 @@ export class InsiderBot extends EventEmitter {
         `<b>🎯 ${this.label} Follow-Token Large Insider Valid Wallet #${validIndex}</b>`,
         `Token: <code>${li.mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
+        this.formatFollowTokenLargeInsiderScrapeWatchTierLine(watch),
         `Qualified SOL: <b>${watch.qualifiedReceivedSol.toFixed(4)}</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
         validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
@@ -3320,14 +3362,21 @@ export class InsiderBot extends EventEmitter {
         this.followTokenLargeInsiderState?.secondGroup ?? null;
       this.ensureFollowTokenTopBuyerWatchSubscribed();
 
+      const liWatch =
+        this.followTokenLargeInsiderState?.scrapeWatches.get(watchedWallet);
       void this.sendTelegramSafe(
         [
           `<b>🟢 ${this.label} Follow-Token Large Insider Buy</b>`,
           `Token: <code>${state.mint}</code>`,
           `Valid wallet: <code>${watchedWallet}</code>`,
+          liWatch
+            ? this.formatFollowTokenLargeInsiderScrapeWatchTierLine(liWatch)
+            : "",
           `Trigger tx: <code>${signature}</code>`,
           "Exit: sell on ≥25% sold by any watched valid wallet (up to 5)",
-        ].join("\n"),
+        ]
+          .filter(Boolean)
+          .join("\n"),
         "follow-token large insider buy",
       );
 
@@ -5410,7 +5459,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, <5 → Large Insider or reset): (1) ≥3 fresh same-fee gate → tag-plan buy + Large Insider side flow; (2) 1 fresh or ≥2 fresh insufficient same-fee → Large Insider only (no reset); (3) late 4-wallet odd top_holder → buy + Large Insider side flow (fallback to normal late-odd exit if no LI valid wallet); (4) no fresh → Large Insider only. Large Insider: feePayer ≥15SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…); reset if window closed with no scrape watches. Round/dust gates disabled.`
+            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, <5 → Large Insider): tag plans (multi-fresh, late 4-wallet odd, no-fresh, single-fresh, insufficient same-fee) defer to Large Insider — buy only on first valid LI wallet. Large Insider: feePayer ≥15SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…); reset if window closed with no scrape watches and no buy. Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -6425,34 +6474,11 @@ export class InsiderBot extends EventEmitter {
         groups: this.summarizeGmgnBundlerGroupsForLog(groups),
       };
 
-      if (
-        this.shouldStartLargeInsiderForInsufficientSecondGroup(
-          secondGroupCandidate.wallets.length,
-        )
-      ) {
-        await this.deferFollowTokenToLargeInsiderAfterInsufficientSecondGroup(
-          state,
-          secondGroupCandidate,
-          insufficientReason,
-          insufficientLogData,
-        );
-        return;
-      }
-
-      this.sendFollowTokenInsufficientSecondGroupTelegram(
-        "failed",
-        state.mint,
-        insufficientReason,
-        {
-          walletCount: secondGroupCandidate.wallets.length,
-          failReason: "late_odd_four_wallet_reset",
-        },
-      );
-      await this.resetFollowTokenAfterGmgnFilterFailed(
-        state.mint,
+      await this.deferFollowTokenToLargeInsiderAfterInsufficientSecondGroup(
+        state,
+        secondGroupCandidate,
         insufficientReason,
         insufficientLogData,
-        { skipTelegram: true },
       );
       return;
     } catch (err) {

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-08-03 (139)
+
+### Follow-token: insufficient second group Telegram — correct shared feePayer
+
+- **Insufficient Second Group — Passed** now shows the **locked shared feePayer** from bundler funding backtrack, not the GMGN stub placeholder (token dev wallet).
+
+## 2026-08-03 (138)
+
+### Follow-token: Large Insider valid-wallet Telegram shows tier
+
+- **Valid wallet** and **Large Insider buy** Telegram cards now include the scrape tier: **tier1** (direct feePayer ≥15 SOL out) or **chain-N** (≥8 SOL downstream from tier1 / prior chain hop).
+
 ## 2026-08-02 (137)
 
 ### Follow-token: buy only from Large Insider — no tag-plan GMGN buys
@@ -7,71 +19,115 @@
 - **Multi-fresh** (`multi_fresh_same_fee_fresh_top_buyer`, `multi_fresh_large_group_same_fee_fresh_tp_250k`) and **late-odd** (`late_second_group_four_wallet_odd_top_holder`) tag plans no longer trigger a GMGN tag-plan buy. They **defer to Large Insider** like single-fresh / no-fresh / insufficient paths; the bot buys only when LI finds the first valid wallet (`emitFollowTokenLargeInsiderBuy`).
 - Removed parallel tag-plan buy + LI side flow (`tagPlanBuyActive`) and late-odd LI fallback to tag-plan MC TP (no upfront tag buy to fall back from).
 
+
+
 ## 2026-08-02 (136)
+
+
 
 ### Follow-token: Large Insider for no-fresh and late-odd tag plans
 
-- **`no_fresh_second_group`**: defer to **Large Insider** instead of reset (same as single-fresh insufficient paths).
-- **`late_second_group_four_wallet_odd_top_holder`**: defer to **Large Insider** (superseded by **137** — no tag-plan buy; buy from LI valid wallet only).
+- `no_fresh_second_group`: defer to **Large Insider** instead of reset (same as single-fresh insufficient paths).
+- `late_second_group_four_wallet_odd_top_holder`: defer to **Large Insider** (superseded by **137** — no tag-plan buy; buy from LI valid wallet only).
+
+
 
 ## 2026-08-02 (135)
+
+
 
 ### Follow-token: Large Insider — 15m feePayer window; reset when no scrape watches
 
 - Tier1 feePayer-out discovery window increased from **10m → 15m** after earliest initial-bundler first buy.
-- When the window closes and **no tier1/chain scrape wallets** remain monitored, tear down connections and **`resetForNewToken`** (`large_insider_feePayer_window_closed_no_monitored_wallets`). Same reset if the last scrape watch is removed after the window closes.
+- When the window closes and **no tier1/chain scrape wallets** remain monitored, tear down connections and `resetForNewToken` (`large_insider_feePayer_window_closed_no_monitored_wallets`). Same reset if the last scrape watch is removed after the window closes.
+
+
 
 ## 2026-08-02 (134)
 
+
+
 ### Bundler funding: fresh-wallet fallback when no zero-balance boundary
 
-- When pre-buy Helius history has **no zero-balance boundary**, if the **oldest tx in the fetched batch** is the wallet’s **first-ever tx**, treat the whole batch as the funding window and select the **latest incoming transfer &gt;15 SOL** (same drain-skip rules as post-zero path). Fixes Large Insider feePayer lock on new bundler wallets with no prior on-chain history.
+- When pre-buy Helius history has **no zero-balance boundary**, if the **oldest tx in the fetched batch** is the wallet’s **first-ever tx**, treat the whole batch as the funding window and select the **latest incoming transfer >15 SOL** (same drain-skip rules as post-zero path). Fixes Large Insider feePayer lock on new bundler wallets with no prior on-chain history.
+
+
 
 ## 2026-08-01 (132)
 
+
+
 ### Follow-token: reset when Large Insider fails to start
 
-- Tag-plan defer and insufficient-second-group defer now call **`resetForNewToken`** when shared feePayer lock fails (`large_insider_feePayer_lock_failed`), instead of leaving the token in zombie pre-buy MC monitoring.
+- Tag-plan defer and insufficient-second-group defer now call `resetForNewToken` when shared feePayer lock fails (`large_insider_feePayer_lock_failed`), instead of leaving the token in zombie pre-buy MC monitoring.
+
+
 
 ## 2026-08-01 (131)
 
-### Follow-token: Large Insider — skip any valid wallet when first buy &gt;10 SOL
 
-- **Tier1 and chain** scrape wallets are not promoted to valid Large Insider buyers when their **first token buy** spends **&gt;10 SOL** (was tier1-only).
+
+### Follow-token: Large Insider — skip any valid wallet when first buy >10 SOL
+
+- **Tier1 and chain** scrape wallets are not promoted to valid Large Insider buyers when their **first token buy** spends **>10 SOL** (was tier1-only).
+
+
 
 ## 2026-08-01 (130)
 
+
+
 ### Follow-token: Telegram on insufficient second group pass / fail
 
-- **`second_group_insufficient_wallets_*`**: **Passed** Telegram when Large Insider starts; **Failed** when feePayer lock fails or **4-wallet** late-odd path resets (replaces duplicate generic reset / Large Insider telegrams for this trigger).
+- `second_group_insufficient_wallets_*`: **Passed** Telegram when Large Insider starts; **Failed** when feePayer lock fails or **4-wallet** late-odd path resets (replaces duplicate generic reset / Large Insider telegrams for this trigger).
+
+
 
 ## 2026-08-01 (129)
 
+
+
 ### Follow-token: remove Helius second-group confirm; bundler funding uses incoming SOL
 
-- **&lt;5** wallet second groups no longer wait **120s** for Helius PUMP_FUN swap confirm — immediate **`second_group_insufficient_wallets_*`** → **Large Insider** (except **4-wallet** late-odd reset) or reset.
-- Shared feePayer funding selection: most recent post-zero transfer with **incoming SOL received &gt;15** (not wallet balance at tx timestamp). When the newest tx shows **dust incoming + high balance** (drain/re-wrap), skip it and pick the latest older tx in the fetched batch that qualifies. `BundlerFundingRecord.amountSol` is the incoming amount.
+- **<5** wallet second groups no longer wait **120s** for Helius PUMP_FUN swap confirm — immediate `second_group_insufficient_wallets_`* → **Large Insider** (except **4-wallet** late-odd reset) or reset.
+- Shared feePayer funding selection: most recent post-zero transfer with **incoming SOL received >15** (not wallet balance at tx timestamp). When the newest tx shows **dust incoming + high balance** (drain/re-wrap), skip it and pick the latest older tx in the fetched batch that qualifies. `BundlerFundingRecord.amountSol` is the incoming amount.
+
+
 
 ## 2026-08-01 (128)
 
-### Follow-token: Large Insider — skip tier1 valid wallet when first buy &gt;10 SOL
 
-- **Tier1** scrape wallets (direct feePayer ≥15 SOL outs) are not promoted to valid Large Insider buyers when their **first token buy** spends **&gt;10 SOL**. Superseded by **131** (all scrape tiers).
+
+### Follow-token: Large Insider — skip tier1 valid wallet when first buy >10 SOL
+
+- **Tier1** scrape wallets (direct feePayer ≥15 SOL outs) are not promoted to valid Large Insider buyers when their **first token buy** spends **>10 SOL**. Superseded by **131** (all scrape tiers).
+
+
 
 ## 2026-08-01 (127)
 
-### Bundler feePayer funding selection — require &gt;15 SOL
 
-- Post-zero funding window now picks the **most recent transfer with effective funding &gt;15 SOL** (not merely the latest incoming transfer). Bundlers with no qualifying transfer fail funding record resolution.
+
+### Bundler feePayer funding selection — require >15 SOL
+
+- Post-zero funding window now picks the **most recent transfer with effective funding >15 SOL** (not merely the latest incoming transfer). Bundlers with no qualifying transfer fail funding record resolution.
+
+
 
 ## 2026-08-01 (126)
+
+
 
 ### Follow-token: Telegram on every Large Insider start attempt
 
 - **Large Insider Flow Started** Telegram on successful start (all entry paths: tag-plan defer, insufficient second group, parallel with tag-plan buy).
 - **Large Insider Flow Failed To Start** Telegram when shared feePayer lock fails (e.g. split bundler funding).
 
+
+
 ## 2026-08-01 (125)
+
+
 
 ### Follow-token: Large Insider — ignore SOL returns to feePayer
 
@@ -79,25 +135,41 @@
 - Tracks each scrape wallet's **last SOL transfer-out**; on **zero balance** when that final out was to the feePayer, the scrape watch is removed and the feePayer remains on the **primary** bundler-funder watch only.
 - Large-drain handoffs and tier1 adds also skip **returns to the original shared feePayer** (no re-subscribe after migration).
 
+
+
 ## 2026-08-01 (124)
+
+
 
 ### Follow-token: Large Insider after insufficient second group (except 4-wallet)
 
-- When Helius confirm times out on **&lt;5** wallet second groups, **`second_group_insufficient_wallets_*`** now starts **Large Insider** instead of reset — **except** **`second_group_insufficient_wallets_4`** (late-odd candidate still resets).
+- When Helius confirm times out on **<5** wallet second groups, `second_group_insufficient_wallets_`* now starts **Large Insider** instead of reset — **except** `second_group_insufficient_wallets_4` (late-odd candidate still resets).
+
+
 
 ## 2026-08-01 (123)
+
+
 
 ### Follow-token: Large Insider chain watches require ≥8 SOL from scrape parent
 
 - Downstream wallets are only scrape-watched when a **tier1 or chain scrape wallet** sends **≥8 SOL** to them; parent must already be on the scrape watch list (rejects orphans / sub-threshold outs). Chain continues tier1 → chain → chain (≤2 children per wallet).
 
+
+
 ## 2026-08-01 (122)
+
+
 
 ### Follow-token: Large Insider feePayer sync — 100 txs after last bundler funding
 
-- Large Insider flow start uses a dedicated feePayer REST sync (not the normal 20-tx sync): **`after-signature`** = last shared-feePayer → bundler funding tx, up to **100** txs.
+- Large Insider flow start uses a dedicated feePayer REST sync (not the normal 20-tx sync): `after-signature` = last shared-feePayer → bundler funding tx, up to **100** txs.
+
+
 
 ## 2026-07-31 (121)
+
+
 
 ### Follow-token: Large Insider — tier1 buys, 5 valid wallets, first-buy window
 
@@ -105,30 +177,46 @@
 - Watch up to **5** valid buyers (tier1 or non-tier1); search stops after 5; **any** watched wallet hitting exit rules triggers sell.
 - FeePayer **10m window** starts at **earliest initial-bundler first buy** (Helius early insider buys), not bundler funding receive time.
 
+
+
 ## 2026-07-30 (120)
+
+
 
 ### Follow-token: Helius confirm for insufficient second group
 
-- Replaced the **10s GMGN grace** on **&lt;5** wallet second groups with **Helius PUMP_FUN SWAP** confirmation.
-- When GMGN’s next group is below **≥5**, fetch mint txs from **`initial + 1`** through **`now`**. **`gte-time`** and **`lte-time`** are captured **once** when confirm starts and sent unchanged on **every** paginated Helius request until confirm ends.
-- Pagination uses **`sort-order=asc`** + **`after-signature`** (forward in time from gte); not desc/before-signature.
-- Helius host **`mainnet.helius-rpc.com`** (enhanced tx API); query matches `token-accounts=none&sort-order=asc&gte-time&lte-time&type=SWAP&source=PUMP_FUN` (+ `after-signature` on later pages).
+- Replaced the **10s GMGN grace** on **<5** wallet second groups with **Helius PUMP_FUN SWAP** confirmation.
+- When GMGN’s next group is below **≥5**, fetch mint txs from `initial + 1` through `now`. `gte-time` and `lte-time` are captured **once** when confirm starts and sent unchanged on **every** paginated Helius request until confirm ends.
+- Pagination uses `sort-order=asc` + `after-signature` (forward in time from gte); not desc/before-signature.
+- Helius host `mainnet.helius-rpc.com` (enhanced tx API); query matches `token-accounts=none&sort-order=asc&gte-time&lte-time&type=SWAP&source=PUMP_FUN` (+ `after-signature` on later pages).
 - For each non-initial GMGN bundler wallet, take the **first buy** in that window; if **≥5** share the same Helius tx timestamp → confirmed second group → continue tag plan / buy.
-- Retries each poll until confirmed or **120s** max confirm window, then `second_group_insufficient_wallets_*` reset.
+- Retries each poll until confirmed or **120s** max confirm window, then `second_group_insufficient_wallets_`* reset.
+
+
 
 ## 2026-07-30 (119)
+
+
 
 ### Follow-token: GMGN bundler trader fetch limit 100
 
 - `fetchBundlerTraders` default and follow-token poll / handoff / third-group refreshes now use limit **100** (GMGN max; was **50**) via `FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT`.
 
+
+
 ## 2026-07-30 (118)
+
+
 
 ### Follow-token: GMGN bundler trader fetch limit 50
 
 - `fetchBundlerTraders` default and follow-token poll / handoff / third-group refreshes now use limit **50** (was **20**) via `FOLLOW_TOKEN_GMGN_BUNDLER_TRADERS_LIMIT`.
 
+
+
 ## 2026-07-30 (117)
+
+
 
 ### Follow-token: Large Insider — 2 valid wallets, 25% sold exit, no early SOL gate
 
@@ -137,21 +225,33 @@
 - **Tag-plan override** exit: unchanged — **sell-all** on either watched valid wallet (scrape only).
 - **Removed:** 50% SOL deploy / 3-minute early-exit gate.
 
+
+
 ## 2026-07-30 (116)
+
+
 
 ### Follow-token: Large Insider exit modes split *(superseded by 117 for exit rules)*
 
 - **Large Insider buy:** was 2nd sell tx → now **≥25% sold** (117).
 - **Tag-plan override:** sell-all on watched valid wallet(s).
 
+
+
 ## 2026-07-30 (115)
+
+
 
 ### Follow-token: Large Insider for single-fresh second group
 
-- Exactly **one** `fresh_wallet` in the second group (**`single_fresh_second_group`**) → **no reset**; **Large Insider** flow starts (same as multi-fresh insufficient same-fee path).
-- **Zero** fresh still **`no_fresh_second_group`** reset (late 4-wallet odd unchanged).
+- Exactly **one** `fresh_wallet` in the second group (`single_fresh_second_group`) → **no reset**; **Large Insider** flow starts (same as multi-fresh insufficient same-fee path).
+- **Zero** fresh still `no_fresh_second_group` reset (late 4-wallet odd unchanged).
+
+
 
 ## 2026-07-30 (114)
+
+
 
 ### Follow-token: Large Insider parallel flow for multi-fresh second groups
 
@@ -161,153 +261,245 @@
 - When the second group has **≥1 fresh** wallet but no tag-plan buy → **no reset**; Large Insider continues.
 - Exit rules refined in **116–117** (25% sold / sell-all / 2 valid wallets / no early SOL gate).
 
+
+
 ## 2026-07-30 (113)
 
-### Follow-token: &lt;9 multi-fresh watches all-fresh top buyer
 
-- **&lt;9** second group still requires **≥3** same-fee fresh (gate unchanged). After buy, **watch** the **top GMGN buyer among all `fresh_wallet` tags** in the group — not limited to the same-fee cluster.
+
+### Follow-token: <9 multi-fresh watches all-fresh top buyer
+
+- **<9** second group still requires **≥3** same-fee fresh (gate unchanged). After buy, **watch** the **top GMGN buyer among all** `fresh_wallet` **tags** in the group — not limited to the same-fee cluster.
 - **≥9** path unchanged: watch top buyer in the **same-fee fresh cluster** + **$250k MC TP**.
+
+
 
 ## 2026-07-30 (112)
 
+
+
 ### Follow-token: multi-fresh buy needs ≥3 same-fee fresh (all group sizes)
 
-- **&lt;9** and **≥9** second-group wallets now both require **≥3** `fresh_wallet` tags sharing the same Helius buy **fee** (largest same-fee cluster) before buy. **2** same-fee fresh → **`multi_fresh_insufficient_same_fee_fresh`**, reset.
-- **&lt;9** with **≥3** same-fee fresh → **`multi_fresh_same_fee_fresh_top_buyer`** (handoff watch). **≥9** → **`multi_fresh_large_group_same_fee_fresh_tp_250k`** ($250k MC TP).
+- **<9** and **≥9** second-group wallets now both require **≥3** `fresh_wallet` tags sharing the same Helius buy **fee** (largest same-fee cluster) before buy. **2** same-fee fresh → `multi_fresh_insufficient_same_fee_fresh`, reset.
+- **<9** with **≥3** same-fee fresh → `multi_fresh_same_fee_fresh_top_buyer` (handoff watch). **≥9** → `multi_fresh_large_group_same_fee_fresh_tp_250k` ($250k MC TP).
+
+
 
 ## 2026-07-29 (111)
 
+
+
 ### Follow-token: only multi-fresh same-fee cluster + late odd buy
 
-- **≥2 `fresh_wallet`** in the second group enters multi-fresh evaluation; Helius buy **fee** must match for at least **3** fresh wallets in the largest same-fee cluster before buy.
-- **&lt;9** wallets in the second group → **`multi_fresh_same_fee_fresh_top_buyer`**: same-fee gate, then watch **top buyer among all fresh**; **buy/sell** + **handoff** on fresh **buy**; no +90% MC TP at entry.
-- **≥9** wallets with **≥3** same-fee fresh in that cluster → **`multi_fresh_large_group_same_fee_fresh_tp_250k`**: watch **top buyer in same-fee cluster** + **$250k MC TP** + handoff.
-- **Removed** as buy paths: dual fresh+`top_holder` priority, **`multi_fresh_top_fresh_buyer`**, fee-mismatch watch, all-wallet fee gates, single-fresh / standard no-fresh odd-minority buys (unchanged **no_buy**: **`single_fresh_second_group`**, **`no_fresh_second_group`**).
-- **`late_second_group_four_wallet_odd_top_holder`** unchanged: poll before ≥5 path; 4 wallets, no fresh, &gt;60s after first, 1-vs-3 **`top_holder`**, minority top buyer, **+90% MC TP**, **sell-only** on watched wallet.
+- **≥2** `fresh_wallet` in the second group enters multi-fresh evaluation; Helius buy **fee** must match for at least **3** fresh wallets in the largest same-fee cluster before buy.
+- **<9** wallets in the second group → `multi_fresh_same_fee_fresh_top_buyer`: same-fee gate, then watch **top buyer among all fresh**; **buy/sell** + **handoff** on fresh **buy**; no +90% MC TP at entry.
+- **≥9** wallets with **≥3** same-fee fresh in that cluster → `multi_fresh_large_group_same_fee_fresh_tp_250k`: watch **top buyer in same-fee cluster** + **$250k MC TP** + handoff.
+- **Removed** as buy paths: dual fresh+`top_holder` priority, `multi_fresh_top_fresh_buyer`, fee-mismatch watch, all-wallet fee gates, single-fresh / standard no-fresh odd-minority buys (unchanged **no_buy**: `single_fresh_second_group`, `no_fresh_second_group`).
+- `late_second_group_four_wallet_odd_top_holder` unchanged: poll before ≥5 path; 4 wallets, no fresh, >60s after first, 1-vs-3 `top_holder`, minority top buyer, **+90% MC TP**, **sell-only** on watched wallet.
+
+
 
 ## 2026-07-28 (110)
 
+
+
 ### Follow-token: no buy on single-fresh second group
 
-- **`single_fresh_wallet`** and **`one_fresh_one_top_holder_higher_buyer`** removed; exactly **one** `fresh_wallet` in the second group → **`single_fresh_second_group`**, reset (no buy).
+- `single_fresh_wallet` and `one_fresh_one_top_holder_higher_buyer` removed; exactly **one** `fresh_wallet` in the second group → `single_fresh_second_group`, reset (no buy).
+
+
 
 ## 2026-07-28 (109)
 
+
+
 ### Follow-token: restore late 4-wallet odd top_holder buy
 
-- **`late_second_group_four_wallet_odd_top_holder`** (+90% MC TP, watched-wallet sell exit) runs again before the ≥5-wallet path. Other zero-fresh second groups still **`no_fresh_second_group`**.
+- `late_second_group_four_wallet_odd_top_holder` (+90% MC TP, watched-wallet sell exit) runs again before the ≥5-wallet path. Other zero-fresh second groups still `no_fresh_second_group`.
+
+
 
 ## 2026-07-28 (108)
 
+
+
 ### Follow-token: no buy when second group has no fresh wallets
 
-- Second group with **zero** `fresh_wallet` tags → **`no_fresh_second_group`**, reset (no buy). Removed **`no_fresh_*` odd-minority** tag-plan buys (not the late 4-wallet odd trigger; see **109**).
+- Second group with **zero** `fresh_wallet` tags → `no_fresh_second_group`, reset (no buy). Removed `no_fresh_`* **odd-minority** tag-plan buys (not the late 4-wallet odd trigger; see **109**).
+
+
 
 ## 2026-07-27 (107)
 
+
+
 ### Follow-token: no-fresh groups need ≥2 top_holder wallets *(removed in 108)*
 
-- Short-lived rule; superseded by **`no_fresh_second_group`** (no buy on any zero-fresh second group).
+- Short-lived rule; superseded by `no_fresh_second_group` (no buy on any zero-fresh second group).
+
+
 
 ## 2026-07-27 (106)
 
+
+
 ### Follow-token: fresh+top_holder priority over all multi-fresh plans
 
-- With **≥2 fresh** and a **`fresh_wallet` + `top_holder`** wallet, **`multi_fresh_fresh_top_holder_fee_mismatch_watch`** runs **before** any other tag plan or fee gate (including **`multi_fresh_top_fresh_buyer`**, **`$250k`**, fee mismatch, large-group rejects). **Sell-only** watch; no Helius fee fetch on that path.
+- With **≥2 fresh** and a `fresh_wallet` **+** `top_holder` wallet, `multi_fresh_fresh_top_holder_fee_mismatch_watch` runs **before** any other tag plan or fee gate (including `multi_fresh_top_fresh_buyer`, `$250k`, fee mismatch, large-group rejects). **Sell-only** watch; no Helius fee fetch on that path.
+
+
 
 ## 2026-07-27 (105)
 
+
+
 ### Follow-token: fresh+top_holder watch overrides large-group fee cluster
 
-- **`multi_fresh_fresh_top_holder_fee_mismatch_watch`** also applies when **≥9** wallets but **&lt;3** fresh share the same buy fee (would be `multi_fresh_large_group_insufficient_same_fee_fresh`): buy and **sell-only** watch on dual-tagged fresh top buyer instead of no-buy.
+- `multi_fresh_fresh_top_holder_fee_mismatch_watch` also applies when **≥9** wallets but **<3** fresh share the same buy fee (would be `multi_fresh_large_group_insufficient_same_fee_fresh`): buy and **sell-only** watch on dual-tagged fresh top buyer instead of no-buy.
+
+
 
 ## 2026-07-27 (104)
 
+
+
 ### Follow-token: multi-fresh fee mismatch fresh+top_holder override
 
-- With **≥2 fresh** and a **`fresh_wallet` + `top_holder`** wallet, **priority buy** + **sell-only** watch (`multi_fresh_fresh_top_holder_fee_mismatch_watch`) overrides **any** other multi-fresh tag/fee outcome (including fee mismatch, **$250k** path, and default top-fresh handoff).
+- With **≥2 fresh** and a `fresh_wallet` **+** `top_holder` wallet, **priority buy** + **sell-only** watch (`multi_fresh_fresh_top_holder_fee_mismatch_watch`) overrides **any** other multi-fresh tag/fee outcome (including fee mismatch, **$250k** path, and default top-fresh handoff).
+
+
 
 ## 2026-07-27 (103)
 
+
+
 ### Follow-token: multi-fresh large-group threshold back to 9 wallets
 
-- **≥9** second-group wallets + **≥3** fresh with same buy fee → **$250k MC TP**; **&lt;9** → top fresh buyer watch + handoff.
+- **≥9** second-group wallets + **≥3** fresh with same buy fee → **$250k MC TP**; **<9** → top fresh buyer watch + handoff.
+
+
 
 ## 2026-07-27 (102)
+
+
 
 ### Follow-token: multi-fresh large-group threshold 7 wallets
 
 - **≥7** second-group wallets + **≥3** fresh with same buy fee → **$250k MC TP**; else no buy on that path.
-- **&lt;7** wallets: top fresh buyer watch + handoff unchanged.
+- **<7** wallets: top fresh buyer watch + handoff unchanged.
+
+
 
 ## 2026-07-27 (101)
 
+
+
 ### Follow-token: no-fresh top_holder minority needs 2+ top holders *(removed in 108)*
 
-- Superseded by **`no_fresh_second_group`** (no buy when second group has no fresh wallets).
+- Superseded by `no_fresh_second_group` (no buy when second group has no fresh wallets).
+
+
 
 ## 2026-07-27 (100)
 
+
+
 ### Follow-token: multi-fresh fee gate, 250k TP, late-odd buy skip only
 
-- **Multi-fresh (≥2 fresh):** Helius buy txs for each second-group wallet; **`fee` (lamports)** must match — **no buy** if **≥2** wallets are off the majority fee (`multi_fresh_fee_mismatch`).
-- **&lt;9** wallets: buy + watch top fresh buyer (existing handoff rules).
+- **Multi-fresh (≥2 fresh):** Helius buy txs for each second-group wallet; `fee` **(lamports)** must match — **no buy** if **≥2** wallets are off the majority fee (`multi_fresh_fee_mismatch`).
+- **<9** wallets: buy + watch top fresh buyer (existing handoff rules).
 - **≥9** wallets + **≥3** fresh wallets sharing the same buy fee: buy + **$250k MC TP** (`multi_fresh_large_group_same_fee_fresh_tp_250k`); otherwise **no buy** (`multi_fresh_large_group_insufficient_same_fee_fresh`).
-- **`late_second_group_four_wallet_odd_top_holder`:** still **+90% MC TP**; **only** this tag plan skips full exit on watched-wallet **buy** (sell-only exit + MC TP).
+- `late_second_group_four_wallet_odd_top_holder`**:** still **+90% MC TP**; **only** this tag plan skips full exit on watched-wallet **buy** (sell-only exit + MC TP).
 - Other tag plans: watched-wallet **buy/sell** full exit restored (except multi-fresh handoff on fresh buy).
+
+
 
 ## 2026-07-27 (99)
 
+
+
 ### Follow-token: watched-wallet exit on sell only (tag plans)
 
-- GMGN tag-plan watches (including **`late_second_group_four_wallet_odd_top_holder`**, **`odd_minority`**, **`standard`** / single-fresh, post-handoff non-fresh) no longer **full-exit on watched-wallet buy**; **sell tx only** (+ MC TP where enabled). **`multi_fresh_top_fresh_buyer`** still runs **handoff** on fresh buy (not a sell). Multi-fresh handoff failures log and **hold** instead of exiting on the fresh buy.
+- GMGN tag-plan watches (including `late_second_group_four_wallet_odd_top_holder`, `odd_minority`, `standard` / single-fresh, post-handoff non-fresh) no longer **full-exit on watched-wallet buy**; **sell tx only** (+ MC TP where enabled). `multi_fresh_top_fresh_buyer` still runs **handoff** on fresh buy (not a sell). Multi-fresh handoff failures log and **hold** instead of exiting on the fresh buy.
+
+
 
 ## 2026-07-26 (98)
+
+
 
 ### Follow-token: multi-fresh handoff exit if non-fresh already sold
 
 - On **multi-fresh handoff**, after picking the non-fresh top buyer, if that wallet already has a **sell after its first buy** on the token (GMGN `sell_tx_count_cur` / `sell_volume_cur`, or Helius tx order), **full exit immediately** instead of re-subscribing the watch.
 
+
+
 ## 2026-07-26 (97)
+
+
 
 ### Follow-token: multi-fresh handoff on fresh top buyer buy
 
-- **`multi_fresh_top_fresh_buyer`:** full exit on the watched fresh top buyer’s next **sell** unchanged. On next **buy**, re-fetch GMGN tags and **hand off** the watch to the **top buyer among non-fresh wallets** in that second group; standard exit on that wallet’s next buy or sell. Handoff failure (GMGN error, no non-fresh top buyer) falls back to full exit on the fresh buy.
+- `multi_fresh_top_fresh_buyer`**:** full exit on the watched fresh top buyer’s next **sell** unchanged. On next **buy**, re-fetch GMGN tags and **hand off** the watch to the **top buyer among non-fresh wallets** in that second group; standard exit on that wallet’s next buy or sell. Handoff failure (GMGN error, no non-fresh top buyer) falls back to full exit on the fresh buy.
+
+
 
 ## 2026-07-26 (96)
 
+
+
 ### Follow-token: multi-fresh second group watches top fresh buyer
 
-- **≥2 `fresh_wallet` in second group:** if **every** wallet in the group is fresh (no non-fresh wallets), **no buy** (`multi_fresh_no_fresh_top_holder_and_no_non_fresh`). Otherwise watch the **top GMGN buyer among fresh wallets** (`multi_fresh_top_fresh_buyer`); full exit on that wallet’s next **buy** or **sell**.
-- **Removed:** dual fresh+`top_holder` subset, non-fresh pool watch, and fresh-vs-non-fresh buy-size skip (`multi_fresh_non_fresh_*`).
+- **≥2** `fresh_wallet` **in second group:** if **every** wallet in the group is fresh (no non-fresh wallets), **no buy** (`multi_fresh_no_fresh_top_holder_and_no_non_fresh`). Otherwise watch the **top GMGN buyer among fresh wallets** (`multi_fresh_top_fresh_buyer`); full exit on that wallet’s next **buy** or **sell**.
+- **Removed:** dual fresh+`top_holder` subset, non-fresh pool watch, and fresh-vs-non-fresh buy-size skip (`multi_fresh_non_fresh_`*).
+
+
 
 ## 2026-07-25 (95)
 
+
+
 ### Insider: remove -50% P/L stop-loss
 
-- **`tryTriggerStopLossSell`** is disabled (no MC stop-loss sell). Rug MC floor, watched-wallet exits, and configured MC take-profit paths unchanged.
+- `tryTriggerStopLossSell` is disabled (no MC stop-loss sell). Rug MC floor, watched-wallet exits, and configured MC take-profit paths unchanged.
+
+
 
 ## 2026-07-25 (94)
 
+
+
 ### Follow-token: late 4-wallet odd top_holder buy (+90% MC TP)
 
-- Second group **&gt;60s** after initial anchor, **4** wallets, **no** `fresh_wallet`, **1-vs-3** `top_holder` odd split → buy without waiting for 5 wallets; **+90% MC take-profit** enabled (+ watched-wallet buy/sell exit).
-- **10s grace** still runs for **&lt;5** wallet second groups before `second_group_insufficient_wallets_*` reset (including counts like 2–4 that do not match the late odd trigger).
+- Second group **>60s** after initial anchor, **4** wallets, **no** `fresh_wallet`, **1-vs-3** `top_holder` odd split → buy without waiting for 5 wallets; **+90% MC take-profit** enabled (+ watched-wallet buy/sell exit).
+- **10s grace** still runs for **<5** wallet second groups before `second_group_insufficient_wallets_`* reset (including counts like 2–4 that do not match the late odd trigger).
+
+
 
 ## 2026-07-25 (93)
+
+
 
 ### Follow-token: 10s grace before second-group wallet-count fail
 
 - When the **second** GMGN same-second group first appears with **<5** wallets, poll every **1s** for **10s** on that **same anchor timestamp** (GMGN may add bundlers to that second). If count reaches **≥5** during grace → continue tag plan / buy. After **10s** still **<5** → `second_group_insufficient_wallets_`* reset + Telegram (no instant fail on first snapshot).
 
+
+
 ## 2026-07-24 (92)
+
+
 
 ### Follow-token second-group watch: one fresh + one top_holder; odd minority buy exit
 
 - **Second group:** exactly **one** `fresh_wallet` and **one** `top_holder` (different wallets); every **other** wallet in the group has **neither** `fresh_wallet` **nor** `top_holder` → watch whichever of the fresh vs top_holder pair **bought more**; full exit on their next **buy** or **sell** (standard watch).
 - **Odd minority (no fresh):** minority top buyer’s next **buy** or **sell** → **sell full position** (removed third-group GMGN fetch / `third_group_fresh` handoff on minority **buy**).
 
+
+
 ## 2026-07-24 (91)
+
+
 
 ### Remove initial-bundler MC buy gate; Telegram on every flow reset
 
@@ -315,16 +507,24 @@
 - `**resetForNewToken**` sends a **Telegram reset notification** for every skip/reset (token, reason, flow type) unless `skipTelegram: true` (e.g. migration MC ceiling already has a dedicated message).
 - **Migration age filter:** `INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC` default **5s** (was 60s). Migrate more than **5s** after CREATE → token skipped (unchanged filter logic, tighter window).
 
+
+
 ## 2026-07-24 (90)
+
+
 
 ### Follow-token: fail-fast second group, 1s GMGN poll, API key rotation
 
 - **Second group:** after initial bundler group is latched, wait for the **next** same-second GMGN group. If it appears with **<5** wallets, **10s grace** on that second (1s polls) for GMGN to reach **≥5**; if still **<5** after grace, stop polling and **reset**. If **≥5** (during or after grace window), continue tag plan / buy as before.
 - **Initial group:** once GMGN shows the earliest same-second group containing **any** expected initial bundler, **all** expected bundlers must appear in that group; otherwise **reset** (do not keep polling for missing bundlers).
 - **Poll interval:** GMGN bundler poll every **1s** (was 2s).
-- **Follow-token poll:** `**gmgn-cli` first** (API fallback on empty CLI); `**GMGN_API_KEY`** and `**GMGN_API_KEY_2**` alternate by **calendar second** (even → key 1, odd → key 2). CLI subprocess uses that client’s key via `GMGN_API_KEY` env. `**GMGN_FALLBACK_API_KEY` removed** (no secondary REST key retry).
+- **Follow-token poll:** `**gmgn-cli` first** (API fallback on empty CLI); `**GMGN_API_KEY`** and `**GMGN_API_KEY_2`** alternate by **calendar second** (even → key 1, odd → key 2). CLI subprocess uses that client’s key via `GMGN_API_KEY` env. `**GMGN_FALLBACK_API_KEY` removed** (no secondary REST key retry).
+
+
 
 ## 2026-07-24 (89)
+
+
 
 ### Follow-token: GMGN tag-based watch selection, no re-entry, poll until second group
 
@@ -333,27 +533,43 @@
 - **GMGN tags:** reads `tags` (`fresh_wallet`) and `maker_token_tags` (`top_holder`) on bundler traders to pick the watched wallet from the second group (multi-fresh, single-fresh, non-fresh fallback, or odd `top_holder` minority). Skips buy when tag split is unanimous or tied.
 - **Exit:** sell full position on watched wallet **sell** or **buy** tx while holding (+90% MC TP disabled; **-50% SL** / dev rug unchanged). **Odd minority** path: sell on minority top buyer **sell** only; on minority **buy**, one-shot GMGN fetch for **third group** → watch fresh top buyer there → sell on their **sell** (no sell on minority buy). If third group / fresh top buyer missing while holding after minority buy → sell; if not holding → reset + PumpPortal.
 
+
+
 ## 2026-07-24 (88)
+
+
 
 ### Follow-token: re-entry +90% TP exit and +50% copy-sell re-entry block
 
 - **Re-entry exit (same top buyer or second-group handoff):** sell when position P/L reaches **+90%** take-profit vs re-entry MC (standard MC checker). Stop-loss **-50% P/L** remains. Removed on-chain top-buyer full-exit sell trigger for re-entry.
 - **Re-entry gate:** after first-entry **copy-sell** on top-buyer sell tx, if position P/L was already above **+50%**, all re-entry is blocked (same top buyer rebuy and second-group handoff).
 
+
+
 ## 2026-07-23 (87)
+
+
 
 ### Follow-token: second-group rebuy only after top buyer sell tx
 
 - Re-entry and second-group handoff buys are ignored until the GMGN **top buyer** has a **sell tx** on the token. Buys from the top buyer or any other second-group wallet before that sell are not considered (including REST backfill replay).
 
+
+
 ## 2026-07-23 (86)
+
+
 
 ### Follow-token: REST backfill while top-buyer / second-group WSS watch connects
 
 - When subscribing (or re-syncing) the Enhanced WSS top-buyer or second-group handoff watch, the bot now **REST-backfills recent wallet history** for the watched address(es) from slightly before subscribe time.
 - Catches buy/sell txs that land while the WebSocket is connecting, reconnecting, or between our buy submit and holding start. Signatures are deduped with live WSS notifications; txs are replayed oldest-first through the same handler.
 
+
+
 ## 2026-07-23 (85)
+
+
 
 ### Follow-token: second-group top-buyer handoff after original top buyer sells
 
@@ -361,14 +577,22 @@
 - If the **same** top buyer buys again → existing re-entry (full on-chain exit sell).
 - If a **different** wallet in the second group buys → **hand off** top-buyer watch to that wallet, re-enter, and exit when the **new** top buyer fully exits on-chain (+90% TP disabled; -50% SL remains).
 
+
+
 ## 2026-07-23 (84)
+
+
 
 ### Follow-token: GMGN-only flow (skip feePayer backtrack)
 
 - Follow-token no longer runs the Helius bundler **zero-balance funding / shared feePayer** backtrack before buy. Migrated tokens often have no funding TRANSFER history in that window (`transferCount: 0`), which blocked GMGN polling entirely.
 - After migration filters + first-four bundlers, the bot loads dev CREATE time and starts the **GMGN second-group poll** immediately (dev rug watch still active).
 
+
+
 ## 2026-07-23 (83)
+
+
 
 ### Follow-token: GMGN bundler second-group buy trigger
 
@@ -380,7 +604,11 @@
 - **Post-buy sell trigger:** while holding a follow-token position, batched on-chain `getTokenAccountsByOwner` checks (SPL + Token-2022, one JSON-RPC batch per tick) run on the **top buyer wallet** during **re-entry** only. When that wallet has zero token balance, the bot sells the full position.
 - **Top buyer watch:** after the GMGN second-group buy, the wallet with the highest GMGN `buy_volume_cur` in that group is watched via Enhanced WSS. **First entry:** copy-sell on any top-buyer sell tx (+90% TP disabled, -50% SL kept). **After sell:** PumpPortal migration resumes but the top-buyer watch stays active. **Re-entry:** if the top buyer buys again before rug, migration feed suspends and the bot re-buys; **second entry** exits when the top buyer fully exits on-chain.
 
+
+
 ## 2026-07-23 (82)
+
+
 
 ### Follow-wallet: respect manual pause across token flow resets
 
@@ -388,13 +616,21 @@
 - Auto-resume after `resetForNewToken` / `completeFlowCycle` (follow-token skip, rug, sell complete, etc.) is skipped while paused.
 - **Resume Follow-Wallet** clears the flag; startup auto-resume also skips when paused.
 
+
+
 ## 2026-07-23 (81)
+
+
 
 ### Follow-token: dev CREATE count 1–3
 
 - Follow-token migration filter accepts dev wallets with **1, 2, or 3** CREATE txs in Helius history (was exactly **1**). **0** or **4+** still rejected.
 
+
+
 ## 2026-07-23 (80)
+
+
 
 ### Follow-token: parallel feePayer-funder watch (≤6h)
 
@@ -405,7 +641,11 @@
 - **Shared FeePayer Locked** Telegram includes the parallel funder when active.
 - Primary and parallel watches dedupe by address: handoff to the parallel funder absorbs the parallel subscription instead of opening a second connection.
 
+
+
 ## 2026-07-23 (79)
+
+
 
 ### Insider: startup handoff when shared feePayer is already at zero SOL
 
@@ -413,13 +653,21 @@
 - Hand off monitoring to that recipient automatically (same migration path as live large-drain), up to **5** chained hops if intermediates are also empty.
 - Skips handoff when the drain returned to the **original** feePayer or the recipient is also at zero.
 
+
+
 ## 2026-07-23 (78)
+
+
 
 ### Follow-token: reject 0 dev CREATE count again
 
 - Migrated tokens with **0** dev CREATE txs in Helius history are skipped again (no bundler fallback). Filter requires **exactly 1** create.
 
+
+
 ## 2026-07-23 (77)
+
+
 
 ### Normal mode: -50% stop-loss; +180% take profit for ~0.1–0.5 SOL rounds
 
@@ -427,47 +675,75 @@
 - Round groups **~0.1 SOL through ~0.5 SOL** use **+180% MC** take profit; **~0.02 / ~0.05 SOL** stay at **+90%**.
 - **$100 first-buy gate unchanged**: among the **first two unique round-group recipients**, buy only proceeds if at least one recipient’s first token buy exceeds **$100**.
 
+
+
 ## 2026-07-23 (76)
+
+
 
 ### Normal mode: expand round SOL sizes; tiered MC exit
 
 - Round group sizes: **~0.02 / ~0.05** (< $10 cap) and **~0.1–0.5 SOL** in **0.05 steps** (USD-exempt, may exceed $10).
 - Exit bands: **+90% MC** for ~0.02 / ~0.05 SOL; **+180% MC** for ~0.1–0.5 SOL (see **2026-07-23 (77)** for stop-loss update).
 
+
+
 ## 2026-07-23 (75)
+
+
 
 ### Follow-token: resubscribe PumpPortal on skip/reset, not only after rug
 
 - `**startFromFollowTokenMigration**` now returns `**true` only when the bundler-funder flow is still active** after startup (fixes PumpPortal staying suspended when startup skip/reset fired `tokenFlowEnded` before unsubscribe).
-- PumpPortal **resubscribes on `tokenFlowEnded`** (`reset` or `cycle_complete`) once `**resetForNewToken` / `completeFlowCycle**` tear down feePayer, recipients, and other token watches — no need to wait for on-chain dev rug while the bot has already skipped/reset.
+- PumpPortal **resubscribes on** `tokenFlowEnded` (`reset` or `cycle_complete`) once `**resetForNewToken` / `completeFlowCycle`** tear down feePayer, recipients, and other token watches — no need to wait for on-chain dev rug while the bot has already skipped/reset.
+
+
 
 ## 2026-07-23 (74)
+
+
 
 ### Follow-token: revert early-filter fail logs; accept 0 dev CREATE count with bundlers
 
 - Filters 1–2 failures back to **debug**; **info** only after pump + metadata URI pass.
 - Dev CREATE history accepts **0 or 1** mint(s); **>1** still rejected. When count is **0**, token continues only if first-four SWAP bundlers validate.
 
+
+
 ## 2026-07-23 (73)
+
+
 
 ### Follow-token: always log filters 1–2 at info (pass or fail)
 
 - **Filter 1** (mint suffix) and **filter 2** (Helius DAS metadata URI) now emit `**info`** logs on both pass and fail; later filters unchanged.
 
+
+
 ## 2026-07-23 (72)
+
+
 
 ### Follow-token: metadata URI via Helius DAS getAsset
 
-- Replaced Metaplex metadata PDA + RPC `getAccountInfo` with **Helius DAS `getAsset(mint)`** (`content.json_uri`) for the ipfs.io/baf metadata filter.
+- Replaced Metaplex metadata PDA + RPC `getAccountInfo` with **Helius DAS** `getAsset(mint)` (`content.json_uri`) for the ipfs.io/baf metadata filter.
 - Retry/debug logs now refer to DAS indexing lag instead of metadata account lookup.
 
+
+
 ## 2026-07-23 (71)
+
+
 
 ### Normal mode: round/dust buy threshold 17 → 15 txs
 
 - `BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY` lowered from **17** to **15** (same 10s window; cumulative dust skip uses the same threshold).
 
+
+
 ## 2026-07-23 (70)
+
+
 
 ### Follow-token: tiered backend logs + unsubscribe PumpPortal during active flow
 
@@ -475,7 +751,11 @@
 - **PumpPortal migration feed unsubscribes** (`unsubscribeMigration` + WebSocket disconnect, no reconnect) when follow-token bundler-funder flow starts; **resubscribes** (`connect` + `subscribeMigration`) on `tokenFlowEnded` for that follow-token mint (rug/reset or cycle complete).
 - Removed `**INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS**` (behavior is now fixed, not env-gated).
 
+
+
 ## 2026-07-23 (69)
+
+
 
 ### Follow-token: Metaplex metadata URI filter (`https://ipfs.io/ipfs/baf…`)
 
@@ -483,20 +763,32 @@
 - Retries metadata lookup on indexing lag (4s / 8s) when the metadata account is missing; wrong URI prefix fails immediately.
 - Added `**token-metaplex-metadata.ts**` (PDA + on-chain decode — same flow as `findMetadataPda` + `fetchMetadata`, no extra npm deps).
 
+
+
 ## 2026-07-23 (68)
+
+
 
 ### Follow-token: retry Helius mint CREATE lookup on indexing lag
 
 - When `**mint create transaction not found**`, retries `**getMintCreateTransaction**` after **4s** and **8s** (same delays as first-four bundler fetch) before skipping the migration.
 
+
+
 ## 2026-07-23 (67)
+
+
 
 ### Follow-token: verbose backend logs for every PumpPortal migration
 
 - New `**INSIDER_FOLLOW_TOKEN_VERBOSE_LOGS**` (default `**true**`) — `[FOLLOW-TOKEN]` info logs for every migration received, evaluation start, duplicate skips, core filter failures (with reason), and bundler indexing retries.
 - When `**false**`, core/bundler skip details stay at **debug** (prior behavior); passes/failures at info/warn unchanged.
 
+
+
 ## 2026-07-23 (66)
+
+
 
 ### Follow-token: revert dev create count to Helius CREATE history
 
@@ -504,7 +796,11 @@
 - Removed Bitquery dependency from follow-token start — no `**BITQUERY_***` env vars required.
 - Deleted `**bitquery-client.ts**`.
 
+
+
 ## 2026-07-23 (65)
+
+
 
 ### Follow-token: Bitquery OAuth client-credentials + startup auth check
 
@@ -513,14 +809,22 @@
 - Bitquery HTTP GraphQL auth uses `**?token=ory_at_...**` on `https://streaming.bitquery.io/graphql` (same URL-token pattern as WSS); `**Authorization: Bearer**` is fallback only.
 - Strips accidental quotes/`Bearer` prefix from `BITQUERY_ACCESS_TOKEN`.
 
+
+
 ## 2026-07-23 (64)
+
+
 
 ### Follow-wallet: verbose backend logs for testing
 
 - New `**INSIDER_FOLLOW_WALLET_VERBOSE_LOGS**` (default `**true**`) — emits `**[FOLLOW-WALLET]**` info logs for monitoring start/pause/resume, buy detection, flow start, and every Enhanced WSS wallet tx (not just buys).
 - Follow-wallet monitors use the `**FOLLOW-WALLET**` log label when verbose (easier to filter in backend logs). Set `**INSIDER_FOLLOW_WALLET_VERBOSE_LOGS=false**` when done testing.
 
+
+
 ## 2026-07-23 (63)
+
+
 
 ### Follow-token: Bitquery V2 auth + creator count query
 
@@ -528,7 +832,11 @@
 - Strips accidental `Bearer`  prefix from env; clearer **403** hint when token/endpoint mismatch.
 - Creator count query uses `**dataset: combined**` and Pump.fun program address filter for full historical create count.
 
+
+
 ## 2026-07-23 (62)
+
+
 
 ### Follow-token: Bitquery Pump.fun creator count
 
@@ -536,7 +844,11 @@
 - Requires `**BITQUERY_ACCESS_TOKEN**` in `.env` for follow-token start.
 - Removed `HeliusClient.countDevCreatedTokenMints`.
 
+
+
 ## 2026-07-23 (61)
+
+
 
 ### Follow-token: PumpPortal migration WebSocket + pause/env controls
 
@@ -547,36 +859,56 @@
 - Env auto-start flags: `**INSIDER_FOLLOW_WALLET_ENABLED**`, `**INSIDER_FUNDER_FIRST_ENABLED**`, `**INSIDER_FOLLOW_TOKEN_ENABLED**` (follow-token TG alerts still require the last).
 - General wallet monitors now pass shared Enhanced WSS for `transactionSubscribe` when `INSIDER_HELIUS_API_KEY` is set.
 
+
+
 ## 2026-07-23 (60)
+
+
 
 ### Follow-token: funded-by requires `Centralized Exchange`
 
 - Dev funder filter now requires Helius funded-by `funderType` `**Centralized Exchange**` (case-insensitive), matching the Wallet API response (e.g. Bybit Hot Wallet). Removed legacy `exchange` / name-heuristic fallback.
 
+
+
 ## 2026-07-23 (59)
+
+
 
 ### Follow-token: tiered logging and Telegram gates
 
 - **Backend info logs** include the token only after core migration filters pass (pump suffix, dev single create, migrate age, exchange funder). Earlier skips are **debug-only** without mint spam.
 - **Telegram** token alerts (filters passed, handoff delayed/skipped) fire only after **first-four bundlers** confirm and only when `**INSIDER_FOLLOW_TOKEN_ENABLED=true`**. Start/stop listener TG unchanged.
 
+
+
 ## 2026-07-23 (58)
+
+
 
 ### Follow-token: Pump.fun migration listener
 
-- New **follow-token** flow listens for Pump.fun `**migrate` / `migrate_v2`** on program `6EF8…` via Helius `**parsedTransactionSubscribe**`.
+- New **follow-token** flow listens for Pump.fun `**migrate` / `migrate_v2`** on program `6EF8…` via Helius `**parsedTransactionSubscribe`**.
 - Migration filters: mint ends `**pump**`, dev created **exactly 1** token, migrate within `**INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC`** (default 60s) of create, dev **funded by Centralized Exchange** (Helius `/v1/wallet/{wallet}/funded-by`, `funderType=Centralized Exchange`).
 - After filters pass, validates **first-four unique SWAP buys** and starts the same **bundler-funder monitoring** as follow-wallet (`startFromFollowTokenMigration` — no follow wallet required).
 - Telegram: **Start / Stop Follow-Token**; optional auto-start via `INSIDER_FOLLOW_TOKEN_ENABLED=true`.
 - Added `getWalletFundedBy`, `countDevCreatedTokenMints` on `HeliusClient`; `pump-migrate-detector.ts`; `FollowTokenMigrationOrchestrator`.
 
+
+
 ## 2026-07-23 (57)
+
+
 
 ### Funder-first: handoff Telegram shows only the confirmed group events
 
 - Fixed handoff message listing every historical fund to the four group wallets (e.g. 7 SOL then 8 SOL re-funds) — it now shows only the four **10s-window** events that formed the active watched group and spread is computed from those.
 
+
+
 ## 2026-07-22 (56)
+
+
 
 ### Funder-first: latest ≥100 SOL handoff when watched 4-in-10s group exists
 
@@ -584,7 +916,11 @@
 - FeePayers with no watched group keep **highest** ≥100 SOL handoff unchanged.
 - Telegram handoff titles reflect latest vs highest.
 
+
+
 ## 2026-07-22 (55)
+
+
 
 ### Funder-first: confirm watched group = mint first-four bundlers
 
@@ -592,13 +928,21 @@
 - Removed loose overlap against all feePayer funding history; mismatches are debug-only (no TG / info spam).
 - Shared `extractFirstUniqueEarlyBundlerBuys` + `watchedGroupMatchesFirstFourBundlers` in `wallet-swap-detector.ts`.
 
+
+
 ## 2026-07-22 (54)
+
+
 
 ### Normal mode: round/dust buy threshold 20 → 17 txs
 
 - `BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY` lowered from **20** to **17** (same 10s window; cumulative dust skip uses the same threshold).
 
+
+
 ## 2026-07-22 (53)
+
+
 
 ### Normal mode: add ~0.15 / ~0.2 SOL round buy triggers
 
@@ -607,14 +951,22 @@
 - **~0.15 / ~0.2** are **exempt** from the $10 cap (may exceed $10 at current SOL price).
 - **~0.15 / ~0.2 / ~0.1** use the +180% MC exit band; **~0.02 / ~0.05** stay at +90%.
 
+
+
 ## 2026-07-22 (52)
+
+
 
 ### Rug reset: MC below $3k
 
 - Added `INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000` — live MC poll triggers the same pre-buy reset / in-position sell path as dev CLOSE_ACCOUNT and dev zero-SOL rug signals.
 - Pre-buy buy-gate rug check (`INSIDER_RUG_MARKET_CAP_USD = 5_000`) unchanged.
 
+
+
 ## 2026-07-21 (51)
+
+
 
 ### Fix funder-first WebSocket subscription exhaustion (1000 cap)
 
@@ -622,7 +974,11 @@
 - **Fix**: removed per-recipient `accountSubscribe` — recipient zero-balance is detected via Enhanced WSS txs (`checkRecipientDrain`) only.
 - Added **900** subscription budget guard + **100** concurrent potential-feePayer cap with idle-watch eviction.
 
+
+
 ## 2026-07-20 (50)
+
+
 
 ### Funder-first: 5 SOL bundler group threshold + silent until confirmed
 
@@ -631,76 +987,116 @@
 - Valid groups are tracked silently — no Telegram or per-group backend info logs until a recipient buy overlaps the token's **first-four bundlers**; then one confirm log + handoff Telegram (with group details).
 - Insider-bot normal-mode **funding** gate after handoff stays **≥20 SOL**.
 
+
+
 ## 2026-07-20 (49)
+
+
 
 ### Follow-wallet max raised to 4
 
 - `MAX_FOLLOW_WALLETS` increased from **3** to **4** on bot 1.
 - Startup env: `INSIDER_FOLLOW_WALLET_4` now loaded with `_1` / `_2` / `_3`.
 
+
+
 ## 2026-07-20 (48)
+
+
 
 ### Follow-wallet max raised to 3
 
 - `MAX_FOLLOW_WALLETS` increased from **2** to **3** on bot 1 (Telegram add/remove, Enhanced WSS monitors, funder-first merge).
 - Startup env: `INSIDER_FOLLOW_WALLET_3` now loaded with `INSIDER_FOLLOW_WALLET` / `_2` (config field already existed).
 
+
+
 ## 2026-07-20 (47)
+
+
 
 ### Telegram: follow-wallet add + funder-first stop button
 
 - Plain-text wallet messages no longer add a follow wallet — only **Add follow wallet** → reply flow (or **Resume** when no wallets are configured).
 - Removed **Stop Funder-First** from the home menu while funder-first is running (**Start** still shown if stopped).
 
+
+
 ## 2026-07-20 (46)
+
+
 
 ### Normal mode: Telegram for dust vs round race outcomes
 
 - **Round wins**: when cumulative dust is ≥20 but a round 10s group already reached ≥20 txs first, sends **🏁 Round Group Won Race to 20** (one per token) instead of log-only.
 - **Dust wins at round gate**: **⏭️ Cumulative Dust Before Round Buy** skip message now includes prior dust count and round group size (follow wallet when applicable).
 
+
+
 ## 2026-07-20 (45)
+
+
 
 ### Fix duplicate Telegram on round-group first-buy skip
 
 - When a qualifying ~0.02 / ~0.05 / ~0.1 SOL round group failed the **$100** first-buy gate, `normalTinyRoundGroupFound` was only set on **pass**, so every later transfer-out in the same sync batch re-ran the gate and sent another identical skip message.
 - Now the round group is **claimed once** (`normalTinyRoundGroupFound`) before the USD gate runs; pre-buy skip helpers stop feePayer discovery immediately (`discoveryStopped`) so only **one** Telegram is sent per token.
 
+
+
 ## 2026-07-19 (44)
+
+
 
 ### Follow-wallet vs funder-first normal-mode funding threshold
 
 - **Follow-wallet**: normal-mode **funding** threshold lowered from **20 SOL** to **>3 SOL**. Buy signals unchanged — tiny round groups on transfer-outs **< $10**, cumulative dust race-to-20, and the **$100** first-buy gate on the first two unique recipients.
 - **Funder-first**: normal-mode **funding** threshold stays **≥20 SOL**. Uses the **same** tiny round-group buy path as follow-wallet (not the old large 20 SOL+ transfer-out → wait-for-recipient-buy path).
 
+
+
 ### Follow-wallet Telegram: show responsible follow wallet
 
-- Follow-sourced skip, watch-start, and buy-gate messages now include **Follow wallet: `…`** (the wallet whose buy started that token flow), including:
+- Follow-sourced skip, watch-start, and buy-gate messages now include **Follow wallet:** `…` (the wallet whose buy started that token flow), including:
   - Low-funding mode disabled / funding-below-threshold skips
   - **Shared FeePayer Locked** (feePayer watch armed after funding gate passes)
   - Normal round-group buy gate and dust / first-buy skip notices
 - Omitted on funder-first messages (`flowSource !== "follow"`).
 
+
+
 ## 2026-07-19 (43)
+
+
 
 ### Normal mode: round-group buy requires selected recipient first buy > $100
 
 - Before a normal-mode ~0.02 / ~0.05 / ~0.1 SOL round buy, the bot picks the **first two unique recipients** in the 10s group (not the first two txs), syncs each wallet's history, and finds its **first buy on the current token**.
 - Buy proceeds if **either** recipient's first buy exceeds **$100 USD**; the qualifying wallet triggers the buy. Otherwise the token is skipped and reset.
 
+
+
 ## 2026-07-19 (42)
+
+
 
 ### Funder-first: ignore feePayer-funder transfer-outs below 1 SOL
 
 - `funder-first-orchestrator.ts`: outgoing SOL transfers from the configured feePayer funder below **1 SOL** are skipped and do not arm or top up a potential feePayer watch.
 
+
+
 ## 2026-07-18 (40)
+
+
 
 ### Normal mode: sub-$0.10 outs tracked as dust; round group wins the race to 20 txs
 
 - `insider-bot.ts`: sub-$0.10 feePayer transfer-outs are recorded as dust (no longer ignored).
 - **Race to 20**: dust skip uses **cumulative** dust count (≥20 total, any timing). Round buy still requires ≥20 same-size outs in a **10s window**. Skip only when cumulative dust hits 20 **before** a round 10s group does; round wins if its 10s group reaches 20 first.
 - Removed the **>20 individual dust txs** skip and the **not-first-qualifying-group** round skip (small dust totals no longer block round buys).
+
+
 
 ## 2026-07-17 (39)
 
@@ -712,21 +1108,33 @@
 - Each wallet’s buy triggers its own backtrack flow (with idle-bot delegation unchanged). Funder-first merge checks **both** follow wallets.
 - Optional env: `INSIDER_FOLLOW_WALLET` + `INSIDER_FOLLOW_WALLET_2` load as paused defaults on startup.
 
+
+
 ## 2026-07-17 (37)
+
+
 
 ### Funder-first: 100+ SOL zero-balance handoff chain
 
 - Each potential feePayer tracks **≥100 SOL** native transfer-outs **only from when that watch episode started** (funder receive, fast-track, or zero-balance handoff subscribe time).
 - On native SOL **→ zero**: unsubscribe the drained wallet; if a ≥100 SOL out was recorded in that window, **hand off** watch to the **highest** such recipient by amount (ties → most recent). Live balance check, fresh bundler pipeline. If that recipient is the **feePayer funder**, stop only — funder is already watched, no duplicate subscribe. If none (or recipient already zero), stop with no handoff.
 
+
+
 ## 2026-07-17 (36)
+
+
 
 ### Fast-track adds feePayers; menu remove buttons
 
 - **Fast-track** now **adds** to the watch list without resetting other feePayers. Re-fast-tracking an address already in `watching` / `normal_candidate` is a no-op (preserves bundler group progress).
 - **/start menu**: **🗑 Remove** button per watched potential feePayer — unsubscribes Enhanced WSS, recipient watches, and cooldown dev watch. Blocked only while `active` on Insider bot.
 
+
+
 ## 2026-07-17 (35)
+
+
 
 ### Normal mode: dust-first group skip at ≥20 txs + feePayer resume on pre-buy skip
 
@@ -734,7 +1142,11 @@
 - **Funder-first pre-buy skip**: rug MC guard, dust-first group, excessive dust, etc. no longer enter dev cooldown. FeePayer watch resumes (`watching` / `normal_candidate`) after `tokenFlowEnded` with `hadPosition: false`.
 - **Cooldown** only after a completed trade (`hadPosition: true`). Pre-buy skip removes mint from `boughtMints` so the same token can hand off again if needed.
 
+
+
 ## 2026-07-17 (34)
+
+
 
 ### Parallel follow-wallet + funder-first on two tokens
 
@@ -742,21 +1154,33 @@
 - **Follow-wallet** monitoring stays on bot 1; if bot 1 is already on a token when the follow wallet buys again, the new flow **delegates to the first idle bot** with the same follow-wallet validation.
 - Mint claiming across bots prevents the same mint on two bots. MC checks, buy/sell triggers, and cooldown `tokenFlowEnded` listeners already run per bot.
 
+
+
 ## 2026-07-17 (33)
+
+
 
 ### Telegram: fast-track potential feePayer from /start menu
 
 - **index.ts**: new **Fast-track feePayer** button on the home menu. Prompts for a wallet address and arms funder-first monitoring as if the feePayer funder had just funded that recipient (current SOL balance baseline, Enhanced WSS + REST sync from baseline timestamp).
 - **funder-first-orchestrator.ts**: `fastTrackPotentialFeePayer()` — validates address/balance, rejects active/cooldown/zero-balance wallets, resets group state, sends Telegram alert, runs forced REST sync. Timestamp-only baseline (no funder tx signature) uses recent desc + timestamp filter for the first sync.
 
+
+
 ## 2026-07-17 (32)
+
+
 
 ### Dev zero native SOL treated as rug signal
 
 - **Insider bot**: while watching a token, dev wallet native SOL balance is subscribed alongside CLOSE_ACCOUNT detection. Zero balance triggers the same pre-buy reset / in-position sell path as a dev WSOL close-account rug. Immediate balance check on subscribe catches devs already drained.
 - **Funder-first cooldown**: dev SOL balance subscription during cooldown; zero balance resumes the feePayer watch (same outcome as CLOSE_ACCOUNT rug). Immediate check on cooldown entry.
 
+
+
 ## 2026-07-16 (31)
+
+
 
 ### Normal mode: first sol group + buy at ≥20 round txs
 
@@ -765,7 +1189,11 @@
 - **Buy** only when a **~0.02 / ~0.05 / ~0.1 SOL** group has **≥20 txs** in 10s and is the first qualifying sol group (2–19 txs waits, no buy).
 - Removed the >20 round-group skip cap.
 
+
+
 ## 2026-07-16 (30)
+
+
 
 ### Normal mode: first 10s group uses tx counts (2–20), not dust-group tally
 
@@ -776,7 +1204,11 @@
 - **>20 individual dust txs** total before the first qualifying group → skip.
 - Removed counting separate “dust groups” over time.
 
+
+
 ## 2026-07-16 (29)
+
+
 
 ### Normal mode: dust skip uses groups, not individual outs
 
@@ -784,7 +1216,11 @@
 - Up to **20 dust groups** may precede the first valid ~0.02 / ~0.05 / ~0.1 SOL round group; the 21st dust group skips the token.
 - Removed immediate skip on any single dust group before a valid round group.
 
+
+
 ## 2026-07-16 (28)
+
+
 
 ### Normal mode: exact ~0.02 / ~0.05 / ~0.1 SOL round groups only
 
@@ -793,7 +1229,11 @@
 - **Dust** = any transfer not matching ~0.02 / ~0.05 / ~0.1 SOL. **>20 dust groups** (≥2 in 10s) before the first valid round group skips the token.
 - Removed range-based buys, micro-dust threshold, out-of-range immediate skip, preamble wait, and stale $1–$5 lock timeout.
 
+
+
 ## 2026-07-16 (27)
+
+
 
 ### Normal mode: restore >20 micro-dust counter + ~~0.02–~~0.1 first group
 
@@ -802,14 +1242,22 @@
 - **Buy** still requires the **first group**: ≥2 recipients in 10s with each transfer in ~~**0.02–~~0.1 SOL** (any amount in range, not just exact round sizes).
 - Only transfers **above ~0.1 SOL** before the first group still skip immediately.
 
+
+
 ## 2026-07-16 (26)
+
+
 
 ### Funder-first: REST sync dev wallet on cooldown entry
 
 - When a feePayer enters post-trade cooldown and starts watching the dev for `CLOSE_ACCOUNT`, the bot now immediately REST-syncs recent dev-wallet transactions.
 - Catches dev rugs that occurred before the Enhanced WSS subscription was armed; processed signatures are deduped between REST and WSS.
 
+
+
 ## 2026-07-16 (25)
+
+
 
 ### Normal mode: unified ~~0.02–~~0.1 SOL first-round buy gate
 
@@ -818,7 +1266,11 @@
 - Removed same-USD-band grouping — a valid first group can mix any amounts in the ~~0.02–~~0.1 SOL range within the same 10s window.
 - Exit: **+90% MC** for triggers below ~0.1 SOL, **+180% MC** when the triggering transfer is ~0.1 SOL.
 
+
+
 ## 2026-07-16 (24)
+
+
 
 ### Funder-first: stop potential feePayer on exchange send
 
@@ -826,7 +1278,11 @@
 - If the recipient `type` is **exchange** (e.g. Bybit hot wallet), the potential feePayer watch is unsubscribed immediately and a Telegram alert is sent.
 - Identity results are cached per wallet address to limit API calls.
 
+
+
 ## 2026-07-15 (23)
+
+
 
 ### Normal mode: first feePayer activity must be a round SOL group
 
@@ -834,7 +1290,11 @@
 - Transfers below **$0.10 USD** are still ignored entirely (not tracked).
 - The **first** buy-triggering group must be ≥2 recipients in 10s at **~0.02**, **~0.05**, or **~0.1 SOL** only.
 
+
+
 ## 2026-07-15 (22)
+
+
 
 ### Insider: -40% P/L stop-loss sell trigger
 
@@ -842,7 +1302,11 @@
 - Stop-loss runs even when the +% MC profit exit is disabled (recipient sell-all / zero-SOL paths).
 - Shown in Insider status and post-buy Telegram.
 
+
+
 ## 2026-07-15 (21)
+
+
 
 ### Funder-first: follow-wallet merge + zero-only bundler drain
 
@@ -850,20 +1314,32 @@
 - Bundler recipient drain stop changed from ≤50% to **native SOL → zero** only.
 - After a bundler recipient token buy is seen, drain-based unsubscribe is skipped so buy confirmation / handoff logic can continue.
 
+
+
 ## 2026-07-15 (20)
+
+
 
 ### Funder-first: stop on zero balance, no handoff
 
 - When a potential feePayer's native SOL hits zero, monitoring stops and unsubscribes. No follow/handoff to the drain recipient wallet.
 
+
+
 ## 2026-07-15 (19)
+
+
 
 ### Dev rug: CLOSE_ACCOUNT only, not sell-all SWAP
 
 - WSS tx normalizer now classifies SWAP before inner `closeAccount` instructions, so Pump AMM sell-all txs (which close token/WSOL accounts) stay `SWAP` instead of mislabeled `CLOSE_ACCOUNT`.
 - Shared `isDevRugCloseAccountTx` rejects `SWAP` txs and any tx involving known DEX programs. Funder-first cooldown resume and Insider dev full-exit reset only fire on standalone dev `CLOSE_ACCOUNT` txs.
 
+
+
 ## 2026-07-15 (18)
+
+
 
 ### Funder-first: ≥20 SOL only, zero-balance follow, no low-funding spam
 
@@ -872,14 +1348,22 @@
 - On zero balance: follow the primary drain recipient as the next potential feePayer; if the drain returned to the top-level funder, stop and unsubscribe.
 - Telegram/UI help text updated to match.
 
+
+
 ## 2026-07-15 (17)
+
+
 
 ### Funder-first: handoff REST sync fallback when after-signature rejected
 
 - Helius often rejects `after-signature` on half-drain handoff (signature from the old feePayer's drain tx is not a valid cursor on the new wallet). On that 400, REST sync now falls back to recent desc fetch + timestamp filter instead of failing with a warn.
 - Watches store `balanceAtFunderReceiveTimestamp` for the fallback path.
 
+
+
 ## 2026-07-15 (16)
+
+
 
 ### Follow-wallet flow: cut Helius REST before low-funding skips
 
@@ -889,7 +1373,11 @@
 - **Follow wallet WSS:** no longer unsubscribes on buy; guards prevent duplicate flows — avoids extra `transactionSubscribe` on every reset.
 - **Balance-at:** use `accountData.nativePostBalance` from funding TRANSFER txs when present; removed duplicate identical `getWalletBalanceAt` call.
 
+
+
 ## 2026-07-15 (15)
+
+
 
 ### Funder-first: require exactly 4 bundler funding txs (remove 5s grace)
 
@@ -897,7 +1385,11 @@
 - Removed `GROUP_ACTIVATION_GRACE_SEC` and deferred 3-wallet activation timers from `(14)`.
 - 5+ recipients in the same tolerance window is still skipped entirely.
 
+
+
 ## 2026-07-15 (14)
+
+
 
 ### Funder-first: 5s grace before locking 3-bundler groups + asset-based swap detection
 
@@ -905,14 +1397,22 @@
 - `**wallet-swap-detector.ts`:** new per-wallet swap classifier — requires tx success, known DEX program participation, and a wallet-level asset exchange (SOL/WSOL ↔ token or token ↔ token). Used for funder-first bundler buy detection and for WSS `type: "SWAP"` normalization (no longer program-ID-only).
 - Added Meteora DLMM and Orca Whirlpool to the known swap program set.
 
+
+
 ## 2026-07-15 (13)
+
+
 
 ### Remove REST backstops; cap forced ascending sync at 20 txs
 
 - Removed all periodic / WS-down REST backstop polling: funder-first feePayer interval sync, insider `runPollTick` REST/pollWallet loop, `scheduleBundlerFunderWsSync`, and onLogs→batch-sync recipient paths (push-only via Enhanced WSS when configured).
 - Forced ascending feePayer sync limits reduced **50 → 20** (`BUNDLER_FUNDER_SYNC_LIMIT`, `POTENTIAL_FEEPAYER_SYNC_LIMIT`). One-shot forced sync on flow events (funder receive, handoff, bundler-funder start/migration, sell rearm) is unchanged.
 
+
+
 ## 2026-07-15 (12)
+
+
 
 ### Funder-first: connect post-funder-receive pipeline with logging (REST backstop removed in `(13)`)
 
@@ -921,7 +1421,11 @@
 - ~~Periodic REST backstop~~ — removed in `(13)`.
 - WSS potential-feePayer notifications drive detection; re-arm watch if subscription was dropped.
 
+
+
 ## 2026-07-15 (11)
+
+
 
 ### Funder-first: REST sync + pre-group half-drain handoff chain
 
@@ -929,13 +1433,21 @@
 - **Before any bundler group:** half-drain (≤50% of post-funder-receive balance) inspects the drain tx; if SOL returns to the top-level funder, keep watching; otherwise stop the current feePayer and start fresh on the SOL recipient (chain can repeat).
 - **After a bundler group is active:** the feePayer itself is only dropped on native SOL → 0 (no more half-drain on the feePayer wallet).
 
+
+
 ## 2026-07-15 (10)
+
+
 
 ### Funder-first: skip 10s windows with 5+ tolerance matches
 
 - If 5 or more recipients in a 10s window have post-balances within 0.5 SOL of each other, that window is skipped entirely — no group is formed from it (previously the earliest 4 were kept).
 
+
+
 ## 2026-07-15 (9)
+
+
 
 ### Funder-first: tighten 3–4 bundler group selection
 
@@ -943,14 +1455,22 @@
 - If 5+ recipients meet the tolerance in one 10s window, that window is skipped (see `2026-07-15 (10)` — was briefly capped to earliest 4).
 - Concurrent groups no longer share recipients: once a wallet is in an active group, it is excluded from forming another overlapping group on the same feePayer.
 
+
+
 ## 2026-07-15 (8)
+
+
 
 ### Fix funder-first missing SOL transfer detection on Enhanced WSS
 
 - `extractOutgoingSolTransfers` now handles delta-reconstructed `nativeTransfers` from Enhanced WSS (`from=funder, to=__pool__` paired with `from=__pool__, to=recipient`). Previously every funder send was silently skipped because the recipient was always `__pool__` on the outgoing leg.
 - `handleFunderTx` uses the fixed helper so new potential feePayer watches and Telegram alerts fire again.
 
+
+
 ## 2026-07-15 (7)
+
+
 
 ### Remove Token Transfer mode; drop all idle token-account RPC polling
 
@@ -958,13 +1478,21 @@
 - `WalletMonitor` no longer runs any recurring `getParsedTokenAccountsByOwner` poll — only a one-time startup snapshot; buy detection is push-driven (Enhanced WSS primary, `onLogs` + `getParsedTransaction` fallback).
 - Removed dead config: `DEFAULT_BOT_MODE`, `WALLET_POLL_INTERVAL`, `defaultBotMode`, `walletPollInterval`, and unused `TokenExitEvent` type.
 
+
+
 ## 2026-07-15 (6)
+
+
 
 ### Follow-wallet: drop idle token-account RPC poll when Enhanced WSS is up
 
 - `WalletMonitor` no longer runs recurring `getParsedTokenAccountsByOwner` polls while Enhanced WSS is connected — only a one-time startup snapshot plus a 15s WS health check. RPC poll resumes as backstop if Enhanced WSS drops.
 
+
+
 ## 2026-07-15 (5)
+
+
 
 ### Funder-first: concurrent groups + 0.5 SOL post-balance clustering
 
@@ -973,7 +1501,11 @@
 - Per-recipient drain/zero only unsubscribes when no remaining active group needs that wallet.
 - Token confirm uses the band of the group that contained the buying wallet.
 
+
+
 ## 2026-07-15 (4)
+
+
 
 ### Follow-wallet Enhanced WSS + funder-first multi-group recipient rules
 
@@ -982,7 +1514,11 @@
 - **Per-recipient rules**: each bundler in the active group is unsubscribed if post-balance drops to ≤50% after the feePayer send or native SOL hits zero (`onAccountChange`). When all recipients in a 3–4 group stop, that group is abandoned.
 - FeePayer zero-balance `onAccountChange` unchanged.
 
+
+
 ## 2026-07-15 (3)
+
+
 
 ### Shared Enhanced WSS + batched recipient subscriptions (API optimization)
 
@@ -994,7 +1530,11 @@
   - Funder re-send logic: if funder sends SOL to an already-watched **undecided** potential feePayer (`watching` / `normal_candidate` / `low_candidate`), updates the balance baseline on the existing monitor; if the wallet is **confirmed** (`active` / `cooldown`), skips the funder tx.
   - Failed Insider handoff restores candidate status and re-subscribes recipients.
 
+
+
 ## 2026-07-15 (2)
+
+
 
 ### Parallel "funder-first" discovery flow (feePayer funder → potential feePayers → bundler validation → normal buy)
 
@@ -1011,7 +1551,11 @@
 - `index.ts`: wires orchestrator, auto-starts when funder address is configured, Telegram `/start` shows funder address + watched potential feePayers, buttons for **FeePayer funder** / **Start/Stop Funder-First**.
 - `config.ts` / `types.ts` / `env.example`: `INSIDER_FEEPAYER_FUNDER_ADDRESS`.
 
+
+
 ## 2026-07-15
+
+
 
 ### Migrated the 6 active "free push → 100-credit REST fetch" sites to Helius Enhanced WSS `transactionSubscribe` (Phase 3)
 
@@ -1032,7 +1576,11 @@
 - **Net effect**: for every site above, per-event cost drops from a 100-credit REST call to a data-metered WebSocket message (typically a few KB, ~0.1-0.3 credits) whenever the Enhanced WSS connection is up, and latency drops from "notify, then wait ~100-400ms for a second request" to "notify with the data already attached." A dropped/unconfigured WS connection degrades gracefully to the exact pre-migration behavior at every single site, not a broken or silently-degraded one.
 - **Not runtime-verified against a live Helius connection** in the environment this was authored in (no confirmed network egress to `wss://mainnet.helius-rpc.com` from that sandbox — even the npm registry hit a TLS verification error there). `tx-normalizer.ts`'s field-extraction logic is defensive (optional chaining throughout, warns-and-skips instead of throwing on an unrecognized shape) specifically because of this. **After deploying, watch for** `[TX-NORMALIZER]`**/**`[...ENHANCED WS]` **warn logs** — if the exact `transactionSubscribe` notification shape differs from what's assumed here, those logs will show a truncated sample of the actual payload, which is what's needed to adjust the normalizer.
 
+
+
 ## 2026-07-14 (5)
+
+
 
 ### Fixed followed-wallet buys being permanently dropped when Helius hadn't indexed the mint's early transactions yet
 
@@ -1042,7 +1590,11 @@
   - Added `startInsiderFlowWithIndexingLagRetry(mint)`, now called from `handleFollowWalletBuy` in place of a direct `startInsiderFlow(mint)` call: if `startInsiderFlow` still throws this same indexing-lag error after exhausting the whole Helius pool, it retries the whole flow up to 2 more times with real-world delays (4s, then 8s) before giving up and letting the existing catch block run `resetForNewToken(true)` as before. Any other error (e.g. `InsiderMinBuySolFilterError`) is rethrown immediately with no extra delay, unchanged from before.
 - Net effect: a followed-wallet buy on a brand-new mint now gets a much more generous window (up to ~10x longer) for Helius's indexing to catch up before the bot gives up on it, instead of failing permanently after a single ~4-second attempt against one API key.
 
+
+
 ## 2026-07-14 (4)
+
+
 
 ### Dust is now defined purely by ~0.01 SOL, not "$0.10-$0.99" USD — and fixed a dead-code bug where dust-group tracking never actually ran
 
@@ -1053,7 +1605,11 @@
   - Updated comments, log messages, and the Telegram "Dust Group Observed"/"dust group was already seen" copy that referenced the old "$0.10-$0.99" USD range to describe the new "~0.01 SOL" definition instead. `BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD` ($0.10) is unchanged and still serves its original, separate purpose: an absolute USD floor below which a transfer-out is ignored entirely (not tracked as dust or anything else), independent of the dust band's own SOL-based definition.
 - Net effect: dust-group detection for the $1-$5 band's "not first group" rule now actually fires in practice (previously silently dead for USD-defined dust), and dust classification no longer drifts with SOL price.
 
+
+
 ## 2026-07-14 (3)
+
+
 
 ### ~0.01 SOL transfer-outs are always treated as dust, regardless of USD value
 
@@ -1061,7 +1617,11 @@
 - `insider-bot.ts`: added `BUNDLER_FUNDER_NORMAL_TINY_DUST_ROUND_SOL_AMOUNT = 0.01`. `getTinyUsdBand` now takes `amountSol` in addition to `amountUsd`, and returns `"lt2_5"` (dust) whenever the SOL amount is within the existing `BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL` (±0.004 SOL — i.e. 0.006-0.014 SOL) of 0.01 SOL, before falling back to the normal USD-based banding. Both call sites (`inspectBundlerFunderTransaction`'s live band check, and `getNormalTinySameBandGroup`'s per-entry re-check) were updated to pass `amountSol` through.
 - Net effect: a transfer-out landing in the ~0.006-0.014 SOL range is now always routed through the dust-group logic (contributing to `normalTinyDustGroupSeen`, the "not first group" tracking via `recordNormalTinyTransferOut`, etc.) instead of being eligible for the $1-$5 buy gate — even if its USD value alone would otherwise put it there.
 
+
+
 ## 2026-07-14 (2)
+
+
 
 ### Replaced the "$5,000 MC" rug reset/sell logic with dev-wallet full-exit detection (CLOSE_ACCOUNT / SOLANA_PROGRAM_LIBRARY)
 
@@ -1071,7 +1631,11 @@
 - `index.ts`: removed the `currentMc < INSIDER_MIN_MARKET_CAP_USD` rug block from `checkInsiderMcapFlow` (the `exitMc` profit-target exit check right below it is untouched) and deleted `checkAndSellIfLowMcap` entirely (it was a second, fully redundant MC<$5k sell trigger only ever called for insider positions). Removed the now-unused `INSIDER_MIN_MARKET_CAP_USD` constant and updated the Insider status-menu footer text to describe the new dev-wallet-based rug detection.
 - Not touched: the three pre-buy buy-gate checks against `INSIDER_RUG_MARKET_CAP_USD` in `insider-bot.ts` (low-funding shared-feePayer/recipient buy gates) — these only run inside low-funding mode, which is currently disabled (`BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED = false`), so they're inert dead code for now.
 
+
+
 ## 2026-07-14
+
+
 
 ### Relaxed the shared-feePayer validation: 3-of-4 matching feePayers now passes (was requiring all 4)
 
@@ -1080,7 +1644,11 @@
 - `earliestFundingTimestamp`, `cursorSignature`, `largestFundingSol`, `processedSignatures`, and the tracked `funderWallet` are now all derived from the majority group only, not the full 4. `bundlerWallets` (the set used to exclude the original early buyers from being mistaken for new recipients later) still comes from all 4 original bundler-buy wallets (`firstFour`), regardless of which ones matched the majority feePayer — the outlier bundler genuinely did buy early, it just isn't used to determine the shared feePayer itself.
 - Net effect: if 4-of-4 match, behavior is unchanged. If 3-of-4 match, the token now proceeds using the 3 matching records. If only 2-of-4 (or fewer) match, the bot still resets as before.
 
+
+
 ## 2026-07-13 (6)
+
+
 
 ### Round-SOL-amount check is now band-specific: >$5-$10 (+180%) only accepts ~0.1 SOL, $1-$5 (+90%) only accepts ~0.02/0.05 SOL
 
@@ -1089,14 +1657,22 @@
 - `isRoundBundlerTinySolAmount(amountSol, band)` now takes the band and only matches against that band's own target(s). Both call sites (the group-formation filter in `getNormalTinySameBandGroup`, and the diagnostic log in `inspectBundlerFunderTransaction`) now pass the band through.
 - Net effect: a >$5-$10 group's members must each be within ±0.004 SOL of exactly **0.1 SOL** to be trusted as a genuine round bundler-funding size and trigger the +180% MC buy; the $1-$5 band remains gated on ~0.02 or ~0.05 SOL for the +90% MC buy, unchanged from before.
 
+
+
 ## 2026-07-13 (5)
+
+
 
 ### Round-SOL-amount tolerance widened from ±0.001 to ±0.004 SOL
 
 - **Why**: production logs showed a real bundler funding round using ~~0.018 SOL (~~$1.37 each, 15 recipients) getting stuck at "Normal tiny transfer waiting for same-band 10s group" with `isRoundBundlerSolAmount: false` forever — 0.018 SOL is 0.002 SOL away from the 0.02 SOL target, just outside the old ±0.001 tolerance.
 - `insider-bot.ts`: `BUNDLER_FUNDER_NORMAL_TINY_ROUND_SOL_TOLERANCE_SOL` changed from `0.001` to `0.004`. At this tolerance the three target ranges are still non-overlapping (0.02 → [0.016, 0.024], 0.05 → [0.046, 0.054], 0.1 → [0.096, 0.104]), so there's no ambiguity between round sizes — just more headroom for real-world fee/slippage variance like the 0.018 SOL case above.
 
+
+
 ## 2026-07-13 (4)
+
+
 
 ### Dust-group-preceded $1-$5 sub-band split now keys off the group's round SOL size, not its USD amount
 
@@ -1105,7 +1681,11 @@
 - Removed the now-unused `BUNDLER_FUNDER_NORMAL_TINY_LOW_MID_SPLIT_USD` ($2.50) constant.
 - Every member of a $1-$5 group already has to match one of the round bundler sizes (0.02/0.05/0.1 SOL) to even form a group at all (see the "round SOL amount" filter above), so this check just reads which round size the group landed on rather than re-deriving anything from USD.
 
+
+
 ## 2026-07-13 (3)
+
+
 
 ### $1-$5/>$5-$10 buy-triggering bands now require a "round" bundler SOL amount (0.02/0.05/0.1 SOL)
 
@@ -1114,7 +1694,11 @@
 - `getNormalTinySameBandGroup` now additionally requires, for the `"2_5_to_5"` ($1-$5) and `"gt5"` (>$5-$10) bands only, that every member of the candidate group's `amountSol` be within that tolerance of one of `0.02`/`0.05`/`0.1` SOL — otherwise the whole candidate group is rejected (same "reject the batch" style already used for the same-band check). The `"lt2_5"` dust-band check (used only for the not-first-group/dust-group flag) is deliberately excluded from this filter, since dust transfers use much smaller, non-round amounts by nature.
 - Net effect: `0.100099385`/`0.099955288` SOL (both ≈0.1 SOL) still forms a valid >$5-$10 buy group; `0.030108614`/`0.030170117` SOL (≈0.03 SOL, not close to 0.02/0.05/0.1) no longer forms a valid $1-$5 buy group — it now falls through to the same "Normal tiny transfer waiting for same-band 10s group" log path (now also logging `isRoundBundlerSolAmount` for visibility) instead of triggering a buy.
 
+
+
 ## 2026-07-13 (2)
+
+
 
 ### New buy filter: buy MC must not be below the token's initial bundler-buy MC
 
@@ -1123,7 +1707,11 @@
 - Rationale: if MC has fallen back below where the earliest bundler bought by the time our own buy gate fires, the token's early momentum has already reversed — not worth buying into a declining chart.
 - `initialBundlerMarketCapUsd` is reset to `null` in both `completeFlowCycle` and `resetForNewToken`, alongside `highestObservedMarketCapUsd`, so each new token starts with a clean slate.
 
+
+
 ## 2026-07-13
+
+
 
 ### Replaced the timestamp-based "not first group" check with an explicit dust-*group* flag (fixes a bug where dust preceding a $1-$2.5 group still bought)
 
@@ -1137,7 +1725,11 @@
 - If no dust group is ever observed for a token, behavior is unchanged from before — groups buy normally with no extra check.
 - This is a strictly more reliable version of the same rule requested earlier (`$1-$2.5 skips, $2.5-$5+ buys, when preceded by dust`) — same intended outcome, but keyed off an explicit grouped-dust-event flag instead of a same-second timestamp comparison that could silently fail to trigger.
 
+
+
 ## 2026-07-12
+
+
 
 ### Normal-funding threshold raised to 20 SOL+; low-funding mode disabled for now
 
@@ -1146,7 +1738,11 @@
 - This is a single boolean flag specifically so low-funding mode can be re-enabled later by flipping `BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED` back to `true` — none of the underlying low-funding logic was removed.
 - Normal-funding mode (now ≥20 SOL) and its own tiny same-band logic (including the recent $1-$5 not-first-group rules) are completely unaffected by this change.
 
+
+
 ## 2026-07-11
+
+
 
 ### Not-first-group disqualification for the $1-$5 band is now split by sub-band: $1-$2.5 still skips, $2.5-$5 buys anyway
 
@@ -1156,10 +1752,14 @@
 - The exit percent for this override case is unchanged (still the mid-band's `BUNDLER_FUNDER_NORMAL_TINY_MID_EXIT_PERCENT`, i.e. +90% MC) — this only changes whether the group is trusted as a buy signal, not what happens after the buy.
 - Groups that genuinely have no earlier transfer-out at all (truly first) are unaffected by any of this — they proceed exactly as before regardless of amount within $1-$5.
 
+
+
 ### The "less than $1" dust band tracked for the not-first-group check is now $0.10-$0.99 (was anything under $1)
 
 - `insider-bot.ts`: added `BUNDLER_FUNDER_NORMAL_TINY_DUST_FLOOR_USD = 0.1`. In `inspectBundlerFunderTransaction`, any feePayer transfer-out below this floor is now skipped outright (logged at debug level, not even recorded into `normalTinyTransferOuts`) before the dust-tracking/band-classification logic runs.
 - Practically this means the "less than $1" band used by the $1-$5 band's not-first-group check (added just above) now only considers transfer-outs in the **$0.10-$0.99** range as trackable dust that can disqualify a $1-$5 group from being "first." Amounts under $0.10 are treated as noise and ignored entirely — they neither count as dust nor affect group formation in any way.
+
+
 
 ### Normal mode's $1-$5 band buy gate now requires that group to be the *first* tiny transfer-out group for the token
 
@@ -1168,7 +1768,11 @@
 - This check only applies to the $1-$5 band (as requested) — the >$5-$10 band's grouping/buy logic is unaffected by it, though it now also benefits from the more accurate `normalTinyTransferOuts` data (a dust transfer-out landing inside its own 10s lookback window already caused group-rejection via the pre-existing mixed-band check, now that dust is actually visible there).
 - Net effect: the $1-$5 band now only ever triggers a buy off the very first cluster of tiny transfer-outs seen for a token — any $1-$5 group that follows an earlier transfer-out of any size (dust or otherwise) is ignored and the bot resets to wait for the next token.
 
+
+
 ## 2026-07-10
+
+
 
 ### Both normal- and low-funding modes' tiny same-band group are now $1-$5 (was $2-$5)
 
@@ -1177,7 +1781,11 @@
 - Followed up by also changing `BUNDLER_FUNDER_LOW_FUNDING_TINY_MIN_BUY_USD` from `2` to `1`, so low-funding mode's own (separate) tiny band — used for its bundler gate and dev-buy-after-create gate — is likewise now $1.00-$5.00 instead of $2.00-$5.00. Updated the "Low-Funding Tiny Bundler Gate" and "Low-Funding Tiny Candidate Pending" notification text accordingly. The overall watched range shown at the "Shared FeePayer Locked" step and in low-funding status logs (built from this constant plus the shared $10 upper bound) also shifts from $2.00-$10 to $1.00-$10.
 - Net effect: **both** funding modes now start grouping/gating tiny transfer-outs at $1 instead of $2; anything below $1 is still ignored as too small in either mode.
 
+
+
 ## 2026-07-10
+
+
 
 ### Token Transfer mode: dev-wallet watch no longer stops after buy; return transfer-in is now an automatic sell signal
 
@@ -1190,7 +1798,11 @@
 - Home/status cards for Token Transfer mode now show the priced (or pending-priced) transfer-out value while a position is held, e.g. "Watching dev wallet for a return transfer-in worth >= $1,234 as a sell signal".
 - The existing zero-balance auto-stop (previous entry below) and the manual "Sell Position" button both still work unchanged and continue to fully stop the dev-wallet watch once the position closes, regardless of which of the three ways (manual, sell-signal, zero-balance) closed it.
 
+
+
 ## 2026-07-10
+
+
 
 ### Skip stale normal-mode $2-$5 band buys (30+ min since shared feePayer lock)
 
@@ -1198,7 +1810,11 @@
 - In `inspectBundlerFunderTransaction`, right before a normal-mode same-band tiny group would pass the buy gate (i.e. right before the `🟢 ... Normal FeePayer Tiny Funding Group Buy Gate` notification), if the band is specifically **$2.00-$5.00** and `Date.now() - state.lockedAt` is **≥ 30 minutes**, the buy is skipped entirely: a `⏭️ ... Normal $2-$5 Band Buy Skipped — Too Stale` Telegram notice is sent, and the bot calls `resetForNewToken(true)` to fully drop this token and resume watching the followed wallet for the next one. The >$5-$10 band is unaffected and still buys regardless of elapsed time.
 - This targets exactly the scenario reported: a $2-$5 band buy gate that took a very long time (tens of minutes) to form after the feePayer lock — by then the token has likely already moved without the bot, so buying in is skipped instead of chasing a stale signal.
 
+
+
 ## 2026-07-09
+
+
 
 ### Token Transfer mode: gate transfer-out buys on a prior dev swap-buy; auto-stop on zero balance; startup Telegram summary; more action logging
 
@@ -1209,6 +1825,8 @@
 - Added a one-off Telegram "🟢 Bot Started" summary sent right after full startup (mode, Insider bot count/follow wallet/running state, Token Transfer dev address/buy SOL/running state, trading wallet, watched-wallet count, health port) — previously nothing was ever sent to Telegram on boot, only to the console/process logs, so there was no way to confirm from Telegram alone that the process came back up after a deploy/restart.
 - Added previously-missing `log.info` calls for: wallet add/remove/pause/resume (`startWallet`/`stopWallet`/`pauseWallet`/`resumeWallet`), the `mode:insider`/`mode:tokentransfer` display-switch buttons, Insider per-bot settings changes (buy SOL, normal/low-funding buy SOL, exit %, bundler min/max USD), and Token Transfer's buy-SOL setter — these previously only produced a Telegram reply with no corresponding backend log line.
 
+
+
 ### Removed Reverse CopySell mode entirely
 
 - Deleted the entire "Reverse CopySell" top-level Telegram mode: `reverse-copysell-orchestrator.ts` (`ReverseCopySellOrchestrator` class), the `reverse_copysell` value from `botMode`, the `REVERSE_COPYSELL_TARGET_WALLET` config field (`ServiceConfig.reverseCopySellTargetWallet`, `env.example`), and its home-screen card/buttons (`Reverse CopySell Bot` text, `Set Target Wallet` button, `reverse:set_target` callback, `reverseTargetWallet` pending-text-input handler).
@@ -1217,12 +1835,16 @@
 - `mode:insider` / `mode:tokentransfer` no longer call `stopReverseCopySellModeServices()` (there is nothing left to stop between those two).
 - This is unrelated to, and does not affect, the separate per-watched-wallet "reverse-buy trigger" feature (`reverse:add`/`reverse:remove` callbacks, `db.addReverseBuyWallet`/`isReverseBuyWallet`, the `reverse_buy_wallets` table, `WalletFilterSettings.reverseBuySellTriggerEnabled`) — that toggle still works exactly as before and was kept as-is.
 
+
+
 ### Insider and Token Transfer modes now run concurrently
 
 - `index.ts` previously treated `mode:insider` / `mode:tokentransfer` as mutually exclusive, mirroring the old Insider/Bundler toggle: switching to Token Transfer called `bot.pause()` on every Insider bot (fully stopping their follow-wallet monitors), and switching to Insider called `stopTokenTransferModeServices()`, which stopped the dev-wallet watch. At startup, only whichever mode `DEFAULT_BOT_MODE` pointed at was actually started — the other never ran at all. The Token Transfer buy-trigger handler also silently dropped any buy if `botMode !== "tokentransfer"` at the moment the transfer-out was detected.
 - `botMode` is now purely a display selector for which card `/start`, `menu:refresh`, etc. render — it no longer starts/stops/pauses anything for Insider or Token Transfer. Both are controlled solely by their own explicit controls (Insider's `Stop`/`Resume` buttons; Token Transfer's `Start`/`Stop` buttons) and both are started at service boot regardless of `DEFAULT_BOT_MODE`, so either can be actively watching/holding/buying/selling at the same time without the other being paused, and switching which card is shown never drops a pending buy.
 - Reverse CopySell is unchanged and remains mutually exclusive with the other two (switching to/from it still stops/starts its trading-wallet watch), since it fundamentally reacts to *any* buy on the trading wallet and would otherwise create feedback with Insider/Token Transfer's own buys.
 - Removed the now-dead `stopTokenTransferModeServices` helper (its only callers were the mutual-exclusivity paths above).
+
+
 
 ### Replaced Bundler mode with Token Transfer mode
 
@@ -1232,13 +1854,19 @@
 - Mode switch button/callback renamed `mode:bundler` → `mode:tokentransfer`; refresh-card context code `b` → `t`; new `sell:tokentransfer:<mint>` manual-sell callback (reuses the same `FilterFailEvent`/`pendingSells`/`executeSellAndNotify` pipeline as every other mode's manual/auto sells). `DEFAULT_BOT_MODE` now accepts `insider|tokentransfer` (was `insider|bundler`); `ServiceConfig['defaultBotMode']` and the Insider/Reverse-CopySell home-screen mode-switch buttons were updated to match.
 - The generic "watched wallet reverse-buy" and `/addwallet` wallet-monitor plumbing that previously only ran during Bundler mode now runs during Token Transfer mode instead (same start/stop lifecycle, just re-gated on the new mode name) — this is unrelated to the dev-wallet watch and unchanged in behavior.
 
+
+
 ### Fixed post-buy log spam and duplicate recipient-watch rejections
 
 - `insider-bot.ts`: `syncBundlerFunderTransactions` / `stopBundlerFunderSourceDiscovery` logged "Stopped shared feePayer transfer-out discovery" on *every* poll tick after the recipient buy cap was reached (i.e. for the entire remaining life of a held position, every ~2s), because the stop routine had no idempotency guard. Added a `discoveryStopped` flag on `BundlerFunderWatchState`; the stop routine and its callers now short-circuit once discovery has already been stopped, so the log (and the redundant unsubscribe/timer-clear work) fires exactly once per token.
 - `insider-bot.ts`: `syncBundlerFunderTransactions`'s per-transaction loop kept calling `inspectBundlerFunderTransaction` for the rest of a fetched batch even after the recipient buy cap was already reached, which caused the normal-mode tiny-transfer-group logic to keep recomputing the same rejected candidates (e.g. ~30 duplicate "Shared feePayer recipient watch cap reached" warnings for the same 2 signatures within a few milliseconds). The loop now breaks as soon as the cap is reached.
 - `index.ts`: the background active-position balance/quote refresh (`startMarketCapChecker`) logged an `ERROR` every retry when a freshly-bought mint's token account wasn't indexed by the RPC node yet (`SolanaJSONRPCError -32602 "could not find mint"`). This is a transient, self-resolving condition (it clears up within a few seconds once the RPC indexes the new position) and is now logged as a `WARN` instead, while genuine unexpected errors still log at `ERROR`.
 
+
+
 ## 2026-07-08
+
+
 
 ### Removed legacy Axiom/authority-pattern-matching code
 
@@ -1247,6 +1875,8 @@
 - Trimmed `InsiderBot`'s constructor from 3 `GmgnClient` params to 1 (`bundlerGmgnClient` and `preBuyAxiomGmgnClient` were only used by the removed Axiom scans); updated the `index.ts` instantiation to match.
 - `rearmPositionMonitoringAfterSellFailure` and `markPositionBought` now re-sync the shared feePayer / funder-recipient watchers instead of the removed authority monitor.
 - Behavior is unchanged for the live flow — the shared feePayer buy/sell/exit logic was not touched.
+
+
 
 ### Shared feePayer tracing rewrite (retroactive summary)
 
@@ -1258,7 +1888,11 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - **Shared feePayer migration**: automatically switches the monitored feePayer if the current one drains >100 SOL, so tracking follows the active funding wallet.
 - **Helius API pooling**: requests rotate across multiple Helius API keys with backoff and rate-limit handling for reliability.
 
+
+
 ## 2026-06-15
+
+
 
 ### Telegram refresh P/L & MC fixes
 
@@ -1266,13 +1900,19 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - Token balance for P/L quotes now sums Token + Token-2022 accounts (fixes missing balance / stuck "Calculating...").
 - Refresh timestamp uses ISO format so Telegram edits always apply; toast shown when already up to date.
 
+
+
 ### Axiom scan excludes multi-buy wallets
 
 - Axiom/empty trader filter now requires exactly `buy_tx_count_cur === 1`; multi-buy entries are counted in `skippedMultiBuy` logs.
 
+
+
 ### Axiom single-buy scan limit increased to 50
 
 - Pre-buy and post-buy `fetchBuyVolumeTraders` scans now request limit 50 (was 20) for a wider view.
+
+
 
 ### Axiom/empty single-buy trader scan replaces profitable-trader GMGN scans
 
@@ -1282,7 +1922,11 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - Logs include `validCount`, `soldAmongValid`, `soldPositionRatio`, `soldWallets`, and `holdingWallets`.
 - Post-buy sell triggers when all eligible axiom/empty single-buy wallets in range have fully exited.
 
+
+
 ## 2026-06-14
+
+
 
 ### Pre-buy profitable trader scan — buy_volume_cur + $100 exit filter
 
@@ -1290,7 +1934,11 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - Pre-buy logs count wallets that pass skip-list exclusions, bought above $100, and sold all positions (`matchingWallets`, `soldPositionRatio`).
 - Post-buy profitable scan uses `tag=bundler`, order-by `profit`, top-5 exit trigger.
 
+
+
 ## 2026-06-11
+
+
 
 ### GMGN_API_KEY_3 — pre-buy profitable trader scan
 
@@ -1298,16 +1946,22 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - Pre-buy logs use `[pre-buy]` label; no sell trigger.
 - Post-buy profitable scan continues on `GMGN_API_KEY_2` with sell trigger when top 5 eligible wallets fully exit.
 
+
+
 ### Pre-buy stop + profitable trader exit trigger
 
 - GMGN bundler scan and insider/transfer monitoring stop as soon as the buy gate passes (before MC fetch / buy execution).
 - Post-buy profitable-trader scan: exclusions applied first; `soldPositionRatio` is sold/valid (e.g. `6/16`). `topExitedRatio` tracks current top 5 eligible wallets for sell trigger.
 - Sell when all 5 of the current top profitable wallets have fully exited on that scan; logs and Telegram include those wallets and reason.
 
+
+
 ### Bundler transfer-out sell
 
 - Post-buy bundler monitoring now triggers an immediate sell when either tracked wallet transfers the token out (Helius `TRANSFER` + `fromUserAccount`).
 - Existing rule remains: sell when both bundlers have sold at least once.
+
+
 
 ### Bundler match race (single vs multi)
 
@@ -1317,12 +1971,16 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - Buy notification classifies trigger as "Single-buy pair" or "Multi-buy pair".
 - Rug-reset Telegram card when MC falls below $5k during pre-buy monitoring.
 
+
+
 ### Insider parallel buy gate (stop-and-wait)
 
 - `INSIDER_REQUIRED_SELLS` env var (default 5) configures how many insider sells are needed before buy.
 - After lowest insider is found, insider monitoring and GMGN bundler scan run in parallel every 2s.
 - Whichever finishes first stops its own monitor and waits; buy fires only when both insider sells and 2 bundler matches are ready.
 - Post-buy bundler sell trigger unchanged: sell when each matched bundler has sold once.
+
+
 
 ### Insider parallel buy gate
 
@@ -1333,6 +1991,8 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - Bot 1 and Bot 2 auto-resume in parallel on insider mode start.
 - Removed dev wallet sell triggers.
 
+
+
 ### Insider bundler buy flow
 
 - After 5 insider sells, scan GMGN bundler traders (limit 20, API key 2) for buy_volume_cur in configurable USD range.
@@ -1341,6 +2001,8 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - Dev wallet sell triggers: 3rd buy after mint, or sell amount exceeding initial mint amount; full dev exit uses ATH % MC.
 - Removed legacy PnL-at-transfer, dev $10 cap, and $40 buy threshold logic.
 - Telegram: bundler min/max USD settings added.
+
+
 
 ### Insider mode rewrite
 
