@@ -6,8 +6,10 @@
 
 - On LI buy, monitor **initial early bundlers** (first 4): paginated Helius sync from each **initial buy tx** as `afterSignature`, then live watch.
 - **Token transfer-out** chains a new watch on the recipient (sync + monitor) and **drops the sender** from monitoring (unsubscribed; counts as sold-all for exit gate). Recipient sync uses the **inbound transfer tx** as Helius `after-signature` (not the bundler's initial buy). No immediate sell on transfer.
-- **MC TP (+80%)** deferred until **every** bundler / transfer recipient has **sold all** holdings.
-- After all sold all: if any wallet has **>150** cumulative sell txs, **drop MC TP**; sell when **≥25%** was reached during the wait (deferred) or on all-sold-all completion.
+- **MC TP (+80%)** deferred until **every** early bundler / transfer recipient has **sold all** holdings.
+- After all sold all: if any **valid LI wallet** already has **≥25%** sold → **sell immediately**. If not → wait for valid LI **≥25%**.
+- No bundler/recipient exceeds **150** sell txs → **+80% MC TP** remains available alongside valid LI **≥25%**.
+- Any bundler/recipient exceeds **150** sell txs → **+80% MC TP disabled**; exit only on valid LI wallet **≥25%** (valid LI **≥25%** during the wait still triggers sell once all bundlers sold all).
 
 ## 2026-08-03 (146)
 

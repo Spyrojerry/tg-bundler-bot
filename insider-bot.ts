@@ -168,6 +168,8 @@ interface FollowTokenEarlyBundlerExitState {
   mcTpReachedPending: boolean;
   allSoldAllComplete: boolean;
   highSellTxMode: boolean;
+  /** Valid LI wallet hit ≥25% before all early bundlers sold all. */
+  validWalletTwentyFivePercentDeferred: boolean;
   exitTriggerSignature: string | null;
   enhancedWatchIds: Map<string, number>;
   logsSubIds: Map<string, number>;
@@ -3293,11 +3295,12 @@ export class InsiderBot extends EventEmitter {
 
   private async handleFollowTokenLargeInsiderValidWalletTwentyFivePercentSoldExit(
     wallet: string,
-    tx: HeliusTransaction,
+    tx: HeliusTransaction | null,
     watch: FollowTokenLargeInsiderScrapeWatch,
   ): Promise<void> {
     const li = this.followTokenLargeInsiderState;
     const funderState = this.bundlerFunderWatch;
+    const ebState = this.followTokenEarlyBundlerExitState;
     if (
       !li?.active ||
       !this.isFollowTokenLargeInsiderTrackedValidWallet(wallet) ||
@@ -3307,11 +3310,29 @@ export class InsiderBot extends EventEmitter {
     }
     if (li.exitTriggerSignature) return;
 
-    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
-      funderState,
-      this.buildFollowTokenLargeInsiderRecipientWatchStub(watch),
-      tx,
-    );
+    if (this.shouldDeferFollowTokenLargeInsiderValidWalletTwentyFivePercentExit()) {
+      if (ebState) {
+        ebState.validWalletTwentyFivePercentDeferred = true;
+      }
+      this.followTokenLargeInsiderLog(
+        "valid wallet ≥25% deferred until all early bundlers sold all",
+        {
+          mint: li.mint,
+          wallet,
+          signature: tx?.signature ?? null,
+        },
+      );
+      return;
+    }
+
+    let remainingAmount: number | null = null;
+    if (tx) {
+      remainingAmount = await this.getRecipientTokenBalanceAtTx(
+        funderState,
+        this.buildFollowTokenLargeInsiderRecipientWatchStub(watch),
+        tx,
+      );
+    }
     if (
       !this.followTokenLargeInsiderWatchReachedExitSoldThreshold(
         watch,
@@ -3323,7 +3344,16 @@ export class InsiderBot extends EventEmitter {
 
     if (this.phase !== "holding" || this.positionSellTriggered) return;
 
-    li.exitTriggerSignature = tx.signature;
+    const signature =
+      tx?.signature ??
+      [...watch.tokenActions]
+        .reverse()
+        .find((action) => action.kind === "sell")?.signature ??
+      "VALID_LI_25_EXIT";
+    li.exitTriggerSignature = signature;
+    if (ebState?.active) {
+      ebState.exitTriggerSignature = signature;
+    }
     const validIndex = li.validWallets.indexOf(wallet) + 1;
     const soldPercent =
       watch.boughtAmount > 0
@@ -3334,10 +3364,18 @@ export class InsiderBot extends EventEmitter {
       mint: li.mint,
       wallet,
       validIndex,
-      signature: tx.signature,
+      signature,
       soldPercent,
       validWallets: li.validWallets,
+      highSellTxMode: ebState?.highSellTxMode ?? false,
+      allBundlersSoldAll: ebState?.allSoldAllComplete ?? false,
     });
+
+    const exitDetail = ebState?.highSellTxMode
+      ? `Valid wallet ≥25% exit (>150 sell txs on a bundler — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled).`
+      : ebState?.allSoldAllComplete
+        ? `All early bundlers sold all; valid wallet ≥25% — selling full position.`
+        : `Valid wallet holdings below 75% — selling full position (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP bypassed).`;
 
     await this.triggerPositionSell(
       funderState.mint,
@@ -3349,11 +3387,11 @@ export class InsiderBot extends EventEmitter {
           ? `Valid wallet #${validIndex}: <code>${wallet}</code>`
           : `Valid wallet: <code>${wallet}</code>`,
         `Sold: <b>≥25%</b> (${soldPercent}% tracked)`,
-        `Tx: <code>${tx.signature}</code>`,
+        tx ? `Tx: <code>${tx.signature}</code>` : "",
         "",
-        `Valid wallet holdings below 75% — selling full position (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP bypassed).`,
-      ],
-      tx.signature,
+        exitDetail,
+      ].filter(Boolean),
+      signature,
     );
   }
 
@@ -3582,7 +3620,7 @@ export class InsiderBot extends EventEmitter {
           `Trigger tx: <code>${signature}</code>`,
           `Still watching for valid wallet #5.`,
           `Exit: <b>+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP</b> · any valid wallet (up to ${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}) ≥25% sell early exit`,
-          `Early bundlers (${this.followTokenEarlyInsiderBuys?.length ?? 0}): sync from initial buy, chain token transfers, exit when all sold all (MC TP deferred until then; >150 sell txs → drop TP / deferred ≥25%).`,
+          `Early bundlers (${this.followTokenEarlyInsiderBuys?.length ?? 0}): all sold all → valid LI ≥25% or +80% MC TP; >150 bundler sell txs → valid LI ≥25% only.`,
         ]
           .filter(Boolean)
           .join("\n"),
@@ -7071,6 +7109,77 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  private shouldDeferFollowTokenLargeInsiderValidWalletTwentyFivePercentExit(): boolean {
+    const ebState = this.followTokenEarlyBundlerExitState;
+    return (
+      !!ebState?.active &&
+      !ebState.allSoldAllComplete &&
+      this.isFollowTokenLargeInsiderBuyExitMode()
+    );
+  }
+
+  private anyFollowTokenLargeInsiderValidWalletReachedTwentyFivePercentSold(): boolean {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active) return false;
+    for (const wallet of li.validWallets) {
+      const watch = li.scrapeWatches.get(wallet);
+      if (!watch) continue;
+      if (
+        this.followTokenLargeInsiderWatchReachedExitSoldThreshold(watch, null)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async triggerFollowTokenLargeInsiderValidWalletTwentyFivePercentExitIfReady(
+    triggerTx?: HeliusTransaction,
+  ): Promise<boolean> {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active) return false;
+
+    for (const wallet of li.validWallets) {
+      const watch = li.scrapeWatches.get(wallet);
+      if (!watch) continue;
+      if (
+        !this.followTokenLargeInsiderWatchReachedExitSoldThreshold(watch, null)
+      ) {
+        continue;
+      }
+      const lastSell = [...watch.tokenActions]
+        .reverse()
+        .find((action) => action.kind === "sell");
+      const tx =
+        triggerTx ??
+        (lastSell
+          ? ({
+              signature: lastSell.signature,
+              timestamp: watch.firstBuyTimestamp ?? 0,
+              type: "SWAP",
+            } as HeliusTransaction)
+          : null);
+      await this.handleFollowTokenLargeInsiderValidWalletTwentyFivePercentSoldExit(
+        wallet,
+        tx,
+        watch,
+      );
+      return (
+        this.positionSellTriggered || !!li.exitTriggerSignature
+      );
+    }
+    return false;
+  }
+
+  private anyFollowTokenEarlyBundlerExitWatchExceedsHighSellTxCount(): boolean {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active) return false;
+    return [...state.watches.values()].some(
+      (watch) =>
+        watch.sellTxCount > FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_TX_COUNT,
+    );
+  }
+
   private async maybeEvaluateFollowTokenEarlyBundlerExit(
     triggerTx?: HeliusTransaction,
   ): Promise<void> {
@@ -7082,23 +7191,11 @@ export class InsiderBot extends EventEmitter {
 
     state.allSoldAllComplete = true;
     const watches = [...state.watches.values()];
-    const highSellTx = watches.some(
-      (watch) =>
-        watch.sellTxCount > FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_TX_COUNT,
-    );
+    const highSellTx = this.anyFollowTokenEarlyBundlerExitWatchExceedsHighSellTxCount();
     if (highSellTx) {
       state.highSellTxMode = true;
       this.profitExitDisabled = true;
     }
-
-    const deferredTwentyFive = watches.some(
-      (watch) => watch.reachedTwentyFivePercentSold,
-    );
-    const signature =
-      triggerTx?.signature ??
-      watches.find((watch) => watch.soldAllSignature)?.soldAllSignature ??
-      "EARLY_BUNDLER_ALL_SOLD_ALL";
-    state.exitTriggerSignature = signature;
 
     const walletLines = watches.map((watch) => {
       const soldPercent =
@@ -7108,56 +7205,62 @@ export class InsiderBot extends EventEmitter {
       return `• <code>${watch.wallet}</code> (${watch.source}): ${watch.sellTxCount} sells, ${soldPercent}% sold`;
     });
 
-    let exitReason: string;
-    let detailLine: string;
-    if (highSellTx && deferredTwentyFive) {
-      exitReason =
-        "follow-token early bundler all sold all — deferred ≥25% exit (>150 sell txs)";
-      detailLine =
-        "All bundlers/recipients sold all. High sell-tx count (>150) dropped MC TP; ≥25% was reached during wait — selling now.";
-    } else if (highSellTx) {
-      exitReason =
-        "follow-token early bundler all sold all — high sell-tx count (>150)";
-      detailLine =
-        "All bundlers/recipients sold all (>150 sell txs on a wallet). MC TP dropped — selling full position.";
-    } else if (state.mcTpReachedPending) {
-      exitReason = "follow-token early bundler all sold all — deferred MC TP";
-      detailLine = `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) was reached; waited for all bundlers to sell all — selling now.`;
-    } else {
-      exitReason = "follow-token early bundler all sold all";
-      detailLine =
-        "All early bundlers and transfer recipients sold all holdings — selling full position.";
-    }
-
-    this.log.warn("Follow-token early bundler exit — all watches sold all", {
+    this.log.warn("Follow-token early bundler all sold all — evaluating LI exit", {
       mint: funderState.mint,
       highSellTx,
-      deferredTwentyFive,
+      validLiTwentyFive:
+        this.anyFollowTokenLargeInsiderValidWalletReachedTwentyFivePercentSold(),
+      validWalletTwentyFivePercentDeferred:
+        state.validWalletTwentyFivePercentDeferred,
       mcTpReachedPending: state.mcTpReachedPending,
-      watchedWallets: watches.map((watch) => ({
-        wallet: watch.wallet,
-        source: watch.source,
-        sellTxCount: watch.sellTxCount,
-        soldAll: watch.soldAll,
-        reachedTwentyFivePercentSold: watch.reachedTwentyFivePercentSold,
-      })),
-      signature,
     });
 
-    await this.triggerPositionSell(
-      funderState.mint,
-      exitReason,
+    if (
+      await this.triggerFollowTokenLargeInsiderValidWalletTwentyFivePercentExitIfReady(
+        triggerTx,
+      )
+    ) {
+      return;
+    }
+
+    if (highSellTx) {
+      void this.sendTelegramSafe(
+        [
+          `<b>⏳ ${this.label} Early Bundler All Sold All — Valid LI ≥25% Only</b>`,
+          `Token: <code>${funderState.mint}</code>`,
+          ...walletLines,
+          "",
+          `A bundler/recipient exceeded ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_TX_COUNT} sell txs — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled.`,
+          "Waiting for ≥25% sold on any valid Large Insider wallet.",
+          state.validWalletTwentyFivePercentDeferred
+            ? "Valid wallet ≥25% was seen during wait — will sell on next qualifying sell."
+            : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        "follow-token early bundler high sell-tx wait valid li",
+      );
+      return;
+    }
+
+    void this.sendTelegramSafe(
       [
-        `<b>🚨 ${this.label} Follow-Token Early Bundler Exit</b>`,
+        `<b>✅ ${this.label} Early Bundler All Sold All — Normal Exit Active</b>`,
         `Token: <code>${funderState.mint}</code>`,
         ...walletLines,
+        "",
+        `No bundler exceeded ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_TX_COUNT} sell txs.`,
+        `Exit: +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP or ≥25% sold on any valid LI wallet.`,
         state.mcTpReachedPending
-          ? "MC TP reached: deferred until all sold all."
+          ? `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) was deferred — re-armed.`
           : "",
-        detailLine,
-        triggerTx ? `Tx: <code>${triggerTx.signature}</code>` : "",
-      ].filter(Boolean),
-      signature,
+        state.validWalletTwentyFivePercentDeferred
+          ? "Valid wallet ≥25% was seen during wait — will sell on next qualifying sell."
+          : "Waiting for ≥25% sold on any valid Large Insider wallet.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "follow-token early bundler normal exit armed",
     );
   }
 
@@ -7434,6 +7537,7 @@ export class InsiderBot extends EventEmitter {
       mcTpReachedPending: false,
       allSoldAllComplete: false,
       highSellTxMode: false,
+      validWalletTwentyFivePercentDeferred: false,
       exitTriggerSignature: null,
       enhancedWatchIds: new Map(),
       logsSubIds: new Map(),
@@ -7464,8 +7568,8 @@ export class InsiderBot extends EventEmitter {
         `Wallets: <b>${watches.size}</b> initial bundler(s)`,
         "",
         "Synced from each initial buy tx (paginated). Token transfers chain new watches; sender dropped.",
-        `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) deferred until every watch sells all.`,
-        `After all sold all: >${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_TX_COUNT} sell txs drops MC TP; ≥25% reached during wait triggers deferred sell.`,
+        `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) deferred until every early bundler/recipient sells all.`,
+        `After all sold all: valid LI wallet ≥25% → sell; no >${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_TX_COUNT} bundler sell txs → +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP also active; any >${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_TX_COUNT} → valid LI ≥25% only.`,
       ].join("\n"),
       "follow-token early bundler exit watch started",
     );
