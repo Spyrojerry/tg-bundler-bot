@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-03 (144)
+
+### Follow-token: Large Insider Qualified SOL buy gate at wallet #4
+
+- On valid wallet **#4**, buy only if **≥1 of the first 4** valid wallets has **Qualified SOL &lt;20**. If all four are **≥20 SOL**, skip buy and reset (`large_insider_qualified_sol_buy_gate_failed`).
+
 ## 2026-08-03 (143)
 
 ### Follow-token: Large Insider — no reset on pre-anchor feePayer txs
@@ -20,26 +26,42 @@
 - Pre-buy reset if window closes before **4** valid wallets (`large_insider_window_closed_before_fourth_valid_wallet`).
 - After buy: **+90% MC TP**; **≥25% sold** early exit on **any** tracked valid wallet (up to 5), not wallet #5 only.
 
+
+
 ## 2026-08-03 (140)
+
+
 
 ### Follow-token: Large Insider — buy on 5th valid wallet; +90% MC TP
 
 - Large Insider no longer buys on the **first** valid wallet. It waits for **5** valid wallets; if the flow resets or the feePayer window closes before wallet #5, **no buy** (`large_insider_window_closed_before_fifth_valid_wallet`).
 - After buy: **+90% MC TP** enabled. **≥25% sold** early exit applies to **valid wallet #5 only** (not wallets #1–4).
 
+
+
 ## 2026-08-03 (139)
+
+
 
 ### Follow-token: insufficient second group Telegram — correct shared feePayer
 
 - **Insufficient Second Group — Passed** now shows the **locked shared feePayer** from bundler funding backtrack, not the GMGN stub placeholder (token dev wallet).
 
+
+
 ## 2026-08-03 (138)
+
+
 
 ### Follow-token: Large Insider valid-wallet Telegram shows tier
 
 - **Valid wallet** and **Large Insider buy** Telegram cards now include the scrape tier: **tier1** (direct feePayer ≥15 SOL out) or **chain-N** (≥8 SOL downstream from tier1 / prior chain hop).
 
+
+
 ## 2026-08-02 (137)
+
+
 
 ### Follow-token: buy only from Large Insider — no tag-plan GMGN buys
 
@@ -116,7 +138,7 @@
 
 ### Follow-token: remove Helius second-group confirm; bundler funding uses incoming SOL
 
-- **<5** wallet second groups no longer wait **120s** for Helius PUMP_FUN swap confirm — immediate `second_group_insufficient_wallets_`* → **Large Insider** (except **4-wallet** late-odd reset) or reset.
+- **<5** wallet second groups no longer wait **120s** for Helius PUMP_FUN swap confirm — immediate `second_group_insufficient_wallets`_* → **Large Insider** (except **4-wallet** late-odd reset) or reset.
 - Shared feePayer funding selection: most recent post-zero transfer with **incoming SOL received >15** (not wallet balance at tx timestamp). When the newest tx shows **dust incoming + high balance** (drain/re-wrap), skip it and pick the latest older tx in the fetched batch that qualifies. `BundlerFundingRecord.amountSol` is the incoming amount.
 
 
