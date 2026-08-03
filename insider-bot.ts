@@ -126,6 +126,7 @@ const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC = 15 * 60;
 const FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_SYNC_LIMIT = 100;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS = 5;
 const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION = 0.25;
+const FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT = 90;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
 /** Scrape wallets (tier1 or chain) with first buy above this SOL are not valid Large Insider buyers. */
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL = 10;
@@ -2228,20 +2229,52 @@ export class InsiderBot extends EventEmitter {
   ): Promise<void> {
     const li = this.followTokenLargeInsiderState;
     if (!li?.active || this.flowSource !== "follow-token") return;
-    if (!this.isFollowTokenLargeInsiderFeePayerWindowClosed()) return;
-    if (li.scrapeWatches.size > 0) return;
     if (this.buySubmitted || this.activePosition) return;
+    if (
+      li.validWallets.length >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
+    ) {
+      return;
+    }
+
+    const windowClosed = this.isFollowTokenLargeInsiderFeePayerWindowClosed();
+    const noScrapeWatches = li.scrapeWatches.size === 0;
+    if (!windowClosed && !noScrapeWatches) return;
 
     this.followTokenLargeInsiderLog(
-      "feePayer window closed with no scrape wallets — resetting follow-token flow",
+      windowClosed
+        ? "feePayer window closed before 5 valid wallets — resetting follow-token flow"
+        : "no scrape wallets left before 5 valid wallets — resetting follow-token flow",
       {
         mint: li.mint,
         reason,
+        validWalletCount: li.validWallets.length,
         bundlerFirstBuyAnchorTimestamp: li.bundlerFirstBuyAnchorTimestamp,
         feePayerWindowEndsAt: li.feePayerWindowEndsAt,
       },
     );
-    await this.resetForNewToken(false, { reason });
+    await this.stopFollowTokenLargeInsiderFlow(reason);
+    await this.resetForNewToken(false, {
+      reason: windowClosed
+        ? "large_insider_window_closed_before_fifth_valid_wallet"
+        : reason,
+    });
+  }
+
+  private getFollowTokenLargeInsiderExitWatchWallet(): string | null {
+    const li = this.followTokenLargeInsiderState;
+    if (
+      !li ||
+      li.validWallets.length < FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
+    ) {
+      return null;
+    }
+    return (
+      li.validWallets[FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS - 1] ?? null
+    );
+  }
+
+  private isFollowTokenLargeInsiderExitWatchWallet(wallet: string): boolean {
+    return this.getFollowTokenLargeInsiderExitWatchWallet() === wallet;
   }
 
   private async stopFollowTokenLargeInsiderFlow(reason: string): Promise<void> {
@@ -2309,7 +2342,7 @@ export class InsiderBot extends EventEmitter {
           options.secondGroupWalletCount !== undefined
             ? `Second group wallets: <b>${options.secondGroupWalletCount}</b>`
             : "",
-          "Waiting for valid wallet to buy alongside.",
+          "Waiting for <b>5</b> valid wallets before buy (+90% MC TP · wallet #5 ≥25% sell early exit).",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -3116,7 +3149,7 @@ export class InsiderBot extends EventEmitter {
     const funderState = this.bundlerFunderWatch;
     if (
       !li?.active ||
-      !this.isFollowTokenLargeInsiderTrackedValidWallet(wallet) ||
+      !this.isFollowTokenLargeInsiderExitWatchWallet(wallet) ||
       !funderState
     ) {
       return;
@@ -3145,7 +3178,7 @@ export class InsiderBot extends EventEmitter {
         ? ((watch.soldAmount / watch.boughtAmount) * 100).toFixed(1)
         : "?";
 
-    this.followTokenLargeInsiderLog("valid wallet ≥25% sold — exiting", {
+    this.followTokenLargeInsiderLog("valid wallet #5 ≥25% sold — exiting", {
       mint: li.mint,
       wallet,
       signature: tx.signature,
@@ -3155,15 +3188,15 @@ export class InsiderBot extends EventEmitter {
 
     await this.triggerPositionSell(
       funderState.mint,
-      "follow-token large insider valid wallet 25% sold",
+      "follow-token large insider valid wallet #5 25% sold",
       [
         `<b>🚨 ${this.label} Follow-Token Large Insider Exit</b>`,
         `Token: <code>${funderState.mint}</code>`,
-        `Valid wallet: <code>${wallet}</code>`,
+        `Valid wallet #5: <code>${wallet}</code>`,
         `Sold: <b>≥25%</b> (${soldPercent}% tracked)`,
         `Tx: <code>${tx.signature}</code>`,
         "",
-        "Valid wallet holdings below 75% — selling full position.",
+        "Wallet #5 holdings below 75% — selling full position (+90% MC TP bypassed).",
       ],
       tx.signature,
     );
@@ -3304,18 +3337,18 @@ export class InsiderBot extends EventEmitter {
         `Qualified SOL: <b>${watch.qualifiedReceivedSol.toFixed(4)}</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
         validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
-          ? `Watching <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> valid wallets — search complete.`
-          : `Watching up to <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> first buyers.`,
-        validIndex === 1
-          ? `Buying alongside first valid wallet · exit on ≥25% sold by any of up to ${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS} watched wallets.`
-          : `Valid wallet #${validIndex} added · exit on ≥25% sold by any watched wallet.`,
+          ? `All <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> valid wallets found — buying now.`
+          : `Waiting for valid wallet <b>#${validIndex + 1}</b> of <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> before buy.`,
+        validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
+          ? `Exit: <b>+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP</b> · wallet #5 ≥25% sell early exit.`
+          : `Planned exit after buy: <b>+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP</b> · wallet #5 ≥25% sell early exit.`,
       ].join("\n"),
       "follow-token large insider valid wallet",
     );
 
     if (this.buySubmitted) return;
 
-    if (validIndex === 1) {
+    if (validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS) {
       await this.emitFollowTokenLargeInsiderBuy(funderState, wallet, tx.signature, tx);
     }
   }
@@ -3347,9 +3380,13 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
-      this.disableProfitExitAfterBuy = true;
-      this.profitExitDisabled = true;
+      this.disableProfitExitAfterBuy = false;
+      this.profitExitDisabled = false;
       this.setEntryMc(currentMc);
+      this.setExitMc(
+        currentMc *
+          (1 + FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT / 100),
+      );
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
@@ -3368,12 +3405,12 @@ export class InsiderBot extends EventEmitter {
         [
           `<b>🟢 ${this.label} Follow-Token Large Insider Buy</b>`,
           `Token: <code>${state.mint}</code>`,
-          `Valid wallet: <code>${watchedWallet}</code>`,
+          `Valid wallet #5: <code>${watchedWallet}</code>`,
           liWatch
             ? this.formatFollowTokenLargeInsiderScrapeWatchTierLine(liWatch)
             : "",
           `Trigger tx: <code>${signature}</code>`,
-          "Exit: sell on ≥25% sold by any watched valid wallet (up to 5)",
+          `Exit: <b>+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP</b> · wallet #5 ≥25% sell early exit`,
         ]
           .filter(Boolean)
           .join("\n"),
@@ -3387,7 +3424,6 @@ export class InsiderBot extends EventEmitter {
         buySol: this.getBuySolForFundingMode(state.lowFundingMode),
         entryMc: currentMc,
         monitoredWallet: watchedWallet,
-        profitExitDisabled: true,
       });
     } finally {
       this.isBuyGateEvaluating = false;
@@ -3628,7 +3664,7 @@ export class InsiderBot extends EventEmitter {
       const scrapeWatch = li?.scrapeWatches.get(wallet);
       if (
         !scrapeWatch ||
-        !this.isFollowTokenLargeInsiderTrackedValidWallet(wallet) ||
+        !this.isFollowTokenLargeInsiderExitWatchWallet(wallet) ||
         scrapeWatch.observedTxSignatures.has(tx.signature)
       ) {
         return;
@@ -5459,7 +5495,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, <5 → Large Insider): tag plans (multi-fresh, late 4-wallet odd, no-fresh, single-fresh, insufficient same-fee) defer to Large Insider — buy only on first valid LI wallet. Large Insider: feePayer ≥15SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…); reset if window closed with no scrape watches and no buy. Round/dust gates disabled.`
+            ? `Follow-token buy triggers (GMGN poll every ${FOLLOW_TOKEN_GMGN_BUNDLER_POLL_INTERVAL_MS / 1_000}s; next group after initial ≥${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}, <5 → Large Insider): tag plans defer to Large Insider — buy when <b>5</b> valid LI wallets found (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · wallet #5 ≥25% sell early exit). Reset if window closes before 5 valid wallets. Large Insider: feePayer ≥15SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`

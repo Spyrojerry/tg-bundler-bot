@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-03 (140)
+
+### Follow-token: Large Insider — buy on 5th valid wallet; +90% MC TP
+
+- Large Insider no longer buys on the **first** valid wallet. It waits for **5** valid wallets; if the flow resets or the feePayer window closes before wallet #5, **no buy** (`large_insider_window_closed_before_fifth_valid_wallet`).
+- After buy: **+90% MC TP** enabled. **≥25% sold** early exit applies to **valid wallet #5 only** (not wallets #1–4).
+
 ## 2026-08-03 (139)
 
 ### Follow-token: insufficient second group Telegram — correct shared feePayer
