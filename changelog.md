@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-08-03 (142)
+
+### Follow-token: Large Insider MC TP 90% → 80%
+
+- Large Insider profit exit target changed from **+90% MC TP** to **+80% MC TP** (≥25% sold early exit on any valid wallet unchanged).
+
+## 2026-08-03 (141)
+
+### Follow-token: Large Insider — buy on #4; exit on any of 5 wallets ≥25% sold
+
+- Buy triggers on **valid wallet #4** (not #5). Search for valid wallet **#5** continues after buy.
+- Pre-buy reset if window closes before **4** valid wallets (`large_insider_window_closed_before_fourth_valid_wallet`).
+- After buy: **+90% MC TP**; **≥25% sold** early exit on **any** tracked valid wallet (up to 5), not wallet #5 only.
+
 ## 2026-08-03 (140)
 
 ### Follow-token: Large Insider — buy on 5th valid wallet; +90% MC TP
