@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-04 (152)
+
+### Follow-token: Large Insider — dynamic valid-wallet pool for ≥25% exit
+
+- **≥25% sell exit** uses whatever valid LI wallets are discovered at buy time (e.g. 2 or 3) and **adds wallets #4–#5** to the same pool as they are found while holding (including after bundler sold-all buy). Each newly added valid wallet is subscribed for scrape monitoring and checked for ≥25% sells immediately.
+- Buy Telegram shows the current valid LI ≥25% exit pool; new valid wallets while holding trigger a re-check against the expanded pool.
+
 ## 2026-08-04 (151)
 
 ### Follow-token: Large Insider — no duplicate early bundler watch after buy
