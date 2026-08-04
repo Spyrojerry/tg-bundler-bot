@@ -5,11 +5,12 @@
 ### Follow-token: Large Insider — remove Qualified SOL buy gate; bundler exit USD thresholds
 
 - Removed **Qualified SOL &lt;20** as a buy gate on valid wallet #4 (buy triggers directly on #4).
-- Replaced **150 sell-tx** bundler exit rule with **highest single sell USD** per bundler/recipient:
+- Replaced **150 sell-tx** bundler exit rule with **cumulative sell USD** per bundler/recipient (sum of all sell txs). **Cumulative-USD branches** ($25k immediate sell, $35k MC TP disable) apply only when **max sell-tx count across watches ≥ 75**:
   - After all sold all + valid LI **≥25%** → sell immediately (unchanged).
-  - Highest sell **≤ $25k** and no valid LI **≥25%** → sell when position MC is in profit; otherwise wait for profit (+80% MC TP still active).
-  - Highest sell **≤ $35k** (and &gt; $25k) → **+80% MC TP** + wait for valid LI **≥25%**.
-  - Any highest sell **&gt; $35k** → **+80% MC TP disabled**; valid LI **≥25%** only.
+  - Max sell txs **&lt; 75** and no valid LI **≥25%** → **sell immediately** (cumulative-USD rules skipped).
+  - Max sell txs **≥ 75** and max cumulative **≤ $25k** and no valid LI **≥25%** → **sell immediately**.
+  - Max sell txs **≥ 75** and max cumulative **≤ $35k** (and &gt; $25k) → **+80% MC TP** + wait for valid LI **≥25%**.
+  - Max sell txs **≥ 75** and any wallet cumulative **&gt; $35k** → **+80% MC TP disabled**; valid LI **≥25%** only.
 
 ## 2026-08-03 (147)
 

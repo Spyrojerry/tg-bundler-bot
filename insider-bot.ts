@@ -136,10 +136,12 @@ const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL = 10;
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON =
   "follow_token_large_insider_valid_wallet";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT = 100;
-/** Bundler highest single sell below this → profit exit once all sold all (if no valid LI ≥25%). */
+/** Bundler max cumulative sell USD at or below this → immediate sell once all sold all (if no valid LI ≥25%). */
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD = 25_000;
-/** Any bundler highest single sell above this → +80% MC TP disabled; valid LI ≥25% only. */
+/** Any bundler cumulative sell USD above this → +80% MC TP disabled; valid LI ≥25% only. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE = 35_000;
+/** Cumulative-USD exit branches require max sell-tx count across watches ≥ this. */
+const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE = 75;
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
 
 interface FollowTokenEarlyBundlerExitWatch {
@@ -155,8 +157,8 @@ interface FollowTokenEarlyBundlerExitWatch {
   boughtAmount: number;
   soldAmount: number;
   sellTxCount: number;
-  /** Highest estimated USD received on a single sell tx for this wallet. */
-  highestSellUsd: number;
+  /** Cumulative estimated USD received across all sell txs for this wallet. */
+  cumulativeSellUsd: number;
   soldAll: boolean;
   soldAllSignature: string | null;
   reachedTwentyFivePercentSold: boolean;
@@ -175,8 +177,6 @@ interface FollowTokenEarlyBundlerExitState {
   highSellUsdMode: boolean;
   /** Valid LI wallet hit ≥25% before all early bundlers sold all. */
   validWalletTwentyFivePercentDeferred: boolean;
-  /** All bundlers sold all, highest sell ≤$25k, waiting for position MC profit. */
-  awaitingProfitExitAfterLowBundlerSellUsd: boolean;
   exitTriggerSignature: string | null;
   enhancedWatchIds: Map<string, number>;
   logsSubIds: Map<string, number>;
@@ -765,9 +765,6 @@ export interface InsiderBot {
   isProfitExitDisabled(): boolean;
   shouldDeferFollowTokenEarlyBundlerMcTp(): boolean;
   notifyFollowTokenEarlyBundlerMcTpReached(currentMc: number): void;
-  tryTriggerFollowTokenEarlyBundlerLowSellUsdProfitExit(
-    currentMc: number,
-  ): Promise<boolean>;
   deferProfitExitUntilDevSwap(currentMc: number): Promise<boolean>;
   setExitMc(value: number): void;
   getExitPercent(): number;
@@ -1405,32 +1402,6 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "follow-token early bundler mc tp deferred",
     );
-  }
-
-  async tryTriggerFollowTokenEarlyBundlerLowSellUsdProfitExit(
-    currentMc: number,
-  ): Promise<boolean> {
-    const state = this.followTokenEarlyBundlerExitState;
-    if (
-      !state?.active ||
-      !state.allSoldAllComplete ||
-      !state.awaitingProfitExitAfterLowBundlerSellUsd ||
-      state.exitTriggerSignature
-    ) {
-      return false;
-    }
-    if (this.phase !== "holding" || this.positionSellTriggered) return false;
-    if (!this.isPositionMcInProfit(currentMc)) return false;
-    if (
-      this.anyFollowTokenLargeInsiderValidWalletReachedTwentyFivePercentSold()
-    ) {
-      return false;
-    }
-    await this.triggerFollowTokenEarlyBundlerLowSellUsdProfitExit(
-      currentMc,
-      "MC_PROFIT_AFTER_LOW_BUNDLER_SELL_USD",
-    );
-    return this.positionSellTriggered;
   }
 
   async deferProfitExitUntilDevSwap(currentMc: number): Promise<boolean> {
@@ -3408,7 +3379,7 @@ export class InsiderBot extends EventEmitter {
     });
 
     const exitDetail = ebState?.highSellUsdMode
-      ? `Valid wallet ≥25% exit (bundler highest sell >$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled).`
+      ? `Valid wallet ≥25% exit (bundler cumulative sell >$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled).`
       : ebState?.allSoldAllComplete
         ? `All early bundlers sold all; valid wallet ≥25% — selling full position.`
         : `Valid wallet holdings below 75% — selling full position (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP bypassed).`;
@@ -3650,7 +3621,7 @@ export class InsiderBot extends EventEmitter {
           `Trigger tx: <code>${signature}</code>`,
           `Still watching for valid wallet #5.`,
           `Exit: <b>+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP</b> · any valid wallet (up to ${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}) ≥25% sell early exit`,
-          `Early bundlers (${this.followTokenEarlyInsiderBuys?.length ?? 0}): all sold all → valid LI ≥25% or +80% MC TP; bundler highest sell >$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → valid LI ≥25% only.`,
+          `Early bundlers (${this.followTokenEarlyInsiderBuys?.length ?? 0}): all sold all → valid LI ≥25% or +80% MC TP; bundler cumulative sell >$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → valid LI ≥25% only.`,
         ]
           .filter(Boolean)
           .join("\n"),
@@ -7201,32 +7172,114 @@ export class InsiderBot extends EventEmitter {
     return false;
   }
 
-  private anyFollowTokenEarlyBundlerExitWatchExceedsHighSellTxCount(): boolean {
+  private anyFollowTokenEarlyBundlerExitWatchExceedsHighSellUsdMcTpDisable(): boolean {
     return (
-      this.getFollowTokenEarlyBundlerExitMaxHighestSellUsd() >
+      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd() >
       FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE
     );
   }
 
   private noFollowTokenEarlyBundlerExitWatchExceedsLowSellUsd(): boolean {
     return (
-      this.getFollowTokenEarlyBundlerExitMaxHighestSellUsd() <=
+      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd() <=
       FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD
     );
   }
 
-  private getFollowTokenEarlyBundlerExitMaxHighestSellUsd(): number {
+  private getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd(): number {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active || state.watches.size === 0) return 0;
     return Math.max(
       0,
-      ...[...state.watches.values()].map((watch) => watch.highestSellUsd),
+      ...[...state.watches.values()].map((watch) => watch.cumulativeSellUsd),
     );
   }
 
-  private isPositionMcInProfit(currentMc: number): boolean {
-    const entryMc = this.entryMc;
-    return entryMc !== null && entryMc > 0 && currentMc > entryMc;
+  private getFollowTokenEarlyBundlerExitMaxSellTxCount(): number {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active || state.watches.size === 0) return 0;
+    return Math.max(
+      0,
+      ...[...state.watches.values()].map((watch) => watch.sellTxCount),
+    );
+  }
+
+  private bundlerExitMeetsMinSellTxCountForCumulativeUsdGate(): boolean {
+    return (
+      this.getFollowTokenEarlyBundlerExitMaxSellTxCount() >=
+      FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE
+    );
+  }
+
+  private async triggerFollowTokenEarlyBundlerLowSellTxCountExit(
+    signature: string,
+    maxSellTxCount: number,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    const funderState = this.bundlerFunderWatch;
+    if (!state?.active || !funderState || state.exitTriggerSignature) return;
+    if (this.phase !== "holding" || this.positionSellTriggered) return;
+
+    state.exitTriggerSignature = signature;
+
+    this.log.warn(
+      "Follow-token early bundler low sell-tx count exit — selling immediately",
+      {
+        mint: funderState.mint,
+        maxSellTxCount,
+        minSellTxCountForUsdGate:
+          FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE,
+        signature,
+      },
+    );
+
+    await this.triggerPositionSell(
+      funderState.mint,
+      "follow-token early bundler low sell-tx count exit",
+      [
+        `<b>🚨 ${this.label} Follow-Token Early Bundler Exit</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        `All bundlers sold all; max sell txs < ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} (max <b>${maxSellTxCount}</b> txs).`,
+        "",
+        "No valid LI ≥25% — selling full position immediately (cumulative-USD rules skipped).",
+      ],
+      signature,
+    );
+  }
+
+  private async triggerFollowTokenEarlyBundlerLowCumulativeSellUsdExit(
+    signature: string,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    const funderState = this.bundlerFunderWatch;
+    if (!state?.active || !funderState || state.exitTriggerSignature) return;
+    if (this.phase !== "holding" || this.positionSellTriggered) return;
+
+    state.exitTriggerSignature = signature;
+    const maxCumulativeSellUsd =
+      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
+
+    this.log.warn(
+      "Follow-token early bundler low cumulative sell-usd exit — selling immediately",
+      {
+        mint: funderState.mint,
+        maxCumulativeSellUsd,
+        signature,
+      },
+    );
+
+    await this.triggerPositionSell(
+      funderState.mint,
+      "follow-token early bundler low cumulative sell-usd exit",
+      [
+        `<b>🚨 ${this.label} Follow-Token Early Bundler Exit</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        `All bundlers sold all; max cumulative sell ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; max <b>${this.getFollowTokenEarlyBundlerExitMaxSellTxCount()}</b> sell txs ≥ ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE}).`,
+        "",
+        "No valid LI ≥25% — selling full position immediately.",
+      ],
+      signature,
+    );
   }
 
   private async estimateWalletSellUsd(
@@ -7240,61 +7293,15 @@ export class InsiderBot extends EventEmitter {
     return solReceived * solPriceUsd;
   }
 
-  private async updateFollowTokenEarlyBundlerExitWatchHighestSellUsd(
+  private async updateFollowTokenEarlyBundlerExitWatchCumulativeSellUsd(
     watch: FollowTokenEarlyBundlerExitWatch,
     tx: HeliusTransaction,
     wallet: string,
   ): Promise<void> {
     const sellUsd = await this.estimateWalletSellUsd(tx, wallet);
-    if (sellUsd !== null && sellUsd > watch.highestSellUsd) {
-      watch.highestSellUsd = sellUsd;
+    if (sellUsd !== null && sellUsd > 0) {
+      watch.cumulativeSellUsd += sellUsd;
     }
-  }
-
-  private async triggerFollowTokenEarlyBundlerLowSellUsdProfitExit(
-    currentMc: number,
-    signature: string,
-  ): Promise<void> {
-    const state = this.followTokenEarlyBundlerExitState;
-    const funderState = this.bundlerFunderWatch;
-    if (!state?.active || !funderState || state.exitTriggerSignature) return;
-    if (this.phase !== "holding" || this.positionSellTriggered) return;
-
-    state.exitTriggerSignature = signature;
-    state.awaitingProfitExitAfterLowBundlerSellUsd = false;
-    const entryMc = this.entryMc;
-    const pnlPct =
-      entryMc !== null && entryMc > 0
-        ? (((currentMc - entryMc) / entryMc) * 100).toFixed(2)
-        : "?";
-    const maxHighestSellUsd =
-      this.getFollowTokenEarlyBundlerExitMaxHighestSellUsd();
-
-    this.log.warn(
-      "Follow-token early bundler low sell-usd profit exit — selling",
-      {
-        mint: funderState.mint,
-        currentMc,
-        entryMc,
-        pnlPct,
-        maxHighestSellUsd,
-        signature,
-      },
-    );
-
-    await this.triggerPositionSell(
-      funderState.mint,
-      "follow-token early bundler low sell-usd profit exit",
-      [
-        `<b>🚨 ${this.label} Follow-Token Early Bundler Exit</b>`,
-        `Token: <code>${funderState.mint}</code>`,
-        `All bundlers sold all; highest single sell ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} (max <b>$${maxHighestSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>).`,
-        `Position in profit by MC: <b>${pnlPct}%</b> (entry $${entryMc?.toLocaleString() ?? "?"} → current $${currentMc.toLocaleString()}).`,
-        "",
-        "Selling full position (no valid LI ≥25% yet).",
-      ],
-      signature,
-    );
   }
 
   private async maybeEvaluateFollowTokenEarlyBundlerExit(
@@ -7308,9 +7315,14 @@ export class InsiderBot extends EventEmitter {
 
     state.allSoldAllComplete = true;
     const watches = [...state.watches.values()];
-    const maxHighestSellUsd =
-      this.getFollowTokenEarlyBundlerExitMaxHighestSellUsd();
-    const highSellUsd = this.anyFollowTokenEarlyBundlerExitWatchExceedsHighSellTxCount();
+    const maxCumulativeSellUsd =
+      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
+    const maxSellTxCount = this.getFollowTokenEarlyBundlerExitMaxSellTxCount();
+    const meetsSellTxGate =
+      this.bundlerExitMeetsMinSellTxCountForCumulativeUsdGate();
+    const highSellUsd =
+      meetsSellTxGate &&
+      this.anyFollowTokenEarlyBundlerExitWatchExceedsHighSellUsdMcTpDisable();
     if (highSellUsd) {
       state.highSellUsdMode = true;
       this.profitExitDisabled = true;
@@ -7321,13 +7333,17 @@ export class InsiderBot extends EventEmitter {
         watch.boughtAmount > 0
           ? ((watch.soldAmount / watch.boughtAmount) * 100).toFixed(1)
           : "?";
-      return `• <code>${watch.wallet}</code> (${watch.source}): highest sell <b>$${watch.highestSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>, ${soldPercent}% sold`;
+      return `• <code>${watch.wallet}</code> (${watch.source}): cumulative sell <b>$${watch.cumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b> (${watch.sellTxCount} txs), ${soldPercent}% sold`;
     });
 
     this.log.warn("Follow-token early bundler all sold all — evaluating LI exit", {
       mint: funderState.mint,
       highSellUsd,
-      maxHighestSellUsd,
+      maxCumulativeSellUsd,
+      maxSellTxCount,
+      meetsSellTxGate,
+      minSellTxCountForUsdGate:
+        FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE,
       validLiTwentyFive:
         this.anyFollowTokenLargeInsiderValidWalletReachedTwentyFivePercentSold(),
       validWalletTwentyFivePercentDeferred:
@@ -7343,6 +7359,14 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
+    if (!meetsSellTxGate) {
+      await this.triggerFollowTokenEarlyBundlerLowSellTxCountExit(
+        triggerTx?.signature ?? "EARLY_BUNDLER_LOW_SELL_TX_COUNT",
+        maxSellTxCount,
+      );
+      return;
+    }
+
     if (highSellUsd) {
       void this.sendTelegramSafe(
         [
@@ -7350,7 +7374,7 @@ export class InsiderBot extends EventEmitter {
           `Token: <code>${funderState.mint}</code>`,
           ...walletLines,
           "",
-          `A bundler/recipient highest sell exceeded $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxHighestSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>) — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled.`,
+          `A bundler/recipient cumulative sell exceeded $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; max <b>${maxSellTxCount}</b> sell txs) — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled.`,
           "Waiting for ≥25% sold on any valid Large Insider wallet.",
           state.validWalletTwentyFivePercentDeferred
             ? "Valid wallet ≥25% was seen during wait — will sell on next qualifying sell."
@@ -7364,28 +7388,8 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (this.noFollowTokenEarlyBundlerExitWatchExceedsLowSellUsd()) {
-      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(
-        funderState.mint,
-      );
-      if (currentMc !== null && this.isPositionMcInProfit(currentMc)) {
-        await this.triggerFollowTokenEarlyBundlerLowSellUsdProfitExit(
-          currentMc,
-          triggerTx?.signature ?? "EARLY_BUNDLER_LOW_SELL_USD_PROFIT",
-        );
-        return;
-      }
-      state.awaitingProfitExitAfterLowBundlerSellUsd = true;
-      void this.sendTelegramSafe(
-        [
-          `<b>⏳ ${this.label} Early Bundler All Sold All — Awaiting MC Profit</b>`,
-          `Token: <code>${funderState.mint}</code>`,
-          ...walletLines,
-          "",
-          `Highest bundler single sell ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} (max <b>$${maxHighestSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>).`,
-          "No valid LI ≥25% yet — waiting for position MC profit to sell.",
-          `+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP also remains active.`,
-        ].join("\n"),
-        "follow-token early bundler await profit after low sell usd",
+      await this.triggerFollowTokenEarlyBundlerLowCumulativeSellUsdExit(
+        triggerTx?.signature ?? "EARLY_BUNDLER_LOW_CUMULATIVE_SELL_USD",
       );
       return;
     }
@@ -7396,7 +7400,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${funderState.mint}</code>`,
         ...walletLines,
         "",
-        `Highest bundler single sell ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxHighestSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>).`,
+        `Max cumulative bundler sell ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; max <b>${maxSellTxCount}</b> sell txs).`,
         `Exit: +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP or ≥25% sold on any valid LI wallet.`,
         state.mcTpReachedPending
           ? `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) was deferred — re-armed.`
@@ -7461,7 +7465,7 @@ export class InsiderBot extends EventEmitter {
       const amount = this.extractTokenAmountForWallet(tx, wallet, mint, "sell");
       watch.sellTxCount += 1;
       watch.soldAmount += amount;
-      await this.updateFollowTokenEarlyBundlerExitWatchHighestSellUsd(
+      await this.updateFollowTokenEarlyBundlerExitWatchCumulativeSellUsd(
         watch,
         tx,
         wallet,
@@ -7499,7 +7503,7 @@ export class InsiderBot extends EventEmitter {
       boughtAmount: transferAmount,
       soldAmount: 0,
       sellTxCount: 0,
-      highestSellUsd: 0,
+      cumulativeSellUsd: 0,
       soldAll: false,
       soldAllSignature: null,
       reachedTwentyFivePercentSold: false,
@@ -7674,7 +7678,7 @@ export class InsiderBot extends EventEmitter {
         boughtAmount: buy.tokenAmount,
         soldAmount: 0,
         sellTxCount: 0,
-        highestSellUsd: 0,
+        cumulativeSellUsd: 0,
         soldAll: false,
         soldAllSignature: null,
         reachedTwentyFivePercentSold: false,
@@ -7692,7 +7696,6 @@ export class InsiderBot extends EventEmitter {
       allSoldAllComplete: false,
       highSellUsdMode: false,
       validWalletTwentyFivePercentDeferred: false,
-      awaitingProfitExitAfterLowBundlerSellUsd: false,
       exitTriggerSignature: null,
       enhancedWatchIds: new Map(),
       logsSubIds: new Map(),
@@ -7724,7 +7727,7 @@ export class InsiderBot extends EventEmitter {
         "",
         "Synced from each initial buy tx (paginated). Token transfers chain new watches; sender dropped.",
         `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) deferred until every early bundler/recipient sells all.`,
-        `After all sold all: valid LI ≥25% → sell; highest sell ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} → profit exit when MC in profit; ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP + valid LI ≥25%; > $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → valid LI ≥25% only.`,
+        `After all sold all: valid LI ≥25% → sell; max sell txs < ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} → immediate sell; ≥ ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} → cumulative-USD rules ($${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} immediate / $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} MC TP disable).`,
       ].join("\n"),
       "follow-token early bundler exit watch started",
     );

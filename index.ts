@@ -2065,12 +2065,6 @@ async function main(): Promise<void> {
       }
 
       if (activePos) {
-        if (await bot.tryTriggerFollowTokenEarlyBundlerLowSellUsdProfitExit(currentMc)) {
-          log.info(
-            `[INSIDER ${botNumber} EXIT] Early bundler low sell-usd profit exit for ${activePos.mint} at MC $${currentMc.toLocaleString()}.`,
-          );
-          return;
-        }
         const exitMc = bot.getExitMc();
         if (bot.isProfitExitDisabled()) {
           log.info(
