@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-08-04 (151)
+
+### Follow-token: Large Insider — no duplicate bundler watch after buy
+
+- Early bundler / transfer-recipient watch still starts at **valid LI wallet #1** (pre-buy). **`markPositionBought` no longer starts it again** — post-buy only runs the exit plan on the existing watch.
+- Sell-failure rearm still starts bundler watch only if it is not already active.
+
+## 2026-08-04 (150)
+
+### Follow-token: Large Insider — bundler cumulative low threshold $24.5k
+
+- **≥ 75** sell txs + max cumulative **≤ $24.5k** (was $25k): pre-buy skip / post-buy immediate sell unchanged in behavior.
+- **≥ 75** sell txs + cumulative **$24.5k–$35k** (was $25k–$35k): **+80% MC TP** + valid LI **≥25%** branch.
+
+## 2026-08-04 (149)
+
+### Follow-token: Large Insider — parallel pre-buy bundler watch + dual buy triggers
+
+- **Early bundler / transfer-recipient watch** starts when the **1st valid Large Insider wallet** is found (not at flow start, not only after buy).
+- **Buy triggers (pre-buy):**
+  - **Direct-sell path** (early bundlers sell themselves, no token transfer-out): buy on **valid wallet #4** **OR** all bundlers/recipients sold all + exit conditions met.
+  - **Transfer-recipient path** (early bundler transferred tokens out): buy **only** when all bundlers/recipients sold all + exit conditions met (valid wallet #4 alone does not buy).
+- **Bundler sold-all pre-buy branches:** max sell txs **&lt; 75** or **≥ 75** + cumulative **≤ $24.5k** → **no buy**, skip token and reset; **≥ 75** + **$24.5k–$35k** → buy with **+80% MC TP**; **&gt; $35k** → buy with MC TP disabled (valid LI **≥25%** only). *(Post-buy holding: &lt; 75 txs or ≤ $24.5k still triggers immediate sell.)*
+- MC TP defer until all sold all unchanged for holding phase.
+
 ## 2026-08-04 (148)
 
 ### Follow-token: Large Insider — remove Qualified SOL buy gate; bundler exit USD thresholds
