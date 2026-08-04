@@ -2,10 +2,9 @@
 
 ## 2026-08-04 (151)
 
-### Follow-token: Large Insider — no duplicate bundler watch after buy
+### Follow-token: Large Insider — no duplicate early bundler watch after buy
 
-- Early bundler / transfer-recipient watch still starts at **valid LI wallet #1** (pre-buy). **`markPositionBought` no longer starts it again** — post-buy only runs the exit plan on the existing watch.
-- Sell-failure rearm still starts bundler watch only if it is not already active.
+- If early bundler / transfer-recipient watch already started pre-buy (on valid wallet #1), it is **not** restarted on `markPositionBought`. Sell-failure rearm also skips restart when watch is still active.
 
 ## 2026-08-04 (150)
 

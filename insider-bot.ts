@@ -4629,7 +4629,6 @@ export class InsiderBot extends EventEmitter {
     void this.syncFunderRecipientBatch(true);
     void this.auditFunderRecipientsAfterBuy();
 
-    // Early bundler watch starts at valid LI wallet #1 (pre-buy); do not restart here.
     void this.executeFollowTokenEarlyBundlerPostBuyExitPlan();
   }
 
@@ -7924,6 +7923,10 @@ export class InsiderBot extends EventEmitter {
       this.followTokenEarlyBundlerExitState?.active &&
       this.followTokenEarlyBundlerExitState.mint === mint
     ) {
+      this.log.info(
+        "Follow-token early bundler exit watch already active — skipping restart",
+        { mint },
+      );
       return;
     }
 
