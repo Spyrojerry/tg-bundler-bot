@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-05 (159)
+
+### Follow-token: early bundler transfer-out — no sell stats on sender
+
+- Transfer-out no longer applies sell accounting on the bundler (removed pool-exit-as-sell from 158).
+- Enhanced WSS `wallet→__pool__` outbound legs are paired with `__pool__→recipient` inbound legs in the same tx so real transfer recipients are chained and monitored for **their** individual sell txs.
+- Unresolved pool legs (no token recipient in tx) drop the sender without sell stats; pre-LI max-single-sell gate uses **transfer-recipient** watches only when transfer path was observed.
+
 ## 2026-08-05 (158)
 
 ### Follow-token: early bundler — skip `__pool__` transfer recipient chaining

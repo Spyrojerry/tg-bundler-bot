@@ -7628,8 +7628,14 @@ export class InsiderBot extends EventEmitter {
   private getFollowTokenEarlyBundlerExitHighestCumulativeSellUsdWatch(): FollowTokenEarlyBundlerExitWatch | null {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active || state.watches.size === 0) return null;
+    const candidates = state.earlyBundlerTransferOutObserved
+      ? [...state.watches.values()].filter(
+          (watch) => watch.source === "transfer_recipient",
+        )
+      : [...state.watches.values()];
+    if (candidates.length === 0) return null;
     let best: FollowTokenEarlyBundlerExitWatch | null = null;
-    for (const watch of state.watches.values()) {
+    for (const watch of candidates) {
       if (!best || watch.cumulativeSellUsd > best.cumulativeSellUsd) {
         best = watch;
       }
@@ -8087,65 +8093,45 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private getFollowTokenEarlyBundlerPoolTransferOutAmountFromTx(
-    tx: HeliusTransaction,
-    wallet: string,
-    mint: string,
-  ): number {
-    let amount = 0;
-    for (const transfer of tx.tokenTransfers ?? []) {
-      if (transfer.mint !== mint || transfer.fromUserAccount !== wallet) continue;
-      if (transfer.toUserAccount !== UNKNOWN_COUNTERPARTY) continue;
-      amount += transfer.tokenAmount ?? 0;
-    }
-    return amount;
-  }
-
   private getFollowTokenEarlyBundlerTransferRecipientsFromTx(
     tx: HeliusTransaction,
     wallet: string,
     mint: string,
   ): Map<string, number> {
     const recipients = new Map<string, number>();
+    const addRecipient = (recipient: string, amount: number) => {
+      if (amount <= 0) return;
+      if (!this.isValidFollowTokenEarlyBundlerWatchWallet(recipient)) return;
+      recipients.set(recipient, (recipients.get(recipient) ?? 0) + amount);
+    };
+
     for (const transfer of tx.tokenTransfers ?? []) {
       if (transfer.mint !== mint || transfer.fromUserAccount !== wallet) continue;
       const recipient = transfer.toUserAccount;
-      if (!recipient || recipient === wallet) continue;
-      if (!this.isValidFollowTokenEarlyBundlerWatchWallet(recipient)) continue;
-      recipients.set(
-        recipient,
-        (recipients.get(recipient) ?? 0) + (transfer.tokenAmount ?? 0),
-      );
+      if (!recipient || recipient === wallet || recipient === UNKNOWN_COUNTERPARTY) {
+        continue;
+      }
+      addRecipient(recipient, transfer.tokenAmount ?? 0);
     }
+
+    // Enhanced WSS delta reconstruction emits wallet→__pool__ outbound legs; pair with
+    // __pool__→recipient inbound legs in the same tx (same pattern as SOL transfers).
+    const hasPoolOutbound = (tx.tokenTransfers ?? []).some(
+      (transfer) =>
+        transfer.mint === mint &&
+        transfer.fromUserAccount === wallet &&
+        transfer.toUserAccount === UNKNOWN_COUNTERPARTY,
+    );
+    if (hasPoolOutbound) {
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint !== mint || transfer.fromUserAccount !== UNKNOWN_COUNTERPARTY) {
+          continue;
+        }
+        addRecipient(transfer.toUserAccount ?? "", transfer.tokenAmount ?? 0);
+      }
+    }
+
     return recipients;
-  }
-
-  private async applyFollowTokenEarlyBundlerExitPoolTransferOut(
-    watch: FollowTokenEarlyBundlerExitWatch,
-    tx: HeliusTransaction,
-    mint: string,
-    poolTransferAmount: number,
-  ): Promise<void> {
-    if (poolTransferAmount <= 0) return;
-
-    this.logTokenTx(
-      mint,
-      "sell",
-      "early_bundler_exit",
-      tx.signature,
-      watch.wallet,
-    );
-    watch.sellTxCount += 1;
-    watch.soldAmount += poolTransferAmount;
-    if (poolTransferAmount > watch.maxSingleSellTokenAmount) {
-      watch.maxSingleSellTokenAmount = poolTransferAmount;
-    }
-    await this.updateFollowTokenEarlyBundlerExitWatchCumulativeSellUsd(
-      watch,
-      tx,
-      watch.wallet,
-    );
-    await this.updateFollowTokenEarlyBundlerExitWatchSoldAll(watch, tx, mint);
   }
 
   private async shouldDropFollowTokenEarlyBundlerWatchAfterTransfer(
@@ -8258,34 +8244,29 @@ export class InsiderBot extends EventEmitter {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active) return;
 
-    const poolTransferAmount =
-      this.getFollowTokenEarlyBundlerPoolTransferOutAmountFromTx(
-        tx,
-        parentWatch.wallet,
-        mint,
-      );
     const recipients = this.getFollowTokenEarlyBundlerTransferRecipientsFromTx(
       tx,
       parentWatch.wallet,
       mint,
     );
-    if (recipients.size === 0 && poolTransferAmount <= 0) return;
+    const hasUnresolvedPoolOutbound =
+      recipients.size === 0 &&
+      (tx.tokenTransfers ?? []).some(
+        (transfer) =>
+          transfer.mint === mint &&
+          transfer.fromUserAccount === parentWatch.wallet &&
+          transfer.toUserAccount === UNKNOWN_COUNTERPARTY,
+      );
+    if (recipients.size === 0 && !hasUnresolvedPoolOutbound) return;
 
-    if (poolTransferAmount > 0) {
+    if (hasUnresolvedPoolOutbound) {
       this.log.info(
-        "Follow-token early bundler transfer to pool — treating as exit, not chaining recipient",
+        "Follow-token early bundler transfer-out pool leg — no token recipient resolved (not counted as sell on sender)",
         {
           mint,
           wallet: parentWatch.wallet,
-          poolTransferAmount,
           signature: tx.signature,
         },
-      );
-      await this.applyFollowTokenEarlyBundlerExitPoolTransferOut(
-        parentWatch,
-        tx,
-        mint,
-        poolTransferAmount,
       );
     }
 
@@ -8325,13 +8306,8 @@ export class InsiderBot extends EventEmitter {
     const telegramLines = [
       `<b>🔗 ${this.label} Early Bundler Token Transfer</b>`,
       `Token: <code>${mint}</code>`,
-      `From: <code>${parentWatch.wallet}</code>${dropParent ? " (dropped from monitoring)" : poolTransferAmount > 0 && recipients.size === 0 ? " (pool exit — still monitored if partial)" : recipients.size > 0 ? " (partial — still monitored)" : ""}`,
+      `From: <code>${parentWatch.wallet}</code>${dropParent ? " (dropped from monitoring)" : recipients.size > 0 ? " (partial — still monitored)" : " (pool leg unresolved — still monitored if partial)"}`,
     ];
-    if (poolTransferAmount > 0) {
-      telegramLines.push(
-        `Pool exit: <b>${poolTransferAmount.toLocaleString()}</b> tokens (sell/swap leg — not chained)`,
-      );
-    }
     if (recipients.size > 0) {
       telegramLines.push(`Recipients: <b>${recipients.size}</b>`);
       for (const [recipient, amount] of recipients) {
@@ -8339,17 +8315,21 @@ export class InsiderBot extends EventEmitter {
           `• <code>${recipient}</code>: <b>${amount.toLocaleString()}</b>`,
         );
       }
+    } else if (hasUnresolvedPoolOutbound) {
+      telegramLines.push(
+        "No token recipient resolved from pool leg — sender not counted as a sell; monitoring continues until balance is zero.",
+      );
     }
     telegramLines.push(
       `Tx: <code>${tx.signature}</code>`,
       "",
       dropParent
         ? recipients.size > 0
-          ? "Sender unsubscribed; every recipient synced and monitored."
-          : "Sender unsubscribed after pool exit."
+          ? "Sender unsubscribed; every recipient synced and monitored for individual sell txs."
+          : "Sender unsubscribed after transfer-out (no sell stats on sender)."
         : recipients.size > 0
-          ? "Every recipient synced and monitored; sender kept until remaining balance is zero."
-          : "Pool exit recorded; sender kept until remaining balance is zero.",
+          ? "Every recipient synced and monitored for individual sell txs; sender kept until remaining balance is zero."
+          : "Sender kept until remaining balance is zero.",
     );
     void this.sendTelegramSafe(
       telegramLines.join("\n"),
