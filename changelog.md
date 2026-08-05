@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-05 (165)
+
+### Follow-token: pre-LI bundler buy — require real 4/4 sold-all on active watches
+
+- **Transfer recipients** no longer count as sold-all from ATA zero until tokens were **observed in-wallet** at least once (`observedNonZeroTokenBalance`); fixes premature pre-LI buy when fresh recipient ATAs read `0` at subscribe time.
+- **Sold-all buy gate** checks only **actively monitored** watches (`monitoringActive`); dropped bundlers after transfer-out no longer participate in the gate — buy waits until every remaining bundler/recipient (4/4 chain) has genuinely sold all.
+
 ## 2026-08-05 (164)
 
 ### Follow-token: dedupe pre-LI bundler sold-all buy blocked Telegram

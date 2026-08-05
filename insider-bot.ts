@@ -177,6 +177,8 @@ interface FollowTokenEarlyBundlerExitWatch {
   syncComplete: boolean;
   /** False after token transfer-out — wallet is no longer subscribed. */
   monitoringActive: boolean;
+  /** Transfer recipients: ATA zero counts as sold-all only after tokens were seen in-wallet. */
+  observedNonZeroTokenBalance: boolean;
 }
 
 interface FollowTokenEarlyBundlerExitState {
@@ -7253,10 +7255,32 @@ export class InsiderBot extends EventEmitter {
   private allFollowTokenEarlyBundlerExitWatchesSoldAll(): boolean {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active || state.watches.size === 0) return false;
-    for (const watch of state.watches.values()) {
+    const activeWatches = [...state.watches.values()].filter(
+      (watch) => watch.monitoringActive,
+    );
+    if (activeWatches.length === 0) return false;
+    for (const watch of activeWatches) {
       if (!watch.syncComplete || !watch.soldAll) return false;
     }
     return true;
+  }
+
+  private markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    liveRaw: bigint,
+  ): void {
+    if (liveRaw > 0n) {
+      watch.observedNonZeroTokenBalance = true;
+    }
+  }
+
+  private followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    liveRaw: bigint | null,
+  ): boolean {
+    if (liveRaw === null || liveRaw > 0n) return false;
+    if (watch.source === "early_bundler") return true;
+    return watch.observedNonZeroTokenBalance;
   }
 
   private followTokenEarlyBundlerExitWatchReachedTwentyFivePercent(
@@ -7295,7 +7319,8 @@ export class InsiderBot extends EventEmitter {
     );
     const soldAllByTrackedAmount =
       watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount;
-    const soldAllByAtaBalance = liveRaw !== null && liveRaw <= 0n;
+    const soldAllByAtaBalance =
+      this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, liveRaw);
     if (soldAllByTrackedAmount || soldAllByAtaBalance) {
       watch.soldAll = true;
       watch.soldAllSignature = signature ?? watch.soldAllSignature;
@@ -8153,6 +8178,7 @@ export class InsiderBot extends EventEmitter {
       observedTxSignatures: new Set([transferReceiveSignature]),
       syncComplete: false,
       monitoringActive: true,
+      observedNonZeroTokenBalance: false,
     };
     state.watches.set(recipient, childWatch);
 
@@ -8340,6 +8366,10 @@ export class InsiderBot extends EventEmitter {
 
     const watch = state.watches.get(wallet);
     if (watch) {
+      this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
+        watch,
+        totalRaw,
+      );
       this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(watch, null);
     }
 
@@ -8386,6 +8416,10 @@ export class InsiderBot extends EventEmitter {
     const totalRaw = [...accounts.values()].reduce((sum, value) => sum + value, 0n);
     const previousRaw = state.tokenAtaLiveBalanceRaw.get(wallet) ?? null;
     state.tokenAtaLiveBalanceRaw.set(wallet, totalRaw);
+    this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
+      watch,
+      totalRaw,
+    );
 
     this.log.debug("Follow-token early bundler ATA balance updated", {
       mint: state.mint,
@@ -8396,7 +8430,12 @@ export class InsiderBot extends EventEmitter {
       previousLiveTokenBalanceRaw: previousRaw?.toString() ?? null,
     });
 
-    if (totalRaw <= 0n && !watch.soldAll && watch.syncComplete) {
+    if (
+      totalRaw <= 0n &&
+      !watch.soldAll &&
+      watch.syncComplete &&
+      this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, totalRaw)
+    ) {
       watch.soldAll = true;
       watch.soldAllSignature = watch.soldAllSignature ?? "ata_zero_balance";
       watch.reachedTwentyFivePercentSold = true;
@@ -8444,6 +8483,10 @@ export class InsiderBot extends EventEmitter {
       state.tokenAtaLiveBalanceRaw.set(wallet, raw);
       const watch = state.watches.get(wallet);
       if (watch) {
+        this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
+          watch,
+          raw,
+        );
         this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
           watch,
           null,
@@ -8621,6 +8664,7 @@ export class InsiderBot extends EventEmitter {
         observedTxSignatures: new Set(),
         syncComplete: false,
         monitoringActive: true,
+        observedNonZeroTokenBalance: false,
       });
     }
 
