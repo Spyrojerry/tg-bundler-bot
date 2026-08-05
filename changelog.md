@@ -8,7 +8,13 @@
 - **Pre–1st-LI wallet** (after GMGN start, before valid LI #1): bundler sold-all can buy **only if** the watch with the **highest cumulative sell USD** has no single sell tx **&gt; 7.5M tokens** → buy with **+80% MC TP** only. If gate fails, wait for 1st valid LI wallet then post-LI rules apply.
 - **Post–1st-LI wallet**: all existing bundler sold-all buy rules unchanged (skip / MC TP / LI-only branches, transfer-out path, valid wallet #4, etc.).
 - 1st valid LI wallet found re-evaluates bundler sold-all if already complete (post-LI rules override pre-LI path).
-- **Pre-LI buy already holding:** if 1st valid LI wallet appears and bundler stats are **&lt;75 txs** or **≤ $24.5k cumulative**, keep **+80% MC TP** from pre-LI buy (post-LI skip branches do not apply); valid LI **≥25%** still arms.
+- **Pre-LI buy already holding:** if 1st valid LI wallet appears and bundler stats are **&lt;75 txs** or **≤ $24.5k cumulative**, keep **+80% MC TP** from pre-LI buy (post-LI skip branches do not apply). If **≥75 txs** and **$24.5k–$35k**, **+80% MC TP + valid LI ≥25%**. If **&gt; $35k**, **+80% MC TP disabled** (valid LI **≥25%** only — same as post-LI LI-only).
+
+## 2026-08-05 (155)
+
+### Follow-token: pre-LI buy — &gt;$35k disables +80% MC TP (LI-only)
+
+- Pre-LI bundler buy now applies bundler cumulative **&gt; $35k** (with ≥75 sell txs) the same as post-LI: **+80% MC TP disabled**, exit on valid LI **≥25%** only. Low-stats retain and $24.5k–$35k dual-exit unchanged.
 
 ## 2026-08-05 (154)
 

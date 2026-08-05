@@ -3558,6 +3558,57 @@ export class InsiderBot extends EventEmitter {
     return !this.followTokenEarlyBundlerUsesTransferRecipientSellPath();
   }
 
+  private applyPreLiBundlerBuyExitModeFromBundlerStats(): {
+    mode: "mc_tp_retained_low_stats" | "mc_tp_and_li" | "li_only";
+    meetsSellTxGate: boolean;
+    maxSellTxCount: number;
+    maxCumulativeSellUsd: number;
+  } {
+    const state = this.followTokenEarlyBundlerExitState;
+    const maxSellTxCount = this.getFollowTokenEarlyBundlerExitMaxSellTxCount();
+    const maxCumulativeSellUsd =
+      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
+    const meetsSellTxGate =
+      this.bundlerExitMeetsMinSellTxCountForCumulativeUsdGate();
+    const highSellUsd =
+      meetsSellTxGate &&
+      this.anyFollowTokenEarlyBundlerExitWatchExceedsHighSellUsdMcTpDisable();
+    const wouldPostLiSkip =
+      !meetsSellTxGate ||
+      this.noFollowTokenEarlyBundlerExitWatchExceedsLowSellUsd();
+
+    if (highSellUsd) {
+      if (state) state.highSellUsdMode = true;
+      this.profitExitDisabled = true;
+      return {
+        mode: "li_only",
+        meetsSellTxGate,
+        maxSellTxCount,
+        maxCumulativeSellUsd,
+      };
+    }
+
+    if (state) state.highSellUsdMode = false;
+    this.profitExitDisabled = false;
+    this.disableProfitExitAfterBuy = false;
+
+    if (wouldPostLiSkip) {
+      return {
+        mode: "mc_tp_retained_low_stats",
+        meetsSellTxGate,
+        maxSellTxCount,
+        maxCumulativeSellUsd,
+      };
+    }
+
+    return {
+      mode: "mc_tp_and_li",
+      meetsSellTxGate,
+      maxSellTxCount,
+      maxCumulativeSellUsd,
+    };
+  }
+
   private preservePreLiBundlerBuyMcTpExitAfterFirstValidWallet(): void {
     const state = this.followTokenEarlyBundlerExitState;
     const funderState = this.bundlerFunderWatch;
@@ -3571,20 +3622,38 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const maxSellTxCount = this.getFollowTokenEarlyBundlerExitMaxSellTxCount();
-    const maxCumulativeSellUsd =
-      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
-    const meetsSellTxGate =
-      this.bundlerExitMeetsMinSellTxCountForCumulativeUsdGate();
-    const wouldPostLiSkip =
-      !meetsSellTxGate ||
-      this.noFollowTokenEarlyBundlerExitWatchExceedsLowSellUsd();
+    const exitMode = this.applyPreLiBundlerBuyExitModeFromBundlerStats();
+    const {
+      mode,
+      meetsSellTxGate,
+      maxSellTxCount,
+      maxCumulativeSellUsd,
+    } = exitMode;
 
-    state.highSellUsdMode = false;
-    this.profitExitDisabled = false;
-    this.disableProfitExitAfterBuy = false;
+    if (mode === "li_only") {
+      this.followTokenLargeInsiderLog(
+        "pre-LI buy — +80% MC TP disabled (bundler cumulative >$35k); valid LI ≥25% only",
+        {
+          mint: funderState.mint,
+          maxSellTxCount,
+          maxCumulativeSellUsd,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏳ ${this.label} Pre-LI Buy — Valid LI ≥25% Only</b>`,
+          `Token: <code>${funderState.mint}</code>`,
+          `Valid LI wallet #1 found while holding pre-LI bundler buy.`,
+          `Bundler cumulative sell > $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; ≥${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} sell txs).`,
+          `+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled — same as post-LI LI-only branch.`,
+          "Waiting for ≥25% sold on any valid Large Insider wallet.",
+        ].join("\n"),
+        "follow-token pre-li buy li-only",
+      );
+      return;
+    }
 
-    if (!wouldPostLiSkip) return;
+    if (mode !== "mc_tp_retained_low_stats") return;
 
     this.followTokenLargeInsiderLog(
       "pre-LI buy — keeping +80% MC TP after 1st valid LI wallet (post-LI skip branches ignored)",
@@ -7773,7 +7842,8 @@ export class InsiderBot extends EventEmitter {
     if (this.phase !== "holding" || this.positionSellTriggered) return;
 
     if (state.preLiBundlerSoldAllBuy) {
-      state.highSellUsdMode = false;
+      const { mode, maxCumulativeSellUsd, maxSellTxCount } =
+        this.applyPreLiBundlerBuyExitModeFromBundlerStats();
       if (
         await this.triggerFollowTokenLargeInsiderValidWalletTwentyFivePercentExitIfReady(
           triggerTx,
@@ -7783,15 +7853,30 @@ export class InsiderBot extends EventEmitter {
       }
       if (!state.preLiExitArmedNotified) {
         state.preLiExitArmedNotified = true;
-        void this.sendTelegramSafe(
-          [
-            `<b>✅ ${this.label} Pre-LI Bundler Buy — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP Active</b>`,
-            `Token: <code>${funderState.mint}</code>`,
-            "All bundlers/recipients sold all before 1st valid LI wallet.",
-            `Exit: +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP; valid LI ≥25% once discovered.`,
-          ].join("\n"),
-          "follow-token pre-li bundler mc tp armed",
-        );
+        if (mode === "li_only") {
+          void this.sendTelegramSafe(
+            [
+              `<b>⏳ ${this.label} Pre-LI Bundler Buy — Valid LI ≥25% Only</b>`,
+              `Token: <code>${funderState.mint}</code>`,
+              "All bundlers/recipients sold all before 1st valid LI wallet.",
+              `Bundler cumulative > $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; max <b>${maxSellTxCount}</b> sell txs).`,
+              `+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled — waiting for valid LI ≥25%.`,
+            ].join("\n"),
+            "follow-token pre-li bundler li-only",
+          );
+        } else {
+          void this.sendTelegramSafe(
+            [
+              `<b>✅ ${this.label} Pre-LI Bundler Buy — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP Active</b>`,
+              `Token: <code>${funderState.mint}</code>`,
+              "All bundlers/recipients sold all before 1st valid LI wallet.",
+              mode === "mc_tp_and_li"
+                ? `Exit: +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP or valid LI ≥25% (bundler cumulative $24.5k–$35k zone).`
+                : `Exit: +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP; valid LI ≥25% once discovered.`,
+            ].join("\n"),
+            "follow-token pre-li bundler mc tp armed",
+          );
+        }
       }
       return;
     }
