@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-05 (163)
+
+### Follow-token early bundler — ATA subscribe, tx-based sells, drop reclassification guard
+
+- **ATA `accountSubscribe`** (SPL + Token-2022) on each monitored wallet for instant zero-balance sold-all detection without per-sell Helius balance-at polling.
+- **Removed sell reclassification guard (160)** that mis-fired when balance-at lagged behind rapid sells.
+- **Per-tx sell size** from `tokenTransfers` (`extractTokenAmountForWallet`); each sell logs `sellAmount`, running `soldAmount` / `boughtAmount`, and live ATA raw balance.
+- **Sold-all after sync/backfill:** paginated tx replay builds `soldAmount` from transfer amounts; post-sync RPC refresh + ATA subscription confirm zero or `soldAmount >= boughtAmount`.
+
 ## 2026-08-05 (161)
 
 ### Follow-token: early bundler — drop sender on any resolved transfer-out

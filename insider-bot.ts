@@ -1,8 +1,15 @@
 import {
+  AccountInfo,
   Connection,
   LAMPORTS_PER_SOL,
   PublicKey,
 } from "@solana/web3.js";
+import {
+  AccountLayout,
+  getAssociatedTokenAddressSync,
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
 import { EventEmitter } from "events";
 import { createLogger, Logger } from "./logger";
 import {
@@ -192,6 +199,12 @@ interface FollowTokenEarlyBundlerExitState {
   exitTriggerSignature: string | null;
   enhancedWatchIds: Map<string, number>;
   logsSubIds: Map<string, number>;
+  /** wallet → (ATA pubkey → accountSubscribe id) */
+  tokenAtaBalanceSubIds: Map<string, Map<string, number>>;
+  /** wallet → (ATA pubkey → raw balance) */
+  tokenAtaBalancesByAccount: Map<string, Map<string, bigint>>;
+  /** wallet → summed raw token balance from ATA subscriptions */
+  tokenAtaLiveBalanceRaw: Map<string, bigint>;
 }
 
 interface FollowTokenLargeInsiderScrapeWatch {
@@ -7244,35 +7257,6 @@ export class InsiderBot extends EventEmitter {
     return true;
   }
 
-  private buildFollowTokenEarlyBundlerExitRecipientWatchStub(
-    watch: FollowTokenEarlyBundlerExitWatch,
-  ): FunderRecipientWatch {
-    return {
-      wallet: watch.wallet,
-      fundingSignature: watch.syncAfterSignature,
-      fundingTimestamp: 0,
-      outAmountSol: 0,
-      heliusPreferredIndex: 0,
-      tokenActions: [],
-      observedTxSignatures: watch.observedTxSignatures,
-      tokenBuyObserved: watch.boughtAmount > 0,
-      zeroSolBalanceSignatures: new Set(),
-      buyTriggersEntry: false,
-      boughtAmount: watch.boughtAmount,
-      soldAmount: watch.soldAmount,
-      firstBuySignature: watch.syncAfterSignature,
-      firstBuyTimestamp: null,
-      normalTinyTransferMode: false,
-      normalTinyExitPercent: null,
-      lowFundingCopySellOnSellAll: false,
-      lowFundingTinyUsdBand: null,
-      lowFundingLargeTransferMode: false,
-      postEntrySwapSignature: null,
-      postEntrySwapBaselineSignatures: new Set(),
-      soldAllSignature: watch.soldAllSignature,
-    };
-  }
-
   private followTokenEarlyBundlerExitWatchReachedTwentyFivePercent(
     watch: FollowTokenEarlyBundlerExitWatch,
     remainingAmount: number | null,
@@ -7291,38 +7275,46 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private async updateFollowTokenEarlyBundlerExitWatchSoldAll(
+  private getFollowTokenEarlyBundlerExitWatchLiveTokenBalanceRaw(
+    wallet: string,
+  ): bigint | null {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state) return null;
+    return state.tokenAtaLiveBalanceRaw.get(wallet) ?? null;
+  }
+
+  private applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
     watch: FollowTokenEarlyBundlerExitWatch,
-    tx: HeliusTransaction,
-    mint: string,
-  ): Promise<void> {
+    signature: string | null,
+  ): void {
     if (watch.soldAll) return;
-    const funderState = this.bundlerFunderWatch;
-    let remainingAmount: number | null = null;
-    if (funderState) {
-      remainingAmount = await this.getRecipientTokenBalanceAtTx(
-        funderState,
-        this.buildFollowTokenEarlyBundlerExitRecipientWatchStub(watch),
-        tx,
-      );
-    }
-    const soldAll =
-      (remainingAmount !== null && remainingAmount <= 0) ||
-      (watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount);
-    if (soldAll) {
+    const liveRaw = this.getFollowTokenEarlyBundlerExitWatchLiveTokenBalanceRaw(
+      watch.wallet,
+    );
+    const soldAllByTrackedAmount =
+      watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount;
+    const soldAllByAtaBalance = liveRaw !== null && liveRaw <= 0n;
+    if (soldAllByTrackedAmount || soldAllByAtaBalance) {
       watch.soldAll = true;
-      watch.soldAllSignature = tx.signature;
+      watch.soldAllSignature = signature ?? watch.soldAllSignature;
       watch.reachedTwentyFivePercentSold = true;
       return;
     }
     if (
-      this.followTokenEarlyBundlerExitWatchReachedTwentyFivePercent(
-        watch,
-        remainingAmount,
-      )
+      this.followTokenEarlyBundlerExitWatchReachedTwentyFivePercent(watch, null)
     ) {
       watch.reachedTwentyFivePercentSold = true;
     }
+  }
+
+  private updateFollowTokenEarlyBundlerExitWatchSoldAll(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    signature: string | null,
+  ): void {
+    this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
+      watch,
+      signature,
+    );
   }
 
   private shouldDeferFollowTokenLargeInsiderValidWalletTwentyFivePercentExit(): boolean {
@@ -7988,23 +7980,26 @@ export class InsiderBot extends EventEmitter {
         watch.maxSingleSellTokenAmount = amount;
       }
 
-      const misclassifiedAsBuy =
-        await this.revertFollowTokenEarlyBundlerExitWatchMisclassifiedSell(
-          watch,
-          tx,
-          mint,
-          amount,
-        );
-      if (misclassifiedAsBuy) {
-        return;
-      }
+      const liveTokenBalanceRaw =
+        this.getFollowTokenEarlyBundlerExitWatchLiveTokenBalanceRaw(wallet);
+      this.log.info("Follow-token early bundler sell observed", {
+        mint,
+        wallet: watch.wallet,
+        source: watch.source,
+        signature: tx.signature,
+        sellAmount: amount,
+        soldAmount: watch.soldAmount,
+        boughtAmount: watch.boughtAmount,
+        expectedRemaining: Math.max(0, watch.boughtAmount - watch.soldAmount),
+        liveTokenBalanceRaw: liveTokenBalanceRaw?.toString() ?? null,
+      });
 
       await this.updateFollowTokenEarlyBundlerExitWatchCumulativeSellUsd(
         watch,
         tx,
         wallet,
       );
-      await this.updateFollowTokenEarlyBundlerExitWatchSoldAll(watch, tx, mint);
+      this.updateFollowTokenEarlyBundlerExitWatchSoldAll(watch, tx.signature);
       await this.maybeEvaluateFollowTokenEarlyBundlerExit(tx);
     }
   }
@@ -8041,54 +8036,6 @@ export class InsiderBot extends EventEmitter {
         signature: tx.signature,
       },
     );
-  }
-
-  /** When post-tx balance exceeds expected remaining, undo sell stats and count as inbound. */
-  private async revertFollowTokenEarlyBundlerExitWatchMisclassifiedSell(
-    watch: FollowTokenEarlyBundlerExitWatch,
-    tx: HeliusTransaction,
-    mint: string,
-    sellAmount: number,
-  ): Promise<boolean> {
-    const funderState = this.bundlerFunderWatch;
-    if (!funderState) return false;
-
-    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
-      funderState,
-      this.buildFollowTokenEarlyBundlerExitRecipientWatchStub(watch),
-      tx,
-    );
-    if (remainingAmount === null) return false;
-
-    const expectedRemaining = Math.max(0, watch.boughtAmount - watch.soldAmount);
-    if (remainingAmount <= expectedRemaining + 1) return false;
-
-    watch.sellTxCount = Math.max(0, watch.sellTxCount - 1);
-    watch.soldAmount = Math.max(0, watch.soldAmount - sellAmount);
-    if (watch.maxSingleSellTokenAmount === sellAmount) {
-      watch.maxSingleSellTokenAmount = 0;
-    }
-    this.applyFollowTokenEarlyBundlerExitWatchInboundAmount(
-      watch,
-      sellAmount,
-      tx,
-      mint,
-      "buy",
-    );
-
-    this.log.warn(
-      "Follow-token early bundler sell reclassified as buy — post-tx balance higher than expected",
-      {
-        mint,
-        wallet: watch.wallet,
-        signature: tx.signature,
-        sellAmount,
-        remainingAmount,
-        expectedRemaining,
-        totalBoughtAmount: watch.boughtAmount,
-      },
-    );
-    return true;
   }
 
   private isValidFollowTokenEarlyBundlerWatchWallet(address: string): boolean {
@@ -8306,29 +8253,205 @@ export class InsiderBot extends EventEmitter {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active) return;
     if (!this.isValidFollowTokenEarlyBundlerWatchWallet(wallet)) return;
-    if (state.enhancedWatchIds.has(wallet) || state.logsSubIds.has(wallet)) {
-      return;
+
+    if (!state.enhancedWatchIds.has(wallet) && !state.logsSubIds.has(wallet)) {
+      if (this.enhancedWs) {
+        const watchId = this.enhancedWs.watch(wallet, (tx) => {
+          this.handleEnhancedWsMintTx(tx, "early_bundler_exit", wallet);
+        });
+        state.enhancedWatchIds.set(wallet, watchId);
+      } else {
+        const pubkey = new PublicKey(wallet);
+        const subId = this.connection.onLogs(
+          pubkey,
+          (logInfo) => {
+            if (!logInfo.err) {
+              this.queueSignature(logInfo.signature, "early_bundler_exit", wallet);
+            }
+          },
+          "processed",
+        );
+        state.logsSubIds.set(wallet, subId);
+      }
     }
 
-    if (this.enhancedWs) {
-      const watchId = this.enhancedWs.watch(wallet, (tx) => {
-        this.handleEnhancedWsMintTx(tx, "early_bundler_exit", wallet);
+    void this.subscribeFollowTokenEarlyBundlerExitTokenAta(wallet, state.mint);
+  }
+
+  private async subscribeFollowTokenEarlyBundlerExitTokenAta(
+    wallet: string,
+    mint: string,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active || state.mint !== mint) return;
+    if (state.tokenAtaBalanceSubIds.has(wallet)) return;
+    if (!this.isValidFollowTokenEarlyBundlerWatchWallet(wallet)) return;
+
+    const owner = new PublicKey(wallet);
+    const mintPubkey = new PublicKey(mint);
+    const programIds = [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID];
+    const subIds = new Map<string, number>();
+    const balances = new Map<string, bigint>();
+
+    for (const programId of programIds) {
+      const ata = getAssociatedTokenAddressSync(mintPubkey, owner, false, programId);
+      const ataKey = ata.toBase58();
+      try {
+        const accountInfo = await this.connection.getAccountInfo(ata, "confirmed");
+        balances.set(
+          ataKey,
+          this.decodeFollowTokenEarlyBundlerExitTokenAtaBalance(accountInfo),
+        );
+      } catch (err) {
+        balances.set(ataKey, 0n);
+        this.log.debug("Early bundler ATA seed balance fetch failed — defaulting to zero", {
+          mint,
+          wallet,
+          ata: ataKey,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      const subId = this.connection.onAccountChange(
+        ata,
+        (accountInfo) => {
+          this.handleFollowTokenEarlyBundlerExitTokenAtaChange(
+            wallet,
+            ataKey,
+            accountInfo,
+          );
+        },
+        "confirmed",
+      );
+      subIds.set(ataKey, subId);
+    }
+
+    state.tokenAtaBalanceSubIds.set(wallet, subIds);
+    state.tokenAtaBalancesByAccount.set(wallet, balances);
+    const totalRaw = [...balances.values()].reduce((sum, value) => sum + value, 0n);
+    state.tokenAtaLiveBalanceRaw.set(wallet, totalRaw);
+
+    const watch = state.watches.get(wallet);
+    if (watch) {
+      this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(watch, null);
+    }
+
+    this.log.info("Subscribed follow-token early bundler token ATA balance", {
+      mint,
+      wallet,
+      ataAccounts: [...subIds.keys()],
+      liveTokenBalanceRaw: totalRaw.toString(),
+    });
+  }
+
+  private decodeFollowTokenEarlyBundlerExitTokenAtaBalance(
+    accountInfo: AccountInfo<Buffer> | null,
+  ): bigint {
+    if (!accountInfo || accountInfo.data.length < AccountLayout.span) {
+      return 0n;
+    }
+    try {
+      return AccountLayout.decode(accountInfo.data).amount;
+    } catch {
+      return 0n;
+    }
+  }
+
+  private handleFollowTokenEarlyBundlerExitTokenAtaChange(
+    wallet: string,
+    ataKey: string,
+    accountInfo: AccountInfo<Buffer>,
+  ): void {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active) return;
+    const watch = state.watches.get(wallet);
+    if (!watch?.monitoringActive) return;
+
+    const balanceRaw =
+      this.decodeFollowTokenEarlyBundlerExitTokenAtaBalance(accountInfo);
+    let accounts = state.tokenAtaBalancesByAccount.get(wallet);
+    if (!accounts) {
+      accounts = new Map<string, bigint>();
+      state.tokenAtaBalancesByAccount.set(wallet, accounts);
+    }
+    accounts.set(ataKey, balanceRaw);
+
+    const totalRaw = [...accounts.values()].reduce((sum, value) => sum + value, 0n);
+    const previousRaw = state.tokenAtaLiveBalanceRaw.get(wallet) ?? null;
+    state.tokenAtaLiveBalanceRaw.set(wallet, totalRaw);
+
+    this.log.debug("Follow-token early bundler ATA balance updated", {
+      mint: state.mint,
+      wallet,
+      ata: ataKey,
+      ataBalanceRaw: balanceRaw.toString(),
+      liveTokenBalanceRaw: totalRaw.toString(),
+      previousLiveTokenBalanceRaw: previousRaw?.toString() ?? null,
+    });
+
+    if (totalRaw <= 0n && !watch.soldAll && watch.syncComplete) {
+      watch.soldAll = true;
+      watch.soldAllSignature = watch.soldAllSignature ?? "ata_zero_balance";
+      watch.reachedTwentyFivePercentSold = true;
+      this.log.info("Follow-token early bundler sold all — ATA balance zero", {
+        mint: state.mint,
+        wallet,
+        soldAmount: watch.soldAmount,
+        boughtAmount: watch.boughtAmount,
       });
-      state.enhancedWatchIds.set(wallet, watchId);
+      void this.maybeEvaluateFollowTokenEarlyBundlerExit();
       return;
     }
 
-    const pubkey = new PublicKey(wallet);
-    const subId = this.connection.onLogs(
-      pubkey,
-      (logInfo) => {
-        if (!logInfo.err) {
-          this.queueSignature(logInfo.signature, "early_bundler_exit", wallet);
-        }
-      },
-      "processed",
-    );
-    state.logsSubIds.set(wallet, subId);
+    this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(watch, null);
+  }
+
+  private async unsubscribeFollowTokenEarlyBundlerExitTokenAta(
+    wallet: string,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state) return;
+
+    const subIds = state.tokenAtaBalanceSubIds.get(wallet);
+    if (subIds) {
+      for (const subId of subIds.values()) {
+        await this.connection
+          .removeAccountChangeListener(subId)
+          .catch(() => undefined);
+      }
+      state.tokenAtaBalanceSubIds.delete(wallet);
+    }
+    state.tokenAtaBalancesByAccount.delete(wallet);
+    state.tokenAtaLiveBalanceRaw.delete(wallet);
+  }
+
+  private async refreshFollowTokenEarlyBundlerExitWatchTokenBalanceAfterSync(
+    wallet: string,
+    mint: string,
+  ): Promise<void> {
+    await this.subscribeFollowTokenEarlyBundlerExitTokenAta(wallet, mint);
+    try {
+      const raw = await this.gmgnClient.getTokenRawBalance(wallet, mint);
+      const state = this.followTokenEarlyBundlerExitState;
+      if (!state) return;
+      state.tokenAtaLiveBalanceRaw.set(wallet, raw);
+      const watch = state.watches.get(wallet);
+      if (watch) {
+        this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
+          watch,
+          null,
+        );
+      }
+    } catch (err) {
+      this.log.warn(
+        "Failed to refresh follow-token early bundler token balance after sync",
+        {
+          mint,
+          wallet,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+    }
   }
 
   private unsubscribeFollowTokenEarlyBundlerExitWallet(wallet: string): void {
@@ -8348,6 +8471,8 @@ export class InsiderBot extends EventEmitter {
         .catch(() => undefined);
       state.logsSubIds.delete(wallet);
     }
+
+    void this.unsubscribeFollowTokenEarlyBundlerExitTokenAta(wallet);
   }
 
   private dropFollowTokenEarlyBundlerExitWatchAfterTransfer(
@@ -8427,6 +8552,10 @@ export class InsiderBot extends EventEmitter {
       });
     } finally {
       watch.syncComplete = true;
+      await this.refreshFollowTokenEarlyBundlerExitWatchTokenBalanceAfterSync(
+        wallet,
+        mint,
+      );
     }
   }
 
@@ -8503,6 +8632,9 @@ export class InsiderBot extends EventEmitter {
       exitTriggerSignature: null,
       enhancedWatchIds: new Map(),
       logsSubIds: new Map(),
+      tokenAtaBalanceSubIds: new Map(),
+      tokenAtaBalancesByAccount: new Map(),
+      tokenAtaLiveBalanceRaw: new Map(),
     };
 
     for (const wallet of watches.keys()) {
@@ -8549,6 +8681,9 @@ export class InsiderBot extends EventEmitter {
     for (const [wallet, watchId] of state.enhancedWatchIds) {
       await this.enhancedWs?.unwatch(watchId).catch(() => undefined);
       state.enhancedWatchIds.delete(wallet);
+    }
+    for (const wallet of [...state.tokenAtaBalanceSubIds.keys()]) {
+      await this.unsubscribeFollowTokenEarlyBundlerExitTokenAta(wallet);
     }
     this.followTokenEarlyBundlerExitState = null;
   }
