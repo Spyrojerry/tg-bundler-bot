@@ -8050,18 +8050,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (kind === "transfer_out") {
-      const recipient = (tx.tokenTransfers ?? []).find(
-        (transfer) =>
-          transfer.mint === mint && transfer.fromUserAccount === wallet,
-      )?.toUserAccount;
-      if (recipient) {
-        await this.chainFollowTokenEarlyBundlerTransferRecipient(
-          watch,
-          recipient,
-          tx,
-          mint,
-        );
-      }
+      await this.handleFollowTokenEarlyBundlerTransferOut(watch, tx, mint);
       return;
     }
 
@@ -8088,29 +8077,90 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async chainFollowTokenEarlyBundlerTransferRecipient(
+  private getFollowTokenEarlyBundlerTransferRecipientsFromTx(
+    tx: HeliusTransaction,
+    wallet: string,
+    mint: string,
+  ): Map<string, number> {
+    const recipients = new Map<string, number>();
+    for (const transfer of tx.tokenTransfers ?? []) {
+      if (transfer.mint !== mint || transfer.fromUserAccount !== wallet) continue;
+      const recipient = transfer.toUserAccount;
+      if (!recipient || recipient === wallet) continue;
+      recipients.set(
+        recipient,
+        (recipients.get(recipient) ?? 0) + (transfer.tokenAmount ?? 0),
+      );
+    }
+    return recipients;
+  }
+
+  private async shouldDropFollowTokenEarlyBundlerWatchAfterTransfer(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    tx: HeliusTransaction,
+    mint: string,
+  ): Promise<boolean> {
+    const funderState = this.bundlerFunderWatch;
+    if (!funderState) return true;
+
+    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
+      funderState,
+      this.buildFollowTokenEarlyBundlerExitRecipientWatchStub(watch),
+      tx,
+    );
+    if (remainingAmount !== null) {
+      return remainingAmount <= 0;
+    }
+
+    const transferredOut = (tx.tokenTransfers ?? [])
+      .filter(
+        (transfer) =>
+          transfer.mint === mint && transfer.fromUserAccount === watch.wallet,
+      )
+      .reduce((sum, transfer) => sum + (transfer.tokenAmount ?? 0), 0);
+    const estimatedRemaining = Math.max(0, watch.boughtAmount - watch.soldAmount);
+    return estimatedRemaining > 0 && transferredOut >= estimatedRemaining;
+  }
+
+  private async ensureFollowTokenEarlyBundlerTransferRecipientWatch(
     parentWatch: FollowTokenEarlyBundlerExitWatch,
     recipient: string,
+    transferAmount: number,
     tx: HeliusTransaction,
     mint: string,
   ): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
-    if (!state?.active || state.watches.has(recipient)) return;
-
-    if (parentWatch.source === "early_bundler") {
-      state.earlyBundlerTransferOutObserved = true;
-    }
-
-    const transferAmount = (tx.tokenTransfers ?? [])
-      .filter(
-        (transfer) =>
-          transfer.mint === mint &&
-          transfer.fromUserAccount === parentWatch.wallet &&
-          transfer.toUserAccount === recipient,
-      )
-      .reduce((sum, transfer) => sum + (transfer.tokenAmount ?? 0), 0);
+    if (!state?.active || transferAmount <= 0) return;
 
     const transferReceiveSignature = tx.signature;
+    const existing = state.watches.get(recipient);
+    if (existing) {
+      existing.boughtAmount += transferAmount;
+      existing.observedTxSignatures.add(transferReceiveSignature);
+      if (existing.soldAll) {
+        existing.soldAll = false;
+        existing.soldAllSignature = null;
+        existing.reachedTwentyFivePercentSold = false;
+        if (!existing.monitoringActive) {
+          existing.monitoringActive = true;
+          this.subscribeFollowTokenEarlyBundlerExitWallet(recipient);
+        }
+      }
+      existing.syncComplete = false;
+      this.log.info(
+        "Follow-token early bundler transfer — added inbound amount to existing recipient watch",
+        {
+          mint,
+          parentWallet: parentWatch.wallet,
+          recipient,
+          transferAmount,
+          totalBoughtAmount: existing.boughtAmount,
+          transferReceiveSignature,
+        },
+      );
+      await this.syncFollowTokenEarlyBundlerExitWallet(recipient, mint);
+      return;
+    }
 
     const childWatch: FollowTokenEarlyBundlerExitWatch = {
       wallet: recipient,
@@ -8131,8 +8181,6 @@ export class InsiderBot extends EventEmitter {
     };
     state.watches.set(recipient, childWatch);
 
-    this.dropFollowTokenEarlyBundlerExitWatchAfterTransfer(parentWatch, tx);
-
     this.log.info(
       "Follow-token early bundler token transfer — chaining recipient watch",
       {
@@ -8141,27 +8189,82 @@ export class InsiderBot extends EventEmitter {
         recipient,
         transferAmount,
         transferReceiveSignature,
-        parentDroppedFromMonitoring: true,
       },
+    );
+
+    this.subscribeFollowTokenEarlyBundlerExitWallet(recipient);
+    await this.syncFollowTokenEarlyBundlerExitWallet(recipient, mint);
+  }
+
+  private async handleFollowTokenEarlyBundlerTransferOut(
+    parentWatch: FollowTokenEarlyBundlerExitWatch,
+    tx: HeliusTransaction,
+    mint: string,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active) return;
+
+    const recipients = this.getFollowTokenEarlyBundlerTransferRecipientsFromTx(
+      tx,
+      parentWatch.wallet,
+      mint,
+    );
+    if (recipients.size === 0) return;
+
+    if (parentWatch.source === "early_bundler") {
+      state.earlyBundlerTransferOutObserved = true;
+    }
+
+    for (const [recipient, transferAmount] of recipients) {
+      await this.ensureFollowTokenEarlyBundlerTransferRecipientWatch(
+        parentWatch,
+        recipient,
+        transferAmount,
+        tx,
+        mint,
+      );
+    }
+
+    const dropParent = await this.shouldDropFollowTokenEarlyBundlerWatchAfterTransfer(
+      parentWatch,
+      tx,
+      mint,
+    );
+    if (dropParent) {
+      this.dropFollowTokenEarlyBundlerExitWatchAfterTransfer(parentWatch, tx);
+    } else {
+      this.log.info(
+        "Follow-token early bundler partial transfer — sender still monitored",
+        {
+          mint,
+          wallet: parentWatch.wallet,
+          signature: tx.signature,
+          recipientCount: recipients.size,
+        },
+      );
+    }
+
+    const recipientLines = [...recipients.entries()].map(
+      ([recipient, amount]) =>
+        `• <code>${recipient}</code>: <b>${amount.toLocaleString()}</b>`,
     );
     void this.sendTelegramSafe(
       [
         `<b>🔗 ${this.label} Early Bundler Token Transfer</b>`,
         `Token: <code>${mint}</code>`,
-        `From: <code>${parentWatch.wallet}</code> (dropped from monitoring)`,
-        `To: <code>${recipient}</code>`,
-        `Amount: <b>${transferAmount.toLocaleString()}</b>`,
+        `From: <code>${parentWatch.wallet}</code>${dropParent ? " (dropped from monitoring)" : " (partial — still monitored)"}`,
+        `Recipients: <b>${recipients.size}</b>`,
+        ...recipientLines,
         `Tx: <code>${tx.signature}</code>`,
         "",
-        "Sender unsubscribed; recipient synced and monitored like an early bundler.",
+        dropParent
+          ? "Sender unsubscribed; every recipient synced and monitored."
+          : "Every recipient synced and monitored; sender kept until remaining balance is zero.",
       ].join("\n"),
       "follow-token early bundler transfer chained",
     );
 
-    this.subscribeFollowTokenEarlyBundlerExitWallet(recipient);
-    await this.syncFollowTokenEarlyBundlerExitWallet(recipient, mint);
-    childWatch.syncComplete = true;
-    await this.maybeEvaluateFollowTokenEarlyBundlerExit();
+    await this.maybeEvaluateFollowTokenEarlyBundlerExit(tx);
   }
 
   private subscribeFollowTokenEarlyBundlerExitWallet(wallet: string): void {
@@ -8248,31 +8351,51 @@ export class InsiderBot extends EventEmitter {
       source: watch.source,
       syncAfterSignature: watch.syncAfterSignature,
     });
-    for (let page = 0; page < 50; page++) {
-      const batch = await this.withHeliusFallback((client) =>
-        client.getAddressTransactionsAsc(
-          wallet,
-          cursor,
-          FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT,
-        ),
-      );
-      if (batch.length === 0) break;
+    try {
+      for (let page = 0; page < 50; page++) {
+        const batch = await this.withHeliusFallback((client) =>
+          client.getAddressTransactionsAsc(
+            wallet,
+            cursor,
+            FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT,
+          ),
+        );
+        if (batch.length === 0) break;
 
-      for (const tx of batch) {
-        if (!tx.signature || watch.observedTxSignatures.has(tx.signature)) {
-          continue;
+        for (const tx of batch) {
+          if (!tx.signature || watch.observedTxSignatures.has(tx.signature)) {
+            continue;
+          }
+          await this.applyFollowTokenEarlyBundlerExitTx(tx, mint, wallet);
         }
-        await this.applyFollowTokenEarlyBundlerExitTx(tx, mint, wallet);
-      }
 
-      const lastSignature = batch[batch.length - 1]?.signature;
-      if (
-        !lastSignature ||
-        batch.length < FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT
-      ) {
-        break;
+        const lastSignature = batch[batch.length - 1]?.signature;
+        if (
+          !lastSignature ||
+          batch.length < FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT
+        ) {
+          break;
+        }
+        cursor = lastSignature;
       }
-      cursor = lastSignature;
+    } finally {
+      watch.syncComplete = true;
+    }
+  }
+
+  /** Paginated sync for every watch, including recipients chained mid-sync. */
+  private async syncAllFollowTokenEarlyBundlerExitWatches(
+    mint: string,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active) return;
+
+    while ([...state.watches.values()].some((watch) => !watch.syncComplete)) {
+      for (const [wallet, watch] of [...state.watches.entries()]) {
+        if (!watch.syncComplete) {
+          await this.syncFollowTokenEarlyBundlerExitWallet(wallet, mint);
+        }
+      }
     }
   }
 
@@ -8339,10 +8462,7 @@ export class InsiderBot extends EventEmitter {
       this.subscribeFollowTokenEarlyBundlerExitWallet(wallet);
     }
 
-    for (const wallet of watches.keys()) {
-      await this.syncFollowTokenEarlyBundlerExitWallet(wallet, mint);
-      watches.get(wallet)!.syncComplete = true;
-    }
+    await this.syncAllFollowTokenEarlyBundlerExitWatches(mint);
 
     await this.maybeEvaluateFollowTokenEarlyBundlerExit();
 
@@ -8359,7 +8479,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `Wallets: <b>${watches.size}</b> initial bundler(s)`,
         "",
-        "Started at Follow-Token GMGN flow. Synced from each initial buy tx (paginated). Token transfers chain new watches; sender dropped.",
+        "Started at Follow-Token GMGN flow. Synced from each initial buy tx (paginated). Token transfers chain **every** recipient (multi-recipient txs included); sender dropped only after full transfer-out. Recipient sync drains until no new watches remain.",
         this.buySubmitted
           ? `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) deferred until every early bundler/recipient sells all.`
           : this.hasFollowTokenLargeInsiderValidWalletDiscovered()

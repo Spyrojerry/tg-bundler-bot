@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-05 (157)
+
+### Follow-token: pre-LI bundler watch — catch all transfer recipients
+
+- **Multi-recipient transfer txs:** every unique outbound recipient in a token transfer tx is chained and synced (not only the first).
+- **Partial transfer-out:** sender stays monitored until post-tx token balance is zero (no premature sold-all / unsubscribe).
+- **Repeat inbound to same recipient:** additional transfers from other bundlers add to `boughtAmount` and re-sync; sold-all resets if new tokens arrive.
+- **Initial sync:** drains all watches in a loop until every bundler/recipient (including mid-sync chains) is paginated and `syncComplete`.
+
 ## 2026-08-05 (156)
 
 ### Follow-token: `initial_group_gmgn_empty_traders` → Large Insider (no reset)
