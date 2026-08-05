@@ -8051,8 +8051,14 @@ export class InsiderBot extends EventEmitter {
     const kind = this.classifyTx(tx, wallet, mint);
     if (!kind) return;
 
-    if (kind === "buy" || kind === "sell") {
-      this.logTokenTx(mint, kind, "early_bundler_exit", tx.signature, wallet);
+    if (kind === "buy" || kind === "sell" || kind === "transfer_in") {
+      this.logTokenTx(
+        mint,
+        kind === "transfer_in" ? "buy" : kind,
+        "early_bundler_exit",
+        tx.signature,
+        wallet,
+      );
     }
 
     if (kind === "transfer_out") {
@@ -8060,19 +8066,39 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    if (kind === "buy") {
+    if (kind === "buy" || kind === "transfer_in") {
       const amount = this.extractTokenAmountForWallet(tx, wallet, mint, "buy");
-      if (amount > 0) watch.boughtAmount += amount;
+      this.applyFollowTokenEarlyBundlerExitWatchInboundAmount(
+        watch,
+        amount,
+        tx,
+        mint,
+        kind,
+      );
       return;
     }
 
     if (kind === "sell") {
       const amount = this.extractTokenAmountForWallet(tx, wallet, mint, "sell");
+      if (amount <= 0) return;
+
       watch.sellTxCount += 1;
       watch.soldAmount += amount;
       if (amount > watch.maxSingleSellTokenAmount) {
         watch.maxSingleSellTokenAmount = amount;
       }
+
+      const misclassifiedAsBuy =
+        await this.revertFollowTokenEarlyBundlerExitWatchMisclassifiedSell(
+          watch,
+          tx,
+          mint,
+          amount,
+        );
+      if (misclassifiedAsBuy) {
+        return;
+      }
+
       await this.updateFollowTokenEarlyBundlerExitWatchCumulativeSellUsd(
         watch,
         tx,
@@ -8081,6 +8107,88 @@ export class InsiderBot extends EventEmitter {
       await this.updateFollowTokenEarlyBundlerExitWatchSoldAll(watch, tx, mint);
       await this.maybeEvaluateFollowTokenEarlyBundlerExit(tx);
     }
+  }
+
+  private applyFollowTokenEarlyBundlerExitWatchInboundAmount(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    amount: number,
+    tx: HeliusTransaction,
+    mint: string,
+    kind: "buy" | "transfer_in",
+  ): void {
+    if (amount <= 0) return;
+
+    watch.boughtAmount += amount;
+    if (watch.soldAll && watch.soldAmount < watch.boughtAmount) {
+      watch.soldAll = false;
+      watch.soldAllSignature = null;
+      if (!watch.monitoringActive) {
+        watch.monitoringActive = true;
+        this.subscribeFollowTokenEarlyBundlerExitWallet(watch.wallet);
+      }
+    }
+
+    this.log.info(
+      kind === "transfer_in"
+        ? "Follow-token early bundler watch — transfer-in increased bought amount"
+        : "Follow-token early bundler watch — buy increased bought amount",
+      {
+        mint,
+        wallet: watch.wallet,
+        source: watch.source,
+        amount,
+        totalBoughtAmount: watch.boughtAmount,
+        signature: tx.signature,
+      },
+    );
+  }
+
+  /** When post-tx balance exceeds expected remaining, undo sell stats and count as inbound. */
+  private async revertFollowTokenEarlyBundlerExitWatchMisclassifiedSell(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    tx: HeliusTransaction,
+    mint: string,
+    sellAmount: number,
+  ): Promise<boolean> {
+    const funderState = this.bundlerFunderWatch;
+    if (!funderState) return false;
+
+    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
+      funderState,
+      this.buildFollowTokenEarlyBundlerExitRecipientWatchStub(watch),
+      tx,
+    );
+    if (remainingAmount === null) return false;
+
+    const expectedRemaining = Math.max(0, watch.boughtAmount - watch.soldAmount);
+    if (remainingAmount <= expectedRemaining + 1) return false;
+
+    watch.sellTxCount = Math.max(0, watch.sellTxCount - 1);
+    watch.soldAmount = Math.max(0, watch.soldAmount - sellAmount);
+    if (watch.maxSingleSellTokenAmount === sellAmount) {
+      watch.maxSingleSellTokenAmount = 0;
+    }
+    this.applyFollowTokenEarlyBundlerExitWatchInboundAmount(
+      watch,
+      sellAmount,
+      tx,
+      mint,
+      "buy",
+    );
+
+    this.log.warn(
+      "Follow-token early bundler sell reclassified as buy — post-tx balance higher than expected",
+      {
+        mint,
+        wallet: watch.wallet,
+        signature: tx.signature,
+        sellAmount,
+        remainingAmount,
+        expectedRemaining,
+        totalBoughtAmount: watch.boughtAmount,
+      },
+    );
+    return true;
   }
 
   private isValidFollowTokenEarlyBundlerWatchWallet(address: string): boolean {
@@ -8132,33 +8240,6 @@ export class InsiderBot extends EventEmitter {
     }
 
     return recipients;
-  }
-
-  private async shouldDropFollowTokenEarlyBundlerWatchAfterTransfer(
-    watch: FollowTokenEarlyBundlerExitWatch,
-    tx: HeliusTransaction,
-    mint: string,
-  ): Promise<boolean> {
-    const funderState = this.bundlerFunderWatch;
-    if (!funderState) return true;
-
-    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
-      funderState,
-      this.buildFollowTokenEarlyBundlerExitRecipientWatchStub(watch),
-      tx,
-    );
-    if (remainingAmount !== null) {
-      return remainingAmount <= 0;
-    }
-
-    const transferredOut = (tx.tokenTransfers ?? [])
-      .filter(
-        (transfer) =>
-          transfer.mint === mint && transfer.fromUserAccount === watch.wallet,
-      )
-      .reduce((sum, transfer) => sum + (transfer.tokenAmount ?? 0), 0);
-    const estimatedRemaining = Math.max(0, watch.boughtAmount - watch.soldAmount);
-    return estimatedRemaining > 0 && transferredOut >= estimatedRemaining;
   }
 
   private async ensureFollowTokenEarlyBundlerTransferRecipientWatch(
@@ -8284,29 +8365,15 @@ export class InsiderBot extends EventEmitter {
       );
     }
 
-    const dropParent = await this.shouldDropFollowTokenEarlyBundlerWatchAfterTransfer(
-      parentWatch,
-      tx,
-      mint,
-    );
+    const dropParent = recipients.size > 0;
     if (dropParent) {
       this.dropFollowTokenEarlyBundlerExitWatchAfterTransfer(parentWatch, tx);
-    } else if (recipients.size > 0) {
-      this.log.info(
-        "Follow-token early bundler partial transfer — sender still monitored",
-        {
-          mint,
-          wallet: parentWatch.wallet,
-          signature: tx.signature,
-          recipientCount: recipients.size,
-        },
-      );
     }
 
     const telegramLines = [
       `<b>🔗 ${this.label} Early Bundler Token Transfer</b>`,
       `Token: <code>${mint}</code>`,
-      `From: <code>${parentWatch.wallet}</code>${dropParent ? " (dropped from monitoring)" : recipients.size > 0 ? " (partial — still monitored)" : " (pool leg unresolved — still monitored if partial)"}`,
+      `From: <code>${parentWatch.wallet}</code>${dropParent ? " (dropped from monitoring)" : hasUnresolvedPoolOutbound ? " (pool leg unresolved — still monitored)" : ""}`,
     ];
     if (recipients.size > 0) {
       telegramLines.push(`Recipients: <b>${recipients.size}</b>`);
@@ -8324,12 +8391,8 @@ export class InsiderBot extends EventEmitter {
       `Tx: <code>${tx.signature}</code>`,
       "",
       dropParent
-        ? recipients.size > 0
-          ? "Sender unsubscribed; every recipient synced and monitored for individual sell txs."
-          : "Sender unsubscribed after transfer-out (no sell stats on sender)."
-        : recipients.size > 0
-          ? "Every recipient synced and monitored for individual sell txs; sender kept until remaining balance is zero."
-          : "Sender kept until remaining balance is zero.",
+        ? "Sender unsubscribed; every recipient synced and monitored for individual sell txs."
+        : "Sender kept until remaining balance is zero.",
     );
     void this.sendTelegramSafe(
       telegramLines.join("\n"),

@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-08-05 (161)
+
+### Follow-token: early bundler — drop sender on any resolved transfer-out
+
+- Removed partial transfer-out logic: when token recipients are resolved from a transfer tx, the sender is always dropped with `soldAll=true` and recipients are monitored for sells (no balance-at-tx or remaining-holdings check).
+- Unresolved pool legs (`__pool__` with no recipient) still leave the sender monitored until balance is zero.
+
+## 2026-08-05 (160)
+
+### Follow-token: early bundler sold-all — buys + full transfer-out drop
+
+- **Buy / transfer-in on any watch** (bundler or transfer recipient) adds to `boughtAmount` and resets `soldAll` when new tokens arrive after a prior sold-all; sold-all threshold uses the updated total (includes post-transfer buys).
+- **Full transfer-out drop:** when outbound amount ≥ remaining holdings (`boughtAmount − soldAmount`) and recipients were resolved, sender is dropped with `soldAll=true` even if balance-at-tx still shows tokens (fixes stuck “partial transfer — sender still monitored”).
+- **Sell guard:** if post-tx balance is higher than `boughtAmount − soldAmount`, the tx is reclassified as inbound instead of counting sell stats (misclassified Enhanced WSS / SWAP legs).
+
 ## 2026-08-05 (159)
 
 ### Follow-token: early bundler transfer-out — no sell stats on sender
