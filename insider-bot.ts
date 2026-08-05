@@ -3201,21 +3201,32 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  private followTokenLargeInsiderEffectiveSoldFraction(
+    watch: FollowTokenLargeInsiderScrapeWatch,
+    remainingAmount: number | null,
+  ): number | null {
+    if (watch.soldAmount > 0 && remainingAmount !== null) {
+      const baselineHoldings = watch.soldAmount + remainingAmount;
+      if (baselineHoldings > 0) {
+        return watch.soldAmount / baselineHoldings;
+      }
+      return null;
+    }
+    if (watch.boughtAmount <= 0) return null;
+    return watch.soldAmount / watch.boughtAmount;
+  }
+
   private followTokenLargeInsiderWatchReachedExitSoldThreshold(
     watch: FollowTokenLargeInsiderScrapeWatch,
     remainingAmount: number | null,
   ): boolean {
-    if (watch.boughtAmount <= 0) return false;
-    if (
-      watch.soldAmount / watch.boughtAmount >=
-      FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION
-    ) {
-      return true;
-    }
-    if (remainingAmount === null) return false;
+    const soldFraction = this.followTokenLargeInsiderEffectiveSoldFraction(
+      watch,
+      remainingAmount,
+    );
     return (
-      remainingAmount <=
-      watch.boughtAmount * (1 - FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION)
+      soldFraction !== null &&
+      soldFraction >= FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION
     );
   }
 
@@ -3465,10 +3476,16 @@ export class InsiderBot extends EventEmitter {
       ebState.exitTriggerSignature = signature;
     }
     const validIndex = li.validWallets.indexOf(wallet) + 1;
+    const soldFraction = this.followTokenLargeInsiderEffectiveSoldFraction(
+      watch,
+      remainingAmount,
+    );
     const soldPercent =
+      soldFraction !== null ? (soldFraction * 100).toFixed(1) : "?";
+    const trackedBoughtPercent =
       watch.boughtAmount > 0
         ? ((watch.soldAmount / watch.boughtAmount) * 100).toFixed(1)
-        : "?";
+        : null;
 
     this.followTokenLargeInsiderLog("valid wallet ≥25% sold — exiting", {
       mint: li.mint,
@@ -3476,6 +3493,9 @@ export class InsiderBot extends EventEmitter {
       validIndex,
       signature,
       soldPercent,
+      trackedBoughtPercent,
+      soldAmount: watch.soldAmount,
+      remainingAmount,
       validWallets: li.validWallets,
       highSellUsdMode: ebState?.highSellUsdMode ?? false,
       allBundlersSoldAll: ebState?.allSoldAllComplete ?? false,

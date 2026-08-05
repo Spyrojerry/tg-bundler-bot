@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-05 (166)
+
+### Follow-token Large Insider: valid-wallet ≥25% exit uses sold + remaining baseline
+
+- **≥25% exit gate** no longer compares post-sell RPC balance to `boughtAmount × 75%` (could fire early when `boughtAmount` was inflated vs actual holdings).
+- When a sell tx provides on-chain remaining balance, exit requires **`soldAmount / (soldAmount + remaining) ≥ 25%`** — cumulative sells must be at least 25% of the wallet's known bag (sold + still held).
+- Without a remaining snapshot (deferred re-check), falls back to **`soldAmount / boughtAmount ≥ 25%`** only.
+- Exit log reports **effective sold %** (sold+remaining baseline) plus optional tracked-bought % for debugging.
+
 ## 2026-08-05 (165)
 
 ### Follow-token: pre-LI bundler buy — require real 4/4 sold-all on active watches
