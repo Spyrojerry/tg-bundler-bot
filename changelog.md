@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-05 (156)
+
+### Follow-token: `initial_group_gmgn_empty_traders` → Large Insider (no reset)
+
+- After **60s** with **0 GMGN bundler traders** and no initial group confirmed, starts **Large Insider flow** (same defer path as `second_group_insufficient_wallets_*`) instead of resetting.
+
 ## 2026-08-05 (153)
 
 ### Follow-token: early bundler watch at GMGN start + pre–1st-LI sold-all buy gate

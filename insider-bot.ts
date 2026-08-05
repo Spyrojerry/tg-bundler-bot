@@ -2185,7 +2185,24 @@ export class InsiderBot extends EventEmitter {
   }
 
   private isFollowTokenInsufficientSecondGroupReason(reason: string): boolean {
-    return reason.startsWith("second_group_insufficient_wallets_");
+    return (
+      reason.startsWith("second_group_insufficient_wallets_") ||
+      reason === "initial_group_gmgn_empty_traders"
+    );
+  }
+
+  private buildFollowTokenStubSecondGroupFromInitialBundlers(
+    state: BundlerFunderWatchState,
+  ): GmgnBundlerTimestampGroup {
+    const earlyBuys = this.followTokenEarlyInsiderBuys;
+    const wallets = earlyBuys?.length
+      ? earlyBuys.map((buy) => buy.wallet)
+      : [...state.bundlerWallets];
+    const anchorTimestamp =
+      earlyBuys?.length
+        ? Math.min(...earlyBuys.map((buy) => buy.timestamp))
+        : this.devCreateTimestamp ?? Math.floor(Date.now() / 1_000);
+    return { anchorTimestamp, wallets };
   }
 
   /** Locked shared feePayer after Large Insider backtrack (not GMGN stub dev placeholder). */
@@ -2211,11 +2228,22 @@ export class InsiderBot extends EventEmitter {
       feePayer?: string | null;
     },
   ): void {
-    const secondGroupLine = `Second group: <b>${options.walletCount}</b> wallet(s) (min <b>${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}</b>)`;
+    const secondGroupLine =
+      reason === "initial_group_gmgn_empty_traders"
+        ? `GMGN returned <b>0</b> bundler traders after <b>${FOLLOW_TOKEN_GMGN_INITIAL_GROUP_EMPTY_MAX_WAIT_SEC}s</b> — starting Large Insider from initial bundlers.`
+        : `Second group: <b>${options.walletCount}</b> wallet(s) (min <b>${FOLLOW_TOKEN_GMGN_BUNDLER_SECOND_GROUP_MIN_WALLETS}</b>)`;
+    const titlePassed =
+      reason === "initial_group_gmgn_empty_traders"
+        ? `<b>✅ ${this.label} Follow-Token GMGN Empty Traders — Large Insider Started</b>`
+        : `<b>✅ ${this.label} Follow-Token Insufficient Second Group — Passed</b>`;
+    const titleFailed =
+      reason === "initial_group_gmgn_empty_traders"
+        ? `<b>⚠️ ${this.label} Follow-Token GMGN Empty Traders — Large Insider Failed</b>`
+        : `<b>⚠️ ${this.label} Follow-Token Insufficient Second Group — Failed</b>`;
     if (outcome === "passed") {
       void this.sendTelegramSafe(
         [
-          `<b>✅ ${this.label} Follow-Token Insufficient Second Group — Passed</b>`,
+          titlePassed,
           `Token: <code>${mint}</code>`,
           `Reason: <code>${reason}</code>`,
           secondGroupLine,
@@ -2232,7 +2260,7 @@ export class InsiderBot extends EventEmitter {
       "Outcome: <b>Large Insider failed to start</b> (shared feePayer lock failed).";
     void this.sendTelegramSafe(
       [
-        `<b>⚠️ ${this.label} Follow-Token Insufficient Second Group — Failed</b>`,
+        titleFailed,
         `Token: <code>${mint}</code>`,
         `Reason: <code>${reason}</code>`,
         secondGroupLine,
@@ -2297,10 +2325,14 @@ export class InsiderBot extends EventEmitter {
       return;
     }
     this.stopFollowTokenGmgnBundlerPoll(
-      "large insider flow — insufficient second group",
+      reason === "initial_group_gmgn_empty_traders"
+        ? "large insider flow — GMGN empty initial traders"
+        : "large insider flow — insufficient second group",
     );
     this.followTokenGmgnBundlerBackend(
-      "GMGN second group insufficient — deferred to large insider flow",
+      reason === "initial_group_gmgn_empty_traders"
+        ? "GMGN empty initial traders — deferred to large insider flow"
+        : "GMGN second group insufficient — deferred to large insider flow",
       {
         mint: state.mint,
         reason,
@@ -6863,8 +6895,11 @@ export class InsiderBot extends EventEmitter {
           if (
             pollElapsedSec >= FOLLOW_TOKEN_GMGN_INITIAL_GROUP_EMPTY_MAX_WAIT_SEC
           ) {
-            await this.resetFollowTokenAfterGmgnFilterFailed(
-              state.mint,
+            const stubGroup =
+              this.buildFollowTokenStubSecondGroupFromInitialBundlers(state);
+            await this.deferFollowTokenToLargeInsiderAfterInsufficientSecondGroup(
+              state,
+              stubGroup,
               "initial_group_gmgn_empty_traders",
               {
                 pollElapsedSec,
@@ -6872,6 +6907,7 @@ export class InsiderBot extends EventEmitter {
                 devCreateTimestamp,
                 elapsedSinceCreateSec: nowSec - devCreateTimestamp,
                 expectedInitialBundlers: [...state.bundlerWallets],
+                stubSecondGroupWallets: stubGroup.wallets,
               },
             );
           }
