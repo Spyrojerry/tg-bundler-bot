@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-05 (158)
+
+### Follow-token: early bundler — skip `__pool__` transfer recipient chaining
+
+- Enhanced WSS balance-delta txs can emit `transfer_out` with recipient `__pool__` (sell/swap leg). Early bundler exit no longer chains/subscribes/syncs that placeholder.
+- Pool transfer-outs apply **sell accounting** on the sender (sold amount, cumulative USD, sold-all eval) and log `transfer to pool — treating as exit, not chaining recipient`.
+- Invalid/non-pubkey addresses are rejected in recipient filter, subscribe, and sync; sync failures are caught so `syncComplete` is always set.
+
 ## 2026-08-05 (157)
 
 ### Follow-token: pre-LI bundler watch — catch all transfer recipients
