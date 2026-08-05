@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-05 (164)
+
+### Follow-token: dedupe pre-LI bundler sold-all buy blocked Telegram
+
+- **Pre-LI Bundler Sold-All Buy Blocked** Telegram (and warn log) sends once per flow when the max-single-sell gate fails; later sell evaluations skip the notification.
+
 ## 2026-08-05 (163)
 
 ### Follow-token early bundler — ATA subscribe, tx-based sells, drop reclassification guard

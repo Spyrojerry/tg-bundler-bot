@@ -194,6 +194,8 @@ interface FollowTokenEarlyBundlerExitState {
   preLiBundlerSoldAllBuy: boolean;
   /** Post-buy pre-LI MC TP armed telegram already sent. */
   preLiExitArmedNotified: boolean;
+  /** Pre-LI sold-all buy blocked telegram already sent (max single sell gate). */
+  preLiBundlerSoldAllBuyBlockedNotified: boolean;
   /** Valid LI wallet hit ≥25% before all early bundlers sold all. */
   validWalletTwentyFivePercentDeferred: boolean;
   exitTriggerSignature: string | null;
@@ -7663,6 +7665,11 @@ export class InsiderBot extends EventEmitter {
 
     if (!this.hasFollowTokenLargeInsiderValidWalletDiscovered()) {
       if (!this.passesPreLiBundlerSoldAllMaxSingleSellTokenGate()) {
+        if (state.preLiBundlerSoldAllBuyBlockedNotified) {
+          return;
+        }
+        state.preLiBundlerSoldAllBuyBlockedNotified = true;
+
         const topWatch =
           this.getFollowTokenEarlyBundlerExitHighestCumulativeSellUsdWatch();
         this.log.warn(
@@ -8628,6 +8635,7 @@ export class InsiderBot extends EventEmitter {
       preBuyBundlerPathTriggered: false,
       preLiBundlerSoldAllBuy: false,
       preLiExitArmedNotified: false,
+      preLiBundlerSoldAllBuyBlockedNotified: false,
       validWalletTwentyFivePercentDeferred: false,
       exitTriggerSignature: null,
       enhancedWatchIds: new Map(),
