@@ -7584,13 +7584,27 @@ export class InsiderBot extends EventEmitter {
     return best;
   }
 
+  private getBundlerSoldAllMaxSingleSellGateSnapshot(): {
+    passes: boolean;
+    topWallet: string | null;
+    maxSingleSellTokenAmount: number;
+    limit: number;
+  } {
+    const topWatch =
+      this.getFollowTokenEarlyBundlerExitHighestCumulativeSellUsdWatch();
+    const limit = FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT;
+    const maxSingleSellTokenAmount = topWatch?.maxSingleSellTokenAmount ?? 0;
+    return {
+      passes:
+        !topWatch || maxSingleSellTokenAmount <= limit,
+      topWallet: topWatch?.wallet ?? null,
+      maxSingleSellTokenAmount,
+      limit,
+    };
+  }
+
   private passesBundlerSoldAllMaxSingleSellTokenGate(): boolean {
-    const watch = this.getFollowTokenEarlyBundlerExitHighestCumulativeSellUsdWatch();
-    if (!watch) return true;
-    return (
-      watch.maxSingleSellTokenAmount <=
-      FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT
-    );
+    return this.getBundlerSoldAllMaxSingleSellGateSnapshot().passes;
   }
 
   private notifyBundlerSoldAllMaxSingleSellBuyBlocked(
@@ -7741,6 +7755,78 @@ export class InsiderBot extends EventEmitter {
     await this.resetForNewToken(false, { reason });
   }
 
+  private async skipFollowTokenLargeInsiderFromBundlerMaxSingleSellGate(
+    rawBranch: "low_tx_immediate" | "low_usd_immediate",
+    triggerTx: HeliusTransaction | undefined,
+    gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    const funderState = this.bundlerFunderWatch;
+    const li = this.followTokenLargeInsiderState;
+    if (!state?.active || !funderState || !li?.active) return;
+
+    state.preBuyBundlerPathTriggered = true;
+    state.exitTriggerSignature =
+      triggerTx?.signature ?? "BUNDLER_SKIP_MAX_SINGLE_SELL";
+
+    const maxSellTxCount = this.getFollowTokenEarlyBundlerExitMaxSellTxCount();
+    const maxCumulativeSellUsd =
+      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
+    const reason = "large_insider_bundler_max_single_sell_skip";
+    const lowBranchLine =
+      rawBranch === "low_tx_immediate"
+        ? `Would qualify for +80% MC TP buy on low sell-tx branch (max <b>${maxSellTxCount}</b> txs &lt; ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE}).`
+        : `Would qualify for +80% MC TP buy on low-USD branch (max cumulative <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b> ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()}).`;
+
+    this.log.warn(
+      "Post-LI bundler sold-all — 7.5M max-single-sell gate failed (low branch skip)",
+      {
+        mint: funderState.mint,
+        rawBranch,
+        maxSellTxCount,
+        maxCumulativeSellUsd,
+        topWallet: gate.topWallet,
+        maxSingleSellTokenAmount: gate.maxSingleSellTokenAmount,
+        limit: gate.limit,
+        signature: state.exitTriggerSignature,
+      },
+    );
+
+    this.followTokenLargeInsiderLog(
+      "bundler sold-all 7.5M gate failed — skipping token (no buy)",
+      {
+        mint: funderState.mint,
+        rawBranch,
+        maxSellTxCount,
+        maxCumulativeSellUsd,
+        topWallet: gate.topWallet,
+        maxSingleSellTokenAmount: gate.maxSingleSellTokenAmount,
+        limit: gate.limit,
+        transferRecipientPath: state.earlyBundlerTransferOutObserved,
+        signature: state.exitTriggerSignature,
+      },
+    );
+
+    void this.sendTelegramSafe(
+      [
+        `<b>⛔ ${this.label} Follow-Token Large Insider Skipped</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        gate.topWallet
+          ? `Highest cumulative-USD watch <code>${gate.topWallet}</code> has a single sell tx of <b>${gate.maxSingleSellTokenAmount.toLocaleString()}</b> tokens (limit <b>${gate.limit.toLocaleString()}</b>).`
+          : "",
+        lowBranchLine,
+        "",
+        "No buy — token skipped and flow reset.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "follow-token large insider bundler max single sell skip",
+    );
+
+    await this.stopFollowTokenLargeInsiderFlow("bundler max_single_sell gate skip");
+    await this.resetForNewToken(false, { reason });
+  }
+
   private async maybeTriggerFollowTokenLargeInsiderPreBuyFromBundlerPath(
     triggerTx?: HeliusTransaction,
   ): Promise<void> {
@@ -7777,7 +7863,13 @@ export class InsiderBot extends EventEmitter {
       } as HeliusTransaction);
 
     if (!this.hasFollowTokenLargeInsiderValidWalletDiscovered()) {
-      if (!this.passesBundlerSoldAllMaxSingleSellTokenGate()) {
+      const preLiGate = this.getBundlerSoldAllMaxSingleSellGateSnapshot();
+      this.log.warn("Pre-LI bundler sold-all — 7.5M gate eval", {
+        mint: funderState.mint,
+        ...preLiGate,
+        signature,
+      });
+      if (!preLiGate.passes) {
         this.notifyBundlerSoldAllMaxSingleSellBuyBlocked("pre_li");
         return;
       }
@@ -7813,21 +7905,54 @@ export class InsiderBot extends EventEmitter {
     const rawBranch = this.resolveFollowTokenEarlyBundlerPreBuyExitBranch();
     if (!rawBranch) return;
 
+    const maxSellTxCount = this.getFollowTokenEarlyBundlerExitMaxSellTxCount();
+    const maxCumulativeSellUsd =
+      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
+    const gate = this.getBundlerSoldAllMaxSingleSellGateSnapshot();
+
     let buyBranch: "normal_mc_tp" | "high_usd_li_only";
     if (
       rawBranch === "low_tx_immediate" ||
       rawBranch === "low_usd_immediate"
     ) {
-      if (!this.passesBundlerSoldAllMaxSingleSellTokenGate()) {
-        await this.skipFollowTokenLargeInsiderFromBundlerLowExitBranch(
+      this.log.warn("Post-LI bundler sold-all — 7.5M gate eval (low branch)", {
+        mint: funderState.mint,
+        rawBranch,
+        maxSellTxCount,
+        maxCumulativeSellUsd,
+        ...gate,
+        signature,
+      });
+      if (!gate.passes) {
+        await this.skipFollowTokenLargeInsiderFromBundlerMaxSingleSellGate(
           rawBranch,
           triggerTx,
+          gate,
         );
         return;
       }
+      this.log.warn(
+        "Post-LI bundler sold-all — 7.5M gate passed on low branch (+80% MC TP buy)",
+        {
+          mint: funderState.mint,
+          rawBranch,
+          maxSellTxCount,
+          maxCumulativeSellUsd,
+          ...gate,
+          signature,
+        },
+      );
       buyBranch = "normal_mc_tp";
     } else {
-      if (!this.passesBundlerSoldAllMaxSingleSellTokenGate()) {
+      this.log.warn("Post-LI bundler sold-all — 7.5M gate eval", {
+        mint: funderState.mint,
+        rawBranch,
+        maxSellTxCount,
+        maxCumulativeSellUsd,
+        ...gate,
+        signature,
+      });
+      if (!gate.passes) {
         this.notifyBundlerSoldAllMaxSingleSellBuyBlocked("post_li");
         return;
       }

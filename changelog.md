@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-08-05 (168)
+
+### Follow-token: explicit 7.5M gate eval logs + distinct low-branch skip reason
+
+- Post-LI **low_tx / low_usd** sold-all path now always logs **`7.5M gate eval (low branch)`** with `passes`, `topWallet`, `maxSingleSellTokenAmount`, and `limit` before buy/skip.
+- **Pass** → log **`7.5M gate passed on low branch (+80% MC TP buy)`** then buy as `normal_mc_tp`.
+- **Fail** → skip with **`large_insider_bundler_max_single_sell_skip`** (not generic `low_sell_tx_skip`); Telegram + LI log cite the 7.5M breach.
+- Pre-LI sold-all path logs **`Pre-LI bundler sold-all — 7.5M gate eval`** before block/buy.
+- **Deploy required** — production logs before this still used pre-167 skip-first behavior.
+
 ## 2026-08-05 (167)
 
 ### Follow-token: post-LI bundler sold-all — 7.5M max-single-sell gate on buy branches
