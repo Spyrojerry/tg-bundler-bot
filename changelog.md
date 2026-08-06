@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-06 (169)
+
+### Follow-token: fix ATA sold-all vs sell-tx ordering race for 7.5M gate
+
+- When **sold-all** is detected from **ATA zero** before the sell tx is processed: infer the last sell size from the ATA balance drop and bump **`maxSingleSellTokenAmount`** only (does not double-count **`soldAmount`**).
+- **Defer** `maybeEvaluateFollowTokenEarlyBundlerExit` by **1000ms** instead of running immediately without **`triggerTx`**.
+- Sell path **cancels** the deferred timer and runs eval immediately with the sell **`triggerTx`** (full sell stats + signature).
+- Timer cleared on stop monitoring.
+
 ## 2026-08-05 (168)
 
 ### Follow-token: explicit 7.5M gate eval logs + distinct low-branch skip reason

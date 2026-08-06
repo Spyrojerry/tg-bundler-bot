@@ -152,6 +152,9 @@ const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE = 75;
 /** Pre–1st-LI-wallet bundler sold-all buy: max single sell token amount on highest cumulative-USD watch. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT = 7_500_000;
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
+/** Defer sold-all exit eval when ATA hits zero before the sell tx is processed. */
+const FOLLOW_TOKEN_EARLY_BUNDLER_ATA_SOLD_ALL_EVAL_DEFER_MS = 1000;
+const PUMP_FUN_TOKEN_RAW_DECIMALS = 6;
 
 interface FollowTokenEarlyBundlerExitWatch {
   wallet: string;
@@ -211,6 +214,8 @@ interface FollowTokenEarlyBundlerExitState {
   tokenAtaBalancesByAccount: Map<string, Map<string, bigint>>;
   /** wallet → summed raw token balance from ATA subscriptions */
   tokenAtaLiveBalanceRaw: Map<string, bigint>;
+  /** ATA sold-all fired before sell tx — wait briefly for sell path to apply max + triggerTx. */
+  deferredSoldAllEvalTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface FollowTokenLargeInsiderScrapeWatch {
@@ -7366,6 +7371,58 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  private clearFollowTokenEarlyBundlerExitDeferredSoldAllEvalTimer(): void {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.deferredSoldAllEvalTimer) return;
+    clearTimeout(state.deferredSoldAllEvalTimer);
+    state.deferredSoldAllEvalTimer = null;
+  }
+
+  private bumpFollowTokenEarlyBundlerExitWatchMaxSingleSellFromAtaBalanceDrop(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    previousRaw: bigint,
+    totalRaw: bigint,
+    mint: string,
+  ): void {
+    if (previousRaw <= totalRaw) return;
+    const dropRaw = previousRaw - totalRaw;
+    const dropAmount = Number(dropRaw) / 10 ** PUMP_FUN_TOKEN_RAW_DECIMALS;
+    if (dropAmount <= 0) return;
+    if (dropAmount <= watch.maxSingleSellTokenAmount) return;
+    watch.maxSingleSellTokenAmount = dropAmount;
+    this.log.info(
+      "Follow-token early bundler max single sell bumped from ATA balance drop",
+      {
+        mint,
+        wallet: watch.wallet,
+        dropAmount,
+        previousLiveTokenBalanceRaw: previousRaw.toString(),
+        liveTokenBalanceRaw: totalRaw.toString(),
+      },
+    );
+  }
+
+  private scheduleFollowTokenEarlyBundlerExitSoldAllEvalFromAta(
+    mint: string,
+    wallet: string,
+  ): void {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active) return;
+    this.clearFollowTokenEarlyBundlerExitDeferredSoldAllEvalTimer();
+    state.deferredSoldAllEvalTimer = setTimeout(() => {
+      state.deferredSoldAllEvalTimer = null;
+      void this.maybeEvaluateFollowTokenEarlyBundlerExit();
+    }, FOLLOW_TOKEN_EARLY_BUNDLER_ATA_SOLD_ALL_EVAL_DEFER_MS);
+    this.log.debug(
+      "Deferred follow-token early bundler sold-all eval (ATA before sell tx)",
+      {
+        mint,
+        wallet,
+        deferMs: FOLLOW_TOKEN_EARLY_BUNDLER_ATA_SOLD_ALL_EVAL_DEFER_MS,
+      },
+    );
+  }
+
   private shouldDeferFollowTokenLargeInsiderValidWalletTwentyFivePercentExit(): boolean {
     const ebState = this.followTokenEarlyBundlerExitState;
     return (
@@ -8238,6 +8295,7 @@ export class InsiderBot extends EventEmitter {
         wallet,
       );
       this.updateFollowTokenEarlyBundlerExitWatchSoldAll(watch, tx.signature);
+      this.clearFollowTokenEarlyBundlerExitDeferredSoldAllEvalTimer();
       await this.maybeEvaluateFollowTokenEarlyBundlerExit(tx);
     }
   }
@@ -8645,13 +8703,25 @@ export class InsiderBot extends EventEmitter {
       watch.soldAll = true;
       watch.soldAllSignature = watch.soldAllSignature ?? "ata_zero_balance";
       watch.reachedTwentyFivePercentSold = true;
+      if (previousRaw !== null && previousRaw > 0n) {
+        this.bumpFollowTokenEarlyBundlerExitWatchMaxSingleSellFromAtaBalanceDrop(
+          watch,
+          previousRaw,
+          totalRaw,
+          state.mint,
+        );
+      }
       this.log.info("Follow-token early bundler sold all — ATA balance zero", {
         mint: state.mint,
         wallet,
         soldAmount: watch.soldAmount,
         boughtAmount: watch.boughtAmount,
+        maxSingleSellTokenAmount: watch.maxSingleSellTokenAmount,
       });
-      void this.maybeEvaluateFollowTokenEarlyBundlerExit();
+      this.scheduleFollowTokenEarlyBundlerExitSoldAllEvalFromAta(
+        state.mint,
+        wallet,
+      );
       return;
     }
 
@@ -8894,6 +8964,7 @@ export class InsiderBot extends EventEmitter {
       tokenAtaBalanceSubIds: new Map(),
       tokenAtaBalancesByAccount: new Map(),
       tokenAtaLiveBalanceRaw: new Map(),
+      deferredSoldAllEvalTimer: null,
     };
 
     for (const wallet of watches.keys()) {
@@ -8932,6 +9003,8 @@ export class InsiderBot extends EventEmitter {
   private async stopFollowTokenEarlyBundlerExitMonitoring(): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state) return;
+
+    this.clearFollowTokenEarlyBundlerExitDeferredSoldAllEvalTimer();
 
     for (const [wallet, subId] of state.logsSubIds) {
       await this.connection.removeOnLogsListener(subId).catch(() => undefined);
