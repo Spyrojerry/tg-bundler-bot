@@ -198,6 +198,8 @@ interface FollowTokenEarlyBundlerExitState {
   preLiExitArmedNotified: boolean;
   /** Pre-LI sold-all buy blocked telegram already sent (max single sell gate). */
   preLiBundlerSoldAllBuyBlockedNotified: boolean;
+  /** Post-LI sold-all buy blocked telegram already sent (max single sell gate). */
+  postLiBundlerSoldAllBuyBlockedNotified: boolean;
   /** Valid LI wallet hit ≥25% before all early bundlers sold all. */
   validWalletTwentyFivePercentDeferred: boolean;
   exitTriggerSignature: string | null;
@@ -7582,12 +7584,78 @@ export class InsiderBot extends EventEmitter {
     return best;
   }
 
-  private passesPreLiBundlerSoldAllMaxSingleSellTokenGate(): boolean {
+  private passesBundlerSoldAllMaxSingleSellTokenGate(): boolean {
     const watch = this.getFollowTokenEarlyBundlerExitHighestCumulativeSellUsdWatch();
     if (!watch) return true;
     return (
       watch.maxSingleSellTokenAmount <=
       FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT
+    );
+  }
+
+  private notifyBundlerSoldAllMaxSingleSellBuyBlocked(
+    phase: "pre_li" | "post_li",
+  ): void {
+    const state = this.followTokenEarlyBundlerExitState;
+    const funderState = this.bundlerFunderWatch;
+    if (!state?.active || !funderState) return;
+
+    const topWatch =
+      this.getFollowTokenEarlyBundlerExitHighestCumulativeSellUsdWatch();
+    const limit = FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT;
+    const topWatchLine = topWatch
+      ? `Highest cumulative-USD watch <code>${topWatch.wallet}</code> has a single sell tx of <b>${topWatch.maxSingleSellTokenAmount.toLocaleString()}</b> tokens (limit <b>${limit.toLocaleString()}</b>).`
+      : "";
+
+    if (phase === "pre_li") {
+      if (state.preLiBundlerSoldAllBuyBlockedNotified) return;
+      state.preLiBundlerSoldAllBuyBlockedNotified = true;
+      this.log.warn(
+        "Pre-LI bundler sold-all buy blocked — max single sell token amount exceeded on highest cumulative-USD watch",
+        {
+          mint: funderState.mint,
+          topWallet: topWatch?.wallet ?? null,
+          maxSingleSellTokenAmount: topWatch?.maxSingleSellTokenAmount ?? 0,
+          limit,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏸️ ${this.label} Pre-LI Bundler Sold-All Buy Blocked</b>`,
+          `Token: <code>${funderState.mint}</code>`,
+          topWatchLine,
+          "",
+          "Waiting for 1st valid Large Insider wallet — post-LI bundler buy rules apply after that.",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        "follow-token pre-li bundler sold-all buy blocked",
+      );
+      return;
+    }
+
+    if (state.postLiBundlerSoldAllBuyBlockedNotified) return;
+    state.postLiBundlerSoldAllBuyBlockedNotified = true;
+    this.log.warn(
+      "Post-LI bundler sold-all buy blocked — max single sell token amount exceeded on highest cumulative-USD watch",
+      {
+        mint: funderState.mint,
+        topWallet: topWatch?.wallet ?? null,
+        maxSingleSellTokenAmount: topWatch?.maxSingleSellTokenAmount ?? 0,
+        limit,
+      },
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏸️ ${this.label} Post-LI Bundler Sold-All Buy Blocked</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        topWatchLine,
+        "",
+        "Valid LI wallet #1+ found — bundler sold-all buy requires max single sell ≤ limit. Waiting for valid wallet #4 (direct-sell) or a later sold-all eval that passes the gate.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "follow-token post-li bundler sold-all buy blocked",
     );
   }
 
@@ -7709,38 +7777,8 @@ export class InsiderBot extends EventEmitter {
       } as HeliusTransaction);
 
     if (!this.hasFollowTokenLargeInsiderValidWalletDiscovered()) {
-      if (!this.passesPreLiBundlerSoldAllMaxSingleSellTokenGate()) {
-        if (state.preLiBundlerSoldAllBuyBlockedNotified) {
-          return;
-        }
-        state.preLiBundlerSoldAllBuyBlockedNotified = true;
-
-        const topWatch =
-          this.getFollowTokenEarlyBundlerExitHighestCumulativeSellUsdWatch();
-        this.log.warn(
-          "Pre-LI bundler sold-all buy blocked — max single sell token amount exceeded on highest cumulative-USD watch",
-          {
-            mint: funderState.mint,
-            topWallet: topWatch?.wallet ?? null,
-            maxSingleSellTokenAmount: topWatch?.maxSingleSellTokenAmount ?? 0,
-            limit: FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT,
-            signature,
-          },
-        );
-        void this.sendTelegramSafe(
-          [
-            `<b>⏸️ ${this.label} Pre-LI Bundler Sold-All Buy Blocked</b>`,
-            `Token: <code>${funderState.mint}</code>`,
-            topWatch
-              ? `Highest cumulative-USD watch <code>${topWatch.wallet}</code> has a single sell tx of <b>${topWatch.maxSingleSellTokenAmount.toLocaleString()}</b> tokens (limit <b>${FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()}</b>).`
-              : "",
-            "",
-            "Waiting for 1st valid Large Insider wallet — post-LI bundler buy rules apply after that.",
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          "follow-token pre-li bundler sold-all buy blocked",
-        );
+      if (!this.passesBundlerSoldAllMaxSingleSellTokenGate()) {
+        this.notifyBundlerSoldAllMaxSingleSellBuyBlocked("pre_li");
         return;
       }
 
@@ -7772,27 +7810,41 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const branch = this.resolveFollowTokenEarlyBundlerPreBuyExitBranch();
-    if (!branch) return;
+    const rawBranch = this.resolveFollowTokenEarlyBundlerPreBuyExitBranch();
+    if (!rawBranch) return;
 
-    if (branch === "low_tx_immediate" || branch === "low_usd_immediate") {
-      await this.skipFollowTokenLargeInsiderFromBundlerLowExitBranch(
-        branch,
-        triggerTx,
-      );
-      return;
+    let buyBranch: "normal_mc_tp" | "high_usd_li_only";
+    if (
+      rawBranch === "low_tx_immediate" ||
+      rawBranch === "low_usd_immediate"
+    ) {
+      if (!this.passesBundlerSoldAllMaxSingleSellTokenGate()) {
+        await this.skipFollowTokenLargeInsiderFromBundlerLowExitBranch(
+          rawBranch,
+          triggerTx,
+        );
+        return;
+      }
+      buyBranch = "normal_mc_tp";
+    } else {
+      if (!this.passesBundlerSoldAllMaxSingleSellTokenGate()) {
+        this.notifyBundlerSoldAllMaxSingleSellBuyBlocked("post_li");
+        return;
+      }
+      buyBranch = rawBranch;
     }
 
     state.preBuyBundlerPathTriggered = true;
     state.preLiBundlerSoldAllBuy = false;
 
-    if (branch === "high_usd_li_only") {
+    if (buyBranch === "high_usd_li_only") {
       state.highSellUsdMode = true;
     }
 
     this.log.warn("Follow-token large insider pre-buy from bundler sold-all path", {
       mint: funderState.mint,
-      branch,
+      branch: buyBranch,
+      rawBranch,
       triggerWallet,
       signature,
       transferRecipientPath: state.earlyBundlerTransferOutObserved,
@@ -7803,7 +7855,7 @@ export class InsiderBot extends EventEmitter {
       triggerWallet,
       signature,
       tx,
-      { triggerSource: "bundler_sold_all", bundlerExitBranch: branch },
+      { triggerSource: "bundler_sold_all", bundlerExitBranch: buyBranch },
     );
   }
 
@@ -7904,6 +7956,11 @@ export class InsiderBot extends EventEmitter {
       mcTpReachedPending: state.mcTpReachedPending,
     });
 
+    const postLiBundlerMcTpBuy =
+      state.preBuyBundlerPathTriggered &&
+      !state.highSellUsdMode &&
+      !state.preLiBundlerSoldAllBuy;
+
     if (
       await this.triggerFollowTokenLargeInsiderValidWalletTwentyFivePercentExitIfReady(
         triggerTx,
@@ -7913,11 +7970,13 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (!meetsSellTxGate) {
-      await this.triggerFollowTokenEarlyBundlerLowSellTxCountExit(
-        triggerTx?.signature ?? "EARLY_BUNDLER_LOW_SELL_TX_COUNT",
-        maxSellTxCount,
-      );
-      return;
+      if (!postLiBundlerMcTpBuy) {
+        await this.triggerFollowTokenEarlyBundlerLowSellTxCountExit(
+          triggerTx?.signature ?? "EARLY_BUNDLER_LOW_SELL_TX_COUNT",
+          maxSellTxCount,
+        );
+        return;
+      }
     }
 
     if (highSellUsd) {
@@ -7941,10 +8000,12 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (this.noFollowTokenEarlyBundlerExitWatchExceedsLowSellUsd()) {
-      await this.triggerFollowTokenEarlyBundlerLowCumulativeSellUsdExit(
-        triggerTx?.signature ?? "EARLY_BUNDLER_LOW_CUMULATIVE_SELL_USD",
-      );
-      return;
+      if (!postLiBundlerMcTpBuy) {
+        await this.triggerFollowTokenEarlyBundlerLowCumulativeSellUsdExit(
+          triggerTx?.signature ?? "EARLY_BUNDLER_LOW_CUMULATIVE_SELL_USD",
+        );
+        return;
+      }
     }
 
     void this.sendTelegramSafe(
@@ -8700,6 +8761,7 @@ export class InsiderBot extends EventEmitter {
       preLiBundlerSoldAllBuy: false,
       preLiExitArmedNotified: false,
       preLiBundlerSoldAllBuyBlockedNotified: false,
+      postLiBundlerSoldAllBuyBlockedNotified: false,
       validWalletTwentyFivePercentDeferred: false,
       exitTriggerSignature: null,
       enhancedWatchIds: new Map(),
@@ -8734,9 +8796,9 @@ export class InsiderBot extends EventEmitter {
         this.buySubmitted
           ? `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) deferred until every early bundler/recipient sells all.`
           : this.hasFollowTokenLargeInsiderValidWalletDiscovered()
-            ? `Post–1st-LI buy: valid wallet #4 (direct-sell) OR sold-all branches (skip / MC TP / LI-only). Transfer-out → sold-all only.`
+            ? `Post–1st-LI buy: valid wallet #4 (direct-sell) OR sold-all branches (skip / MC TP / LI-only) when highest-USD watch max single sell ≤ ${FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()} tokens. Transfer-out → sold-all only.`
             : `Pre–1st-LI buy: sold-all + highest-USD watch max single sell ≤ ${FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()} tokens → +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP.`,
-        `After buy + all sold all (post–1st-LI): valid LI ≥25% → sell; max sell txs < ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} → skip; ≥ ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} → cumulative-USD rules ($${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} skip / $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} MC TP disable).`,
+        `After buy + all sold all (post–1st-LI): valid LI ≥25% → sell; max sell txs < ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} or cumulative ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} → skip unless max single sell ≤ ${FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()} tokens (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP buy); ≥ ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} txs + $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()}–$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → dual exit; cumulative > $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → LI-only.`,
       ].join("\n"),
       "follow-token early bundler exit watch started",
     );

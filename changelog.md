@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-08-05 (167)
+
+### Follow-token: post-LI bundler sold-all — 7.5M max-single-sell gate on buy branches
+
+- After valid LI wallet #1, **bundler/recipient sold-all buy** now requires the highest cumulative-USD watch to have **no single sell tx &gt; 7.5M tokens** (same gate as pre-LI).
+- **Pass + ≥75 txs + $24.5k–$35k cumulative** → buy with **+80% MC TP or valid LI ≥25%** (`normal_mc_tp`, unchanged).
+- **Pass + ≥75 txs + cumulative &gt; $35k** → buy with **valid LI ≥25% only** (+80% MC TP disabled, unchanged).
+- **&lt;75 txs or cumulative ≤ $24.5k (≥75 txs) + passes 7.5M gate** → buy with **+80% MC TP or valid LI ≥25%** (same as `normal_mc_tp`; no longer skipped).
+- **&lt;75 txs or cumulative ≤ $24.5k + fails 7.5M gate** → skip (`low_tx_immediate` / `low_usd_immediate`).
+- **Fail 7.5M gate** on ≥75-tx buy branches → no bundler sold-all buy (deduped Telegram); valid wallet #4 direct-sell path still available.
+
 ## 2026-08-05 (166)
 
 ### Follow-token Large Insider: valid-wallet ≥25% exit uses sold + remaining baseline
