@@ -8,75 +8,111 @@
 - **Migration pre-buy flow** now starts **directly** from `startFollowTokenLargeInsiderPreBuyFlow`: Helius first-four stub watch → early bundler exit monitoring → Large Insider (feePayer lock + scrape). No GMGN poll step; fixes stuck 11h poll loops with no buy/reset.
 - Renamed misleading GMGN labels (`gmgn_flow_started` → `large_insider_pre_buy_started`, logger `FOLLOW-TOKEN-WATCH`). Removed dead `tagPlanBuyActive` / unused second-group latch fields.
 
+
+
 ## 2026-08-06 (169)
+
+
 
 ### Follow-token: fix ATA sold-all vs sell-tx ordering race for 7.5M gate
 
-- When **sold-all** is detected from **ATA zero** before the sell tx is processed: infer the last sell size from the ATA balance drop and bump **`maxSingleSellTokenAmount`** only (does not double-count **`soldAmount`**).
-- **Defer** `maybeEvaluateFollowTokenEarlyBundlerExit` by **1000ms** instead of running immediately without **`triggerTx`**.
-- Sell path **cancels** the deferred timer and runs eval immediately with the sell **`triggerTx`** (full sell stats + signature).
+- When **sold-all** is detected from **ATA zero** before the sell tx is processed: infer the last sell size from the ATA balance drop and bump `maxSingleSellTokenAmount` only (does not double-count `soldAmount`).
+- **Defer** `maybeEvaluateFollowTokenEarlyBundlerExit` by **1000ms** instead of running immediately without `triggerTx`.
+- Sell path **cancels** the deferred timer and runs eval immediately with the sell `triggerTx` (full sell stats + signature).
 - Timer cleared on stop monitoring.
+
+
 
 ## 2026-08-05 (168)
 
+
+
 ### Follow-token: explicit 7.5M gate eval logs + distinct low-branch skip reason
 
-- Post-LI **low_tx / low_usd** sold-all path now always logs **`7.5M gate eval (low branch)`** with `passes`, `topWallet`, `maxSingleSellTokenAmount`, and `limit` before buy/skip.
-- **Pass** → log **`7.5M gate passed on low branch (+80% MC TP buy)`** then buy as `normal_mc_tp`.
-- **Fail** → skip with **`large_insider_bundler_max_single_sell_skip`** (not generic `low_sell_tx_skip`); Telegram + LI log cite the 7.5M breach.
-- Pre-LI sold-all path logs **`Pre-LI bundler sold-all — 7.5M gate eval`** before block/buy.
+- Post-LI **low_tx / low_usd** sold-all path now always logs `7.5M gate eval (low branch)` with `passes`, `topWallet`, `maxSingleSellTokenAmount`, and `limit` before buy/skip.
+- **Pass** → log `7.5M gate passed on low branch (+80% MC TP buy)` then buy as `normal_mc_tp`.
+- **Fail** → skip with `large_insider_bundler_max_single_sell_skip` (not generic `low_sell_tx_skip`); Telegram + LI log cite the 7.5M breach.
+- Pre-LI sold-all path logs `Pre-LI bundler sold-all — 7.5M gate eval` before block/buy.
 - **Deploy required** — production logs before this still used pre-167 skip-first behavior.
+
+
 
 ## 2026-08-05 (167)
 
+
+
 ### Follow-token: post-LI bundler sold-all — 7.5M max-single-sell gate on buy branches
 
-- After valid LI wallet #1, **bundler/recipient sold-all buy** now requires the highest cumulative-USD watch to have **no single sell tx &gt; 7.5M tokens** (same gate as pre-LI).
+- After valid LI wallet #1, **bundler/recipient sold-all buy** now requires the highest cumulative-USD watch to have **no single sell tx > 7.5M tokens** (same gate as pre-LI).
 - **Pass + ≥75 txs + $24.5k–$35k cumulative** → buy with **+80% MC TP or valid LI ≥25%** (`normal_mc_tp`, unchanged).
-- **Pass + ≥75 txs + cumulative &gt; $35k** → buy with **valid LI ≥25% only** (+80% MC TP disabled, unchanged).
-- **&lt;75 txs or cumulative ≤ $24.5k (≥75 txs) + passes 7.5M gate** → buy with **+80% MC TP or valid LI ≥25%** (same as `normal_mc_tp`; no longer skipped).
-- **&lt;75 txs or cumulative ≤ $24.5k + fails 7.5M gate** → skip (`low_tx_immediate` / `low_usd_immediate`).
+- **Pass + ≥75 txs + cumulative > $35k** → buy with **valid LI ≥25% only** (+80% MC TP disabled, unchanged).
+- **<75 txs or cumulative ≤ $24.5k (≥75 txs) + passes 7.5M gate** → buy with **+80% MC TP or valid LI ≥25%** (same as `normal_mc_tp`; no longer skipped).
+- **<75 txs or cumulative ≤ $24.5k + fails 7.5M gate** → skip (`low_tx_immediate` / `low_usd_immediate`).
 - **Fail 7.5M gate** on ≥75-tx buy branches → no bundler sold-all buy (deduped Telegram); valid wallet #4 direct-sell path still available.
 
+
+
 ## 2026-08-05 (166)
+
+
 
 ### Follow-token Large Insider: valid-wallet ≥25% exit uses sold + remaining baseline
 
 - **≥25% exit gate** no longer compares post-sell RPC balance to `boughtAmount × 75%` (could fire early when `boughtAmount` was inflated vs actual holdings).
-- When a sell tx provides on-chain remaining balance, exit requires **`soldAmount / (soldAmount + remaining) ≥ 25%`** — cumulative sells must be at least 25% of the wallet's known bag (sold + still held).
-- Without a remaining snapshot (deferred re-check), falls back to **`soldAmount / boughtAmount ≥ 25%`** only.
+- When a sell tx provides on-chain remaining balance, exit requires `soldAmount / (soldAmount + remaining) ≥ 25%` — cumulative sells must be at least 25% of the wallet's known bag (sold + still held).
+- Without a remaining snapshot (deferred re-check), falls back to `soldAmount / boughtAmount ≥ 25%` only.
 - Exit log reports **effective sold %** (sold+remaining baseline) plus optional tracked-bought % for debugging.
 
+
+
 ## 2026-08-05 (165)
+
+
 
 ### Follow-token: pre-LI bundler buy — require real 4/4 sold-all on active watches
 
 - **Transfer recipients** no longer count as sold-all from ATA zero until tokens were **observed in-wallet** at least once (`observedNonZeroTokenBalance`); fixes premature pre-LI buy when fresh recipient ATAs read `0` at subscribe time.
 - **Sold-all buy gate** checks only **actively monitored** watches (`monitoringActive`); dropped bundlers after transfer-out no longer participate in the gate — buy waits until every remaining bundler/recipient (4/4 chain) has genuinely sold all.
 
+
+
 ## 2026-08-05 (164)
+
+
 
 ### Follow-token: dedupe pre-LI bundler sold-all buy blocked Telegram
 
 - **Pre-LI Bundler Sold-All Buy Blocked** Telegram (and warn log) sends once per flow when the max-single-sell gate fails; later sell evaluations skip the notification.
 
+
+
 ## 2026-08-05 (163)
+
+
 
 ### Follow-token early bundler — ATA subscribe, tx-based sells, drop reclassification guard
 
-- **ATA `accountSubscribe`** (SPL + Token-2022) on each monitored wallet for instant zero-balance sold-all detection without per-sell Helius balance-at polling.
+- **ATA** `accountSubscribe` (SPL + Token-2022) on each monitored wallet for instant zero-balance sold-all detection without per-sell Helius balance-at polling.
 - **Removed sell reclassification guard (160)** that mis-fired when balance-at lagged behind rapid sells.
 - **Per-tx sell size** from `tokenTransfers` (`extractTokenAmountForWallet`); each sell logs `sellAmount`, running `soldAmount` / `boughtAmount`, and live ATA raw balance.
 - **Sold-all after sync/backfill:** paginated tx replay builds `soldAmount` from transfer amounts; post-sync RPC refresh + ATA subscription confirm zero or `soldAmount >= boughtAmount`.
 
+
+
 ## 2026-08-05 (161)
+
+
 
 ### Follow-token: early bundler — drop sender on any resolved transfer-out
 
 - Removed partial transfer-out logic: when token recipients are resolved from a transfer tx, the sender is always dropped with `soldAll=true` and recipients are monitored for sells (no balance-at-tx or remaining-holdings check).
 - Unresolved pool legs (`__pool__` with no recipient) still leave the sender monitored until balance is zero.
 
+
+
 ## 2026-08-05 (160)
+
+
 
 ### Follow-token: early bundler sold-all — buys + full transfer-out drop
 
@@ -84,7 +120,11 @@
 - **Full transfer-out drop:** when outbound amount ≥ remaining holdings (`boughtAmount − soldAmount`) and recipients were resolved, sender is dropped with `soldAll=true` even if balance-at-tx still shows tokens (fixes stuck “partial transfer — sender still monitored”).
 - **Sell guard:** if post-tx balance is higher than `boughtAmount − soldAmount`, the tx is reclassified as inbound instead of counting sell stats (misclassified Enhanced WSS / SWAP legs).
 
+
+
 ## 2026-08-05 (159)
+
+
 
 ### Follow-token: early bundler transfer-out — no sell stats on sender
 
@@ -92,7 +132,11 @@
 - Enhanced WSS `wallet→__pool__` outbound legs are paired with `__pool__→recipient` inbound legs in the same tx so real transfer recipients are chained and monitored for **their** individual sell txs.
 - Unresolved pool legs (no token recipient in tx) drop the sender without sell stats; pre-LI max-single-sell gate uses **transfer-recipient** watches only when transfer path was observed.
 
+
+
 ## 2026-08-05 (158)
+
+
 
 ### Follow-token: early bundler — skip `__pool__` transfer recipient chaining
 
@@ -100,7 +144,11 @@
 - Pool transfer-outs apply **sell accounting** on the sender (sold amount, cumulative USD, sold-all eval) and log `transfer to pool — treating as exit, not chaining recipient`.
 - Invalid/non-pubkey addresses are rejected in recipient filter, subscribe, and sync; sync failures are caught so `syncComplete` is always set.
 
+
+
 ## 2026-08-05 (157)
+
+
 
 ### Follow-token: pre-LI bundler watch — catch all transfer recipients
 
@@ -109,55 +157,87 @@
 - **Repeat inbound to same recipient:** additional transfers from other bundlers add to `boughtAmount` and re-sync; sold-all resets if new tokens arrive.
 - **Initial sync:** drains all watches in a loop until every bundler/recipient (including mid-sync chains) is paginated and `syncComplete`.
 
+
+
 ## 2026-08-05 (156)
+
+
 
 ### Follow-token: `initial_group_gmgn_empty_traders` → Large Insider (no reset)
 
-- After **60s** with **0 GMGN bundler traders** and no initial group confirmed, starts **Large Insider flow** (same defer path as `second_group_insufficient_wallets_*`) instead of resetting.
+- After **60s** with **0 GMGN bundler traders** and no initial group confirmed, starts **Large Insider flow** (same defer path as `second_group_insufficient_wallets_`*) instead of resetting.
+
+
 
 ## 2026-08-05 (153)
+
+
 
 ### Follow-token: early bundler watch at GMGN start + pre–1st-LI sold-all buy gate
 
 - **Early bundler / transfer-recipient watch** starts on **Follow-Token GMGN Flow Started** (not on 1st valid LI wallet).
-- **Pre–1st-LI wallet** (after GMGN start, before valid LI #1): bundler sold-all can buy **only if** the watch with the **highest cumulative sell USD** has no single sell tx **&gt; 7.5M tokens** → buy with **+80% MC TP** only. If gate fails, wait for 1st valid LI wallet then post-LI rules apply.
+- **Pre–1st-LI wallet** (after GMGN start, before valid LI #1): bundler sold-all can buy **only if** the watch with the **highest cumulative sell USD** has no single sell tx **> 7.5M tokens** → buy with **+80% MC TP** only. If gate fails, wait for 1st valid LI wallet then post-LI rules apply.
 - **Post–1st-LI wallet**: all existing bundler sold-all buy rules unchanged (skip / MC TP / LI-only branches, transfer-out path, valid wallet #4, etc.).
 - 1st valid LI wallet found re-evaluates bundler sold-all if already complete (post-LI rules override pre-LI path).
-- **Pre-LI buy already holding:** if 1st valid LI wallet appears and bundler stats are **&lt;75 txs** or **≤ $24.5k cumulative**, keep **+80% MC TP** from pre-LI buy (post-LI skip branches do not apply). If **≥75 txs** and **$24.5k–$35k**, **+80% MC TP + valid LI ≥25%**. If **&gt; $35k**, **+80% MC TP disabled** (valid LI **≥25%** only — same as post-LI LI-only).
+- **Pre-LI buy already holding:** if 1st valid LI wallet appears and bundler stats are **<75 txs** or **≤ $24.5k cumulative**, keep **+80% MC TP** from pre-LI buy (post-LI skip branches do not apply). If **≥75 txs** and **$24.5k–$35k**, **+80% MC TP + valid LI ≥25%**. If **> $35k**, **+80% MC TP disabled** (valid LI **≥25%** only — same as post-LI LI-only).
+
+
 
 ## 2026-08-05 (155)
 
-### Follow-token: pre-LI buy — &gt;$35k disables +80% MC TP (LI-only)
 
-- Pre-LI bundler buy now applies bundler cumulative **&gt; $35k** (with ≥75 sell txs) the same as post-LI: **+80% MC TP disabled**, exit on valid LI **≥25%** only. Low-stats retain and $24.5k–$35k dual-exit unchanged.
+
+### Follow-token: pre-LI buy — >$35k disables +80% MC TP (LI-only)
+
+- Pre-LI bundler buy now applies bundler cumulative **> $35k** (with ≥75 sell txs) the same as post-LI: **+80% MC TP disabled**, exit on valid LI **≥25%** only. Low-stats retain and $24.5k–$35k dual-exit unchanged.
+
+
 
 ## 2026-08-05 (154)
 
+
+
 ### Follow-token: pre-LI buy keeps +80% MC TP when 1st LI wallet found on low bundler stats
 
-- If **pre-LI bundler buy** is already holding and valid LI **#1** is discovered while bundler stats would post-LI **skip** (&lt;75 txs or ≤$24.5k cumulative), exit stays **+80% MC TP** (no skip, no exit-mode override).
+- If **pre-LI bundler buy** is already holding and valid LI **#1** is discovered while bundler stats would post-LI **skip** (<75 txs or ≤$24.5k cumulative), exit stays **+80% MC TP** (no skip, no exit-mode override).
+
+
 
 ## 2026-08-04 (152)
+
+
 
 ### Follow-token: Large Insider — dynamic valid-wallet pool for ≥25% exit
 
 - **≥25% sell exit** uses whatever valid LI wallets are discovered at buy time (e.g. 2 or 3) and **adds wallets #4–#5** to the same pool as they are found while holding (including after bundler sold-all buy). Each newly added valid wallet is subscribed for scrape monitoring and checked for ≥25% sells immediately.
 - Buy Telegram shows the current valid LI ≥25% exit pool; new valid wallets while holding trigger a re-check against the expanded pool.
 
+
+
 ## 2026-08-04 (151)
+
+
 
 ### Follow-token: Large Insider — no duplicate early bundler watch after buy
 
 - If early bundler / transfer-recipient watch already started pre-buy (on valid wallet #1), it is **not** restarted on `markPositionBought`. Sell-failure rearm also skips restart when watch is still active.
 
+
+
 ## 2026-08-04 (150)
+
+
 
 ### Follow-token: Large Insider — bundler cumulative low threshold $24.5k
 
 - **≥ 75** sell txs + max cumulative **≤ $24.5k** (was $25k): pre-buy skip / post-buy immediate sell unchanged in behavior.
 - **≥ 75** sell txs + cumulative **$24.5k–$35k** (was $25k–$35k): **+80% MC TP** + valid LI **≥25%** branch.
 
+
+
 ## 2026-08-04 (149)
+
+
 
 ### Follow-token: Large Insider — parallel pre-buy bundler watch + dual buy triggers
 
@@ -165,22 +245,30 @@
 - **Buy triggers (pre-buy):**
   - **Direct-sell path** (early bundlers sell themselves, no token transfer-out): buy on **valid wallet #4** **OR** all bundlers/recipients sold all + exit conditions met.
   - **Transfer-recipient path** (early bundler transferred tokens out): buy **only** when all bundlers/recipients sold all + exit conditions met (valid wallet #4 alone does not buy).
-- **Bundler sold-all pre-buy branches:** max sell txs **&lt; 75** or **≥ 75** + cumulative **≤ $24.5k** → **no buy**, skip token and reset; **≥ 75** + **$24.5k–$35k** → buy with **+80% MC TP**; **&gt; $35k** → buy with MC TP disabled (valid LI **≥25%** only). *(Post-buy holding: &lt; 75 txs or ≤ $24.5k still triggers immediate sell.)*
+- **Bundler sold-all pre-buy branches:** max sell txs **< 75** or **≥ 75** + cumulative **≤ $24.5k** → **no buy**, skip token and reset; **≥ 75** + **$24.5k–$35k** → buy with **+80% MC TP**; **> $35k** → buy with MC TP disabled (valid LI **≥25%** only). *(Post-buy holding: < 75 txs or ≤ $24.5k still triggers immediate sell.)*
 - MC TP defer until all sold all unchanged for holding phase.
+
+
 
 ## 2026-08-04 (148)
 
+
+
 ### Follow-token: Large Insider — remove Qualified SOL buy gate; bundler exit USD thresholds
 
-- Removed **Qualified SOL &lt;20** as a buy gate on valid wallet #4 (buy triggers directly on #4).
+- Removed **Qualified SOL <20** as a buy gate on valid wallet #4 (buy triggers directly on #4).
 - Replaced **150 sell-tx** bundler exit rule with **cumulative sell USD** per bundler/recipient (sum of all sell txs). **Cumulative-USD branches** ($25k immediate sell, $35k MC TP disable) apply only when **max sell-tx count across watches ≥ 75**:
   - After all sold all + valid LI **≥25%** → sell immediately (unchanged).
-  - Max sell txs **&lt; 75** and no valid LI **≥25%** → **sell immediately** (cumulative-USD rules skipped).
+  - Max sell txs **< 75** and no valid LI **≥25%** → **sell immediately** (cumulative-USD rules skipped).
   - Max sell txs **≥ 75** and max cumulative **≤ $25k** and no valid LI **≥25%** → **sell immediately**.
-  - Max sell txs **≥ 75** and max cumulative **≤ $35k** (and &gt; $25k) → **+80% MC TP** + wait for valid LI **≥25%**.
-  - Max sell txs **≥ 75** and any wallet cumulative **&gt; $35k** → **+80% MC TP disabled**; valid LI **≥25%** only.
+  - Max sell txs **≥ 75** and max cumulative **≤ $35k** (and > $25k) → **+80% MC TP** + wait for valid LI **≥25%**.
+  - Max sell txs **≥ 75** and any wallet cumulative **> $35k** → **+80% MC TP disabled**; valid LI **≥25%** only.
+
+
 
 ## 2026-08-03 (147)
+
+
 
 ### Follow-token: Large Insider — early bundler exit watch after buy
 
@@ -191,37 +279,61 @@
 - No bundler/recipient exceeds **150** sell txs → **+80% MC TP** remains available alongside valid LI **≥25%**.
 - Any bundler/recipient exceeds **150** sell txs → **+80% MC TP disabled**; exit only on valid LI wallet **≥25%** (valid LI **≥25%** during the wait still triggers sell once all bundlers sold all).
 
+
+
 ## 2026-08-03 (146)
+
+
 
 ### Follow-token: restore Large Insider feePayer window — 20m
 
 - Restored tier1 feePayer-out discovery window (**20 minutes** after initial-bundler first buy; was 15m before removal). Pre-buy reset when window closes before 4 valid wallets (`large_insider_window_closed_before_fourth_valid_wallet`). Pre-anchor feePayer txs still skipped without reset.
 
+
+
 ## 2026-08-03 (145)
+
+
 
 ### Follow-token: remove Large Insider 15m feePayer window
 
 - Removed the **15-minute** tier1 feePayer-out window and its timer reset. LI now runs until other exit points: **no scrape watches** before 4 valid wallets (pre-buy), **qualified-SOL buy gate** fail, rug/dev reset, or normal post-buy exits (+80% MC TP / ≥25% sold). FeePayer outs before initial-bundler first buy are still ignored.
 
+
+
 ## 2026-08-03 (144)
+
+
 
 ### Follow-token: Large Insider Qualified SOL buy gate at wallet #4
 
-- On valid wallet **#4**, buy only if **≥1 of the first 4** valid wallets has **Qualified SOL &lt;20**. If all four are **≥20 SOL**, skip buy and reset (`large_insider_qualified_sol_buy_gate_failed`).
+- On valid wallet **#4**, buy only if **≥1 of the first 4** valid wallets has **Qualified SOL <20**. If all four are **≥20 SOL**, skip buy and reset (`large_insider_qualified_sol_buy_gate_failed`).
+
+
 
 ## 2026-08-03 (143)
+
+
 
 ### Follow-token: Large Insider — no reset on pre-anchor feePayer txs
 
 - FeePayer outs **before** the initial-bundler first-buy anchor are **skipped** instead of calling `maybeReset`. Fixes instant reset at LI start when REST sync sees older feePayer activity while scrape watches are still empty.
 
+
+
 ## 2026-08-03 (142)
+
+
 
 ### Follow-token: Large Insider MC TP 90% → 80%
 
 - Large Insider profit exit target changed from **+90% MC TP** to **+80% MC TP** (≥25% sold early exit on any valid wallet unchanged).
 
+
+
 ## 2026-08-03 (141)
+
+
 
 ### Follow-token: Large Insider — buy on #4; exit on any of 5 wallets ≥25% sold
 
@@ -2231,37 +2343,4 @@ The insider bot's core detection/entry logic was rewritten to trace the shared *
 - After lowest insider is found, insider monitoring and GMGN bundler scan run in parallel every 2s.
 - Whichever finishes first stops its own monitor and waits; buy fires only when both insider sells and 2 bundler matches are ready.
 - Post-buy bundler sell trigger unchanged: sell when each matched bundler has sold once.
-
-
-
-### Insider parallel buy gate
-
-- GMGN bundler scan starts immediately when lowest insider is found (parallel with insider monitoring).
-- Buy only triggers when both insider sell threshold and 2 bundler matches ($110–$120 default) are ready.
-- Post-buy: sell when both tracked bundlers have sold at least once.
-- Buy/sell tx logs include running totals per token.
-- Bot 1 and Bot 2 auto-resume in parallel on insider mode start.
-- Removed dev wallet sell triggers.
-
-
-
-### Insider bundler buy flow
-
-- After 5 insider sells, scan GMGN bundler traders (limit 20, API key 2) for buy_volume_cur in configurable USD range.
-- Buy when 2 bundler wallets match; then monitor both via WSS + Helius until each sells once before resuming follow wallet.
-- Cross-bot mint lock prevents Bot 1 and Bot 2 from working the same token simultaneously.
-- Dev wallet sell triggers: 3rd buy after mint, or sell amount exceeding initial mint amount; full dev exit uses ATH % MC.
-- Removed legacy PnL-at-transfer, dev $10 cap, and $40 buy threshold logic.
-- Telegram: bundler min/max USD settings added.
-
-
-
-### Insider mode rewrite
-
-- Follow-wallet monitoring now pauses on new token buy and switches to lowest early insider wallet detection via Helius.
-- Insider wallet activity (buy/sell/transfer in/out) is tracked to trigger bot buys after sell signals and positive wallet PnL.
-- Transfer-out events chain monitoring to the recipient wallet with Helius history sync.
-- Rug threshold raised to $5,000 market cap; bot resets back to follow-wallet monitoring after rug, failed filters, or sell completion.
-- Exit strategy now uses ATH price converted to market cap (default +40% from entry, configurable in Telegram).
-- Telegram insider menu simplified to follow wallet, buy SOL, and exit % settings.
 
