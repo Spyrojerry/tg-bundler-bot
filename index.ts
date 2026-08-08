@@ -161,15 +161,6 @@ async function main(): Promise<void> {
     () =>
       new RateLimiter(config.rateLimitMinTime, config.rateLimitMaxConcurrent),
   );
-  /** Follow-token GMGN poll: dedicated clients (GMGN_API_KEY + GMGN_API_KEY_2). */
-  const followTokenGmgnPollRateMinMs = Math.min(config.rateLimitMinTime, 100);
-  const followTokenGmgnPollLimiters = [0, 1].map(
-    () =>
-      new RateLimiter(
-        followTokenGmgnPollRateMinMs,
-        config.rateLimitMaxConcurrent,
-      ),
-  );
   const gmgnClients = insiderBotDefinitions.map(
     (definition, index) =>
       new GmgnClient(
@@ -178,20 +169,6 @@ async function main(): Promise<void> {
         definition.rpcUrl,
       ),
   );
-  const followTokenGmgnPollClients: GmgnClient[] = [];
-  const followTokenGmgnPollKeysSeen = new Set<string>();
-  for (let slot = 0; slot < 2; slot += 1) {
-    const gmgnApiKey = [config.gmgnApiKey, config.gmgnApiKey2][slot]?.trim();
-    if (!gmgnApiKey || followTokenGmgnPollKeysSeen.has(gmgnApiKey)) continue;
-    followTokenGmgnPollKeysSeen.add(gmgnApiKey);
-    followTokenGmgnPollClients.push(
-      new GmgnClient(
-        { ...config, gmgnApiKey },
-        followTokenGmgnPollLimiters[slot] ?? followTokenGmgnPollLimiters[0]!,
-        insiderBotDefinitions[0]?.rpcUrl ?? config.insiderSolanaRpcUrl,
-      ),
-    );
-  }
   const insiderDasMarketCapClient = new HeliusDasMarketCapClient(
     config.insiderHeliusApiKey3 ||
       insiderBotDefinitions[2]?.heliusApiKey ||
@@ -1444,7 +1421,6 @@ async function main(): Promise<void> {
       () => undefined,
       `Insider ${definition.botNumber}`,
       sharedEnhancedWs,
-      followTokenGmgnPollClients,
     );
     bot.on("heliusCreditsExhausted", (info) => {
       void (async () => {
@@ -3008,16 +2984,11 @@ async function main(): Promise<void> {
     sharedEnhancedWs?.close();
 
     await Promise.all(
-      [...gmgnLimiters, ...followTokenGmgnPollLimiters].map((limiter, index) =>
+      gmgnLimiters.map((limiter, index) =>
         limiter
           .drain()
           .catch((e) =>
-            log.warn(
-              index < gmgnLimiters.length
-                ? `GMGN limiter ${index + 1} drain error`
-                : `Follow-token GMGN poll limiter ${index - gmgnLimiters.length + 1} drain error`,
-              e,
-            ),
+            log.warn(`GMGN limiter ${index + 1} drain error`, e),
           ),
       ),
     );

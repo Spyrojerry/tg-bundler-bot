@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-08 (170)
+
+### Follow-token: remove legacy GMGN bundler poll + dead tag-plan buy path
+
+- **Removed** logging-only GMGN bundler poll (`startFollowTokenGmgnBundlerPoll`, poll timer/ticks, `followTokenGmgnPollClients`, `emitFollowTokenGmgnBundlerBuy`, tag-plan / 2nd-group / third-group / multi-fresh GMGN fetches, trader snapshot helpers, `followTokenGmgnInitialBundlerGroup` latch).
+- **Migration pre-buy flow** now starts **directly** from `startFollowTokenLargeInsiderPreBuyFlow`: Helius first-four stub watch → early bundler exit monitoring → Large Insider (feePayer lock + scrape). No GMGN poll step; fixes stuck 11h poll loops with no buy/reset.
+- Renamed misleading GMGN labels (`gmgn_flow_started` → `large_insider_pre_buy_started`, logger `FOLLOW-TOKEN-WATCH`). Removed dead `tagPlanBuyActive` / unused second-group latch fields.
+
 ## 2026-08-06 (169)
 
 ### Follow-token: fix ATA sold-all vs sell-tx ordering race for 7.5M gate

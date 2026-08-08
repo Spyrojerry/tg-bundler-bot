@@ -294,7 +294,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
           `Dev: <code>${this.html(devWallet)}</code>`,
           `Create → migrate: <b>${migrationAgeSec.toFixed(0)}s</b>`,
           `Dev funder: <code>${this.html(funding?.funder ?? 'unknown')}</code>${funding?.funderName ? ` (${this.html(funding.funderName)})` : ''}`,
-          'First-four unique SWAP buys confirmed — starting GMGN bundler watch…',
+          'First-four unique SWAP buys confirmed — starting Large Insider pre-buy flow…',
         ]);
       }
 
