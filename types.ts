@@ -186,6 +186,10 @@ export interface ServiceConfig {
   insiderFollowTokenEnabled: boolean;
   /** Max seconds between token CREATE and migrate for follow-token filter (default 5). */
   insiderFollowTokenMaxMigrationAgeSec: number;
+  /** Follow-token bundler sold-all: buy SOL when 8M gate fails but 15M fallback passes (pre-LI). */
+  insiderFollowToken15mPreLiBuySol: number;
+  /** Follow-token bundler sold-all: buy SOL when 8M gate fails but 15M fallback passes (post-LI). */
+  insiderFollowToken15mPostLiBuySol: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   telegramBotToken: string | null;
   telegramChatId: string | null;

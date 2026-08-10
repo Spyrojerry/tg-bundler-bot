@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-08-10 (175)
+
+### Follow-token: LI ≥25% exit on 15M fallback (+40% MC TP) buys
+
+- Confirmed **valid LI wallet ≥25% sell exit** remains active on **15M fallback** bundler sold-all buys (8M–15M global max-single-sell tier): dual exit **+40% MC TP or any valid LI ≥25%** (same as standard `normal_mc_tp`; unlike standard high-USD branch which disables MC TP).
+- 15M fallback does **not** set `highSellUsdMode` or `disableProfitExitAfterBuy` — both MC TP and LI exit paths stay armed.
+- LI ≥25% exit log/Telegram now cite **15M fallback buy** when applicable; MC TP % in exit copy uses actual entry/exit MC (40% on fallback, not hardcoded 80%).
+
+## 2026-08-10 (174)
+
+### Follow-token: 8M/15M gate tier from global highest max-single-sell
+
+- Gate tier (80% vs 40% TP vs fail) now uses the **highest `maxSingleSellTokenAmount` across all actively monitored watches**, not only the largest-bag watch — fixes a case where largest bag had &lt;8M on one sell but another watch had 8M–15M and the bot wrongly bought at +80%.
+- Logs and Telegram always report **global highest max-single-sell** (wallet + amount) plus largest-bag context when it differs.
+
+## 2026-08-10 (173)
+
+### Follow-token: 8M/15M gate watch — largest bag (not cumulative sell USD)
+
+- Max-single-sell gate (8M / 15M) now picks the **actively monitored watch with the largest token bag** (`boughtAmount`):
+  - **Early bundler** still holding → initial buy amount (first-four bundler)
+  - **Transfer recipient** → tokens received on transfer-out (can mix with bundlers still holding)
+- Replaces prior rule that used highest **cumulative sell USD** and ignored non-recipient watches after transfer-out.
+- Example: four bundlers transfer out → recipient with largest received amount (e.g. 429M to `BcSaAaGs…`) is the gate watch.
+
+## 2026-08-10 (172)
+
+### Follow-token: 15M max-single-sell fallback buy (+40% MC TP)
+
+- Bundler sold-all buy paths now use **two tiers** on highest cumulative-USD watch max single sell:
+  - **≤ 8M tokens** → standard buy (`INSIDER_NORMAL_BUY_SOL` / low-funding SOL) · **+80% MC TP**
+  - **> 8M and ≤ 15M** → **15M fallback buy** · **+40% MC TP** · dedicated buy SOL:
+    - Pre-LI: `INSIDER_FOLLOW_TOKEN_15M_PRE_LI_BUY_SOL` (default: `INSIDER_NORMAL_BUY_SOL`)
+    - Post-LI: `INSIDER_FOLLOW_TOKEN_15M_POST_LI_BUY_SOL` (default: `INSIDER_NORMAL_BUY_SOL`)
+  - **> 15M** → unchanged block/skip (wait for LI #4 on normal/high branches; skip+reset on low branches)
+- Applies to **pre-LI** and **post-LI** bundler sold-all buys. Valid wallet #4 direct buy unchanged (no max-single-sell gate).
+- 15M fallback keeps **+40% MC TP enabled** even on high-USD bundler branch (does not force LI-only exit).
+
 ## 2026-08-10 (171)
 
 ### Follow-token: max single-sell gate 7.5M → 8M

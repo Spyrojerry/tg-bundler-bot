@@ -160,6 +160,14 @@ export function loadConfig(): ServiceConfig {
   const insiderBuySol          = optionalNumber('INSIDER_BUY_SOL', 0.01);
   const insiderNormalBuySol    = optionalNumber('INSIDER_NORMAL_BUY_SOL', insiderBuySol);
   const insiderLowFundingBuySol = optionalNumber('INSIDER_LOW_FUNDING_BUY_SOL', insiderBuySol);
+  const insiderFollowToken15mPreLiBuySol = optionalNumber(
+    'INSIDER_FOLLOW_TOKEN_15M_PRE_LI_BUY_SOL',
+    insiderNormalBuySol,
+  );
+  const insiderFollowToken15mPostLiBuySol = optionalNumber(
+    'INSIDER_FOLLOW_TOKEN_15M_POST_LI_BUY_SOL',
+    insiderNormalBuySol,
+  );
   const insiderEntryMc         = optionalNumber('INSIDER_ENTRY_MC', 15_000);
   const insiderExitMc          = optionalNumber('INSIDER_EXIT_MC', 30_000);
   const insiderExitPercent     = optionalNumber('INSIDER_EXIT_PERCENT', 40);
@@ -240,6 +248,8 @@ export function loadConfig(): ServiceConfig {
     insiderFunderFirstEnabled,
     insiderFollowTokenEnabled,
     insiderFollowTokenMaxMigrationAgeSec,
+    insiderFollowToken15mPreLiBuySol,
+    insiderFollowToken15mPostLiBuySol,
     logLevel: rawLogLevel,
     telegramBotToken,
     telegramChatId,
