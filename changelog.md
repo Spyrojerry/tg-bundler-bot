@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-10 (171)
+
+### Follow-token: max single-sell gate 7.5M → 8M
+
+- Pre-LI and post-LI bundler sold-all buy paths now require highest cumulative-USD watch **max single sell ≤ 8,000,000 tokens** (was 7,500,000). Applies to pre-LI sold-all buy, post-LI low/normal/high branches, skip Telegram, and blocked-buy notifications.
+
 ## 2026-08-08 (170)
 
 ### Follow-token: remove legacy GMGN bundler poll + dead tag-plan buy path

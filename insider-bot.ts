@@ -113,7 +113,7 @@ const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE = 35_000;
 /** Cumulative-USD exit branches require max sell-tx count across watches ≥ this. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE = 75;
 /** Pre–1st-LI-wallet bundler sold-all buy: max single sell token amount on highest cumulative-USD watch. */
-const FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT = 7_500_000;
+const FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT = 8_000_000;
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
 /** Defer sold-all exit eval when ATA hits zero before the sell tx is processed. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_ATA_SOLD_ALL_EVAL_DEFER_MS = 1000;
@@ -6209,7 +6209,7 @@ export class InsiderBot extends EventEmitter {
         : `Would qualify for +80% MC TP buy on low-USD branch (max cumulative <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b> ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()}).`;
 
     this.log.warn(
-      "Post-LI bundler sold-all — 7.5M max-single-sell gate failed (low branch skip)",
+      "Post-LI bundler sold-all — 8M max-single-sell gate failed (low branch skip)",
       {
         mint: funderState.mint,
         rawBranch,
@@ -6223,7 +6223,7 @@ export class InsiderBot extends EventEmitter {
     );
 
     this.followTokenLargeInsiderLog(
-      "bundler sold-all 7.5M gate failed — skipping token (no buy)",
+      "bundler sold-all 8M gate failed — skipping token (no buy)",
       {
         mint: funderState.mint,
         rawBranch,
@@ -6294,7 +6294,7 @@ export class InsiderBot extends EventEmitter {
 
     if (!this.hasFollowTokenLargeInsiderValidWalletDiscovered()) {
       const preLiGate = this.getBundlerSoldAllMaxSingleSellGateSnapshot();
-      this.log.warn("Pre-LI bundler sold-all — 7.5M gate eval", {
+      this.log.warn("Pre-LI bundler sold-all — 8M gate eval", {
         mint: funderState.mint,
         ...preLiGate,
         signature,
@@ -6345,7 +6345,7 @@ export class InsiderBot extends EventEmitter {
       rawBranch === "low_tx_immediate" ||
       rawBranch === "low_usd_immediate"
     ) {
-      this.log.warn("Post-LI bundler sold-all — 7.5M gate eval (low branch)", {
+      this.log.warn("Post-LI bundler sold-all — 8M gate eval (low branch)", {
         mint: funderState.mint,
         rawBranch,
         maxSellTxCount,
@@ -6362,7 +6362,7 @@ export class InsiderBot extends EventEmitter {
         return;
       }
       this.log.warn(
-        "Post-LI bundler sold-all — 7.5M gate passed on low branch (+80% MC TP buy)",
+        "Post-LI bundler sold-all — 8M gate passed on low branch (+80% MC TP buy)",
         {
           mint: funderState.mint,
           rawBranch,
@@ -6374,7 +6374,7 @@ export class InsiderBot extends EventEmitter {
       );
       buyBranch = "normal_mc_tp";
     } else {
-      this.log.warn("Post-LI bundler sold-all — 7.5M gate eval", {
+      this.log.warn("Post-LI bundler sold-all — 8M gate eval", {
         mint: funderState.mint,
         rawBranch,
         maxSellTxCount,
