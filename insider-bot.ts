@@ -6061,13 +6061,20 @@ export class InsiderBot extends EventEmitter {
     return best;
   }
 
-  private getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch(): FollowTokenEarlyBundlerExitWatch | null {
+  private getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch(options?: {
+    activeOnly?: boolean;
+    source?: "early_bundler" | "transfer_recipient";
+  }): FollowTokenEarlyBundlerExitWatch | null {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active || state.watches.size === 0) return null;
 
+    const activeOnly = options?.activeOnly ?? true;
+    const sourceFilter = options?.source;
+
     let best: FollowTokenEarlyBundlerExitWatch | null = null;
     for (const watch of state.watches.values()) {
-      if (!watch.monitoringActive) continue;
+      if (activeOnly && !watch.monitoringActive) continue;
+      if (sourceFilter && watch.source !== sourceFilter) continue;
       if (
         !best ||
         watch.maxSingleSellTokenAmount > best.maxSingleSellTokenAmount
@@ -6084,11 +6091,37 @@ export class InsiderBot extends EventEmitter {
     return source === "transfer_recipient" ? "transfer recipient" : "early bundler";
   }
 
+  private getFollowTokenEarlyBundlerExitActiveRolesAtSoldAll(): Array<
+    "early_bundler" | "transfer_recipient"
+  > {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active) return [];
+    const roles = new Set<"early_bundler" | "transfer_recipient">();
+    for (const watch of state.watches.values()) {
+      if (!watch.monitoringActive) continue;
+      roles.add(watch.source);
+    }
+    return [...roles];
+  }
+
   private getBundlerSoldAllMaxSingleSellGateSnapshot(): {
     tier: FollowTokenMaxSingleSellGateTier;
+    candidateTier: FollowTokenMaxSingleSellGateTier;
+    activeRolesAtSoldAll: Array<"early_bundler" | "transfer_recipient">;
     maxSingleSellTokenAmount: number;
     maxSingleSellWallet: string | null;
     maxSingleSellWatchSource: FollowTokenEarlyBundlerExitWatch["source"] | null;
+    earlyBundlerMaxSingleSellTokenAmount: number;
+    earlyBundlerMaxSingleSellWallet: string | null;
+    transferRecipientMaxSingleSellTokenAmount: number;
+    transferRecipientMaxSingleSellWallet: string | null;
+    perSourceGateFailure: {
+      source: "early_bundler" | "transfer_recipient";
+      wallet: string;
+      maxSingleSellTokenAmount: number;
+      limit: number;
+      candidateTier: "standard_8m" | "fallback_15m";
+    } | null;
     largestBagWallet: string | null;
     largestBagWatchSource: FollowTokenEarlyBundlerExitWatch["source"] | null;
     largestBagAmount: number;
@@ -6096,27 +6129,104 @@ export class InsiderBot extends EventEmitter {
     fallbackLimit: number;
   } {
     const largestBagWatch = this.getFollowTokenEarlyBundlerExitLargestBagWatch();
+    const activeRolesAtSoldAll =
+      this.getFollowTokenEarlyBundlerExitActiveRolesAtSoldAll();
     const maxSingleSellWatch =
-      this.getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch();
+      this.getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch({
+        activeOnly: true,
+      });
+    const earlyBundlerMaxSingleSellWatch =
+      activeRolesAtSoldAll.includes("early_bundler")
+        ? this.getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch({
+            activeOnly: true,
+            source: "early_bundler",
+          })
+        : null;
+    const transferRecipientMaxSingleSellWatch =
+      activeRolesAtSoldAll.includes("transfer_recipient")
+        ? this.getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch({
+            activeOnly: true,
+            source: "transfer_recipient",
+          })
+        : null;
     const standardLimit =
       FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT;
     const fallbackLimit =
       FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_MAX_SINGLE_SELL_TOKEN_AMOUNT;
     const maxSingleSellTokenAmount =
       maxSingleSellWatch?.maxSingleSellTokenAmount ?? 0;
-    let tier: FollowTokenMaxSingleSellGateTier;
+    const earlyBundlerMaxSingleSellTokenAmount =
+      earlyBundlerMaxSingleSellWatch?.maxSingleSellTokenAmount ?? 0;
+    const transferRecipientMaxSingleSellTokenAmount =
+      transferRecipientMaxSingleSellWatch?.maxSingleSellTokenAmount ?? 0;
+    let candidateTier: FollowTokenMaxSingleSellGateTier;
     if (maxSingleSellTokenAmount <= standardLimit) {
-      tier = "standard_8m";
+      candidateTier = "standard_8m";
     } else if (maxSingleSellTokenAmount <= fallbackLimit) {
-      tier = "fallback_15m";
+      candidateTier = "fallback_15m";
     } else {
-      tier = "fail";
+      candidateTier = "fail";
     }
+
+    let tier = candidateTier;
+    let perSourceGateFailure: {
+      source: "early_bundler" | "transfer_recipient";
+      wallet: string;
+      maxSingleSellTokenAmount: number;
+      limit: number;
+      candidateTier: "standard_8m" | "fallback_15m";
+    } | null = null;
+
+    if (candidateTier === "standard_8m" || candidateTier === "fallback_15m") {
+      const limit =
+        candidateTier === "standard_8m" ? standardLimit : fallbackLimit;
+      const perSourceChecks: Array<{
+        source: "early_bundler" | "transfer_recipient";
+        watch: FollowTokenEarlyBundlerExitWatch | null;
+        amount: number;
+      }> = [];
+      if (activeRolesAtSoldAll.includes("early_bundler")) {
+        perSourceChecks.push({
+          source: "early_bundler",
+          watch: earlyBundlerMaxSingleSellWatch,
+          amount: earlyBundlerMaxSingleSellTokenAmount,
+        });
+      }
+      if (activeRolesAtSoldAll.includes("transfer_recipient")) {
+        perSourceChecks.push({
+          source: "transfer_recipient",
+          watch: transferRecipientMaxSingleSellWatch,
+          amount: transferRecipientMaxSingleSellTokenAmount,
+        });
+      }
+      for (const check of perSourceChecks) {
+        if (check.amount <= limit) continue;
+        tier = "fail";
+        perSourceGateFailure = {
+          source: check.source,
+          wallet: check.watch!.wallet,
+          maxSingleSellTokenAmount: check.amount,
+          limit,
+          candidateTier,
+        };
+        break;
+      }
+    }
+
     return {
       tier,
+      candidateTier,
+      activeRolesAtSoldAll,
       maxSingleSellTokenAmount,
       maxSingleSellWallet: maxSingleSellWatch?.wallet ?? null,
       maxSingleSellWatchSource: maxSingleSellWatch?.source ?? null,
+      earlyBundlerMaxSingleSellTokenAmount,
+      earlyBundlerMaxSingleSellWallet:
+        earlyBundlerMaxSingleSellWatch?.wallet ?? null,
+      transferRecipientMaxSingleSellTokenAmount,
+      transferRecipientMaxSingleSellWallet:
+        transferRecipientMaxSingleSellWatch?.wallet ?? null,
+      perSourceGateFailure,
       largestBagWallet: largestBagWatch?.wallet ?? null,
       largestBagWatchSource: largestBagWatch?.source ?? null,
       largestBagAmount: largestBagWatch?.boughtAmount ?? 0,
@@ -6144,6 +6254,43 @@ export class InsiderBot extends EventEmitter {
     };
   }
 
+  private formatFollowTokenActiveRoleMaxSingleSellGateLimitLine(
+    gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
+    limitLabel: string,
+  ): string {
+    if (gate.activeRolesAtSoldAll.length === 0) return "";
+    const roleLabels = gate.activeRolesAtSoldAll.map((role) =>
+      this.formatFollowTokenEarlyBundlerExitWatchRoleLabel(role),
+    );
+    if (roleLabels.length === 1) {
+      return `(active ${roleLabels[0]} path at sold-all · ≤ ${limitLabel}).`;
+    }
+    return `(active ${roleLabels.join(" + ")} paths at sold-all · each ≤ ${limitLabel}).`;
+  }
+
+  private formatFollowTokenPerSourceMaxSingleSellGateTelegramLines(
+    gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
+  ): string[] {
+    const lines: string[] = [];
+    if (
+      gate.activeRolesAtSoldAll.includes("early_bundler") &&
+      gate.earlyBundlerMaxSingleSellWallet
+    ) {
+      lines.push(
+        `Active early bundler max-single-sell: <b>${gate.earlyBundlerMaxSingleSellTokenAmount.toLocaleString()}</b> on <code>${gate.earlyBundlerMaxSingleSellWallet}</code>`,
+      );
+    }
+    if (
+      gate.activeRolesAtSoldAll.includes("transfer_recipient") &&
+      gate.transferRecipientMaxSingleSellWallet
+    ) {
+      lines.push(
+        `Active transfer recipient max-single-sell: <b>${gate.transferRecipientMaxSingleSellTokenAmount.toLocaleString()}</b> on <code>${gate.transferRecipientMaxSingleSellWallet}</code>`,
+      );
+    }
+    return lines;
+  }
+
   private formatFollowTokenMaxSingleSellGateTelegramLine(
     gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
   ): string {
@@ -6152,6 +6299,8 @@ export class InsiderBot extends EventEmitter {
       gate.maxSingleSellWatchSource ?? "early_bundler",
     );
     const maxSellLine = `Highest max-single-sell across active watches: <b>${gate.maxSingleSellTokenAmount.toLocaleString()}</b> tokens on ${maxSellRole} <code>${gate.maxSingleSellWallet}</code>`;
+    const perSourceLines =
+      this.formatFollowTokenPerSourceMaxSingleSellGateTelegramLines(gate);
     const largestBagLine =
       gate.largestBagWallet &&
       gate.largestBagWallet !== gate.maxSingleSellWallet
@@ -6159,11 +6308,18 @@ export class InsiderBot extends EventEmitter {
         : gate.largestBagWallet
           ? `Largest bag: same wallet (<b>${gate.largestBagAmount.toLocaleString(undefined, { maximumFractionDigits: 3 })}</b> tokens).`
           : "";
+    const perSourceFailureLine = gate.perSourceGateFailure
+      ? `Active ${this.formatFollowTokenEarlyBundlerExitWatchRoleLabel(gate.perSourceGateFailure.source)} <code>${gate.perSourceGateFailure.wallet}</code> max-single-sell <b>${gate.perSourceGateFailure.maxSingleSellTokenAmount.toLocaleString()}</b> exceeds ${gate.perSourceGateFailure.candidateTier === "standard_8m" ? "8M" : "15M"} limit <b>${gate.perSourceGateFailure.limit.toLocaleString()}</b> (global active tier was <b>${gate.perSourceGateFailure.candidateTier === "standard_8m" ? "8M standard" : "15M fallback"}</b>).`
+      : "";
     if (gate.tier === "fail") {
       return [
         maxSellLine,
+        ...perSourceLines,
         largestBagLine,
-        `(8M limit <b>${gate.standardLimit.toLocaleString()}</b> · 15M limit <b>${gate.fallbackLimit.toLocaleString()}</b>).`,
+        perSourceFailureLine,
+        gate.perSourceGateFailure
+          ? ""
+          : `(8M limit <b>${gate.standardLimit.toLocaleString()}</b> · 15M limit <b>${gate.fallbackLimit.toLocaleString()}</b>).`,
       ]
         .filter(Boolean)
         .join("\n");
@@ -6171,16 +6327,18 @@ export class InsiderBot extends EventEmitter {
     if (gate.tier === "fallback_15m") {
       return [
         maxSellLine,
+        ...perSourceLines,
         largestBagLine,
-        `→ <b>15M fallback buy</b> (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP; exceeds 8M limit <b>${gate.standardLimit.toLocaleString()}</b>).`,
+        `→ <b>15M fallback buy</b> (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP; exceeds 8M limit <b>${gate.standardLimit.toLocaleString()}</b>${gate.activeRolesAtSoldAll.length > 0 ? `; ${this.formatFollowTokenActiveRoleMaxSingleSellGateLimitLine(gate, "15M")}` : ""}).`,
       ]
         .filter(Boolean)
         .join("\n");
     }
     return [
       maxSellLine,
+      ...perSourceLines,
       largestBagLine,
-      `(≤ 8M limit <b>${gate.standardLimit.toLocaleString()}</b> · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP).`,
+      `(≤ 8M limit <b>${gate.standardLimit.toLocaleString()}</b> · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP${gate.activeRolesAtSoldAll.length > 0 ? `; ${this.formatFollowTokenActiveRoleMaxSingleSellGateLimitLine(gate, "8M")}` : ""}).`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -6286,12 +6444,23 @@ export class InsiderBot extends EventEmitter {
       if (state.preLiBundlerSoldAllBuyBlockedNotified) return;
       state.preLiBundlerSoldAllBuyBlockedNotified = true;
       this.log.warn(
-        "Pre-LI bundler sold-all buy blocked — global max single sell exceeds 15M",
+        gate.perSourceGateFailure
+          ? "Pre-LI bundler sold-all buy blocked — active-role max single sell exceeds gate limit"
+          : "Pre-LI bundler sold-all buy blocked — global max single sell exceeds 15M",
         {
           mint: funderState.mint,
           maxSingleSellWallet: gate.maxSingleSellWallet,
           maxSingleSellWatchSource: gate.maxSingleSellWatchSource,
           maxSingleSellTokenAmount: gate.maxSingleSellTokenAmount,
+          candidateTier: gate.candidateTier,
+          earlyBundlerMaxSingleSellWallet: gate.earlyBundlerMaxSingleSellWallet,
+          earlyBundlerMaxSingleSellTokenAmount:
+            gate.earlyBundlerMaxSingleSellTokenAmount,
+          transferRecipientMaxSingleSellWallet:
+            gate.transferRecipientMaxSingleSellWallet,
+          transferRecipientMaxSingleSellTokenAmount:
+            gate.transferRecipientMaxSingleSellTokenAmount,
+          perSourceGateFailure: gate.perSourceGateFailure,
           largestBagWallet: gate.largestBagWallet,
           largestBagAmount: gate.largestBagAmount,
           standardLimit: gate.standardLimit,
@@ -6304,7 +6473,9 @@ export class InsiderBot extends EventEmitter {
           `Token: <code>${funderState.mint}</code>`,
           topWatchLine,
           "",
-          "Exceeds 15M max-single-sell limit — waiting for 1st valid Large Insider wallet; post-LI bundler buy rules apply after that.",
+          gate.perSourceGateFailure
+            ? "Per-role max-single-sell check failed — waiting for 1st valid Large Insider wallet; post-LI bundler buy rules apply after that."
+            : "Exceeds 15M max-single-sell limit — waiting for 1st valid Large Insider wallet; post-LI bundler buy rules apply after that.",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -6316,12 +6487,23 @@ export class InsiderBot extends EventEmitter {
     if (state.postLiBundlerSoldAllBuyBlockedNotified) return;
     state.postLiBundlerSoldAllBuyBlockedNotified = true;
     this.log.warn(
-      "Post-LI bundler sold-all buy blocked — global max single sell exceeds 15M",
+      gate.perSourceGateFailure
+        ? "Post-LI bundler sold-all buy blocked — active-role max single sell exceeds gate limit"
+        : "Post-LI bundler sold-all buy blocked — global max single sell exceeds 15M",
       {
         mint: funderState.mint,
         maxSingleSellWallet: gate.maxSingleSellWallet,
         maxSingleSellWatchSource: gate.maxSingleSellWatchSource,
         maxSingleSellTokenAmount: gate.maxSingleSellTokenAmount,
+        candidateTier: gate.candidateTier,
+        earlyBundlerMaxSingleSellWallet: gate.earlyBundlerMaxSingleSellWallet,
+        earlyBundlerMaxSingleSellTokenAmount:
+          gate.earlyBundlerMaxSingleSellTokenAmount,
+        transferRecipientMaxSingleSellWallet:
+          gate.transferRecipientMaxSingleSellWallet,
+        transferRecipientMaxSingleSellTokenAmount:
+          gate.transferRecipientMaxSingleSellTokenAmount,
+        perSourceGateFailure: gate.perSourceGateFailure,
         largestBagWallet: gate.largestBagWallet,
         largestBagAmount: gate.largestBagAmount,
         standardLimit: gate.standardLimit,
@@ -6334,7 +6516,9 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${funderState.mint}</code>`,
         topWatchLine,
         "",
-        "Exceeds 15M max-single-sell limit — waiting for valid wallet #4 (direct-sell) or a later sold-all eval that passes 8M/15M gates.",
+        gate.perSourceGateFailure
+          ? "Per-role max-single-sell check failed — waiting for valid wallet #4 (direct-sell) or a later sold-all eval that passes 8M/15M gates."
+          : "Exceeds 15M max-single-sell limit — waiting for valid wallet #4 (direct-sell) or a later sold-all eval that passes 8M/15M gates.",
       ]
         .filter(Boolean)
         .join("\n"),
@@ -6448,15 +6632,26 @@ export class InsiderBot extends EventEmitter {
         : `Would qualify for +80% MC TP buy on low-USD branch (max cumulative <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b> ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()}).`;
 
     this.log.warn(
-      "Post-LI bundler sold-all — max-single-sell gates failed (low branch skip)",
+      gate.perSourceGateFailure
+        ? "Post-LI bundler sold-all — active-role max-single-sell gate failed (low branch skip)"
+        : "Post-LI bundler sold-all — max-single-sell gates failed (low branch skip)",
       {
         mint: funderState.mint,
         rawBranch,
         maxSellTxCount,
         maxCumulativeSellUsd,
+        candidateTier: gate.candidateTier,
         maxSingleSellWallet: gate.maxSingleSellWallet,
         maxSingleSellWatchSource: gate.maxSingleSellWatchSource,
         maxSingleSellTokenAmount: gate.maxSingleSellTokenAmount,
+        earlyBundlerMaxSingleSellWallet: gate.earlyBundlerMaxSingleSellWallet,
+        earlyBundlerMaxSingleSellTokenAmount:
+          gate.earlyBundlerMaxSingleSellTokenAmount,
+        transferRecipientMaxSingleSellWallet:
+          gate.transferRecipientMaxSingleSellWallet,
+        transferRecipientMaxSingleSellTokenAmount:
+          gate.transferRecipientMaxSingleSellTokenAmount,
+        perSourceGateFailure: gate.perSourceGateFailure,
         largestBagWallet: gate.largestBagWallet,
         largestBagAmount: gate.largestBagAmount,
         standardLimit: gate.standardLimit,
@@ -6466,15 +6661,26 @@ export class InsiderBot extends EventEmitter {
     );
 
     this.followTokenLargeInsiderLog(
-      "bundler sold-all max-single-sell gates failed — skipping token (no buy)",
+      gate.perSourceGateFailure
+        ? "bundler sold-all active-role max-single-sell gate failed — skipping token (no buy)"
+        : "bundler sold-all max-single-sell gates failed — skipping token (no buy)",
       {
         mint: funderState.mint,
         rawBranch,
         maxSellTxCount,
         maxCumulativeSellUsd,
+        candidateTier: gate.candidateTier,
         maxSingleSellWallet: gate.maxSingleSellWallet,
         maxSingleSellWatchSource: gate.maxSingleSellWatchSource,
         maxSingleSellTokenAmount: gate.maxSingleSellTokenAmount,
+        earlyBundlerMaxSingleSellWallet: gate.earlyBundlerMaxSingleSellWallet,
+        earlyBundlerMaxSingleSellTokenAmount:
+          gate.earlyBundlerMaxSingleSellTokenAmount,
+        transferRecipientMaxSingleSellWallet:
+          gate.transferRecipientMaxSingleSellWallet,
+        transferRecipientMaxSingleSellTokenAmount:
+          gate.transferRecipientMaxSingleSellTokenAmount,
+        perSourceGateFailure: gate.perSourceGateFailure,
         largestBagWallet: gate.largestBagWallet,
         largestBagAmount: gate.largestBagAmount,
         transferRecipientPath: state.earlyBundlerTransferOutObserved,
@@ -6489,7 +6695,9 @@ export class InsiderBot extends EventEmitter {
         this.formatFollowTokenMaxSingleSellGateTelegramLine(gate),
         lowBranchLine,
         "",
-        "No buy — exceeds 15M max-single-sell limit; token skipped and flow reset.",
+        gate.perSourceGateFailure
+          ? "No buy — active-role max-single-sell check failed; token skipped and flow reset."
+          : "No buy — exceeds 15M max-single-sell limit; token skipped and flow reset.",
       ]
         .filter(Boolean)
         .join("\n"),

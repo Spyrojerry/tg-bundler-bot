@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-08-10 (176)
+
+### Follow-token: active-role max-single-sell gate at sold-all
+
+- Before a bundler sold-all buy (8M standard or 15M fallback), the supplementary max-single-sell check applies only to **whichever role path is active at sold-all** — **early bundler** watches **or** **transfer recipient** watches (not both; inactive parent bundlers after transfer-out are ignored).
+- **Transfer path** (recipients active, bundlers dropped): gate uses **active transfer recipient** max-single-sell only.
+- **Direct bundler path** (bundlers still holding): gate uses **active early bundler** max-single-sell only.
+- **Mixed** (both roles still active): each active role group is checked separately against the tier limit (8M or 15M).
+- If global active tier would pass but the active role check fails → **block/skip**; logs/TG show active-role highs and which role failed.
+
 ## 2026-08-10 (175)
 
 ### Follow-token: LI ≥25% exit on 15M fallback (+40% MC TP) buys
