@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-08-12 (181)
+
+### Follow-token: 15M ATH gate uses GMGN token ATH at buy (not poll-built high)
+
+- **15M fallback** ATH MC check now **fetches token ATH once** via `fetchTokenAthMarketCapUsd` at buy gate eval — no longer uses `highestObservedMarketCapUsd` from MC checker polls.
+- ATH fetch retries **3 times** (500ms apart) before the gate is skipped; if all attempts fail, buy proceeds with a warning log.
+
+## 2026-08-12 (180)
+
+### Follow-token: Qualified SOL &lt;25 gate on post-LI 8M bundler sold-all buys
+
+- Post-LI bundler sold-all on **8M standard** tier now uses the same buy gate as **15M fallback**: **≥1 present valid LI wallet** with **Qualified SOL &lt; 25 SOL**; otherwise skip + reset with per-wallet Telegram breakdown.
+- Shared constant `FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW` (25 SOL) applies to both tiers; ATH MC gate remains **15M fallback only**.
+
+## 2026-08-12 (179)
+
+### Follow-token: 15M fallback buy gates + pre-LI sold-all skip
+
+- **Pre-LI sold-all on 8M–15M tier** → **skip + reset** (no wait-for-LI post-LI fallback buy).
+- **Post-LI 15M fallback buy** now requires:
+  - Observed **ATH MC &lt; 2×** calculated exit MC at entry (**GMGN token ATH fetch at buy** — see 181; was poll-built high in 179).
+  - **≥1 present valid LI wallet** with **Qualified SOL &lt; 25 SOL** (also required on **8M standard** post-LI sold-all — see 180).
+- Pre-LI sold-all buy remains **≤8M only** (+80% MC TP).
+
+## 2026-08-12 (178)
+
+### Follow-token: no pre-LI buy on 15M fallback tier (superseded by 179)
+
+- Pre-LI 15M path no longer buys; **179** changes wait-for-LI to **skip+reset**.
+
+## 2026-08-11 (177)
+
+### Follow-token: pre-LI “MC TP Active” Telegram uses actual buy tier (+40% on 15M fallback)
+
+- Fixed misleading **Pre-LI Bundler Buy — +80% MC TP Active** follow-up after a **15M fallback (+40%)** buy; armed notification now reads entry/exit MC via `getFollowTokenActiveProfitExitPercent()`.
+- Pre-LI post-buy exit re-eval no longer forces **LI-only** (disabling MC TP) on **15M fallback** buys when bundler cumulative sell is high — same exception as the initial buy emit.
+
 ## 2026-08-10 (176)
 
 ### Follow-token: active-role max-single-sell gate at sold-all
