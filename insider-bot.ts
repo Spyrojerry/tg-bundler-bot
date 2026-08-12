@@ -3057,6 +3057,15 @@ export class InsiderBot extends EventEmitter {
     this.isBuyGateEvaluating = true;
     const ebState = this.followTokenEarlyBundlerExitState;
     try {
+      if (this.anyFollowTokenLargeInsiderValidWalletReachedTwentyFivePercentSold()) {
+        await this.skipFollowTokenLargeInsiderFromValidWalletTwentyFivePercentAlreadySold(
+          state.mint,
+          options.triggerSource ?? "valid_wallet_4",
+          triggerTx,
+        );
+        return;
+      }
+
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) return;
       this.recordObservedMarketCapUsd(currentMc);
@@ -5948,6 +5957,97 @@ export class InsiderBot extends EventEmitter {
       }
     }
     return false;
+  }
+
+  private summarizeFollowTokenLargeInsiderValidWalletsAtOrAboveExitSoldThreshold(): Array<{
+    index: number;
+    wallet: string;
+    soldPercent: string;
+  }> {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active) return [];
+    return li.validWallets.flatMap((wallet, index) => {
+      const watch = li.scrapeWatches.get(wallet);
+      if (
+        !watch ||
+        !this.followTokenLargeInsiderWatchReachedExitSoldThreshold(watch, null)
+      ) {
+        return [];
+      }
+      const soldFraction = this.followTokenLargeInsiderEffectiveSoldFraction(
+        watch,
+        null,
+      );
+      return [
+        {
+          index: index + 1,
+          wallet,
+          soldPercent:
+            soldFraction !== null
+              ? (soldFraction * 100).toFixed(1)
+              : "?",
+        },
+      ];
+    });
+  }
+
+  private async skipFollowTokenLargeInsiderFromValidWalletTwentyFivePercentAlreadySold(
+    mint: string,
+    triggerSource: "valid_wallet_4" | "bundler_sold_all",
+    triggerTx?: HeliusTransaction,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    const funderState = this.bundlerFunderWatch;
+    if (state) {
+      state.preBuyBundlerPathTriggered = true;
+      state.exitTriggerSignature =
+        triggerTx?.signature ??
+        "FOLLOW_TOKEN_SKIP_LI_25PCT_ALREADY_SOLD_BEFORE_BUY";
+    }
+    const reason = "large_insider_valid_wallet_25pct_already_sold_before_buy";
+    const wallets =
+      this.summarizeFollowTokenLargeInsiderValidWalletsAtOrAboveExitSoldThreshold();
+    const triggerLabel =
+      triggerSource === "bundler_sold_all"
+        ? "bundler sold-all"
+        : "valid wallet #4";
+
+    this.followTokenLargeInsiderLog(
+      "buy skipped — valid LI wallet already sold ≥25% before buy",
+      {
+        mint,
+        triggerSource,
+        wallets,
+        signature: state?.exitTriggerSignature ?? null,
+      },
+    );
+
+    void this.sendTelegramSafe(
+      [
+        `<b>⛔ ${this.label} Follow-Token Buy Skipped</b>`,
+        `Token: <code>${mint}</code>`,
+        `Trigger: ${triggerLabel}`,
+        "",
+        `≥1 valid Large Insider wallet already sold <b>≥25%</b> of holdings before buy — would buy then exit immediately.`,
+        "",
+        ...wallets.map(
+          ({ index, wallet, soldPercent }) =>
+            `${index}. <code>${wallet}</code> — sold <b>${soldPercent}%</b> tracked`,
+        ),
+        "",
+        "No buy — token skipped and flow reset.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "follow-token li 25pct already sold before buy skip",
+    );
+
+    if (funderState && this.followTokenLargeInsiderState?.active) {
+      await this.stopFollowTokenLargeInsiderFlow(
+        "valid LI ≥25% already sold before buy",
+      );
+    }
+    await this.resetForNewToken(false, { reason });
   }
 
   private async triggerFollowTokenLargeInsiderValidWalletTwentyFivePercentExitIfReady(

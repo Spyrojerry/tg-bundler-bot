@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-12 (183)
+
+### Follow-token: skip buy when valid LI already sold ≥25% before buy
+
+- All follow-token Large Insider buy paths (`valid wallet #4`, pre/post-LI bundler sold-all) now **skip + reset** if **any discovered valid LI wallet** already sold **≥25%** of holdings before buy — avoids buy-then-immediate-exit on stale LI ≥25% state.
+
 ## 2026-08-12 (182)
 
 ### Follow-token: bundler cumulative low USD gate $24.5k → $25.5k
