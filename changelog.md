@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-12 (184)
+
+### Follow-token: max-single-sell fallback gate 15M → 16M
+
+- `FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_MAX_SINGLE_SELL_TOKEN_AMOUNT` raised to **16,000,000** (was 15,000,000). Fallback tier (+40% MC TP) now applies on **>8M and ≤16M** max single sell; **>16M** fail/skip unchanged. Telegram/log copy updated to **16M**.
+
 ## 2026-08-12 (183)
 
 ### Follow-token: skip buy when valid LI already sold ≥25% before buy
