@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-12 (182)
+
+### Follow-token: bundler cumulative low USD gate $24.5k → $25.5k
+
+- `FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD` raised to **$25,500** (was $24,500). Affects pre/post-LI sold-all skip branches, dual-exit zone floor ($25.5k–$35k), and related Telegram copy.
+
 ## 2026-08-12 (181)
 
 ### Follow-token: 15M ATH gate uses GMGN token ATH at buy (not poll-built high)

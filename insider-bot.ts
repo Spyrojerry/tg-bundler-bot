@@ -107,7 +107,7 @@ const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON =
   "follow_token_large_insider_valid_wallet";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT = 100;
 /** Bundler max cumulative sell USD at or below this → immediate sell once all sold all (if no valid LI ≥25%). */
-const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD = 24_500;
+const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD = 25_500;
 /** Any bundler cumulative sell USD above this → +80% MC TP disabled; valid LI ≥25% only. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE = 35_000;
 /** Cumulative-USD exit branches require max sell-tx count across watches ≥ this. */
@@ -7127,7 +7127,7 @@ export class InsiderBot extends EventEmitter {
               `Token: <code>${funderState.mint}</code>`,
               "All bundlers/recipients sold all before 1st valid LI wallet.",
               mode === "mc_tp_and_li"
-                ? `Exit: +${activeMcTpPercent.toFixed(0)}% MC TP or valid LI ≥25% (bundler cumulative $24.5k–$35k zone).`
+                ? `Exit: +${activeMcTpPercent.toFixed(0)}% MC TP or valid LI ≥25% (bundler cumulative $${(FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD / 1000).toFixed(1)}k–$${(FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE / 1000).toFixed(0)}k zone).`
                 : `Exit: +${activeMcTpPercent.toFixed(0)}% MC TP; valid LI ≥25% once discovered.`,
             ].join("\n"),
             "follow-token pre-li bundler mc tp armed",
