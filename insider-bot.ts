@@ -103,6 +103,8 @@ const FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT = 80;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
 /** Scrape wallets (tier1 or chain) with first buy above this SOL are not valid Large Insider buyers. */
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL = 10;
+/** First token buy on a scrape wallet must exceed this USD to count as a valid Large Insider wallet. */
+const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD = 110;
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON =
   "follow_token_large_insider_valid_wallet";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT = 100;
@@ -1715,7 +1717,7 @@ export class InsiderBot extends EventEmitter {
           options.secondGroupWalletCount !== undefined
             ? `Initial bundlers: <b>${options.secondGroupWalletCount}</b>`
             : "",
-          `Buy on valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all path (up to <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> LI tracked · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit).`,
+          `Buy on valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all path (up to <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> LI tracked · first buy &gt; $${FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD} · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit).`,
         ]
           .filter(Boolean)
           .join("\n"),
@@ -2483,7 +2485,7 @@ export class InsiderBot extends EventEmitter {
         watch.firstBuySignature = tx.signature;
         watch.firstBuyTimestamp = tx.timestamp;
         if (
-          this.shouldSkipFollowTokenLargeInsiderValidWalletBuy(
+          await this.shouldSkipFollowTokenLargeInsiderValidWalletBuy(
             watch,
             tx,
             wallet,
@@ -2543,32 +2545,75 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private shouldSkipFollowTokenLargeInsiderValidWalletBuy(
+  private async estimateFollowTokenLargeInsiderValidWalletFirstBuyUsd(
+    tx: HeliusTransaction,
+    wallet: string,
+  ): Promise<number | null> {
+    const buySol = this.estimateEarlyBuySol(tx, wallet);
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    if (buySol === null || solPriceUsd === null) return null;
+    return buySol * solPriceUsd;
+  }
+
+  private async shouldSkipFollowTokenLargeInsiderValidWalletBuy(
     watch: FollowTokenLargeInsiderScrapeWatch,
     tx: HeliusTransaction,
     wallet: string,
-  ): boolean {
+  ): Promise<boolean> {
+    const li = this.followTokenLargeInsiderState;
     const buySol = this.estimateEarlyBuySol(tx, wallet);
     if (
-      buySol === null ||
-      buySol <= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL
+      buySol !== null &&
+      buySol > FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL
     ) {
-      return false;
+      this.followTokenLargeInsiderLog(
+        "scrape wallet first buy skipped — above max SOL for valid wallet",
+        {
+          mint: li?.mint ?? null,
+          wallet,
+          buySol,
+          tier1DirectFromFeePayer: watch.tier1DirectFromFeePayer,
+          maxValidWalletFirstBuySol:
+            FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL,
+          signature: tx.signature,
+        },
+      );
+      return true;
     }
-    const li = this.followTokenLargeInsiderState;
-    this.followTokenLargeInsiderLog(
-      "scrape wallet first buy skipped — above max SOL for valid wallet",
-      {
-        mint: li?.mint ?? null,
-        wallet,
-        buySol,
-        tier1DirectFromFeePayer: watch.tier1DirectFromFeePayer,
-        maxValidWalletFirstBuySol:
-          FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL,
-        signature: tx.signature,
-      },
+
+    const firstBuyUsd = await this.estimateFollowTokenLargeInsiderValidWalletFirstBuyUsd(
+      tx,
+      wallet,
     );
-    return true;
+    if (firstBuyUsd === null) {
+      this.followTokenLargeInsiderLog(
+        "scrape wallet first buy skipped — first buy USD unavailable for valid wallet gate",
+        {
+          mint: li?.mint ?? null,
+          wallet,
+          buySol,
+          signature: tx.signature,
+        },
+      );
+      return true;
+    }
+    if (firstBuyUsd <= FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD) {
+      this.followTokenLargeInsiderLog(
+        "scrape wallet first buy skipped — below min USD for valid wallet",
+        {
+          mint: li?.mint ?? null,
+          wallet,
+          buySol,
+          firstBuyUsd,
+          requiredMinUsd:
+            FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD,
+          signature: tx.signature,
+        },
+      );
+      return true;
+    }
+
+    return false;
   }
 
   private async handleFollowTokenLargeInsiderValidWalletTwentyFivePercentSoldExit(

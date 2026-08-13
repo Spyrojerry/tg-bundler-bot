@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-08-13 (186)
+
+### Follow-token: valid LI wallet first-buy minimum $100 → $110
+
+- `FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD` raised to **$110** (was $100). First token buy must still be **&gt;** this threshold to join the valid LI pool.
+
+## 2026-08-13 (185)
+
+### Follow-token: valid LI wallet first buy must exceed $100
+
+- Scrape wallets only join the valid Large Insider pool when their **first token buy** is **&gt; $100 USD** (SOL spent × cached SOL price). Below or unestimable → not counted as valid LI (affects wallet #4 buy, post-LI 8M/16M gates, Qualified SOL gate, ≥25% exit pool).
+
 ## 2026-08-12 (184)
 
 ### Follow-token: max-single-sell fallback gate 15M → 16M
