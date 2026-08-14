@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-14 (199)
+
+### Follow-token: fix premature pre-LI bundler sold-all buy with unsold largest bag
+
+- **Sync:** `syncComplete` is set only after a successful Helius paginated sync; failed sync no longer marks a watch complete. On “signature filter too old”, sync retries once without the transfer-receive cursor.
+- **Transfer recipients:** ATA zero alone no longer counts as sold-all — requires **≥1 observed sell** (`soldAmount > 0`) after tokens were seen in-wallet. Sold-all from live state also requires `syncComplete` for ATA-based detection.
+- **Sold-all gate:** blocks when any active watch has **`boughtAmount > 0` and `soldAmount === 0`**, when sync is incomplete, or when the **largest-bag wallet** has not genuinely sold all. Erroneous `soldAll=true` on zero-sell watches is cleared automatically.
+- **Logging:** `maybeEvaluateFollowTokenEarlyBundlerExit` logs reason + largest-bag / never-sold wallet context when sold-all buy eval is blocked.
+
 ## 2026-08-14 (198)
 
 ### Revert entry MC to buy-gate snapshot (pre-deferred)

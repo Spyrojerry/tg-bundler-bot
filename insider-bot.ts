@@ -5918,17 +5918,57 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private allFollowTokenEarlyBundlerExitWatchesSoldAll(): boolean {
+  private followTokenEarlyBundlerExitWatchHasNeverSold(
+    watch: FollowTokenEarlyBundlerExitWatch,
+  ): boolean {
+    return watch.boughtAmount > 0 && watch.soldAmount === 0;
+  }
+
+  private healFollowTokenEarlyBundlerExitWatchErroneousSoldAll(
+    watch: FollowTokenEarlyBundlerExitWatch,
+  ): boolean {
+    if (
+      !watch.monitoringActive ||
+      !watch.soldAll ||
+      !this.followTokenEarlyBundlerExitWatchHasNeverSold(watch)
+    ) {
+      return false;
+    }
+    watch.soldAll = false;
+    watch.soldAllSignature = null;
+    return true;
+  }
+
+  private followTokenEarlyBundlerExitSoldAllBlockReason(): string | null {
     const state = this.followTokenEarlyBundlerExitState;
-    if (!state?.active || state.watches.size === 0) return false;
+    if (!state?.active || state.watches.size === 0) return "inactive";
     const activeWatches = [...state.watches.values()].filter(
       (watch) => watch.monitoringActive,
     );
-    if (activeWatches.length === 0) return false;
+    if (activeWatches.length === 0) return "no_active_watches";
     for (const watch of activeWatches) {
-      if (!watch.syncComplete || !watch.soldAll) return false;
+      if (this.healFollowTokenEarlyBundlerExitWatchErroneousSoldAll(watch)) {
+        return "active_watch_never_sold";
+      }
+      if (!watch.syncComplete) return "sync_incomplete";
+      if (this.followTokenEarlyBundlerExitWatchHasNeverSold(watch)) {
+        return "active_watch_never_sold";
+      }
+      if (!watch.soldAll) return "watch_not_sold_all";
     }
-    return true;
+    const largestBag = this.getFollowTokenEarlyBundlerExitLargestBagWatch();
+    if (
+      largestBag &&
+      (!largestBag.soldAll ||
+        this.followTokenEarlyBundlerExitWatchHasNeverSold(largestBag))
+    ) {
+      return "largest_bag_not_sold_all";
+    }
+    return null;
+  }
+
+  private allFollowTokenEarlyBundlerExitWatchesSoldAll(): boolean {
+    return this.followTokenEarlyBundlerExitSoldAllBlockReason() === null;
   }
 
   private markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
@@ -5946,7 +5986,8 @@ export class InsiderBot extends EventEmitter {
   ): boolean {
     if (liveRaw === null || liveRaw > 0n) return false;
     if (watch.source === "early_bundler") return true;
-    return watch.observedNonZeroTokenBalance;
+    if (!watch.observedNonZeroTokenBalance) return false;
+    return watch.soldAmount > 0;
   }
 
   private followTokenEarlyBundlerExitWatchReachedTwentyFivePercent(
@@ -5979,6 +6020,9 @@ export class InsiderBot extends EventEmitter {
     watch: FollowTokenEarlyBundlerExitWatch,
     signature: string | null,
   ): void {
+    if (this.healFollowTokenEarlyBundlerExitWatchErroneousSoldAll(watch)) {
+      return;
+    }
     if (watch.soldAll) return;
     const liveRaw = this.getFollowTokenEarlyBundlerExitWatchLiveTokenBalanceRaw(
       watch.wallet,
@@ -5986,6 +6030,7 @@ export class InsiderBot extends EventEmitter {
     const soldAllByTrackedAmount =
       watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount;
     const soldAllByAtaBalance =
+      watch.syncComplete &&
       this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, liveRaw);
     if (soldAllByTrackedAmount || soldAllByAtaBalance) {
       watch.soldAll = true;
@@ -7313,7 +7358,33 @@ export class InsiderBot extends EventEmitter {
     const funderState = this.bundlerFunderWatch;
     const li = this.followTokenLargeInsiderState;
     if (!state?.active || !funderState || state.exitTriggerSignature) return;
-    if (!this.allFollowTokenEarlyBundlerExitWatchesSoldAll()) return;
+    const soldAllBlockReason = this.followTokenEarlyBundlerExitSoldAllBlockReason();
+    if (soldAllBlockReason) {
+      const largestBag = this.getFollowTokenEarlyBundlerExitLargestBagWatch();
+      const neverSoldWallets = [...state.watches.values()]
+        .filter(
+          (watch) =>
+            watch.monitoringActive &&
+            this.followTokenEarlyBundlerExitWatchHasNeverSold(watch),
+        )
+        .map((watch) => ({
+          wallet: watch.wallet,
+          source: watch.source,
+          boughtAmount: watch.boughtAmount,
+          soldAll: watch.soldAll,
+          syncComplete: watch.syncComplete,
+        }));
+      this.log.info("Follow-token early bundler sold-all eval blocked", {
+        mint: state.mint,
+        reason: soldAllBlockReason,
+        triggerSignature: triggerTx?.signature ?? null,
+        largestBagWallet: largestBag?.wallet ?? null,
+        largestBagAmount: largestBag?.boughtAmount ?? 0,
+        largestBagSoldAll: largestBag?.soldAll ?? null,
+        neverSoldWallets,
+      });
+      return;
+    }
 
     state.allSoldAllComplete = true;
 
@@ -8020,6 +8091,7 @@ export class InsiderBot extends EventEmitter {
   private async refreshFollowTokenEarlyBundlerExitWatchTokenBalanceAfterSync(
     wallet: string,
     mint: string,
+    options?: { applySoldAll?: boolean },
   ): Promise<void> {
     await this.subscribeFollowTokenEarlyBundlerExitTokenAta(wallet, mint);
     try {
@@ -8033,10 +8105,12 @@ export class InsiderBot extends EventEmitter {
           watch,
           raw,
         );
-        this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
-          watch,
-          null,
-        );
+        if (options?.applySoldAll !== false) {
+          this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
+            watch,
+            null,
+          );
+        }
       }
     } catch (err) {
       this.log.warn(
@@ -8106,53 +8180,97 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    let cursor: string | undefined = watch.syncAfterSignature;
     this.log.info("Follow-token early bundler exit wallet sync started", {
       mint,
       wallet,
       source: watch.source,
       syncAfterSignature: watch.syncAfterSignature,
     });
+    let syncSucceeded = false;
     try {
-      for (let page = 0; page < 50; page++) {
-        const batch = await this.withHeliusFallback((client) =>
-          client.getAddressTransactionsAsc(
-            wallet,
-            cursor,
-            FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT,
-          ),
-        );
-        if (batch.length === 0) break;
-
-        for (const tx of batch) {
-          if (!tx.signature || watch.observedTxSignatures.has(tx.signature)) {
-            continue;
-          }
-          await this.applyFollowTokenEarlyBundlerExitTx(tx, mint, wallet);
-        }
-
-        const lastSignature = batch[batch.length - 1]?.signature;
-        if (
-          !lastSignature ||
-          batch.length < FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT
-        ) {
-          break;
-        }
-        cursor = lastSignature;
-      }
+      syncSucceeded = await this.paginateFollowTokenEarlyBundlerExitWalletSync(
+        watch,
+        mint,
+        watch.syncAfterSignature || undefined,
+      );
     } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
       this.log.warn("Follow-token early bundler exit wallet sync failed", {
         mint,
         wallet,
-        error: err instanceof Error ? err.message : String(err),
+        error,
       });
-    } finally {
-      watch.syncComplete = true;
-      await this.refreshFollowTokenEarlyBundlerExitWatchTokenBalanceAfterSync(
-        wallet,
-        mint,
-      );
+      if (
+        watch.syncAfterSignature &&
+        error.includes("signature filter is too old")
+      ) {
+        this.log.warn(
+          "Follow-token early bundler exit wallet sync retrying without signature cursor",
+          { mint, wallet, syncAfterSignature: watch.syncAfterSignature },
+        );
+        try {
+          syncSucceeded =
+            await this.paginateFollowTokenEarlyBundlerExitWalletSync(
+              watch,
+              mint,
+              undefined,
+            );
+        } catch (retryErr) {
+          this.log.warn(
+            "Follow-token early bundler exit wallet sync retry failed",
+            {
+              mint,
+              wallet,
+              error:
+                retryErr instanceof Error ? retryErr.message : String(retryErr),
+            },
+          );
+        }
+      }
     }
+    if (syncSucceeded) {
+      watch.syncComplete = true;
+    }
+    await this.refreshFollowTokenEarlyBundlerExitWatchTokenBalanceAfterSync(
+      wallet,
+      mint,
+      { applySoldAll: syncSucceeded },
+    );
+  }
+
+  private async paginateFollowTokenEarlyBundlerExitWalletSync(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    mint: string,
+    cursor: string | undefined,
+  ): Promise<boolean> {
+    let pageCursor: string | undefined = cursor;
+    for (let page = 0; page < 50; page++) {
+      const batch = await this.withHeliusFallback((client) =>
+        client.getAddressTransactionsAsc(
+          watch.wallet,
+          pageCursor,
+          FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT,
+        ),
+      );
+      if (batch.length === 0) break;
+
+      for (const tx of batch) {
+        if (!tx.signature || watch.observedTxSignatures.has(tx.signature)) {
+          continue;
+        }
+        await this.applyFollowTokenEarlyBundlerExitTx(tx, mint, watch.wallet);
+      }
+
+      const lastSignature = batch[batch.length - 1]?.signature;
+      if (
+        !lastSignature ||
+        batch.length < FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT
+      ) {
+        break;
+      }
+      pageCursor = lastSignature;
+    }
+    return true;
   }
 
   /** Paginated sync for every watch, including recipients chained mid-sync. */
