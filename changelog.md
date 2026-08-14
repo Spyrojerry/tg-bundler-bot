@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-08-14 (198)
+
+### Revert entry MC to buy-gate snapshot (pre-deferred)
+
+- **Entry MC** and **exit MC** are set again when the buy gate passes (`currentMc` at trigger time in `insider-bot`), not at PumpPortal submit or +1s after buy.
+- Removed `BuyOptions.onSubmitted` / post-submit MC fetch from the buy executor.
+
+## 2026-08-14 (197)
+
+### Persistent insider sell until PumpPortal confirms
+
+- Triggered sells (exit rules, dev token-out, manual **Sell Position** button) now **retry every 5s** until PumpPortal reports a real confirmed sell (tx signature or balance-proven fill).
+- Zero-balance reads and `already-sold` / stale-balance PumpPortal responses no longer abort or clear the position — they schedule another attempt.
+- Manual Telegram sell now arms `positionSellTriggered` like authority exits so duplicate exit triggers stay blocked while retries run.
+
+## 2026-08-14 (196)
+
+### Fix sell abort on stale zero balance cache
+
+- **Sell path** always re-fetches live wallet balance (with one 2s retry); no longer trusts `activePositionCache` zero alone.
+- **Background balance refresh** no longer writes RPC zero over a positive cached balance, and skips seeding zero when cache is empty (transient indexing lag).
+- **Buy confirm** seeds `activePositionCache` from PumpPortal `balanceAfter` so authority sells have a known-good balance baseline.
+
 ## 2026-08-14 (195)
 
 ### Dev wallet gate: transfer_out only (not sell)

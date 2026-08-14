@@ -1251,12 +1251,6 @@ export class GmgnClient {
         amount,
         pool: this.pumpPortalPoolForVenue(venue),
       });
-      if (action === "buy") {
-        const onSubmitted = (options as BuyOptions).onSubmitted;
-        if (onSubmitted) {
-          await onSubmitted({ mint, signature });
-        }
-      }
       return signature;
     } finally {
       clearTimeout(timer);

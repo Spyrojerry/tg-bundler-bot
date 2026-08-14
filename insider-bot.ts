@@ -448,6 +448,7 @@ export interface InsiderBot {
   clearActivePosition(): void;
   clearActivePositionAfterSuccessfulSell(): void;
   rearmPositionMonitoringAfterSellFailure(mint: string): void;
+  armPositionSellTrigger(mint: string): void;
   clearPreBuyMint(): void;
   getEntryMc(): number;
   getExitMc(): number;
@@ -940,6 +941,11 @@ export class InsiderBot extends EventEmitter {
 
   clearActivePositionAfterSuccessfulSell(): void {
     void this.resetForNewToken(true);
+  }
+
+  armPositionSellTrigger(mint: string): void {
+    if (!this.activePosition || this.activePosition.mint !== mint) return;
+    this.positionSellTriggered = true;
   }
 
   rearmPositionMonitoringAfterSellFailure(mint: string): void {
@@ -3227,6 +3233,8 @@ export class InsiderBot extends EventEmitter {
       if (this.isBuyBlockedByDevTokenOut(state.mint)) {
         return;
       }
+      this.setEntryMc(currentMc);
+      this.setExitMc(currentMc * (1 + profitExitPercent / 100));
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
@@ -11624,6 +11632,7 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
+      this.setEntryMc(currentMc);
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
@@ -11720,6 +11729,8 @@ export class InsiderBot extends EventEmitter {
       if (this.isBuyBlockedByDevTokenOut(state.mint)) {
         return;
       }
+      if (exitMc !== null) this.setExitMc(exitMc);
+      this.setEntryMc(currentMc);
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
@@ -11831,6 +11842,8 @@ export class InsiderBot extends EventEmitter {
       if (this.isBuyBlockedByDevTokenOut(state.mint)) {
         return;
       }
+      this.setExitMc(newExitMc);
+      this.setEntryMc(currentMc);
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;

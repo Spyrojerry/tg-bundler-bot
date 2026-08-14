@@ -239,6 +239,7 @@ async function main(): Promise<void> {
     { balance: bigint; quote: SellQuote | null; timestamp: number }
   >();
   const activePositionRefreshes = new Set<string>();
+  const INSIDER_SELL_RETRY_DELAY_MS = 5_000;
   const insiderDasNoPriceUntil = new Map<string, number>();
   const handledHeliusUsageStops = new Set<number>();
   let heliusUsageProcessStopRequested = false;
@@ -605,27 +606,6 @@ async function main(): Promise<void> {
       }
     }
     return null;
-  }
-
-  async function captureInsiderBuyEntryMcAtSubmit(
-    botIndex: number,
-    bot: InsiderBot,
-    trigger: InsiderBuyTrigger,
-  ): Promise<number | null> {
-    const botNumber = getInsiderBotNumber(botIndex);
-    const fetched = await fetchInsiderMarketCapUsd(botIndex, trigger.mint);
-    const entryMc = fetched?.marketCap ?? null;
-    if (entryMc === null) return null;
-    log.info(
-      `[INSIDER ${botNumber} ENTRY MC] Token: ${trigger.mint} MC: $${entryMc.toLocaleString()} (Source: ${fetched?.source ?? "Unknown"})`,
-    );
-    bot.setEntryMc(entryMc);
-    if (trigger.fixedExitMc !== undefined) {
-      bot.setExitMc(trigger.fixedExitMc);
-    } else if (trigger.profitExitPercent !== undefined) {
-      bot.setExitMc(entryMc * (1 + trigger.profitExitPercent / 100));
-    }
-    return entryMc;
   }
 
   const handleProcessHeliusUsageExhaustion = (
@@ -1607,7 +1587,6 @@ async function main(): Promise<void> {
 
       void (async () => {
         const tradersListStr = trigger.tradersListStr || "";
-        let entryMcAtSubmit: number | null = null;
 
         if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
           log.warn(
@@ -1624,12 +1603,8 @@ async function main(): Promise<void> {
               `<b>🚀 Insider ${botNumber} Buy Executing</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
               `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
-              `Entry MC: <i>snapshot at PumpPortal submit</i>`,
-              trigger.profitExitPercent !== undefined
-                ? `Exit target: <b>+${trigger.profitExitPercent}%</b> from entry MC`
-                : trigger.fixedExitMc !== undefined
-                  ? `Exit MC: <b>$${trigger.fixedExitMc.toLocaleString()}</b> (fixed)`
-                  : "",
+              `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
+              `Exit MC: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
               "",
               tradersListStr,
               "",
@@ -1665,21 +1640,8 @@ async function main(): Promise<void> {
               slippage: config.sellSlippage,
               autoSlippage: config.sellAutoSlippage,
               priorityFeeSol: config.sellPriorityFeeSol,
-              onSubmitted: async () => {
-                entryMcAtSubmit = await captureInsiderBuyEntryMcAtSubmit(
-                  index,
-                  bot,
-                  trigger,
-                );
-              },
             },
           );
-
-          const resolvedEntryMc = entryMcAtSubmit ?? trigger.entryMc ?? null;
-          const completedTrigger: InsiderBuyTrigger = {
-            ...trigger,
-            entryMc: resolvedEntryMc ?? undefined,
-          };
 
           if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
             log.warn(
@@ -1689,7 +1651,16 @@ async function main(): Promise<void> {
                 hash: result.hash,
               },
             );
-            bot.markPositionBought(completedTrigger);
+            bot.markPositionBought(trigger);
+            const recoveryBalance =
+              parseConfirmedBuyBalance(result) ??
+              (await getTokenRawBalance(
+                new PublicKey(config.tradingWalletAddress!),
+                new PublicKey(trigger.mint),
+              ).catch(() => null));
+            if (recoveryBalance !== null) {
+              seedActivePositionCacheFromBuy(trigger.mint, recoveryBalance);
+            }
             if (config.tradingWalletAddress) {
               db.addSeenMint(config.tradingWalletAddress, trigger.mint);
             }
@@ -1701,7 +1672,11 @@ async function main(): Promise<void> {
             return;
           }
 
-          bot.markPositionBought(completedTrigger);
+          bot.markPositionBought(trigger);
+          const confirmedBuyBalance = parseConfirmedBuyBalance(result);
+          if (confirmedBuyBalance !== null) {
+            seedActivePositionCacheFromBuy(trigger.mint, confirmedBuyBalance);
+          }
           // ── Persist to DB so this mint is skipped on restart ─────────────
           if (config.tradingWalletAddress) {
             db.addSeenMint(config.tradingWalletAddress, trigger.mint);
@@ -1713,9 +1688,7 @@ async function main(): Promise<void> {
               [
                 `<b>✅ Insider ${botNumber} Buy Completed</b>`,
                 `Token: <code>${html(trigger.mint)}</code>`,
-                resolvedEntryMc !== null
-                  ? `Entry MC: <b>$${html(resolvedEntryMc.toLocaleString())}</b>`
-                  : `Entry MC: <b>${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
+                `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
                 `Status: <b>${html(result.status)}</b>`,
                 result.hash
                   ? `Tx: https://solscan.io/tx/${html(result.hash)}`
@@ -1802,6 +1775,10 @@ async function main(): Promise<void> {
                       },
                     );
                     bot.markPositionBought(trigger);
+                    seedActivePositionCacheFromBuy(
+                      trigger.mint,
+                      state.tokenBalance,
+                    );
                     db.addSeenMint(config.tradingWalletAddress!, trigger.mint);
                     bot.triggerDevTokenOutRecoverySell(
                       trigger.mint,
@@ -1810,6 +1787,10 @@ async function main(): Promise<void> {
                     return;
                   }
                   bot.markPositionBought(trigger);
+                  seedActivePositionCacheFromBuy(
+                    trigger.mint,
+                    state.tokenBalance,
+                  );
                   db.addSeenMint(config.tradingWalletAddress!, trigger.mint);
                   log.warn(
                     `[INSIDER ${botNumber}] Uncertain PumpPortal buy recovered from token balance`,
@@ -1929,6 +1910,7 @@ async function main(): Promise<void> {
         );
         return;
       }
+      bot.armPositionSellTrigger(trigger.positionMint);
       if (
         hasPendingSellForMint(config.tradingWalletAddress, trigger.positionMint)
       ) {
@@ -2238,6 +2220,29 @@ async function main(): Promise<void> {
                   .catch(() => null),
               ])
                 .then(([balance, quote]) => {
+                  const existing = activePositionCache.get(activePos.mint);
+                  if (balance <= 0n) {
+                    if (existing && existing.balance > 0n) {
+                      log.warn(
+                        `[INSIDER ${getInsiderBotNumber(i)} BACKGROUND] Zero balance from RPC but cache positive; keeping cached balance`,
+                        {
+                          mint: activePos.mint,
+                          cachedBalance: existing.balance.toString(),
+                        },
+                      );
+                      activePositionCache.set(activePos.mint, {
+                        balance: existing.balance,
+                        quote: quote ?? existing.quote,
+                        timestamp: Date.now(),
+                      });
+                      return;
+                    }
+                    log.warn(
+                      `[INSIDER ${getInsiderBotNumber(i)} BACKGROUND] Zero balance with no positive cache; skipping cache update (RPC may still be indexing)`,
+                      { mint: activePos.mint },
+                    );
+                    return;
+                  }
                   activePositionCache.set(activePos.mint, {
                     balance,
                     quote,
@@ -2879,6 +2884,60 @@ async function main(): Promise<void> {
     ].join("\n");
   }
 
+  function parseConfirmedBuyBalance(result: SellResult): bigint | null {
+    const raw = result.raw?.balanceAfter;
+    if (typeof raw !== "string" || !/^\d+$/.test(raw)) return null;
+    const balance = BigInt(raw);
+    return balance > 0n ? balance : null;
+  }
+
+  function seedActivePositionCacheFromBuy(mint: string, balance: bigint): void {
+    if (balance <= 0n) return;
+    activePositionCache.set(mint, {
+      balance,
+      quote: null,
+      timestamp: Date.now(),
+    });
+  }
+
+  function parseSellResultBalanceField(
+    value: unknown,
+  ): bigint | null {
+    if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+    return BigInt(value);
+  }
+
+  function isPumpPortalSellConfirmed(
+    result: SellResult,
+    sellPercent: number,
+  ): boolean {
+    if (result.status !== "confirmed") return false;
+    const verification =
+      typeof result.raw?.verification === "string"
+        ? result.raw.verification
+        : "";
+    if (
+      verification === "already-sold" ||
+      verification === "lightning-error-balance-zero" ||
+      verification === "direct-backup-already-sold"
+    ) {
+      return false;
+    }
+    if (result.hash) return true;
+    if (verification !== "signature-confirmed") {
+      const balanceBefore = parseSellResultBalanceField(
+        result.raw?.balanceBefore,
+      );
+      const balanceAfter = parseSellResultBalanceField(result.raw?.balanceAfter);
+      if (balanceBefore === null || balanceAfter === null) return false;
+      if (sellPercent >= 100) {
+        return balanceAfter === 0n && balanceBefore > 0n;
+      }
+      return balanceAfter < balanceBefore;
+    }
+    return true;
+  }
+
   async function getTokenRawBalance(
     owner: PublicKey,
     mint: PublicKey,
@@ -2908,97 +2967,139 @@ async function main(): Promise<void> {
     const pending = pendingSells.get(sellId);
     if (!pending) return;
 
+    const mint = pending.event.mint;
+    let attempt = 0;
+    let failureNotified = false;
+
     try {
-      const owner = new PublicKey(pending.event.walletAddress);
-      const mintPk = new PublicKey(pending.event.mint);
+      while (true) {
+        attempt++;
+        if (!pendingSells.has(sellId)) return;
 
-      // Check Cache for balance first
-      const cached = activePositionCache.get(pending.event.mint);
-      let startingBalance: bigint | null = cached ? cached.balance : null;
-
-      if (startingBalance === null) {
-        startingBalance = await getTokenRawBalance(owner, mintPk).catch(
+        const owner = new PublicKey(pending.event.walletAddress);
+        const mintPk = new PublicKey(mint);
+        const cached = activePositionCache.get(mint);
+        let startingBalance = await getTokenRawBalance(owner, mintPk).catch(
           () => null,
         );
-      }
 
-      if (startingBalance !== null && startingBalance <= 0n) {
+        if (startingBalance !== null && startingBalance <= 0n) {
+          await new Promise((resolve) => setTimeout(resolve, 2_000));
+          startingBalance = await getTokenRawBalance(owner, mintPk).catch(
+            () => null,
+          );
+        }
+
+        if (
+          cached &&
+          startingBalance !== null &&
+          cached.balance !== startingBalance
+        ) {
+          log.info(
+            `[SELL BALANCE] Live balance differs from cache for ${mint}`,
+            {
+              cachedBalance: cached.balance.toString(),
+              liveBalance: startingBalance.toString(),
+            },
+          );
+        }
+
+        if (startingBalance !== null && startingBalance > 0n) {
+          activePositionCache.set(mint, {
+            balance: startingBalance,
+            quote: cached?.quote ?? null,
+            timestamp: Date.now(),
+          });
+        }
+
+        if (startingBalance !== null && startingBalance <= 0n) {
+          log.warn(
+            `[SELL RETRY] Zero balance read for ${mint} on attempt ${attempt}; continuing until PumpPortal sell is confirmed`,
+          );
+        } else {
+          log.info(
+            `[SELL EXECUTE] Attempt ${attempt} for ${mint} (balance: ${startingBalance ?? "unknown"})`,
+          );
+        }
+
+        try {
+          const lastResult = await gmgnClients[0].sellTokenForSol(
+            pending.event.walletAddress,
+            mint,
+            {
+              percent: config.sellPercent,
+              slippage: config.sellSlippage,
+              autoSlippage: config.sellAutoSlippage,
+              priorityFeeSol: config.sellPriorityFeeSol,
+              preFetchedBalance:
+                startingBalance !== null && startingBalance > 0n
+                  ? startingBalance
+                  : undefined,
+            },
+          );
+
+          if (!isPumpPortalSellConfirmed(lastResult, config.sellPercent)) {
+            log.warn(
+              `[SELL RETRY] Sell not confirmed for ${mint}; will retry`,
+              {
+                attempt,
+                verification: lastResult.raw?.verification ?? null,
+                hash: lastResult.hash,
+              },
+            );
+          } else {
+            activePositionCache.delete(mint);
+            if (pending.event.insiderBotIndex !== undefined) {
+              insiderBots[
+                pending.event.insiderBotIndex
+              ]?.clearActivePositionAfterSuccessfulSell();
+            }
+
+            if (
+              pending.event.entryMc !== null &&
+              pending.event.entryMc !== undefined
+            ) {
+              const sellMcClient =
+                pending.event.insiderBotIndex !== undefined
+                  ? gmgnClients[pending.event.insiderBotIndex]
+                  : gmgnClients[0];
+              pending.event.sellMc = await sellMcClient
+                .fetchTokenMarketCapUsd(mint)
+                .catch(() => null);
+            }
+            const receipt = sellReceipt(pending.event, lastResult);
+            if (chatId && telegramBot) {
+              await telegramBot.sendChat(chatId, receipt);
+            } else {
+              log.info("Sell completed without Telegram receipt chat", {
+                mint,
+                status: lastResult.status,
+                hash: lastResult.hash,
+                orderId: lastResult.orderId,
+              });
+            }
+            return;
+          }
+        } catch (err) {
+          log.warn(`[SELL RETRY] Attempt ${attempt} failed for ${mint}`, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          if (!failureNotified && chatId && telegramBot) {
+            failureNotified = true;
+            await telegramBot.sendChat(
+              chatId,
+              sellFailedReply(pending.event, err),
+            );
+          }
+        }
+
         log.info(
-          `[SELL ABORT] No token accounts found for ${pending.event.mint}, assuming already sold.`,
+          `[SELL RETRY] Scheduling retry for ${mint} in ${INSIDER_SELL_RETRY_DELAY_MS}ms`,
+          { attempt },
         );
-        return;
-      }
-
-      const currentPending = pendingSells.get(sellId);
-      if (!currentPending) return;
-
-      let lastResult: SellResult | null = null;
-
-      log.info(
-        `[SELL EXECUTE] Starting sell for ${currentPending.event.mint} (Initial Balance: ${startingBalance ?? "unknown"})`,
-      );
-
-      lastResult = await gmgnClients[0].sellTokenForSol(
-        currentPending.event.walletAddress,
-        currentPending.event.mint,
-        {
-          percent: config.sellPercent,
-          slippage: config.sellSlippage,
-          autoSlippage: config.sellAutoSlippage,
-          priorityFeeSol: config.sellPriorityFeeSol,
-          preFetchedBalance: startingBalance ?? undefined,
-        },
-      );
-      if (lastResult.status !== "confirmed") {
-        throw new Error(
-          `PumpPortal sell returned unexpected status: ${lastResult.status}`,
+        await new Promise((resolve) =>
+          setTimeout(resolve, INSIDER_SELL_RETRY_DELAY_MS),
         );
-      }
-
-      // Cleanup cache
-      activePositionCache.delete(pending.event.mint);
-      if (pending.event.insiderBotIndex !== undefined) {
-        insiderBots[pending.event.insiderBotIndex]?.clearActivePositionAfterSuccessfulSell();
-      }
-
-      const receiptResult = lastResult;
-      if (
-        currentPending.event.entryMc !== null &&
-        currentPending.event.entryMc !== undefined
-      ) {
-        const sellMcClient =
-          currentPending.event.insiderBotIndex !== undefined
-            ? gmgnClients[currentPending.event.insiderBotIndex]
-            : gmgnClients[0];
-        currentPending.event.sellMc = await sellMcClient
-          .fetchTokenMarketCapUsd(currentPending.event.mint)
-          .catch(() => null);
-      }
-      const receipt = sellReceipt(currentPending.event, receiptResult);
-      if (chatId && telegramBot) {
-        await telegramBot.sendChat(chatId, receipt);
-      } else {
-        log.info("Sell completed without Telegram receipt chat", {
-          mint: currentPending.event.mint,
-          status: receiptResult.status,
-          hash: receiptResult.hash,
-          orderId: receiptResult.orderId,
-        });
-      }
-    } catch (err) {
-      // Clear the failed attempt before rearming the Insider trigger.
-      // Otherwise an immediate authority sell retry can be discarded by
-      // hasPendingSellForMint() as a duplicate of the failed attempt.
-      pendingSells.delete(sellId);
-      if (pending.event.insiderBotIndex !== undefined) {
-        insiderBots[
-          pending.event.insiderBotIndex
-        ]?.rearmPositionMonitoringAfterSellFailure(pending.event.mint);
-      }
-      if (chatId && telegramBot) {
-        await telegramBot.sendChat(chatId, sellFailedReply(pending.event, err));
-      } else {
-        log.error("Sell failed without Telegram receipt chat", err);
       }
     } finally {
       pendingSells.delete(sellId);
