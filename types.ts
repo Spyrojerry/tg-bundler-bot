@@ -256,6 +256,11 @@ export interface BuyOptions {
   slippage: number;
   autoSlippage: boolean;
   priorityFeeSol: number;
+  /** Called immediately after PumpPortal returns a buy signature (before confirmation wait). */
+  onSubmitted?: (info: {
+    mint: string;
+    signature: string;
+  }) => void | Promise<void>;
 }
 
 export interface SellResult {

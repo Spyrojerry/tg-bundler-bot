@@ -31,7 +31,7 @@ import {
 } from "./types";
 import { FunderFirstOrchestrator } from "./funder-first-orchestrator";
 import { FollowTokenMigrationOrchestrator } from "./follow-token-migration-orchestrator";
-import { InsiderBot, MAX_FOLLOW_WALLETS, INSIDER_BUY_ENTRY_MC_DELAY_MS } from "./insider-bot";
+import { InsiderBot, MAX_FOLLOW_WALLETS } from "./insider-bot";
 import type { InsiderBuyTrigger, InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
 import { PumpReserveMarketCapClient } from "./pump-reserve-market-cap";
@@ -607,16 +607,12 @@ async function main(): Promise<void> {
     return null;
   }
 
-  async function applyDeferredInsiderBuyEntryMc(
+  async function captureInsiderBuyEntryMcAtSubmit(
     botIndex: number,
     bot: InsiderBot,
     trigger: InsiderBuyTrigger,
-    buyInitiatedAtMs: number,
   ): Promise<number | null> {
     const botNumber = getInsiderBotNumber(botIndex);
-    const remaining =
-      INSIDER_BUY_ENTRY_MC_DELAY_MS - (Date.now() - buyInitiatedAtMs);
-    if (remaining > 0) await sleep(remaining);
     const fetched = await fetchInsiderMarketCapUsd(botIndex, trigger.mint);
     const entryMc = fetched?.marketCap ?? null;
     if (entryMc === null) return null;
@@ -1611,14 +1607,24 @@ async function main(): Promise<void> {
 
       void (async () => {
         const tradersListStr = trigger.tradersListStr || "";
-        const buyInitiatedAtMs = Date.now();
+        let entryMcAtSubmit: number | null = null;
+
+        if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
+          log.warn(
+            `[INSIDER ${botNumber} BUY SKIP] Dev token-out blocked mint before submit`,
+            trigger,
+          );
+          bot.resetBuyAttempt();
+          return;
+        }
+
         void telegramBot
           ?.sendDefault(
             [
               `<b>🚀 Insider ${botNumber} Buy Executing</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
               `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
-              `Entry MC: <i>snapshot ~1s after submit</i>`,
+              `Entry MC: <i>snapshot at PumpPortal submit</i>`,
               trigger.profitExitPercent !== undefined
                 ? `Exit target: <b>+${trigger.profitExitPercent}%</b> from entry MC`
                 : trigger.fixedExitMc !== undefined
@@ -1642,30 +1648,58 @@ async function main(): Promise<void> {
         try {
           bot.setBuyExecuting(true);
 
-          const [result, deferredEntryMc] = await Promise.all([
-            client.buyTokenWithSol(
-              config.tradingWalletAddress!,
-              trigger.mint,
-              {
-                solAmount: trigger.buySol,
-                slippage: config.sellSlippage,
-                autoSlippage: config.sellAutoSlippage,
-                priorityFeeSol: config.sellPriorityFeeSol,
-              },
-            ),
-            applyDeferredInsiderBuyEntryMc(
-              index,
-              bot,
+          if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
+            log.warn(
+              `[INSIDER ${botNumber} BUY SKIP] Dev token-out blocked mint at submit gate`,
               trigger,
-              buyInitiatedAtMs,
-            ),
-          ]);
+            );
+            bot.resetBuyAttempt();
+            return;
+          }
 
-          const resolvedEntryMc = deferredEntryMc ?? trigger.entryMc ?? null;
+          const result = await client.buyTokenWithSol(
+            config.tradingWalletAddress!,
+            trigger.mint,
+            {
+              solAmount: trigger.buySol,
+              slippage: config.sellSlippage,
+              autoSlippage: config.sellAutoSlippage,
+              priorityFeeSol: config.sellPriorityFeeSol,
+              onSubmitted: async () => {
+                entryMcAtSubmit = await captureInsiderBuyEntryMcAtSubmit(
+                  index,
+                  bot,
+                  trigger,
+                );
+              },
+            },
+          );
+
+          const resolvedEntryMc = entryMcAtSubmit ?? trigger.entryMc ?? null;
           const completedTrigger: InsiderBuyTrigger = {
             ...trigger,
             entryMc: resolvedEntryMc ?? undefined,
           };
+
+          if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
+            log.warn(
+              `[INSIDER ${botNumber} BUY ABORT] Dev token-out blocked mint after submit — selling immediately`,
+              {
+                mint: trigger.mint,
+                hash: result.hash,
+              },
+            );
+            bot.markPositionBought(completedTrigger);
+            if (config.tradingWalletAddress) {
+              db.addSeenMint(config.tradingWalletAddress, trigger.mint);
+            }
+            bot.triggerDevTokenOutRecoverySell(
+              trigger.mint,
+              result.hash ?? trigger.signature,
+            );
+            bot.setBuyExecuting(false);
+            return;
+          }
 
           bot.markPositionBought(completedTrigger);
           // ── Persist to DB so this mint is skipped on restart ─────────────
@@ -1759,6 +1793,22 @@ async function main(): Promise<void> {
                 );
                 reconcileCallCount++;
                 if (state.tokenBalance > 0n) {
+                  if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
+                    log.warn(
+                      `[INSIDER ${botNumber} BUY ABORT] Dev token-out blocked mint on balance reconcile — selling immediately`,
+                      {
+                        mint: trigger.mint,
+                        signature: submittedSignature,
+                      },
+                    );
+                    bot.markPositionBought(trigger);
+                    db.addSeenMint(config.tradingWalletAddress!, trigger.mint);
+                    bot.triggerDevTokenOutRecoverySell(
+                      trigger.mint,
+                      submittedSignature,
+                    );
+                    return;
+                  }
                   bot.markPositionBought(trigger);
                   db.addSeenMint(config.tradingWalletAddress!, trigger.mint);
                   log.warn(

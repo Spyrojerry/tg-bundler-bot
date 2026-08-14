@@ -1,11 +1,25 @@
 # Changelog
 
+## 2026-08-14 (194)
+
+### Entry MC at PumpPortal submit (not +1s)
+
+- **Entry MC** is now fetched immediately when PumpPortal Lightning returns the buy signature (`BuyOptions.onSubmitted`), same MC path (PumpSwap vault reserves → Helius DAS). Removed `INSIDER_BUY_ENTRY_MC_DELAY_MS` / parallel +1s deferred snapshot.
+
+## 2026-08-14 (193)
+
+### Dev wallet token-out: 3m post-buy watch + buy race abort
+
+- Dev **transfer-out / sell** watch continues for **3 minutes after buy submit** (not just pre-buy). Post-buy hit → **sell 100%** (`dev_wallet_token_out_after_buy` path); pre-buy / in-flight → **skip + reset** (`dev_wallet_token_out_before_buy`).
+- **Race fix:** mint is added to a blocked set on dev token-out; `index.ts` re-checks before swap submit and after swap before `markPositionBought`. If swap already landed, **immediate recovery sell** via `triggerDevTokenOutRecoverySell`.
+- Re-check `isBuyBlockedByDevTokenOut(mint)` after async MC gates in LI buy emit; pre-buy Telegram now **awaits** before reset (dev-out alert before reset message).
+
 ## 2026-08-14 (192)
 
 ### Pre-buy dev wallet token-out gate + deferred entry MC snapshot
 
-- From token flow start, dev wallet is monitored for **any token transfer-out or sell** on the mint before bot buy → **skip + reset** (`dev_wallet_token_out_before_buy`). After buy submits, pre-buy token-out checks stop (full-exit rug watch unchanged).
-- **Entry MC** is now captured **1s after buy submit** (`INSIDER_BUY_ENTRY_MC_DELAY_MS`) via the same path as the 1s MC checker — **PumpSwap vault reserves** first, then **Helius DAS** (`[INSIDER N ENTRY MC]` log); **exit MC** derived from that snapshot (percent-based) or fixed exit MC when configured.
+- From token flow start, dev wallet is monitored for **any token transfer-out or sell** on the mint → **skip + reset** before buy (`dev_wallet_token_out_before_buy`); **3m post-buy** watch and race abort added in (193). Full-exit rug watch unchanged.
+- **Entry MC** captured at PumpPortal submit — see (194). Same MC path: **PumpSwap vault reserves** first, then **Helius DAS** (`[INSIDER N ENTRY MC]` log); **exit MC** derived from that snapshot (percent-based) or fixed exit MC when configured.
 
 ## 2026-08-14 (191)
 

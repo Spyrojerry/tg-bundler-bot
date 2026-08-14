@@ -105,8 +105,8 @@ const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL = 10;
 /** First token buy on a scrape wallet must exceed this USD to count as a valid Large Insider wallet. */
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD = 110;
-/** Entry MC snapshot delay after buy submit — reflects MC when the swap lands. */
-export const INSIDER_BUY_ENTRY_MC_DELAY_MS = 1_000;
+/** Keep dev transfer-out/sell watch active this long after buy submit. */
+const DEV_WALLET_TOKEN_OUT_POST_BUY_WATCH_MS = 3 * 60 * 1_000;
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON =
   "follow_token_large_insider_valid_wallet";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT = 100;
@@ -484,6 +484,8 @@ export interface InsiderBot {
   resumeFollowWalletMonitoring(): Promise<void>;
   isBuyInProgress(): boolean;
   setBuyExecuting(executing: boolean): void;
+  isDevTokenOutBuyBlocked(mint: string): boolean;
+  triggerDevTokenOutRecoverySell(mint: string, signature: string): void;
   resetBuyAttempt(): void;
   seedSeenMints(mints: Set<string>): void;
   followWallet(address: string): Promise<void>;
@@ -700,8 +702,14 @@ export class InsiderBot extends EventEmitter {
   private devCreateTimestamp: number | null = null;
   /** Set once a dev full-exit CLOSE_ACCOUNT tx has been acted on for the current token, so we don't re-trigger the reset/sell on the next poll tick. */
   private devFullExitHandled = false;
-  /** Set when dev sends token out (transfer or sell) before bot buy — blocks buy and resets flow. */
-  private devPreBuyTokenOutHandled = false;
+  /** Set when dev token-out is acted on for the current flow (pre-buy reset or post-buy sell). */
+  private devTokenOutHandled = false;
+  /** Mints blocked from buy completion after dev token-out (race recovery). */
+  private devTokenOutBlockedMints = new Set<string>();
+  /** Post-buy dev token-out watch expires at this timestamp (ms). */
+  private devTokenOutWatchUntilMs: number | null = null;
+  private devTokenOutPostBuyWatchTimer: ReturnType<typeof setTimeout> | null =
+    null;
   /** Highest market cap observed for the current token across all pre-buy MC fetches — used to skip normal-mode buys that would already be past their own exit target. */
   private highestObservedMarketCapUsd: number | null = null;
   private preBuyStopped = false;
@@ -3147,7 +3155,7 @@ export class InsiderBot extends EventEmitter {
       this.buyDisabled ||
       this.isBuyExecuting ||
       this.isBuyGateEvaluating ||
-      this.isBuyBlockedByDevPreBuyTokenOut()
+      this.isBuyBlockedByDevTokenOut(state.mint)
     ) {
       return;
     }
@@ -3216,9 +3224,13 @@ export class InsiderBot extends EventEmitter {
       ) {
         this.disableProfitExitAfterBuy = true;
       }
+      if (this.isBuyBlockedByDevTokenOut(state.mint)) {
+        return;
+      }
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
+      this.armDevTokenOutPostBuyWatch(state.mint);
       if (
         ebState?.active &&
         options.triggerSource === "bundler_sold_all" &&
@@ -3710,6 +3722,25 @@ export class InsiderBot extends EventEmitter {
 
   setBuyExecuting(executing: boolean): void {
     this.isBuyExecuting = executing;
+  }
+
+  isDevTokenOutBuyBlocked(mint: string): boolean {
+    return this.devTokenOutBlockedMints.has(mint);
+  }
+
+  triggerDevTokenOutRecoverySell(mint: string, signature: string): void {
+    void this.triggerPositionSell(
+      mint,
+      "Dev wallet moved tokens before buy completed (race) — immediate 100% exit",
+      [
+        `<b>⛔ ${this.label} Dev Token-Out Race Recovery — Selling 100%</b>`,
+        `Token: <code>${mint}</code>`,
+        `Tx: <code>${signature}</code>`,
+        "",
+        "Buy landed after dev token-out reset — dumping position immediately.",
+      ],
+      signature,
+    );
   }
 
   resetBuyAttempt(): void {
@@ -8846,8 +8877,60 @@ export class InsiderBot extends EventEmitter {
     return sorted[0] ?? null;
   }
 
-  private isBuyBlockedByDevPreBuyTokenOut(): boolean {
-    return this.devPreBuyTokenOutHandled;
+  private isBuyBlockedByDevTokenOut(mint?: string | null): boolean {
+    if (this.devTokenOutHandled) return true;
+    if (mint && this.devTokenOutBlockedMints.has(mint)) return true;
+    return false;
+  }
+
+  private getDevTokenOutFlowMint(): string | null {
+    return (
+      this.watchingMint ??
+      this.activePosition?.mint ??
+      this.followTokenTopBuyerMint ??
+      this.bundlerFunderWatch?.mint ??
+      null
+    );
+  }
+
+  private isDevWalletTokenOutWatchActive(mint: string): boolean {
+    if (!this.devWallet || this.devTokenOutHandled) return false;
+    if (this.activePosition?.mint === mint) {
+      return (
+        this.devTokenOutWatchUntilMs !== null &&
+        Date.now() <= this.devTokenOutWatchUntilMs
+      );
+    }
+    if (this.watchingMint === mint && !this.activePosition) return true;
+    if (
+      this.buySubmitted &&
+      !this.activePosition &&
+      this.getDevTokenOutFlowMint() === mint
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  private armDevTokenOutPostBuyWatch(mint: string): void {
+    this.clearDevTokenOutPostBuyWatchTimer();
+    this.devTokenOutWatchUntilMs =
+      Date.now() + DEV_WALLET_TOKEN_OUT_POST_BUY_WATCH_MS;
+    this.devTokenOutPostBuyWatchTimer = setTimeout(() => {
+      this.devTokenOutPostBuyWatchTimer = null;
+      this.devTokenOutWatchUntilMs = null;
+      this.log.info("Dev wallet token-out post-buy watch expired", {
+        mint,
+        watchMs: DEV_WALLET_TOKEN_OUT_POST_BUY_WATCH_MS,
+      });
+    }, DEV_WALLET_TOKEN_OUT_POST_BUY_WATCH_MS);
+  }
+
+  private clearDevTokenOutPostBuyWatchTimer(): void {
+    if (this.devTokenOutPostBuyWatchTimer !== null) {
+      clearTimeout(this.devTokenOutPostBuyWatchTimer);
+      this.devTokenOutPostBuyWatchTimer = null;
+    }
   }
 
   private isDevWalletPreBuyTokenOutTx(tx: HeliusTransaction, mint: string): boolean {
@@ -8863,28 +8946,21 @@ export class InsiderBot extends EventEmitter {
     return kind === "transfer_out" || kind === "sell";
   }
 
-  private async evaluateDevWalletPreBuyTokenOutTx(
+  private async evaluateDevWalletTokenOutTx(
     tx: HeliusTransaction,
   ): Promise<void> {
-    if (
-      !this.devWallet ||
-      this.devPreBuyTokenOutHandled ||
-      this.buySubmitted ||
-      this.activePosition
-    ) {
-      return;
-    }
-    const mint = this.watchingMint;
-    if (!mint || !this.isDevWalletPreBuyTokenOutTx(tx, mint)) return;
-    await this.handleDevWalletPreBuyTokenOut(mint, tx);
+    if (!this.devWallet || this.devTokenOutHandled) return;
+    const mint = this.getDevTokenOutFlowMint();
+    if (!mint || !this.isDevWalletTokenOutWatchActive(mint)) return;
+    if (!this.isDevWalletPreBuyTokenOutTx(tx, mint)) return;
+    await this.handleDevWalletTokenOut(mint, tx);
   }
 
-  private async syncDevWalletPreBuyTokenOutHistory(mint: string): Promise<void> {
+  private async syncDevWalletTokenOutHistory(mint: string): Promise<void> {
     if (
       !this.devWallet ||
-      this.devPreBuyTokenOutHandled ||
-      this.buySubmitted ||
-      this.activePosition
+      this.devTokenOutHandled ||
+      !this.isDevWalletTokenOutWatchActive(mint)
     ) {
       return;
     }
@@ -8896,11 +8972,11 @@ export class InsiderBot extends EventEmitter {
         if (this.devFullExitSeenSignatures.has(tx.signature)) continue;
         if (!this.isDevWalletPreBuyTokenOutTx(tx, mint)) continue;
         this.devFullExitSeenSignatures.add(tx.signature);
-        await this.handleDevWalletPreBuyTokenOut(mint, tx);
+        await this.handleDevWalletTokenOut(mint, tx);
         return;
       }
     } catch (err) {
-      this.log.warn("Dev wallet pre-buy token-out history sync failed", {
+      this.log.warn("Dev wallet token-out history sync failed", {
         mint,
         devWallet: this.devWallet,
         error: err instanceof Error ? err.message : String(err),
@@ -8908,26 +8984,49 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async handleDevWalletPreBuyTokenOut(
+  private async handleDevWalletTokenOut(
     mint: string,
     tx: HeliusTransaction,
   ): Promise<void> {
-    if (
-      this.devPreBuyTokenOutHandled ||
-      this.buySubmitted ||
-      this.activePosition
-    ) {
+    if (this.devTokenOutHandled || !this.isDevWalletTokenOutWatchActive(mint)) {
       return;
     }
-    this.devPreBuyTokenOutHandled = true;
+    this.devTokenOutHandled = true;
+    this.devTokenOutBlockedMints.add(mint);
     const kind = this.classifyTx(tx, this.devWallet!, mint);
+    const hasPosition = !!this.activePosition;
+
+    if (hasPosition) {
+      this.log.warn("Dev wallet token out after buy — selling 100%", {
+        mint,
+        devWallet: this.devWallet,
+        signature: tx.signature,
+        kind,
+      });
+      await this.triggerPositionSell(
+        mint,
+        `Dev wallet ${this.devWallet} ${kind ?? "token_out"} within 3m post-buy`,
+        [
+          `<b>⛔ ${this.label} Dev Wallet Token Out After Buy — Selling 100%</b>`,
+          `Token: <code>${mint}</code>`,
+          `Dev: <code>${this.devWallet}</code>`,
+          `Tx: <code>${tx.signature}</code>`,
+          `Action: <b>${kind ?? "token_out"}</b>`,
+          "",
+          "Dev moved tokens within 3 minutes of buy — selling 100%.",
+        ],
+        tx.signature,
+      );
+      return;
+    }
+
     this.log.warn("Dev wallet token out before buy — skipping token", {
       mint,
       devWallet: this.devWallet,
       signature: tx.signature,
       kind,
     });
-    void this.sendTelegramSafe(
+    await this.sendTelegramSafe(
       [
         `<b>⛔ ${this.label} Dev Wallet Token Out Before Buy</b>`,
         `Token: <code>${mint}</code>`,
@@ -8972,7 +9071,7 @@ export class InsiderBot extends EventEmitter {
       this.devFullExitEnhancedWatchId = this.enhancedWs.watch(this.devWallet, (tx) => {
         if (this.devFullExitSeenSignatures.has(tx.signature)) return;
         this.devFullExitSeenSignatures.add(tx.signature);
-        void this.evaluateDevWalletPreBuyTokenOutTx(tx);
+        void this.evaluateDevWalletTokenOutTx(tx);
         void this.evaluateDevWalletFullExitTx(tx);
       });
       this.log.info("Subscribed to dev wallet for full-exit (CLOSE_ACCOUNT) detection via Enhanced WSS", {
@@ -9011,7 +9110,7 @@ export class InsiderBot extends EventEmitter {
     void this.checkDevWalletZeroBalanceImmediate();
     const mint = this.watchingMint;
     if (mint) {
-      void this.syncDevWalletPreBuyTokenOutHistory(mint);
+      void this.syncDevWalletTokenOutHistory(mint);
     }
   }
 
@@ -9098,8 +9197,8 @@ export class InsiderBot extends EventEmitter {
       );
       const tx = txs.find((t) => t.signature === signature);
       if (!tx) return;
-      await this.evaluateDevWalletPreBuyTokenOutTx(tx);
-      if (this.devPreBuyTokenOutHandled) return;
+      await this.evaluateDevWalletTokenOutTx(tx);
+      if (this.devTokenOutHandled) return;
       if (!isDevRugCloseAccountTx(tx, this.devWallet)) return;
       if (
         this.devCreateTimestamp !== null &&
@@ -11493,7 +11592,7 @@ export class InsiderBot extends EventEmitter {
       this.buyDisabled ||
       this.isBuyExecuting ||
       this.isBuyGateEvaluating ||
-      this.isBuyBlockedByDevPreBuyTokenOut()
+      this.isBuyBlockedByDevTokenOut(state.mint)
     ) {
       return;
     }
@@ -11524,9 +11623,14 @@ export class InsiderBot extends EventEmitter {
         return;
       }
 
+      if (this.isBuyBlockedByDevTokenOut(state.mint)) {
+        return;
+      }
+
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
+      this.armDevTokenOutPostBuyWatch(state.mint);
       this.emit("buyTrigger", {
         followedWallet: this.getFlowFollowWallet()!,
         mint: state.mint,
@@ -11570,7 +11674,7 @@ export class InsiderBot extends EventEmitter {
       this.buyDisabled ||
       this.isBuyExecuting ||
       this.isBuyGateEvaluating ||
-      this.isBuyBlockedByDevPreBuyTokenOut()
+      this.isBuyBlockedByDevTokenOut(state.mint)
     ) {
       return;
     }
@@ -11616,9 +11720,13 @@ export class InsiderBot extends EventEmitter {
       const exitPercent =
         exitOptions.exitPercent ??
         (exitOptions.fixedExitMc === undefined ? this.exitPercent : undefined);
+      if (this.isBuyBlockedByDevTokenOut(state.mint)) {
+        return;
+      }
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
+      this.armDevTokenOutPostBuyWatch(state.mint);
       this.disableProfitExitAfterBuy = exitOptions.disableProfitExit ?? true;
       this.emit("buyTrigger", {
         followedWallet: this.getFlowFollowWallet()!,
@@ -11664,7 +11772,7 @@ export class InsiderBot extends EventEmitter {
       this.buyDisabled ||
       this.isBuyExecuting ||
       this.isBuyGateEvaluating ||
-      this.isBuyBlockedByDevPreBuyTokenOut()
+      this.isBuyBlockedByDevTokenOut(state.mint)
     ) {
       return;
     }
@@ -11723,9 +11831,13 @@ export class InsiderBot extends EventEmitter {
         );
         return;
       }
+      if (this.isBuyBlockedByDevTokenOut(state.mint)) {
+        return;
+      }
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
+      this.armDevTokenOutPostBuyWatch(state.mint);
       this.disableProfitExitAfterBuy = watch.normalTinyTransferMode
         ? false
         : disableProfitExitAfterBuy;
@@ -12767,6 +12879,8 @@ export class InsiderBot extends EventEmitter {
 
   private async stopFlowMonitoring(): Promise<void> {
     this.stopPollLoop();
+    this.clearDevTokenOutPostBuyWatchTimer();
+    this.devTokenOutWatchUntilMs = null;
     await this.stopPreBuyMonitoring();
     await this.stopInsiderMonitoring();
     await this.stopBundlerMonitoring();
@@ -13242,7 +13356,9 @@ export class InsiderBot extends EventEmitter {
     this.devCreateSignature = null;
     this.devCreateTimestamp = null;
     this.devFullExitHandled = false;
-    this.devPreBuyTokenOutHandled = false;
+    this.devTokenOutHandled = false;
+    this.clearDevTokenOutPostBuyWatchTimer();
+    this.devTokenOutWatchUntilMs = null;
     this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
     this.preBuyStopped = false;
@@ -13343,7 +13459,9 @@ export class InsiderBot extends EventEmitter {
     this.devCreateSignature = null;
     this.devCreateTimestamp = null;
     this.devFullExitHandled = false;
-    this.devPreBuyTokenOutHandled = false;
+    this.devTokenOutHandled = false;
+    this.clearDevTokenOutPostBuyWatchTimer();
+    this.devTokenOutWatchUntilMs = null;
     this.devFullExitSeenSignatures.clear();
     this.highestObservedMarketCapUsd = null;
     this.preBuyStopped = false;
