@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-08-14 (190)
+
+### Follow-token: rename internal 15M identifiers → 16M
+
+- Tier type `fallback_15m` → `fallback_16m`; ATH gate constants `FOLLOW_TOKEN_15M_*` → `FOLLOW_TOKEN_16M_*`.
+- Env/config: `INSIDER_FOLLOW_TOKEN_15M_POST_LI_BUY_SOL` → `INSIDER_FOLLOW_TOKEN_16M_POST_LI_BUY_SOL`.
+- Reset/skip reasons: `large_insider_bundler_15m_fallback_pre_li_skip` → `large_insider_bundler_16m_fallback_pre_li_skip`; `large_insider_15m_fallback_ath_mc_skip` → `large_insider_16m_fallback_ath_mc_skip`.
+- Telegram callback `insider:15mfallbackbuysol` → `insider:16mfallbackbuysol`.
+
+## 2026-08-14 (189)
+
+### Follow-token: remove unused pre-LI 16M fallback buy SOL
+
+- Dropped `INSIDER_FOLLOW_TOKEN_15M_PRE_LI_BUY_SOL` / `followToken15mPreLiBuySol` — pre-LI 16M tier is **skip+reset only** (no buy). Post-LI 16M fallback still uses `INSIDER_FOLLOW_TOKEN_15M_POST_LI_BUY_SOL`; Telegram **16M Fallback Buy SOL** now overrides that single value.
+
+## 2026-08-14 (188)
+
+### Telegram: 16M fallback buy SOL setting; remove low-funding buy SOL
+
+- Added **16M Fallback Buy SOL** button — runtime override for `INSIDER_FOLLOW_TOKEN_15M_PRE_LI_BUY_SOL` and `INSIDER_FOLLOW_TOKEN_15M_POST_LI_BUY_SOL` (sets both to the same value).
+- Removed **Low-Funding Buy SOL** button (low-funding mode disabled).
+- Default Buy SOL line notes it is display-only; actual buys use **Normal Buy SOL** or **16M fallback** amounts.
+
+## 2026-08-14 (187)
+
+### Follow-token: remove pre-buy reset when last scrape watch drains
+
+- Removed `large_insider_no_scrape_wallets_after_watch_removed` — zero-balance scrape watch removal no longer resets the flow. Pre-buy Large Insider now ends only on the **20m feePayer window** closing before 4 valid wallets (or other existing exit points: qualified-SOL gate fail, rug/dev reset, post-buy exits).
+
 ## 2026-08-13 (186)
 
 ### Follow-token: valid LI wallet first-buy minimum $100 → $110

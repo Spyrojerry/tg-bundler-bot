@@ -119,14 +119,14 @@ const FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT = 8_000_000
 /** Fallback when standard 8M gate fails: max single sell ≤ this → buy with reduced MC TP + dedicated buy SOL. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_MAX_SINGLE_SELL_TOKEN_AMOUNT = 16_000_000;
 const FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT = 40;
-/** Post-LI 15M fallback buy: skip when token ATH MC (GMGN fetch at buy) ≥ this multiple of calculated exit MC. */
-const FOLLOW_TOKEN_15M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER = 2;
-const FOLLOW_TOKEN_15M_FALLBACK_ATH_MC_FETCH_RETRIES = 3;
-const FOLLOW_TOKEN_15M_FALLBACK_ATH_MC_FETCH_RETRY_DELAY_MS = 500;
-/** Post-LI bundler sold-all buy (8M standard or 15M fallback): ≥1 present valid LI wallet must have Qualified SOL below this. */
+/** Post-LI 16M fallback buy: skip when token ATH MC (GMGN fetch at buy) ≥ this multiple of calculated exit MC. */
+const FOLLOW_TOKEN_16M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER = 2;
+const FOLLOW_TOKEN_16M_FALLBACK_ATH_MC_FETCH_RETRIES = 3;
+const FOLLOW_TOKEN_16M_FALLBACK_ATH_MC_FETCH_RETRY_DELAY_MS = 500;
+/** Post-LI bundler sold-all buy (8M standard or 16M fallback): ≥1 present valid LI wallet must have Qualified SOL below this. */
 const FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW = 25;
 
-type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_15m" | "fail";
+type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
 /** Defer sold-all exit eval when ATA hits zero before the sell tx is processed. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_ATA_SOLD_ALL_EVAL_DEFER_MS = 1000;
@@ -165,7 +165,7 @@ interface FollowTokenEarlyBundlerExitState {
   preLiBundlerSoldAllBuyBlockedNotified: boolean;
   postLiBundlerSoldAllBuyBlockedNotified: boolean;
   validWalletTwentyFivePercentDeferred: boolean;
-  /** Set when bundler sold-all buy fires — used for LI ≥25% exit logging (8M standard vs 15M fallback). */
+  /** Set when bundler sold-all buy fires — used for LI ≥25% exit logging (8M standard vs 16M fallback). */
   maxSingleSellGateTierAtBuy: FollowTokenMaxSingleSellGateTier | null;
   exitTriggerSignature: string | null;
   enhancedWatchIds: Map<string, number>;
@@ -657,8 +657,7 @@ export class InsiderBot extends EventEmitter {
   private buySol: number;
   private normalFundingBuySol: number;
   private lowFundingBuySol: number;
-  private followToken15mPreLiBuySol: number;
-  private followToken15mPostLiBuySol: number;
+  private followToken16mPostLiBuySol: number;
   private entryMc: number;
   private exitMc: number;
   private exitPercent: number;
@@ -881,8 +880,7 @@ export class InsiderBot extends EventEmitter {
     this.buySol = config.insiderBuySol;
     this.normalFundingBuySol = config.insiderNormalBuySol;
     this.lowFundingBuySol = config.insiderLowFundingBuySol;
-    this.followToken15mPreLiBuySol = config.insiderFollowToken15mPreLiBuySol;
-    this.followToken15mPostLiBuySol = config.insiderFollowToken15mPostLiBuySol;
+    this.followToken16mPostLiBuySol = config.insiderFollowToken16mPostLiBuySol;
     this.entryMc = config.insiderEntryMc;
     this.exitMc = config.insiderExitMc;
     this.exitPercent = config.insiderExitPercent;
@@ -982,6 +980,15 @@ export class InsiderBot extends EventEmitter {
 
   getLowFundingBuySol() {
     return this.lowFundingBuySol;
+  }
+
+  setFollowToken16mFallbackBuySol(value: number): void {
+    this.assertBuySol(value, "Insider 16M fallback buy SOL");
+    this.followToken16mPostLiBuySol = value;
+  }
+
+  getFollowToken16mPostLiBuySol(): number {
+    return this.followToken16mPostLiBuySol;
   }
 
   private getBuySolForFundingMode(lowFundingMode: boolean): number {
@@ -1507,9 +1514,7 @@ export class InsiderBot extends EventEmitter {
     const delayMs = Math.max(0, (li.feePayerWindowEndsAt - nowSec) * 1_000);
     this.followTokenLargeInsiderWindowTimer = setTimeout(() => {
       this.followTokenLargeInsiderWindowTimer = null;
-      void this.maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
-        "large_insider_feePayer_window_closed_no_monitored_wallets",
-      );
+      void this.maybeResetFollowTokenLargeInsiderWindowClosedBeforeBuy();
     }, delayMs);
   }
 
@@ -1519,9 +1524,7 @@ export class InsiderBot extends EventEmitter {
     return Math.floor(Date.now() / 1000) > li.feePayerWindowEndsAt;
   }
 
-  private async maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
-    reason: string,
-  ): Promise<void> {
+  private async maybeResetFollowTokenLargeInsiderWindowClosedBeforeBuy(): Promise<void> {
     const li = this.followTokenLargeInsiderState;
     if (!li?.active || this.flowSource !== "follow-token") return;
     if (this.buySubmitted || this.activePosition) return;
@@ -1531,29 +1534,21 @@ export class InsiderBot extends EventEmitter {
     ) {
       return;
     }
+    if (!this.isFollowTokenLargeInsiderFeePayerWindowClosed()) return;
 
-    const windowClosed = this.isFollowTokenLargeInsiderFeePayerWindowClosed();
-    const noScrapeWatches = li.scrapeWatches.size === 0;
-    if (!windowClosed && !noScrapeWatches) return;
-
+    const resetReason = "large_insider_window_closed_before_fourth_valid_wallet";
     this.followTokenLargeInsiderLog(
-      windowClosed
-        ? "feePayer window closed before 4 valid wallets — resetting follow-token flow"
-        : "no scrape wallets left before 4 valid wallets — resetting follow-token flow",
+      "feePayer window closed before 4 valid wallets — resetting follow-token flow",
       {
         mint: li.mint,
-        reason,
+        reason: resetReason,
         validWalletCount: li.validWallets.length,
         bundlerFirstBuyAnchorTimestamp: li.bundlerFirstBuyAnchorTimestamp,
         feePayerWindowEndsAt: li.feePayerWindowEndsAt,
       },
     );
-    await this.stopFollowTokenLargeInsiderFlow(reason);
-    await this.resetForNewToken(false, {
-      reason: windowClosed
-        ? "large_insider_window_closed_before_fourth_valid_wallet"
-        : reason,
-    });
+    await this.stopFollowTokenLargeInsiderFlow(resetReason);
+    await this.resetForNewToken(false, { reason: resetReason });
   }
 
   private passesFollowTokenLargeInsiderFirstFourQualifiedSolBuyGate(): boolean {
@@ -2074,9 +2069,7 @@ export class InsiderBot extends EventEmitter {
       return;
     }
     if (tx.timestamp > li.feePayerWindowEndsAt) {
-      void this.maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
-        "large_insider_feePayer_window_closed_no_monitored_wallets",
-      );
+      void this.maybeResetFollowTokenLargeInsiderWindowClosedBeforeBuy();
       return;
     }
     if (transferOut.amountSol < FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL) {
@@ -2418,9 +2411,6 @@ export class InsiderBot extends EventEmitter {
       },
     );
     this.unsubscribeFollowTokenLargeInsiderScrapeWallet(wallet);
-    void this.maybeResetFollowTokenLargeInsiderNoMonitoredWallets(
-      "large_insider_no_scrape_wallets_after_watch_removed",
-    );
   }
 
   private async applyFollowTokenLargeInsiderScrapeNotificationTx(
@@ -2706,7 +2696,7 @@ export class InsiderBot extends EventEmitter {
 
     const activeMcTpPercent = this.getFollowTokenActiveProfitExitPercent();
     const gateTierNote =
-      ebState?.maxSingleSellGateTierAtBuy === "fallback_15m"
+      ebState?.maxSingleSellGateTierAtBuy === "fallback_16m"
         ? " (16M max-single-sell fallback buy — +40% MC TP tier)"
         : "";
     const exitDetail = ebState?.highSellUsdMode
@@ -2855,7 +2845,7 @@ export class InsiderBot extends EventEmitter {
       this.noFollowTokenEarlyBundlerExitWatchExceedsLowSellUsd();
 
     if (highSellUsd) {
-      if (state?.maxSingleSellGateTierAtBuy === "fallback_15m") {
+      if (state?.maxSingleSellGateTierAtBuy === "fallback_16m") {
         if (state) state.highSellUsdMode = false;
         this.profitExitDisabled = false;
         this.disableProfitExitAfterBuy = false;
@@ -3087,7 +3077,7 @@ export class InsiderBot extends EventEmitter {
       preLiPhase?: boolean;
       profitExitPercent?: number;
       buySolOverride?: number;
-      maxSingleSellGateTier?: "standard_8m" | "fallback_15m";
+      maxSingleSellGateTier?: "standard_8m" | "fallback_16m";
     } = {},
   ): Promise<void> {
     if (
@@ -3125,26 +3115,26 @@ export class InsiderBot extends EventEmitter {
       this.profitExitDisabled = false;
       const profitExitPercent =
         options.profitExitPercent ?? FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT;
-      if (options.maxSingleSellGateTier === "fallback_15m") {
+      if (options.maxSingleSellGateTier === "fallback_16m") {
         const exitMc = currentMc * (1 + profitExitPercent / 100);
         const athSkipThreshold =
-          exitMc * FOLLOW_TOKEN_15M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER;
-        const tokenAthMc = await this.fetchTokenAthMarketCapUsdFor15mFallbackGate(
+          exitMc * FOLLOW_TOKEN_16M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER;
+        const tokenAthMc = await this.fetchTokenAthMarketCapUsdFor16mFallbackGate(
           state.mint,
         );
         if (tokenAthMc === null) {
           this.log.warn(
-            "15M fallback buy — token ATH MC unavailable after retries; ATH gate skipped",
+            "16M fallback buy — token ATH MC unavailable after retries; ATH gate skipped",
             {
               mint: state.mint,
               entryMc: currentMc,
               exitMc,
               athSkipThreshold,
-              fetchAttempts: 1 + FOLLOW_TOKEN_15M_FALLBACK_ATH_MC_FETCH_RETRIES,
+              fetchAttempts: 1 + FOLLOW_TOKEN_16M_FALLBACK_ATH_MC_FETCH_RETRIES,
             },
           );
         } else if (tokenAthMc >= athSkipThreshold) {
-          await this.skipFollowTokenLargeInsiderFrom15mFallbackAthMcGate(
+          await this.skipFollowTokenLargeInsiderFrom16mFallbackAthMcGate(
             state.mint,
             currentMc,
             exitMc,
@@ -3159,7 +3149,7 @@ export class InsiderBot extends EventEmitter {
         options.triggerSource === "bundler_sold_all" &&
         ebState?.highSellUsdMode &&
         !options.preLiPhase &&
-        options.maxSingleSellGateTier !== "fallback_15m"
+        options.maxSingleSellGateTier !== "fallback_16m"
       ) {
         this.disableProfitExitAfterBuy = true;
       }
@@ -3187,7 +3177,7 @@ export class InsiderBot extends EventEmitter {
       const triggerSource = options.triggerSource ?? "valid_wallet_4";
       const bundlerBranch = options.bundlerExitBranch;
       const gateTierLine =
-        options.maxSingleSellGateTier === "fallback_15m"
+        options.maxSingleSellGateTier === "fallback_16m"
           ? `Max-single-sell gate: <b>16M fallback</b> (failed 8M · ≤16M).`
           : "";
       const buySol =
@@ -3195,11 +3185,11 @@ export class InsiderBot extends EventEmitter {
         this.getBuySolForFundingMode(state.lowFundingMode);
       const buyTitle =
         options.preLiPhase
-          ? options.maxSingleSellGateTier === "fallback_15m"
+          ? options.maxSingleSellGateTier === "fallback_16m"
             ? `<b>🟢 ${this.label} Follow-Token Buy (Pre-LI Bundler Sold-All · 16M Fallback)</b>`
             : `<b>🟢 ${this.label} Follow-Token Buy (Pre-LI Bundler Sold-All)</b>`
           : triggerSource === "bundler_sold_all"
-            ? options.maxSingleSellGateTier === "fallback_15m"
+            ? options.maxSingleSellGateTier === "fallback_16m"
               ? `<b>🟢 ${this.label} Follow-Token Large Insider Buy (Bundler Sold-All · 16M Fallback)</b>`
               : `<b>🟢 ${this.label} Follow-Token Large Insider Buy (Bundler Sold-All)</b>`
             : `<b>🟢 ${this.label} Follow-Token Large Insider Buy</b>`;
@@ -3212,7 +3202,7 @@ export class InsiderBot extends EventEmitter {
       const postBuyExitLine =
         options.preLiPhase
           ? `Post-buy: +${profitExitPercent}% MC TP only (until valid LI wallets join ≥25% pool).`
-          : options.maxSingleSellGateTier === "fallback_15m"
+          : options.maxSingleSellGateTier === "fallback_16m"
             ? `Post-buy: +${profitExitPercent}% MC TP or valid LI ≥25%.`
           : bundlerBranch === "high_usd_li_only"
           ? `Post-buy: +${profitExitPercent}% MC TP disabled; valid LI ≥25% only.`
@@ -5116,7 +5106,7 @@ export class InsiderBot extends EventEmitter {
         activeFunderWatch.lowFundingMode
           ? "Low-funding mode uses tiny same-band groups only."
           : this.flowSource === "follow-token"
-            ? `Follow-token buy triggers: Large Insider on valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all (still watch for #5 · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit). Reset on 20m window closes or no scrape watches before buy. Large Insider: feePayer ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL} SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…). Round/dust gates disabled.`
+            ? `Follow-token buy triggers: Large Insider on valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all (still watch for #5 · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit). Reset on 20m window close before buy. Large Insider: feePayer ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL} SOL outs (${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m after initial bundler first buy) → downstream watches only on ≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL outs (tier1→chain→…). Round/dust gates disabled.`
             : `Round groups, dust race-to-${BUNDLER_FUNDER_NORMAL_TINY_MIN_ROUND_GROUP_TXS_FOR_BUY}, and recipient first-buy gates apply.`,
         activeFunderWatch.parallelFeePayerFunderWallet
           ? `Parallel feePayer funder (≤6h): <code>${activeFunderWatch.parallelFeePayerFunderWallet}</code>`
@@ -6344,7 +6334,7 @@ export class InsiderBot extends EventEmitter {
       wallet: string;
       maxSingleSellTokenAmount: number;
       limit: number;
-      candidateTier: "standard_8m" | "fallback_15m";
+      candidateTier: "standard_8m" | "fallback_16m";
     } | null;
     largestBagWallet: string | null;
     largestBagWatchSource: FollowTokenEarlyBundlerExitWatch["source"] | null;
@@ -6387,7 +6377,7 @@ export class InsiderBot extends EventEmitter {
     if (maxSingleSellTokenAmount <= standardLimit) {
       candidateTier = "standard_8m";
     } else if (maxSingleSellTokenAmount <= fallbackLimit) {
-      candidateTier = "fallback_15m";
+      candidateTier = "fallback_16m";
     } else {
       candidateTier = "fail";
     }
@@ -6398,10 +6388,10 @@ export class InsiderBot extends EventEmitter {
       wallet: string;
       maxSingleSellTokenAmount: number;
       limit: number;
-      candidateTier: "standard_8m" | "fallback_15m";
+      candidateTier: "standard_8m" | "fallback_16m";
     } | null = null;
 
-    if (candidateTier === "standard_8m" || candidateTier === "fallback_15m") {
+    if (candidateTier === "standard_8m" || candidateTier === "fallback_16m") {
       const limit =
         candidateTier === "standard_8m" ? standardLimit : fallbackLimit;
       const perSourceChecks: Array<{
@@ -6460,16 +6450,14 @@ export class InsiderBot extends EventEmitter {
   }
 
   private resolveFollowTokenBundlerSoldAllBuyParams(
-    gateTier: "standard_8m" | "fallback_15m",
+    gateTier: "standard_8m" | "fallback_16m",
     preLiPhase: boolean,
     lowFundingMode: boolean,
   ): { profitExitPercent: number; buySol: number } {
-    if (gateTier === "fallback_15m") {
+    if (gateTier === "fallback_16m") {
       return {
         profitExitPercent: FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT,
-        buySol: preLiPhase
-          ? this.followToken15mPreLiBuySol
-          : this.followToken15mPostLiBuySol,
+        buySol: this.followToken16mPostLiBuySol,
       };
     }
     return {
@@ -6548,7 +6536,7 @@ export class InsiderBot extends EventEmitter {
         .filter(Boolean)
         .join("\n");
     }
-    if (gate.tier === "fallback_15m") {
+    if (gate.tier === "fallback_16m") {
       return [
         maxSellLine,
         ...perSourceLines,
@@ -6583,14 +6571,14 @@ export class InsiderBot extends EventEmitter {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active) return;
 
-    if (options.preLiPhase && gate.tier === "fallback_15m") {
-      await this.skipFollowTokenLargeInsiderFromBundler15mFallbackPreLi(tx, gate);
+    if (options.preLiPhase && gate.tier === "fallback_16m") {
+      await this.skipFollowTokenLargeInsiderFromBundler16mFallbackPreLi(tx, gate);
       return;
     }
 
     if (
       !options.preLiPhase &&
-      (gate.tier === "standard_8m" || gate.tier === "fallback_15m") &&
+      (gate.tier === "standard_8m" || gate.tier === "fallback_16m") &&
       !this.passesFollowTokenPostLiBundlerQualifiedSolBuyGate()
     ) {
       await this.skipFollowTokenLargeInsiderFromPostLiBundlerQualifiedSolGate(
@@ -6637,7 +6625,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     const gateLabel =
-      gate.tier === "fallback_15m" ? "16M fallback" : "8M standard";
+      gate.tier === "fallback_16m" ? "16M fallback" : "8M standard";
     this.log.warn(
       `Follow-token bundler sold-all buy (${gateLabel}, +${buyParams.profitExitPercent}% MC TP)`,
       {
@@ -6666,7 +6654,7 @@ export class InsiderBot extends EventEmitter {
         profitExitPercent: buyParams.profitExitPercent,
         buySolOverride: buyParams.buySol,
         maxSingleSellGateTier:
-          gate.tier === "fallback_15m" ? "fallback_15m" : "standard_8m",
+          gate.tier === "fallback_16m" ? "fallback_16m" : "standard_8m",
       },
     );
   }
@@ -6950,7 +6938,7 @@ export class InsiderBot extends EventEmitter {
     await this.resetForNewToken(false, { reason });
   }
 
-  private async skipFollowTokenLargeInsiderFromBundler15mFallbackPreLi(
+  private async skipFollowTokenLargeInsiderFromBundler16mFallbackPreLi(
     triggerTx: HeliusTransaction | undefined,
     gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
   ): Promise<void> {
@@ -6960,8 +6948,8 @@ export class InsiderBot extends EventEmitter {
 
     state.preBuyBundlerPathTriggered = true;
     state.exitTriggerSignature =
-      triggerTx?.signature ?? "BUNDLER_SKIP_15M_FALLBACK_PRE_LI";
-    const reason = "large_insider_bundler_15m_fallback_pre_li_skip";
+      triggerTx?.signature ?? "BUNDLER_SKIP_16M_FALLBACK_PRE_LI";
+    const reason = "large_insider_bundler_16m_fallback_pre_li_skip";
 
     this.log.warn(
       "Pre-LI bundler sold-all — 16M fallback tier; skipping token (no buy)",
@@ -6984,7 +6972,7 @@ export class InsiderBot extends EventEmitter {
       ]
         .filter(Boolean)
         .join("\n"),
-      "follow-token large insider 15m fallback pre-li skip",
+      "follow-token large insider 16m fallback pre-li skip",
     );
 
     await this.stopFollowTokenLargeInsiderFlow("16M fallback pre-LI skip");
@@ -7006,7 +6994,7 @@ export class InsiderBot extends EventEmitter {
     const reason = "large_insider_post_li_bundler_qualified_sol_buy_gate_failed";
     const summary = this.summarizeFollowTokenPresentQualifiedSol();
     const gateLabel =
-      gate.tier === "fallback_15m" ? "16M fallback" : "8M standard";
+      gate.tier === "fallback_16m" ? "16M fallback" : "8M standard";
 
     this.log.warn(
       `Post-LI bundler sold-all buy gate failed (${gateLabel}) — all present valid LI wallets have Qualified SOL ≥25`,
@@ -7047,15 +7035,15 @@ export class InsiderBot extends EventEmitter {
     await this.resetForNewToken(false, { reason });
   }
 
-  private async fetchTokenAthMarketCapUsdFor15mFallbackGate(
+  private async fetchTokenAthMarketCapUsdFor16mFallbackGate(
     mint: string,
   ): Promise<number | null> {
-    const maxAttempts = 1 + FOLLOW_TOKEN_15M_FALLBACK_ATH_MC_FETCH_RETRIES;
+    const maxAttempts = 1 + FOLLOW_TOKEN_16M_FALLBACK_ATH_MC_FETCH_RETRIES;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const tokenAthMc = await this.gmgnClient.fetchTokenAthMarketCapUsd(mint);
       if (tokenAthMc !== null) {
         if (attempt > 1) {
-          this.log.info("15M fallback ATH MC fetch succeeded after retry", {
+          this.log.info("16M fallback ATH MC fetch succeeded after retry", {
             mint,
             attempt,
             tokenAthMc,
@@ -7064,13 +7052,13 @@ export class InsiderBot extends EventEmitter {
         return tokenAthMc;
       }
       if (attempt < maxAttempts) {
-        await this.delay(FOLLOW_TOKEN_15M_FALLBACK_ATH_MC_FETCH_RETRY_DELAY_MS);
+        await this.delay(FOLLOW_TOKEN_16M_FALLBACK_ATH_MC_FETCH_RETRY_DELAY_MS);
       }
     }
     return null;
   }
 
-  private async skipFollowTokenLargeInsiderFrom15mFallbackAthMcGate(
+  private async skipFollowTokenLargeInsiderFrom16mFallbackAthMcGate(
     mint: string,
     entryMc: number,
     exitMc: number,
@@ -7083,14 +7071,14 @@ export class InsiderBot extends EventEmitter {
     if (state) {
       state.preBuyBundlerPathTriggered = true;
       state.exitTriggerSignature =
-        triggerTx?.signature ?? "BUNDLER_SKIP_15M_ATH_MC";
+        triggerTx?.signature ?? "BUNDLER_SKIP_16M_ATH_MC";
     }
-    const reason = "large_insider_15m_fallback_ath_mc_skip";
+    const reason = "large_insider_16m_fallback_ath_mc_skip";
     const athSkipThreshold =
-      exitMc * FOLLOW_TOKEN_15M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER;
+      exitMc * FOLLOW_TOKEN_16M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER;
 
     this.log.warn(
-      "15M fallback buy skipped — token ATH MC already ≥2× calculated exit MC",
+      "16M fallback buy skipped — token ATH MC already ≥2× calculated exit MC",
       {
         mint,
         entryMc,
@@ -7098,7 +7086,7 @@ export class InsiderBot extends EventEmitter {
         profitExitPercent,
         tokenAthMc,
         athSkipThreshold,
-        athExitMcMultiplier: FOLLOW_TOKEN_15M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER,
+        athExitMcMultiplier: FOLLOW_TOKEN_16M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER,
         signature: state?.exitTriggerSignature ?? null,
       },
     );
@@ -7110,11 +7098,11 @@ export class InsiderBot extends EventEmitter {
         `Entry MC would be: <b>$${entryMc.toLocaleString(undefined, { maximumFractionDigits: 3 })}</b>`,
         `Exit MC (+${profitExitPercent}%): <b>$${exitMc.toLocaleString(undefined, { maximumFractionDigits: 3 })}</b>`,
         `Token ATH MC: <b>$${tokenAthMc.toLocaleString(undefined, { maximumFractionDigits: 3 })}</b>`,
-        `Skip when token ATH ≥ <b>${FOLLOW_TOKEN_15M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER}×</b> exit MC (<b>$${athSkipThreshold.toLocaleString(undefined, { maximumFractionDigits: 3 })}</b>).`,
+        `Skip when token ATH ≥ <b>${FOLLOW_TOKEN_16M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER}×</b> exit MC (<b>$${athSkipThreshold.toLocaleString(undefined, { maximumFractionDigits: 3 })}</b>).`,
         "",
         "No buy — token skipped and flow reset.",
       ].join("\n"),
-      "follow-token 15m fallback ath mc skip",
+      "follow-token 16m fallback ath mc skip",
     );
 
     if (funderState && this.followTokenLargeInsiderState?.active) {
@@ -7242,7 +7230,7 @@ export class InsiderBot extends EventEmitter {
         this.applyPreLiBundlerBuyExitModeFromBundlerStats();
       const activeMcTpPercent = this.getFollowTokenActiveProfitExitPercent();
       const fallbackBuyNote =
-        state.maxSingleSellGateTierAtBuy === "fallback_15m"
+        state.maxSingleSellGateTierAtBuy === "fallback_16m"
           ? " · 16M fallback buy"
           : "";
       if (
@@ -8176,7 +8164,7 @@ export class InsiderBot extends EventEmitter {
           : this.hasFollowTokenLargeInsiderValidWalletDiscovered()
             ? `Post–1st-LI buy: valid wallet #4 (direct-sell) OR sold-all branches — 8M/16M gate uses largest active watch bag (early bundler buy or transfer received). Transfer-out → sold-all only.`
             : `Pre–1st-LI buy: sold-all + max single sell ≤ ${FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()} only (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP). 8M–16M pre-LI sold-all → skip+reset.`,
-        `Post–1st-LI sold-all: 8M (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP) or 16M fallback (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP) · ≥1 valid LI Qualified SOL &lt;${FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} SOL · 16M also requires token ATH MC &lt; ${FOLLOW_TOKEN_15M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER}× exit MC (GMGN fetch at buy).`,
+        `Post–1st-LI sold-all: 8M (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP) or 16M fallback (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP) · ≥1 valid LI Qualified SOL &lt;${FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} SOL · 16M also requires token ATH MC &lt; ${FOLLOW_TOKEN_16M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER}× exit MC (GMGN fetch at buy).`,
         `After buy + all sold all (post–1st-LI): valid LI ≥25% → sell; max sell txs &lt; ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} or cumulative ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} → skip unless max single sell ≤ ${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()} tokens (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP buy on 8M–16M fallback); ≥ ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} txs + $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()}–$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → dual exit; cumulative &gt; $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → LI-only.`,
       ].join("\n"),
       "follow-token early bundler exit watch started",

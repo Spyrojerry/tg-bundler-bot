@@ -218,7 +218,7 @@ async function main(): Promise<void> {
           | "insiderFollowWallet"
           | "insiderBuySol"
           | "insiderNormalBuySol"
-          | "insiderLowFundingBuySol"
+          | "insiderFollowToken16mFallbackBuySol"
           | "insiderExitPercent"
           | "insiderBundlerMinUsd"
           | "insiderBundlerMaxUsd";
@@ -1041,14 +1041,14 @@ async function main(): Promise<void> {
             editCurrent: true,
           };
         }
-        if (data === "insider:lowfundingbuysol") {
+        if (data === "insider:16mfallbackbuysol") {
           activeInsiderIndex = 0;
           pendingTelegramActions.set(chatId, {
-            type: "insiderLowFundingBuySol",
+            type: "insiderFollowToken16mFallbackBuySol",
             index: 0,
           });
           return {
-            text: "Send the SOL amount Insider Bot should buy with in low-funding mode.",
+            text: "Send the SOL amount for post-LI 16M fallback bundler sold-all buys.",
             trackPrompt: true,
             editCurrent: true,
           };
@@ -1304,14 +1304,14 @@ async function main(): Promise<void> {
             );
             return homeReply();
           }
-          if (pendingAction.type === "insiderLowFundingBuySol") {
+          if (pendingAction.type === "insiderFollowToken16mFallbackBuySol") {
             const bot = insiderBots[pendingAction.index];
             const value = Number(text.trim());
             if (!Number.isFinite(value) || value <= 0)
               return "Send a SOL amount greater than 0.";
-            bot.setLowFundingBuySol(value);
+            bot.setFollowToken16mFallbackBuySol(value);
             log.info(
-              `[SETTINGS] Insider ${getInsiderBotNumber(pendingAction.index)} low-funding buy SOL set to ${value}`,
+              `[SETTINGS] Insider ${getInsiderBotNumber(pendingAction.index)} 16M fallback buy SOL set to ${value}`,
             );
             return homeReply();
           }
@@ -2583,9 +2583,9 @@ async function main(): Promise<void> {
         `Follow-token (Pump migrate): <b>${followTokenRunning ? "Running" : "Stopped"}</b>`,
         "<b>Watched potential feePayers:</b>",
         ...potentialLines,
-        `Default Buy SOL: <b>${html(String(bot.getBuySol()))}</b>`,
+        `Default Buy SOL: <b>${html(String(bot.getBuySol()))}</b> <i>(display only; buys use Normal / 16M fallback)</i>`,
         `Normal Funding Buy SOL: <b>${html(String(bot.getNormalFundingBuySol()))}</b>`,
-        `Low-Funding Buy SOL: <b>${html(String(bot.getLowFundingBuySol()))}</b>`,
+        `16M Fallback Buy SOL: <b>${html(String(bot.getFollowToken16mPostLiBuySol()))}</b>`,
         `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% Current MC from Entry</b>`,
         `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
         "",
@@ -2643,7 +2643,7 @@ async function main(): Promise<void> {
             { text: "Normal Buy SOL", callback_data: "insider:normalbuysol" },
           ],
           [
-            { text: "Low-Funding Buy SOL", callback_data: "insider:lowfundingbuysol" },
+            { text: "16M Fallback Buy SOL", callback_data: "insider:16mfallbackbuysol" },
             { text: "Set Exit %", callback_data: "insider:exitpercent" },
           ],
           [disableBuyButton],
@@ -2697,9 +2697,9 @@ async function main(): Promise<void> {
       "<b>Primary Insider Bot</b>",
       `Status: ${status}`,
       `Follow wallets: ${followed.length > 0 ? followed.map((w) => `<code>${html(w)}</code>`).join(", ") : "not set"}`,
-      `Default Buy: ${bot?.getBuySol() ?? config.insiderBuySol} SOL`,
+      `Default Buy: ${bot?.getBuySol() ?? config.insiderBuySol} SOL (display only)`,
       `Normal Buy: ${bot?.getNormalFundingBuySol() ?? config.insiderNormalBuySol} SOL`,
-      `Low-Funding Buy: ${bot?.getLowFundingBuySol() ?? config.insiderLowFundingBuySol} SOL`,
+      `16M Fallback Buy: ${bot?.getFollowToken16mPostLiBuySol() ?? config.insiderFollowToken16mPostLiBuySol} SOL`,
       `Helius key pool: ${insiderBots.length} key${insiderBots.length === 1 ? "" : "s"}`,
     ].join("\n");
 
