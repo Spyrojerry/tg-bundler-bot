@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-14 (195)
+
+### Dev wallet gate: transfer_out only (not sell)
+
+- Dev wallet token-out watch now triggers only on **`transfer_out`** (plain SPL transfer). Dev **sell/swap** txs on the mint are ignored for this gate; full-exit rug watch unchanged.
+
 ## 2026-08-14 (194)
 
 ### Entry MC at PumpPortal submit (not +1s)
@@ -10,7 +16,7 @@
 
 ### Dev wallet token-out: 3m post-buy watch + buy race abort
 
-- Dev **transfer-out / sell** watch continues for **3 minutes after buy submit** (not just pre-buy). Post-buy hit → **sell 100%** (`dev_wallet_token_out_after_buy` path); pre-buy / in-flight → **skip + reset** (`dev_wallet_token_out_before_buy`).
+- Dev **`transfer_out`** watch continues for **3 minutes after buy submit** (not just pre-buy). Post-buy hit → **sell 100%**; pre-buy / in-flight → **skip + reset**. Dev **sell/swap** does not trigger this gate.
 - **Race fix:** mint is added to a blocked set on dev token-out; `index.ts` re-checks before swap submit and after swap before `markPositionBought`. If swap already landed, **immediate recovery sell** via `triggerDevTokenOutRecoverySell`.
 - Re-check `isBuyBlockedByDevTokenOut(mint)` after async MC gates in LI buy emit; pre-buy Telegram now **awaits** before reset (dev-out alert before reset message).
 
@@ -18,7 +24,7 @@
 
 ### Pre-buy dev wallet token-out gate + deferred entry MC snapshot
 
-- From token flow start, dev wallet is monitored for **any token transfer-out or sell** on the mint → **skip + reset** before buy (`dev_wallet_token_out_before_buy`); **3m post-buy** watch and race abort added in (193). Full-exit rug watch unchanged.
+- From token flow start, dev wallet is monitored for **`transfer_out`** on the mint → **skip + reset** before buy; **3m post-buy** watch and race abort added in (193). **Sell/swap** excluded from this gate (195). Full-exit rug watch unchanged.
 - **Entry MC** captured at PumpPortal submit — see (194). Same MC path: **PumpSwap vault reserves** first, then **Helius DAS** (`[INSIDER N ENTRY MC]` log); **exit MC** derived from that snapshot (percent-based) or fixed exit MC when configured.
 
 ## 2026-08-14 (191)

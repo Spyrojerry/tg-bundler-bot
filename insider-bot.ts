@@ -105,7 +105,7 @@ const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL = 10;
 /** First token buy on a scrape wallet must exceed this USD to count as a valid Large Insider wallet. */
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD = 110;
-/** Keep dev transfer-out/sell watch active this long after buy submit. */
+/** Keep dev transfer-out watch active this long after buy submit. */
 const DEV_WALLET_TOKEN_OUT_POST_BUY_WATCH_MS = 3 * 60 * 1_000;
 const FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_REASON =
   "follow_token_large_insider_valid_wallet";
@@ -3731,13 +3731,13 @@ export class InsiderBot extends EventEmitter {
   triggerDevTokenOutRecoverySell(mint: string, signature: string): void {
     void this.triggerPositionSell(
       mint,
-      "Dev wallet moved tokens before buy completed (race) — immediate 100% exit",
+      "Dev wallet transfer_out before buy completed (race) — immediate 100% exit",
       [
         `<b>⛔ ${this.label} Dev Token-Out Race Recovery — Selling 100%</b>`,
         `Token: <code>${mint}</code>`,
         `Tx: <code>${signature}</code>`,
         "",
-        "Buy landed after dev token-out reset — dumping position immediately.",
+        "Buy landed after dev transfer-out reset — dumping position immediately.",
       ],
       signature,
     );
@@ -8933,7 +8933,7 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private isDevWalletPreBuyTokenOutTx(tx: HeliusTransaction, mint: string): boolean {
+  private isDevWalletTokenTransferOutTx(tx: HeliusTransaction, mint: string): boolean {
     if (!this.devWallet) return false;
     if (!this.isRelevantMintTx(tx, mint)) return false;
     if (
@@ -8943,7 +8943,7 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
     const kind = this.classifyTx(tx, this.devWallet, mint);
-    return kind === "transfer_out" || kind === "sell";
+    return kind === "transfer_out";
   }
 
   private async evaluateDevWalletTokenOutTx(
@@ -8952,7 +8952,7 @@ export class InsiderBot extends EventEmitter {
     if (!this.devWallet || this.devTokenOutHandled) return;
     const mint = this.getDevTokenOutFlowMint();
     if (!mint || !this.isDevWalletTokenOutWatchActive(mint)) return;
-    if (!this.isDevWalletPreBuyTokenOutTx(tx, mint)) return;
+    if (!this.isDevWalletTokenTransferOutTx(tx, mint)) return;
     await this.handleDevWalletTokenOut(mint, tx);
   }
 
@@ -8970,7 +8970,7 @@ export class InsiderBot extends EventEmitter {
       );
       for (const tx of [...txs].reverse()) {
         if (this.devFullExitSeenSignatures.has(tx.signature)) continue;
-        if (!this.isDevWalletPreBuyTokenOutTx(tx, mint)) continue;
+        if (!this.isDevWalletTokenTransferOutTx(tx, mint)) continue;
         this.devFullExitSeenSignatures.add(tx.signature);
         await this.handleDevWalletTokenOut(mint, tx);
         return;
@@ -8993,50 +8993,47 @@ export class InsiderBot extends EventEmitter {
     }
     this.devTokenOutHandled = true;
     this.devTokenOutBlockedMints.add(mint);
-    const kind = this.classifyTx(tx, this.devWallet!, mint);
     const hasPosition = !!this.activePosition;
 
     if (hasPosition) {
-      this.log.warn("Dev wallet token out after buy — selling 100%", {
+      this.log.warn("Dev wallet token transfer-out after buy — selling 100%", {
         mint,
         devWallet: this.devWallet,
         signature: tx.signature,
-        kind,
       });
       await this.triggerPositionSell(
         mint,
-        `Dev wallet ${this.devWallet} ${kind ?? "token_out"} within 3m post-buy`,
+        `Dev wallet ${this.devWallet} transfer_out within 3m post-buy`,
         [
-          `<b>⛔ ${this.label} Dev Wallet Token Out After Buy — Selling 100%</b>`,
+          `<b>⛔ ${this.label} Dev Wallet Token Transfer-Out After Buy — Selling 100%</b>`,
           `Token: <code>${mint}</code>`,
           `Dev: <code>${this.devWallet}</code>`,
           `Tx: <code>${tx.signature}</code>`,
-          `Action: <b>${kind ?? "token_out"}</b>`,
+          `Action: <b>transfer_out</b>`,
           "",
-          "Dev moved tokens within 3 minutes of buy — selling 100%.",
+          "Dev transferred tokens out within 3 minutes of buy — selling 100%.",
         ],
         tx.signature,
       );
       return;
     }
 
-    this.log.warn("Dev wallet token out before buy — skipping token", {
+    this.log.warn("Dev wallet token transfer-out before buy — skipping token", {
       mint,
       devWallet: this.devWallet,
       signature: tx.signature,
-      kind,
     });
     await this.sendTelegramSafe(
       [
-        `<b>⛔ ${this.label} Dev Wallet Token Out Before Buy</b>`,
+        `<b>⛔ ${this.label} Dev Wallet Token Transfer-Out Before Buy</b>`,
         `Token: <code>${mint}</code>`,
         `Dev: <code>${this.devWallet}</code>`,
         `Tx: <code>${tx.signature}</code>`,
-        `Action: <b>${kind ?? "token_out"}</b>`,
+        `Action: <b>transfer_out</b>`,
         "",
-        "Dev moved tokens before bot buy — skipping token and resetting flow.",
+        "Dev transferred tokens out before bot buy — skipping token and resetting flow.",
       ].join("\n"),
-      "dev wallet token out before buy",
+      "dev wallet token transfer-out before buy",
     );
     await this.resetForNewToken(false, {
       reason: "dev_wallet_token_out_before_buy",
