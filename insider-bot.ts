@@ -214,6 +214,11 @@ interface FollowTokenLargeInsiderState {
   scrapeEnhancedWatchIds: Map<string, number>;
   scrapeSolBalanceSubIds: Map<string, number>;
   seenFeePayerOutSignatures: Set<string>;
+  /** Scrape wallets that bought but first buy USD was ≤ min — would be valid LI if above threshold. */
+  firstBuyBelowMinUsdWallets: Map<
+    string,
+    { firstBuyUsd: number; buySol: number | null; signature: string }
+  >;
 }
 
 function readHeliusTxFeeLamports(tx: HeliusTransaction): number | null {
@@ -1811,6 +1816,7 @@ export class InsiderBot extends EventEmitter {
       scrapeEnhancedWatchIds: new Map<string, number>(),
       scrapeSolBalanceSubIds: new Map<string, number>(),
       seenFeePayerOutSignatures: new Set<string>(),
+      firstBuyBelowMinUsdWallets: new Map(),
     };
 
     watchState.discoveryStopped = false;
@@ -2588,6 +2594,12 @@ export class InsiderBot extends EventEmitter {
       return true;
     }
     if (firstBuyUsd <= FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD) {
+      this.recordFollowTokenLargeInsiderFirstBuyUsdNearMiss(
+        wallet,
+        firstBuyUsd,
+        buySol,
+        tx.signature,
+      );
       this.followTokenLargeInsiderLog(
         "scrape wallet first buy skipped — below min USD for valid wallet",
         {
@@ -2604,6 +2616,49 @@ export class InsiderBot extends EventEmitter {
     }
 
     return false;
+  }
+
+  private recordFollowTokenLargeInsiderFirstBuyUsdNearMiss(
+    wallet: string,
+    firstBuyUsd: number,
+    buySol: number | null,
+    signature: string,
+  ): void {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active || li.validWallets.includes(wallet)) return;
+    li.firstBuyBelowMinUsdWallets.set(wallet, {
+      firstBuyUsd,
+      buySol,
+      signature,
+    });
+  }
+
+  private async sendFollowTokenLargeInsiderFirstBuyUsdNearMissTelegram(
+    mint: string,
+    nearMisses: ReadonlyArray<
+      readonly [
+        string,
+        { firstBuyUsd: number; buySol: number | null; signature: string },
+      ]
+    >,
+  ): Promise<void> {
+    const minUsd = FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD;
+    const walletLines = nearMisses.map(([wallet, info]) => {
+      const solPart =
+        info.buySol !== null ? ` · ${info.buySol.toFixed(4)} SOL` : "";
+      return `• <code>${wallet}</code> — first buy <b>$${info.firstBuyUsd.toFixed(2)}</b>${solPart}`;
+    });
+    await this.sendTelegramSafe(
+      [
+        `<b>🟡 ${this.label} Follow-Token Large Insider — First Buy ≤ $${minUsd}</b>`,
+        `Token: <code>${mint}</code>`,
+        `These scrape wallets bought the token but first buy was ≤ <b>$${minUsd}</b> — not counted as valid LI:`,
+        ...walletLines,
+        "",
+        `With first buy &gt; <b>$${minUsd}</b>, they would join the valid LI pool (wallet #4 buy, post-LI 8M/16M gates, Qualified SOL gate, ≥25% exit pool).`,
+      ].join("\n"),
+      "follow-token large insider first buy usd near miss",
+    );
   }
 
   private async handleFollowTokenLargeInsiderValidWalletTwentyFivePercentSoldExit(
@@ -13109,6 +13164,22 @@ export class InsiderBot extends EventEmitter {
     const endedSource = this.flowSource;
     const hadPosition = clearPosition && !!this.activePosition;
     const resetReason = options?.reason ?? "flow_reset";
+    const liNearMisses =
+      endedSource === "follow-token" &&
+      !this.buySubmitted &&
+      !this.activePosition &&
+      (this.followTokenLargeInsiderState?.firstBuyBelowMinUsdWallets.size ?? 0) > 0
+        ? [
+            ...this.followTokenLargeInsiderState!.firstBuyBelowMinUsdWallets.entries(),
+          ]
+        : null;
+
+    if (!options?.skipTelegram && liNearMisses?.length && endedMint) {
+      await this.sendFollowTokenLargeInsiderFirstBuyUsdNearMissTelegram(
+        endedMint,
+        liNearMisses,
+      );
+    }
 
     if (!options?.skipTelegram && endedMint) {
       const flowLabel =

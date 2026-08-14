@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-14 (191)
+
+### Follow-token: Telegram near-miss valid LI wallets before reset
+
+- When a follow-token flow resets **without a buy**, if any scrape wallet bought the token but first buy was **≤ $110** (only the USD gate — not &gt;10 SOL or other skips), Telegram sends a **near-miss** message immediately before the reset listing those wallets and noting they would have joined the valid LI pool had first buy exceeded **$110**.
+
 ## 2026-08-14 (190)
 
 ### Follow-token: rename internal 15M identifiers → 16M
