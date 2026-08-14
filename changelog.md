@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-14 (192)
+
+### Pre-buy dev wallet token-out gate + deferred entry MC snapshot
+
+- From token flow start, dev wallet is monitored for **any token transfer-out or sell** on the mint before bot buy → **skip + reset** (`dev_wallet_token_out_before_buy`). After buy submits, pre-buy token-out checks stop (full-exit rug watch unchanged).
+- **Entry MC** is now captured **1s after buy submit** (`INSIDER_BUY_ENTRY_MC_DELAY_MS`) via the same path as the 1s MC checker — **PumpSwap vault reserves** first, then **Helius DAS** (`[INSIDER N ENTRY MC]` log); **exit MC** derived from that snapshot (percent-based) or fixed exit MC when configured.
+
 ## 2026-08-14 (191)
 
 ### Follow-token: Telegram near-miss valid LI wallets before reset

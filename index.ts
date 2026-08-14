@@ -31,8 +31,8 @@ import {
 } from "./types";
 import { FunderFirstOrchestrator } from "./funder-first-orchestrator";
 import { FollowTokenMigrationOrchestrator } from "./follow-token-migration-orchestrator";
-import { InsiderBot, MAX_FOLLOW_WALLETS } from "./insider-bot";
-import type { InsiderMintClaimFn } from "./insider-bot";
+import { InsiderBot, MAX_FOLLOW_WALLETS, INSIDER_BUY_ENTRY_MC_DELAY_MS } from "./insider-bot";
+import type { InsiderBuyTrigger, InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
 import { PumpReserveMarketCapClient } from "./pump-reserve-market-cap";
 import { HeliusClient } from "./helius-client";
@@ -605,6 +605,31 @@ async function main(): Promise<void> {
       }
     }
     return null;
+  }
+
+  async function applyDeferredInsiderBuyEntryMc(
+    botIndex: number,
+    bot: InsiderBot,
+    trigger: InsiderBuyTrigger,
+    buyInitiatedAtMs: number,
+  ): Promise<number | null> {
+    const botNumber = getInsiderBotNumber(botIndex);
+    const remaining =
+      INSIDER_BUY_ENTRY_MC_DELAY_MS - (Date.now() - buyInitiatedAtMs);
+    if (remaining > 0) await sleep(remaining);
+    const fetched = await fetchInsiderMarketCapUsd(botIndex, trigger.mint);
+    const entryMc = fetched?.marketCap ?? null;
+    if (entryMc === null) return null;
+    log.info(
+      `[INSIDER ${botNumber} ENTRY MC] Token: ${trigger.mint} MC: $${entryMc.toLocaleString()} (Source: ${fetched?.source ?? "Unknown"})`,
+    );
+    bot.setEntryMc(entryMc);
+    if (trigger.fixedExitMc !== undefined) {
+      bot.setExitMc(trigger.fixedExitMc);
+    } else if (trigger.profitExitPercent !== undefined) {
+      bot.setExitMc(entryMc * (1 + trigger.profitExitPercent / 100));
+    }
+    return entryMc;
   }
 
   const handleProcessHeliusUsageExhaustion = (
@@ -1586,14 +1611,19 @@ async function main(): Promise<void> {
 
       void (async () => {
         const tradersListStr = trigger.tradersListStr || "";
+        const buyInitiatedAtMs = Date.now();
         void telegramBot
           ?.sendDefault(
             [
               `<b>🚀 Insider ${botNumber} Buy Executing</b>`,
               `Token: <code>${html(trigger.mint)}</code>`,
               `Buying: <b>${html(String(trigger.buySol))} SOL</b>`,
-              `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
-              `Exit MC: <b>$${html(bot.getExitMc().toLocaleString())}</b>`,
+              `Entry MC: <i>snapshot ~1s after submit</i>`,
+              trigger.profitExitPercent !== undefined
+                ? `Exit target: <b>+${trigger.profitExitPercent}%</b> from entry MC`
+                : trigger.fixedExitMc !== undefined
+                  ? `Exit MC: <b>$${trigger.fixedExitMc.toLocaleString()}</b> (fixed)`
+                  : "",
               "",
               tradersListStr,
               "",
@@ -1610,21 +1640,34 @@ async function main(): Promise<void> {
           );
 
         try {
-          // Mark that we are executing a buy to prevent cleanup logic from wiping state
           bot.setBuyExecuting(true);
 
-          const result = await client.buyTokenWithSol(
-            config.tradingWalletAddress!,
-            trigger.mint,
-            {
-              solAmount: trigger.buySol,
-              slippage: config.sellSlippage,
-              autoSlippage: config.sellAutoSlippage,
-              priorityFeeSol: config.sellPriorityFeeSol,
-            },
-          );
+          const [result, deferredEntryMc] = await Promise.all([
+            client.buyTokenWithSol(
+              config.tradingWalletAddress!,
+              trigger.mint,
+              {
+                solAmount: trigger.buySol,
+                slippage: config.sellSlippage,
+                autoSlippage: config.sellAutoSlippage,
+                priorityFeeSol: config.sellPriorityFeeSol,
+              },
+            ),
+            applyDeferredInsiderBuyEntryMc(
+              index,
+              bot,
+              trigger,
+              buyInitiatedAtMs,
+            ),
+          ]);
 
-          bot.markPositionBought(trigger);
+          const resolvedEntryMc = deferredEntryMc ?? trigger.entryMc ?? null;
+          const completedTrigger: InsiderBuyTrigger = {
+            ...trigger,
+            entryMc: resolvedEntryMc ?? undefined,
+          };
+
+          bot.markPositionBought(completedTrigger);
           // ── Persist to DB so this mint is skipped on restart ─────────────
           if (config.tradingWalletAddress) {
             db.addSeenMint(config.tradingWalletAddress, trigger.mint);
@@ -1636,7 +1679,9 @@ async function main(): Promise<void> {
               [
                 `<b>✅ Insider ${botNumber} Buy Completed</b>`,
                 `Token: <code>${html(trigger.mint)}</code>`,
-                `Entry MC: <b>$${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
+                resolvedEntryMc !== null
+                  ? `Entry MC: <b>$${html(resolvedEntryMc.toLocaleString())}</b>`
+                  : `Entry MC: <b>${html(trigger.entryMc?.toLocaleString() ?? "Unknown")}</b>`,
                 `Status: <b>${html(result.status)}</b>`,
                 result.hash
                   ? `Tx: https://solscan.io/tx/${html(result.hash)}`
