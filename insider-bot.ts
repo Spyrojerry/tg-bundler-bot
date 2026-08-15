@@ -6733,6 +6733,15 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (
+      options.preLiPhase &&
+      this.resolveFollowTokenEarlyBundlerPreBuyExitBranch() ===
+        "high_usd_li_only"
+    ) {
+      await this.skipFollowTokenLargeInsiderFromBundlerHighUsdPreLi(tx, gate);
+      return;
+    }
+
+    if (
       !options.preLiPhase &&
       (gate.tier === "standard_8m" || gate.tier === "fallback_16m") &&
       !this.passesFollowTokenPostLiBundlerQualifiedSolBuyGate()
@@ -7135,6 +7144,57 @@ export class InsiderBot extends EventEmitter {
     await this.resetForNewToken(false, { reason });
   }
 
+  private async skipFollowTokenLargeInsiderFromBundlerHighUsdPreLi(
+    triggerTx: HeliusTransaction | undefined,
+    gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    const funderState = this.bundlerFunderWatch;
+    if (!state?.active || !funderState) return;
+
+    state.preBuyBundlerPathTriggered = true;
+    state.exitTriggerSignature =
+      triggerTx?.signature ?? "BUNDLER_SKIP_HIGH_USD_PRE_LI";
+    const reason = "large_insider_bundler_high_usd_pre_li_skip";
+    const maxSellTxCount = this.getFollowTokenEarlyBundlerExitMaxSellTxCount();
+    const maxCumulativeSellUsd =
+      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
+
+    this.log.warn(
+      "Pre-LI bundler sold-all — high cumulative sell; skipping token (no buy)",
+      {
+        mint: funderState.mint,
+        signature: state.exitTriggerSignature,
+        maxSellTxCount,
+        maxCumulativeSellUsd,
+        highSellUsdThreshold:
+          FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE,
+        transferRecipientPath: state.earlyBundlerTransferOutObserved,
+        ...gate,
+      },
+    );
+
+    void this.sendTelegramSafe(
+      [
+        `<b>⛔ ${this.label} Follow-Token Large Insider Skipped</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        this.formatFollowTokenMaxSingleSellGateTelegramLine(gate),
+        "",
+        `All bundlers/recipients sold all before 1st valid LI wallet.`,
+        `Bundler cumulative sell &gt; $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; max <b>${maxSellTxCount}</b> sell txs ≥ ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE}).`,
+        "",
+        "Pre-LI path has no valid LI wallets for ≥25% exit and +80% MC TP would be disabled — no viable post-buy exit.",
+        "No buy — token skipped and flow reset.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "follow-token large insider high usd pre-li skip",
+    );
+
+    await this.stopFollowTokenLargeInsiderFlow("high USD pre-LI skip");
+    await this.resetForNewToken(false, { reason });
+  }
+
   private async skipFollowTokenLargeInsiderFromPostLiBundlerQualifiedSolGate(
     triggerTx: HeliusTransaction | undefined,
     gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
@@ -7304,6 +7364,19 @@ export class InsiderBot extends EventEmitter {
 
     if (!this.hasFollowTokenLargeInsiderValidWalletDiscovered()) {
       const gate = this.getBundlerSoldAllMaxSingleSellGateSnapshot();
+      const rawBranch = this.resolveFollowTokenEarlyBundlerPreBuyExitBranch();
+      if (rawBranch === "high_usd_li_only") {
+        this.log.warn("Pre-LI bundler sold-all — high cumulative sell skip eval", {
+          mint: funderState.mint,
+          ...gate,
+          signature,
+          maxCumulativeSellUsd:
+            this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd(),
+          maxSellTxCount: this.getFollowTokenEarlyBundlerExitMaxSellTxCount(),
+        });
+        await this.skipFollowTokenLargeInsiderFromBundlerHighUsdPreLi(tx, gate);
+        return;
+      }
       this.log.warn("Pre-LI bundler sold-all — max-single-sell gate eval", {
         mint: funderState.mint,
         ...gate,
@@ -8392,7 +8465,7 @@ export class InsiderBot extends EventEmitter {
           ? `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) deferred until every early bundler/recipient sells all.`
           : this.hasFollowTokenLargeInsiderValidWalletDiscovered()
             ? `Post–1st-LI buy: valid wallet #4 (direct-sell) OR sold-all branches — 8M/16M gate uses largest active watch bag (early bundler buy or transfer received). Transfer-out → sold-all only.`
-            : `Pre–1st-LI buy: sold-all + max single sell ≤ ${FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()} only (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP). 8M–16M pre-LI sold-all → skip+reset.`,
+            : `Pre–1st-LI buy: sold-all + max single sell ≤ ${FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()} only (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP). 8M–16M pre-LI sold-all → skip+reset. Cumulative &gt; $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} before 1st valid LI → skip+reset (no LI ≥25% exit; MC TP disabled).`,
         `Post–1st-LI sold-all: 8M (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP) or 16M fallback (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP) · ≥1 valid LI Qualified SOL &lt;${FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} SOL · 16M also requires token ATH MC &lt; ${FOLLOW_TOKEN_16M_FALLBACK_BUY_ATH_EXIT_MC_MULTIPLIER}× exit MC (GMGN fetch at buy).`,
         `After buy + all sold all (post–1st-LI): valid LI ≥25% → sell; max sell txs &lt; ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} or cumulative ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} → skip unless max single sell ≤ ${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_MAX_SINGLE_SELL_TOKEN_AMOUNT.toLocaleString()} tokens (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP buy on 8M–16M fallback); ≥ ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} txs + $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()}–$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → dual exit; cumulative &gt; $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} → LI-only.`,
       ].join("\n"),

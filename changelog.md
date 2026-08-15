@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-15 (201)
+
+### Follow-token: pre-LI bundler sold-all skip when cumulative sell &gt; $35k
+
+- Before 1st valid LI wallet, pre-LI bundler/transfer-recipient sold-all buy now **skip+reset** when max cumulative bundler sell exceeds **$35,000** (same threshold as post-LI high-USD / LI-only branch: ≥75 sell txs + cumulative &gt; $35k).
+- Rationale: pre-LI has **no valid LI wallets** for ≥25% exit and **+80% MC TP is disabled** in that branch — no viable post-buy exit.
+
 ## 2026-08-15 (200)
 
 ### Dev buy count gate before bot buy
