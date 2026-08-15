@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-15 (200)
+
+### Dev buy count gate before bot buy
+
+- Before any bot buy (follow-token LI, bundler-funder recipient, low-funding paths), sync dev wallet txs and count **token buys after mint/create** (create tx excluded).
+- **Proceed** when dev buy count is **&lt; 2** (0 or 1 post-mint dev buy). **Skip + reset** when dev has **≥ 2** buys after mint. Helius fetch failure defers buy (no reset).
+- Telegram lists dev buy signatures when skipped.
+
 ## 2026-08-14 (199)
 
 ### Follow-token: fix premature pre-LI bundler sold-all buy with unsold largest bag

@@ -31,6 +31,8 @@ const NATIVE_SOL_BALANCE_MINT =
   "So11111111111111111111111111111111111111111";
 const INSIDER_HISTORY_LIMIT = 21;
 const LOW_FUNDING_DEV_BUY_SYNC_LIMIT = 10;
+/** Proceed with bot buy only while dev has fewer than this many mint buys after create (create tx excluded). */
+const DEV_BUY_COUNT_AFTER_CREATE_MAX_EXCLUSIVE = 2;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
@@ -3231,6 +3233,14 @@ export class InsiderBot extends EventEmitter {
         this.disableProfitExitAfterBuy = true;
       }
       if (this.isBuyBlockedByDevTokenOut(state.mint)) {
+        return;
+      }
+      if (
+        !(await this.ensureDevBuyCountAllowsBuy(state.mint, {
+          signature,
+          triggerLabel: options.triggerSource ?? "valid_wallet_4",
+        }))
+      ) {
         return;
       }
       this.setEntryMc(currentMc);
@@ -9059,6 +9069,146 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  private async listDevBuysAfterCreateMint(
+    mint: string,
+  ): Promise<HeliusTransaction[]> {
+    if (!this.devWallet) return [];
+    const txs = await this.withHeliusFallback(
+      (client) =>
+        client.getWalletTransactionsDesc(
+          this.devWallet!,
+          LOW_FUNDING_DEV_BUY_SYNC_LIMIT,
+        ),
+      HELIUS_POOL_MC_RESERVED_INDEX,
+    );
+    return txs
+      .filter((tx) => this.isRelevantMintTx(tx, mint))
+      .filter((tx) => tx.signature !== this.devCreateSignature)
+      .filter(
+        (tx) =>
+          this.devCreateTimestamp === null ||
+          tx.timestamp > this.devCreateTimestamp,
+      )
+      .filter((tx) => this.classifyTx(tx, this.devWallet!, mint) === "buy")
+      .sort((a, b) => a.timestamp - b.timestamp || a.slot - b.slot);
+  }
+
+  private async evaluateDevBuyCountBeforeBuyGate(mint: string): Promise<{
+    pass: boolean;
+    deferred: boolean;
+    devBuyCountAfterCreate: number;
+    devBuys: HeliusTransaction[];
+  }> {
+    if (!this.devWallet) {
+      return {
+        pass: true,
+        deferred: false,
+        devBuyCountAfterCreate: 0,
+        devBuys: [],
+      };
+    }
+    try {
+      const devBuys = await this.listDevBuysAfterCreateMint(mint);
+      const devBuyCountAfterCreate = devBuys.length;
+      return {
+        pass: devBuyCountAfterCreate < DEV_BUY_COUNT_AFTER_CREATE_MAX_EXCLUSIVE,
+        deferred: false,
+        devBuyCountAfterCreate,
+        devBuys,
+      };
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Dev buy count before buy gate check failed; deferring buy", {
+        mint,
+        devWallet: this.devWallet,
+        devCreateSignature: this.devCreateSignature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return {
+        pass: false,
+        deferred: true,
+        devBuyCountAfterCreate: -1,
+        devBuys: [],
+      };
+    }
+  }
+
+  private async ensureDevBuyCountAllowsBuy(
+    mint: string,
+    context: { signature?: string; triggerLabel: string },
+  ): Promise<boolean> {
+    const gate = await this.evaluateDevBuyCountBeforeBuyGate(mint);
+    if (gate.pass) return true;
+    if (gate.deferred) return false;
+    await this.skipFromDevBuyCountAfterCreateGate(
+      mint,
+      gate.devBuyCountAfterCreate,
+      gate.devBuys,
+      context,
+    );
+    return false;
+  }
+
+  private async skipFromDevBuyCountAfterCreateGate(
+    mint: string,
+    devBuyCountAfterCreate: number,
+    devBuys: HeliusTransaction[],
+    context: { signature?: string; triggerLabel: string },
+  ): Promise<void> {
+    const ebState = this.followTokenEarlyBundlerExitState;
+    const funderState = this.bundlerFunderWatch;
+    if (ebState?.active) {
+      ebState.preBuyBundlerPathTriggered = true;
+      ebState.exitTriggerSignature =
+        context.signature ?? "DEV_BUY_COUNT_AFTER_CREATE_GATE";
+    }
+    const reason = "dev_buy_count_after_create_gate";
+    const devBuyLines = devBuys.slice(0, 5).map(
+      (tx, index) =>
+        `${index + 1}. <code>${tx.signature}</code> · ${new Date(tx.timestamp * 1000).toISOString()}`,
+    );
+
+    this.log.warn("Buy skipped — dev wallet made too many buys after mint", {
+      mint,
+      triggerLabel: context.triggerLabel,
+      devWallet: this.devWallet,
+      devCreateSignature: this.devCreateSignature,
+      devBuyCountAfterCreate,
+      maxExclusive: DEV_BUY_COUNT_AFTER_CREATE_MAX_EXCLUSIVE,
+      triggerSignature: context.signature ?? null,
+      devBuySignatures: devBuys.map((tx) => tx.signature),
+    });
+
+    void this.sendTelegramSafe(
+      [
+        `<b>⛔ ${this.label} Buy Skipped — Dev Buy Count Gate</b>`,
+        `Token: <code>${mint}</code>`,
+        `Trigger: <b>${context.triggerLabel}</b>`,
+        `Dev: <code>${this.devWallet ?? "unknown"}</code>`,
+        `Mint/create tx: <code>${this.devCreateSignature ?? "unknown"}</code>`,
+        "",
+        `Dev buys after mint (excluding create): <b>${devBuyCountAfterCreate}</b> — limit is <b>&lt; ${DEV_BUY_COUNT_AFTER_CREATE_MAX_EXCLUSIVE}</b>.`,
+        "",
+        ...devBuyLines,
+        devBuys.length > devBuyLines.length
+          ? `… and ${devBuys.length - devBuyLines.length} more`
+          : "",
+        "",
+        "No buy — token skipped and flow reset.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "dev buy count after create gate skip",
+    );
+
+    if (funderState && this.followTokenLargeInsiderState?.active) {
+      await this.stopFollowTokenLargeInsiderFlow(
+        "dev buy count after create gate skip",
+      );
+    }
+    await this.resetForNewToken(false, { reason });
+  }
+
   private isDevWalletTokenTransferOutTx(tx: HeliusTransaction, mint: string): boolean {
     if (!this.devWallet) return false;
     if (!this.isRelevantMintTx(tx, mint)) return false;
@@ -11749,6 +11899,14 @@ export class InsiderBot extends EventEmitter {
       if (this.isBuyBlockedByDevTokenOut(state.mint)) {
         return;
       }
+      if (
+        !(await this.ensureDevBuyCountAllowsBuy(state.mint, {
+          signature,
+          triggerLabel: "low_funding_shared_feepayer",
+        }))
+      ) {
+        return;
+      }
 
       this.setEntryMc(currentMc);
       this.setBuyExecuting(true);
@@ -11845,6 +12003,14 @@ export class InsiderBot extends EventEmitter {
         exitOptions.exitPercent ??
         (exitOptions.fixedExitMc === undefined ? this.exitPercent : undefined);
       if (this.isBuyBlockedByDevTokenOut(state.mint)) {
+        return;
+      }
+      if (
+        !(await this.ensureDevBuyCountAllowsBuy(state.mint, {
+          signature,
+          triggerLabel: "low_funding_recipient",
+        }))
+      ) {
         return;
       }
       if (exitMc !== null) this.setExitMc(exitMc);
@@ -11958,6 +12124,14 @@ export class InsiderBot extends EventEmitter {
         return;
       }
       if (this.isBuyBlockedByDevTokenOut(state.mint)) {
+        return;
+      }
+      if (
+        !(await this.ensureDevBuyCountAllowsBuy(state.mint, {
+          signature,
+          triggerLabel: "bundler_funder_recipient",
+        }))
+      ) {
         return;
       }
       this.setExitMc(newExitMc);
