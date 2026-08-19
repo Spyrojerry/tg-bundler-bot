@@ -484,32 +484,58 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private async fetchMintCreateTransactionWithRetry(
     mint: string,
   ): Promise<Awaited<ReturnType<HeliusClient['getMintCreateTransaction']>>> {
+    const retryDelaysMs = [0, ...HELIUS_INDEXING_RETRY_DELAYS_MS];
     for (
       let attempt = 0;
-      attempt <= HELIUS_INDEXING_RETRY_DELAYS_MS.length;
+      attempt < retryDelaysMs.length;
       attempt += 1
     ) {
-      const createTx = await this.heliusClient.getMintCreateTransaction(mint);
-      if (createTx?.timestamp) {
-        if (attempt > 0) {
-          log.info('Mint CREATE transaction found after Helius indexing retry', {
-            mint,
-            attempt,
-            createSignature: createTx.signature,
-          });
-        }
-        return createTx;
+      const delayMs = retryDelaysMs[attempt] ?? 0;
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
 
-      const delayMs = HELIUS_INDEXING_RETRY_DELAYS_MS[attempt];
-      if (delayMs === undefined) break;
+      try {
+        const createTx = await this.heliusClient.getMintCreateTransaction(mint);
+        if (createTx?.timestamp) {
+          if (attempt > 0) {
+            log.info('Mint CREATE transaction found after Helius indexing retry', {
+              mint,
+              attempt,
+              createSignature: createTx.signature,
+            });
+          }
+          return createTx;
+        }
 
-      log.info('Mint CREATE transaction not indexed yet — retrying', {
-        mint,
-        attempt: attempt + 1,
-        retryInMs: delayMs,
-      });
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (attempt === retryDelaysMs.length - 1) break;
+
+        log.info('Mint CREATE transaction not indexed yet — retrying', {
+          mint,
+          attempt: attempt + 1,
+          retryInMs: retryDelaysMs[attempt + 1],
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const retryable = message.includes('Helius API error: 500');
+        if (!retryable || attempt === retryDelaysMs.length - 1) {
+          log.warn('Follow-token core filter failed', {
+            mint,
+            stage: 'mint_create_transaction',
+            attempt: attempt + 1,
+            error: message,
+          });
+          throw err;
+        }
+
+        log.warn('Follow-token core Helius request returned 500; retrying', {
+          mint,
+          stage: 'mint_create_transaction',
+          attempt: attempt + 1,
+          retryInMs: retryDelaysMs[attempt + 1],
+          error: message,
+        });
+      }
     }
 
     return null;
