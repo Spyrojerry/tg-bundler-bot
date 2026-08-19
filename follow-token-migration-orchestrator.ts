@@ -153,16 +153,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     const endedMint = event.mint ?? this.activeFollowTokenMint;
     this.activeFollowTokenMint = null;
 
-    if (!this.pumpPortalWs.isMigrationFeedSuspended()) {
-      log.debug('Follow-token flow ended but PumpPortal migration feed was not suspended', {
-        mint: endedMint,
-        reason: event.reason,
-        hadPosition: event.hadPosition,
-        feePayer: event.feePayer,
-      });
-      return;
-    }
-
     this.pumpPortalWs.resumeMigrationFeed(
       `follow-token flow ended (${event.reason}${event.hadPosition ? ', had position' : ''})`,
     );
@@ -298,16 +288,25 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         ]);
       }
 
+      // Suspend before handoff. Startup can emit tokenFlowEnded before the
+      // handoff promise returns when initialization fails.
+      this.unsubscribeMigrationFeedForActiveFlow(mint);
       const started = await this.tryStartFollowTokenFlow(mint, signature);
       this.seenMigrationMints.add(mint);
       if (started) {
-        this.unsubscribeMigrationFeedForActiveFlow(mint);
         log.info('Follow-token migration passed all filters and started insider flow', {
           mint,
           signature,
         });
+      } else if (this.activeFollowTokenMint === mint) {
+        this.activeFollowTokenMint = null;
+        this.pumpPortalWs?.resumeMigrationFeed('follow-token handoff rejected');
       }
     } catch (err) {
+      if (this.activeFollowTokenMint === mint) {
+        this.activeFollowTokenMint = null;
+        this.pumpPortalWs?.resumeMigrationFeed('follow-token handoff failed');
+      }
       log.warn('Follow-token migration processing failed', {
         mint,
         signature,
