@@ -366,8 +366,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return `migration ${migrationAgeSec.toFixed(0)}s after create (max ${this.maxMigrationAgeSec}s)`;
     }
 
-    const devCreateCount =
-      await this.heliusClient.countDevCreatedTokenMints(devWallet);
+    const devCreateCount = await this.fetchCoreFilterWithRetry(
+      'count_dev_created_tokens',
+      mint,
+      () => this.heliusClient.countDevCreatedTokenMints(devWallet),
+    );
     if (
       devCreateCount < FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN ||
       devCreateCount > FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX
@@ -375,12 +378,63 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return `dev created ${devCreateCount} tokens in Helius CREATE history (expected ${FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN}–${FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX})`;
     }
 
-    const funding = await this.heliusClient.getWalletFundedBy(devWallet);
+    const funding = await this.fetchCoreFilterWithRetry(
+      'wallet_funded_by',
+      mint,
+      () => this.heliusClient.getWalletFundedBy(devWallet),
+    );
     if (!isExchangeFundedBy(funding)) {
       return `dev funder is not a Centralized Exchange (${funding?.funderType ?? funding?.funder ?? 'unknown'})`;
     }
 
     return { devWallet, migrationAgeSec, funding, metadata, devCreateCount };
+  }
+
+  private async fetchCoreFilterWithRetry<T>(
+    stage: 'count_dev_created_tokens' | 'wallet_funded_by',
+    mint: string,
+    request: () => Promise<T>,
+  ): Promise<T> {
+    const retryDelaysMs = [0, ...HELIUS_INDEXING_RETRY_DELAYS_MS];
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < retryDelaysMs.length; attempt += 1) {
+      const delayMs = retryDelaysMs[attempt] ?? 0;
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+
+      try {
+        return await request();
+      } catch (err) {
+        lastError = err;
+        const message = err instanceof Error ? err.message : String(err);
+        const retryable =
+          message.includes('Helius API error: 500') ||
+          message.includes('Helius wallet funded-by API error: 500');
+        if (!retryable || attempt === retryDelaysMs.length - 1) {
+          log.warn('Follow-token core filter failed', {
+            mint,
+            stage,
+            attempt: attempt + 1,
+            error: message,
+          });
+          throw err;
+        }
+
+        log.warn('Follow-token core Helius request returned 500; retrying', {
+          mint,
+          stage,
+          attempt: attempt + 1,
+          retryInMs: retryDelaysMs[attempt + 1],
+          error: message,
+        });
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(String(lastError ?? `Core filter failed: ${stage}`));
   }
 
   private async fetchMetadataUriWithRetry(
