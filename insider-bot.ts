@@ -168,6 +168,7 @@ interface FollowTokenEarlyBundlerExitState {
   preBuyBundlerPathTriggered: boolean;
   preLiBundlerSoldAllBuy: boolean;
   preLiExitArmedNotified: boolean;
+  preLiWaitingForValidLiNotified: boolean;
   preLiBundlerSoldAllBuyBlockedNotified: boolean;
   postLiBundlerSoldAllBuyBlockedNotified: boolean;
   validWalletTwentyFivePercentDeferred: boolean;
@@ -7365,7 +7366,45 @@ export class InsiderBot extends EventEmitter {
         type: "SWAP",
       } as HeliusTransaction);
 
+    const waitingGate = this.getBundlerSoldAllMaxSingleSellGateSnapshot();
+    if (waitingGate.tier === "fail") {
+      await this.skipFollowTokenLargeInsiderFromPreLiMaxSingleSellGate(
+        tx,
+        waitingGate,
+      );
+      return;
+    }
+
     if (!this.hasFollowTokenLargeInsiderValidWalletDiscovered()) {
+      if (
+        !state.preLiWaitingForValidLiNotified &&
+        (waitingGate.tier === "standard_8m" ||
+          waitingGate.tier === "fallback_16m")
+      ) {
+        state.preLiWaitingForValidLiNotified = true;
+        const gateLabel =
+          waitingGate.tier === "fallback_16m" ? "16M fallback" : "8M standard";
+        const profitExitPercent =
+          waitingGate.tier === "fallback_16m"
+            ? FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT
+            : FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT;
+        const windowRemainingSec = Math.max(
+          0,
+          (li?.feePayerWindowEndsAt ?? 0) - Math.floor(Date.now() / 1000),
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>⏳ ${this.label} Pre-LI Bundler Sold-All — Waiting for LI</b>`,
+            `Token: <code>${funderState.mint}</code>`,
+            `Path: <b>${gateLabel}</b> (+${profitExitPercent}% MC TP)`,
+            "All early bundlers/transfer recipients sold all before the first valid LI wallet.",
+            "No buy yet — waiting for at least 1 valid LI wallet.",
+            `Remaining LI window: <b>${Math.ceil(windowRemainingSec / 60)}m</b>`,
+            "Rug detection remains active; window close with no valid LI resets the flow.",
+          ].join("\n"),
+          "follow-token pre-li sold-all waiting for valid LI",
+        );
+      }
       this.log.info("Pre-LI bundler sold-all — waiting for first valid LI wallet", {
         mint: funderState.mint,
         signature,
@@ -7408,6 +7447,46 @@ export class InsiderBot extends EventEmitter {
         bundlerExitBranch: "normal_mc_tp",
       },
     );
+  }
+
+  private async skipFollowTokenLargeInsiderFromPreLiMaxSingleSellGate(
+    triggerTx: HeliusTransaction,
+    gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    const funderState = this.bundlerFunderWatch;
+    if (!state?.active || !funderState) return;
+
+    state.preBuyBundlerPathTriggered = true;
+    state.exitTriggerSignature = triggerTx.signature;
+    const reason = "large_insider_bundler_pre_li_max_single_sell_skip";
+
+    this.log.warn(
+      "Pre-LI bundler sold-all — max-single-sell exceeds 16M; skipping token",
+      {
+        mint: funderState.mint,
+        signature: triggerTx.signature,
+        transferRecipientPath: state.earlyBundlerTransferOutObserved,
+        ...gate,
+      },
+    );
+
+    void this.sendTelegramSafe(
+      [
+        `<b>⛔ ${this.label} Follow-Token Pre-LI Bundler Sold-All Skipped</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        this.formatFollowTokenMaxSingleSellGateTelegramLine(gate),
+        "",
+        "All early bundlers/transfer recipients sold all before the first valid LI wallet.",
+        "No buy — maximum single sell exceeds the 16M fallback limit; token skipped and flow reset.",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      "follow-token pre-li max single sell skip",
+    );
+
+    await this.stopFollowTokenLargeInsiderFlow("pre-LI max single sell gate skip");
+    await this.resetForNewToken(false, { reason });
   }
 
   private async maybeEvaluateFollowTokenEarlyBundlerExit(
@@ -8402,6 +8481,7 @@ export class InsiderBot extends EventEmitter {
       preBuyBundlerPathTriggered: false,
       preLiBundlerSoldAllBuy: false,
       preLiExitArmedNotified: false,
+      preLiWaitingForValidLiNotified: false,
       preLiBundlerSoldAllBuyBlockedNotified: false,
       postLiBundlerSoldAllBuyBlockedNotified: false,
       validWalletTwentyFivePercentDeferred: false,
