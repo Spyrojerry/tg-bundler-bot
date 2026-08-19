@@ -8,6 +8,7 @@ import { createLogger, Logger } from './logger';
 const PUMPPORTAL_WS_BASE = 'wss://pumpportal.fun/api/data';
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
+const CONNECT_TIMEOUT_MS = 10_000;
 const HEARTBEAT_INTERVAL_MS = 20_000;
 const HEARTBEAT_TIMEOUT_MS = 12_000;
 
@@ -29,6 +30,7 @@ export class PumpPortalWsClient {
   private closedByUser = false;
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private connectTimeoutTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private lastPongAt = Date.now();
   private migrationCallback: MigrationCallback | null = null;
@@ -53,8 +55,17 @@ export class PumpPortalWsClient {
     this.log.info('Connecting to PumpPortal WebSocket');
     const ws = new WebSocket(this.url);
     this.ws = ws;
+    this.connectTimeoutTimer = setTimeout(() => {
+      if (this.ws !== ws || !this.connecting) return;
+      this.log.warn('PumpPortal WebSocket connection timed out, forcing reconnect', {
+        timeoutMs: CONNECT_TIMEOUT_MS,
+      });
+      this.connecting = false;
+      ws.terminate();
+    }, CONNECT_TIMEOUT_MS);
 
     ws.on('open', () => {
+      this.clearConnectTimeout();
       this.connecting = false;
       this.connected = true;
       this.reconnectAttempts = 0;
@@ -80,6 +91,7 @@ export class PumpPortalWsClient {
     });
 
     ws.on('close', (code: number, reason: Buffer) => {
+      this.clearConnectTimeout();
       this.connecting = false;
       this.connected = false;
       this.migrationSubscribed = false;
@@ -102,6 +114,7 @@ export class PumpPortalWsClient {
   close(): void {
     this.closedByUser = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.clearConnectTimeout();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.ws?.close();
     this.ws = null;
@@ -134,6 +147,7 @@ export class PumpPortalWsClient {
       this.ws = null;
       this.connecting = false;
       this.connected = false;
+      this.clearConnectTimeout();
       if (this.heartbeatTimer) {
         clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
@@ -171,6 +185,12 @@ export class PumpPortalWsClient {
       this.reconnectTimer = null;
       this.connect();
     }, delay + jitter);
+  }
+
+  private clearConnectTimeout(): void {
+    if (!this.connectTimeoutTimer) return;
+    clearTimeout(this.connectTimeoutTimer);
+    this.connectTimeoutTimer = null;
   }
 
   private startHeartbeat(): void {
