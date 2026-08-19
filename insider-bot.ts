@@ -6746,7 +6746,7 @@ export class InsiderBot extends EventEmitter {
         maxSellLine,
         ...perSourceLines,
         largestBagLine,
-        `→ <b>Post-LI 16M fallback buy</b> (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP; exceeds 8M limit <b>${gate.standardLimit.toLocaleString()}</b>${gate.activeRolesAtSoldAll.length > 0 ? `; ${this.formatFollowTokenActiveRoleMaxSingleSellGateLimitLine(gate, "16M")}` : ""}; pre-LI skip+reset).`,
+        `→ <b>16M fallback buy after first LI</b> (+${FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT}% MC TP; exceeds 8M limit <b>${gate.standardLimit.toLocaleString()}</b>${gate.activeRolesAtSoldAll.length > 0 ? `; ${this.formatFollowTokenActiveRoleMaxSingleSellGateLimitLine(gate, "16M")}` : ""}; waits for ≥1 valid LI within the 20m window).`,
       ]
         .filter(Boolean)
         .join("\n");
@@ -6775,11 +6775,6 @@ export class InsiderBot extends EventEmitter {
   ): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active) return;
-
-    if (options.preLiPhase && gate.tier === "fallback_16m") {
-      await this.skipFollowTokenLargeInsiderFromBundler16mFallbackPreLi(tx, gate);
-      return;
-    }
 
     if (
       options.preLiPhase &&
@@ -7149,47 +7144,6 @@ export class InsiderBot extends EventEmitter {
     );
 
     await this.stopFollowTokenLargeInsiderFlow("bundler max_single_sell gate skip");
-    await this.resetForNewToken(false, { reason });
-  }
-
-  private async skipFollowTokenLargeInsiderFromBundler16mFallbackPreLi(
-    triggerTx: HeliusTransaction | undefined,
-    gate: ReturnType<InsiderBot["getBundlerSoldAllMaxSingleSellGateSnapshot"]>,
-  ): Promise<void> {
-    const state = this.followTokenEarlyBundlerExitState;
-    const funderState = this.bundlerFunderWatch;
-    if (!state?.active || !funderState) return;
-
-    state.preBuyBundlerPathTriggered = true;
-    state.exitTriggerSignature =
-      triggerTx?.signature ?? "BUNDLER_SKIP_16M_FALLBACK_PRE_LI";
-    const reason = "large_insider_bundler_16m_fallback_pre_li_skip";
-
-    this.log.warn(
-      "Pre-LI bundler sold-all — 16M fallback tier; skipping token (no buy)",
-      {
-        mint: funderState.mint,
-        signature: state.exitTriggerSignature,
-        transferRecipientPath: state.earlyBundlerTransferOutObserved,
-        ...gate,
-      },
-    );
-
-    void this.sendTelegramSafe(
-      [
-        `<b>⛔ ${this.label} Follow-Token Large Insider Skipped</b>`,
-        `Token: <code>${funderState.mint}</code>`,
-        this.formatFollowTokenMaxSingleSellGateTelegramLine(gate),
-        "",
-        "All bundlers/recipients sold all before 1st valid LI wallet on 8M–16M max-single-sell tier.",
-        "No buy — 16M fallback requires post-LI path; token skipped and flow reset.",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      "follow-token large insider 16m fallback pre-li skip",
-    );
-
-    await this.stopFollowTokenLargeInsiderFlow("16M fallback pre-LI skip");
     await this.resetForNewToken(false, { reason });
   }
 
