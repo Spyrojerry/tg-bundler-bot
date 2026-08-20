@@ -2276,6 +2276,13 @@ export class InsiderBot extends EventEmitter {
   private subscribeFollowTokenLargeInsiderScrapeWallet(wallet: string): void {
     const li = this.followTokenLargeInsiderState;
     if (!li?.active || li.scrapeEnhancedWatchIds.has(wallet)) return;
+    if (!this.isValidFollowTokenEarlyBundlerWatchWallet(wallet)) {
+      this.log.warn("Skipped invalid Large Insider scrape wallet subscription", {
+        mint: li.mint,
+        wallet,
+      });
+      return;
+    }
 
     if (this.enhancedWs) {
       const watchId = this.enhancedWs.watch(wallet, (tx) => {
@@ -3267,6 +3274,11 @@ export class InsiderBot extends EventEmitter {
         this.followTokenLargeInsiderState?.scrapeWatches.get(watchedWallet);
       const triggerSource = options.triggerSource ?? "valid_wallet_4";
       const bundlerBranch = options.bundlerExitBranch;
+      const hasDiscoveredLi =
+        (this.followTokenLargeInsiderState?.validWallets.length ?? 0) > 0;
+      const soldAllAfterFirstLi =
+        triggerSource === "bundler_sold_all" && hasDiscoveredLi;
+      const displayedPreLiPhase = options.preLiPhase && !soldAllAfterFirstLi;
       const gateTierLine =
         options.maxSingleSellGateTier === "fallback_16m"
           ? `Max-single-sell gate: <b>16M fallback</b> (failed 8M · ≤16M).`
@@ -3275,7 +3287,7 @@ export class InsiderBot extends EventEmitter {
         options.buySolOverride ??
         this.getBuySolForFundingMode(state.lowFundingMode);
       const buyTitle =
-        options.preLiPhase
+        displayedPreLiPhase
           ? options.maxSingleSellGateTier === "fallback_16m"
             ? `<b>🟢 ${this.label} Follow-Token Buy (Pre-LI Bundler Sold-All · 16M Fallback)</b>`
             : `<b>🟢 ${this.label} Follow-Token Buy (Pre-LI Bundler Sold-All)</b>`
@@ -3285,13 +3297,15 @@ export class InsiderBot extends EventEmitter {
               : `<b>🟢 ${this.label} Follow-Token Large Insider Buy (Bundler Sold-All)</b>`
             : `<b>🟢 ${this.label} Follow-Token Large Insider Buy</b>`;
       const triggerLine =
-        options.preLiPhase
+        displayedPreLiPhase
           ? `Trigger: all early bundlers/recipients sold all before 1st valid LI wallet · +${profitExitPercent}% MC TP`
+          : soldAllAfterFirstLi
+            ? `Trigger: all early bundlers/recipients sold all after valid LI discovery · +${profitExitPercent}% MC TP`
           : triggerSource === "bundler_sold_all"
             ? `Trigger: all early bundlers/recipients sold all · branch <b>${bundlerBranch ?? "unknown"}</b>`
             : `Valid wallet #4: <code>${watchedWallet}</code>`;
       const postBuyExitLine =
-        options.preLiPhase
+        displayedPreLiPhase
           ? `Post-buy: +${profitExitPercent}% MC TP only (until valid LI wallets join ≥25% pool).`
           : options.maxSingleSellGateTier === "fallback_16m"
             ? `Post-buy: +${profitExitPercent}% MC TP or valid LI ≥25%.`
