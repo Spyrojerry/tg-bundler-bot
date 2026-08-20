@@ -1552,7 +1552,7 @@ export class InsiderBot extends EventEmitter {
   private isFollowTokenLargeInsiderFeePayerWindowClosed(): boolean {
     const li = this.followTokenLargeInsiderState;
     if (!li?.active) return false;
-    return Math.floor(Date.now() / 1000) > li.feePayerWindowEndsAt;
+    return Math.floor(Date.now() / 1000) >= li.feePayerWindowEndsAt;
   }
 
   private async maybeResetFollowTokenLargeInsiderWindowClosedBeforeBuy(): Promise<void> {
@@ -1562,7 +1562,12 @@ export class InsiderBot extends EventEmitter {
     if (li.validWallets.length >= 1) {
       return;
     }
-    if (!this.isFollowTokenLargeInsiderFeePayerWindowClosed()) return;
+    if (!this.isFollowTokenLargeInsiderFeePayerWindowClosed()) {
+      // The timeout can fire just before the epoch-second boundary. Keep the
+      // close check armed instead of leaving the pre-buy flow without a timer.
+      this.scheduleFollowTokenLargeInsiderWindowCloseCheck();
+      return;
+    }
 
     const resetReason = "large_insider_window_closed_before_fourth_valid_wallet";
     this.followTokenLargeInsiderLog(
