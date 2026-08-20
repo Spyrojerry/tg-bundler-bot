@@ -9442,7 +9442,7 @@ export class InsiderBot extends EventEmitter {
       devWallet: this.devWallet,
       signature: tx.signature,
     });
-    await this.sendTelegramSafe(
+    void this.sendTelegramSafe(
       [
         `<b>⛔ ${this.label} Dev Wallet Token Transfer-Out Before Buy</b>`,
         `Token: <code>${mint}</code>`,
@@ -9454,6 +9454,8 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "dev wallet token transfer-out before buy",
     );
+    // Teardown must not wait on Telegram. The transfer-out is terminal for
+    // this pre-buy flow, and pending watcher callbacks must be stopped first.
     await this.resetForNewToken(false, {
       reason: "dev_wallet_token_out_before_buy",
     });
