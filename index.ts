@@ -2118,6 +2118,9 @@ async function main(): Promise<void> {
       }
 
       if (activePos) {
+        if (await bot.tryTriggerFastMigrationTransferOutMcSell(currentMc)) {
+          return;
+        }
         const exitMc = bot.getExitMc();
         if (bot.isProfitExitDisabled()) {
           log.info(

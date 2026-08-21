@@ -291,7 +291,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       // Suspend before handoff. Startup can emit tokenFlowEnded before the
       // handoff promise returns when initialization fails.
       this.unsubscribeMigrationFeedForActiveFlow(mint);
-      const started = await this.tryStartFollowTokenFlow(mint, signature);
+      const started = await this.tryStartFollowTokenFlow(
+        mint,
+        signature,
+        migrationAgeSec,
+      );
       this.seenMigrationMints.add(mint);
       if (started) {
         log.info('Follow-token migration passed all filters and started insider flow', {
@@ -574,6 +578,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private async tryStartFollowTokenFlow(
     mint: string,
     migrationSignature: string,
+    migrationAgeSec: number,
   ): Promise<boolean> {
     const targetBot = this.pickIdleInsiderBot();
     if (!targetBot) {
@@ -589,6 +594,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     const started = await targetBot.startFromFollowTokenMigration(
       mint,
       migrationSignature,
+      migrationAgeSec,
     );
     if (!started) {
       void this.sendMigrationTelegram([
