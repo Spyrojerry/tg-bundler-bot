@@ -3336,19 +3336,34 @@ export class InsiderBot extends EventEmitter {
           : bundlerBranch === "normal_mc_tp"
             ? `Post-buy: +${profitExitPercent}% MC TP or valid LI ≥25%.`
             : "";
+      const isFastMigrationBuy =
+        triggerSource === "migration_2_4s_immediate";
+      const fastMigrationModeLine = isFastMigrationBuy
+        ? `Special migration buy: <b>2s–4s immediate path</b> · dev transfer-out watch has no 3-minute expiry · ${this.fastMigrationSellMode === "transfer_out_mc_retrace" ? "4s mode waits for +60% TP or MC retrace to transfer-out baseline." : "2s/3s mode sells immediately on dev transfer-out."}`
+        : "";
       void this.sendTelegramSafe(
         [
-          buyTitle,
+          isFastMigrationBuy
+            ? `<b>🟢 ${this.label} Follow-Token Immediate Migration Buy</b>`
+            : buyTitle,
           `Token: <code>${state.mint}</code>`,
-          triggerLine,
+          isFastMigrationBuy
+            ? "Trigger: Create → migrate time was between 2s and 4s and all migration filters passed."
+            : triggerLine,
           gateTierLine,
+          fastMigrationModeLine,
           triggerSource === "valid_wallet_4"
             ? liWatch
               ? this.formatFollowTokenLargeInsiderScrapeWatchTierLine(liWatch)
               : ""
-            : `Reference wallet: <code>${watchedWallet}</code>`,
+            : isFastMigrationBuy
+              ? `Reference early bundler: <code>${watchedWallet}</code>`
+              : `Reference wallet: <code>${watchedWallet}</code>`,
           `Trigger tx: <code>${signature}</code>`,
           `Buy: <b>${buySol} SOL</b>`,
+          isFastMigrationBuy
+            ? `Exit: <b>+${profitExitPercent}% MC TP</b> · special dev transfer-out handling applies`
+            : "",
           triggerSource === "valid_wallet_4"
             ? `Still watching for valid wallet #5.`
             : "",
@@ -3679,6 +3694,14 @@ export class InsiderBot extends EventEmitter {
               skipAthGate: true,
             },
           );
+          this.log.warn("Follow-token immediate migration buy path evaluated", {
+            mint,
+            migrationAgeSec,
+            mode: this.fastMigrationSellMode,
+            buySol: this.followToken16mPostLiBuySol,
+            profitExitPercent: FOLLOW_TOKEN_FAST_MIGRATION_PROFIT_EXIT_PERCENT,
+            transferOutWatch: "no_expiry",
+          });
         }
       }
       return flowActive;
