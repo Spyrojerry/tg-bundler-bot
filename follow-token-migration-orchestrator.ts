@@ -41,7 +41,6 @@ interface EarlyMigrationFilterContext {
 
 interface CoreMigrationFilterContext {
   devWallet: string;
-  devCreateTimestamp: number;
   migrationAgeSec: number;
   funding: Awaited<ReturnType<HeliusClient['getWalletFundedBy']>>;
   metadata: EarlyMigrationFilterContext;
@@ -260,7 +259,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         mint,
         signature,
         devWallet,
-        migrationAgeSec,
         devCreateCount,
         devFunder: funding?.funder ?? null,
         devFunderName: funding?.funderName ?? null,
@@ -295,11 +293,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       const started = await this.tryStartFollowTokenFlow(
         mint,
         signature,
-        migrationAgeSec,
-        migrationAgeSec >= 2 && migrationAgeSec <= 4 ? devWallet : undefined,
-        migrationAgeSec >= 2 && migrationAgeSec <= 4
-          ? coreResult.devCreateTimestamp
-          : undefined,
       );
       this.seenMigrationMints.add(mint);
       if (started) {
@@ -396,14 +389,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return `dev funder is not a Centralized Exchange (${funding?.funderType ?? funding?.funder ?? 'unknown'})`;
     }
 
-    return {
-      devWallet,
-      devCreateTimestamp: createTx.timestamp,
-      migrationAgeSec,
-      funding,
-      metadata,
-      devCreateCount,
-    };
+    return { devWallet, migrationAgeSec, funding, metadata, devCreateCount };
   }
 
   private async fetchCoreFilterWithRetry<T>(
@@ -590,9 +576,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private async tryStartFollowTokenFlow(
     mint: string,
     migrationSignature: string,
-    migrationAgeSec: number,
-    devWallet?: string,
-    devCreateTimestamp?: number,
   ): Promise<boolean> {
     const targetBot = this.pickIdleInsiderBot();
     if (!targetBot) {
@@ -608,9 +591,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     const started = await targetBot.startFromFollowTokenMigration(
       mint,
       migrationSignature,
-      migrationAgeSec,
-      devWallet,
-      devCreateTimestamp,
     );
     if (!started) {
       void this.sendMigrationTelegram([

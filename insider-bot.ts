@@ -123,7 +123,6 @@ const FOLLOW_TOKEN_EARLY_BUNDLER_PRE_LI_MAX_SINGLE_SELL_TOKEN_AMOUNT = 8_000_000
 /** Fallback when standard 8M gate fails: max single sell ≤ this → buy with reduced MC TP + dedicated buy SOL. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_MAX_SINGLE_SELL_TOKEN_AMOUNT = 16_000_000;
 const FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT = 40;
-const FOLLOW_TOKEN_FAST_MIGRATION_PROFIT_EXIT_PERCENT = 60;
 /** A sold-all gate watch must have disposed of essentially all tracked holdings. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_SOLD_ALL_MIN_SOLD_FRACTION = 0.9;
 /** Post-LI 16M fallback buy: skip when token ATH MC (GMGN fetch at buy) ≥ this multiple of calculated exit MC. */
@@ -717,12 +716,6 @@ export class InsiderBot extends EventEmitter {
   private devTokenOutWatchUntilMs: number | null = null;
   private devTokenOutPostBuyWatchTimer: ReturnType<typeof setTimeout> | null =
     null;
-  /** Extra exit state used only by the 2s-4s follow-token migration path. */
-  private fastMigrationSellMode:
-    | "transfer_out_immediate"
-    | "transfer_out_mc_retrace"
-    | null = null;
-  private fastMigrationTransferOutMc: number | null = null;
   /** Highest market cap observed for the current token across all pre-buy MC fetches — used to skip normal-mode buys that would already be past their own exit target. */
   private highestObservedMarketCapUsd: number | null = null;
   private preBuyStopped = false;
@@ -3167,8 +3160,7 @@ export class InsiderBot extends EventEmitter {
     options: {
       triggerSource?:
         | "valid_wallet_4"
-        | "bundler_sold_all"
-        | "migration_2_4s_immediate";
+        | "bundler_sold_all";
       bundlerExitBranch?:
         | "low_tx_immediate"
         | "low_usd_immediate"
@@ -3178,7 +3170,6 @@ export class InsiderBot extends EventEmitter {
       profitExitPercent?: number;
       buySolOverride?: number;
       maxSingleSellGateTier?: "standard_8m" | "fallback_16m";
-      skipAthGate?: boolean;
     } = {},
   ): Promise<void> {
     if (
@@ -3194,10 +3185,7 @@ export class InsiderBot extends EventEmitter {
     this.isBuyGateEvaluating = true;
     const ebState = this.followTokenEarlyBundlerExitState;
     try {
-      if (
-        options.triggerSource !== "migration_2_4s_immediate" &&
-        this.anyFollowTokenLargeInsiderValidWalletReachedTwentyFivePercentSold()
-      ) {
+      if (this.anyFollowTokenLargeInsiderValidWalletReachedTwentyFivePercentSold()) {
         await this.skipFollowTokenLargeInsiderFromValidWalletTwentyFivePercentAlreadySold(
           state.mint,
           options.triggerSource ?? "valid_wallet_4",
@@ -3221,8 +3209,7 @@ export class InsiderBot extends EventEmitter {
       const profitExitPercent =
         options.profitExitPercent ?? FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT;
       if (
-        options.maxSingleSellGateTier === "fallback_16m" &&
-        !options.skipAthGate
+        options.maxSingleSellGateTier === "fallback_16m"
       ) {
         const exitMc = currentMc * (1 + profitExitPercent / 100);
         const athSkipThreshold =
@@ -3336,34 +3323,19 @@ export class InsiderBot extends EventEmitter {
           : bundlerBranch === "normal_mc_tp"
             ? `Post-buy: +${profitExitPercent}% MC TP or valid LI ≥25%.`
             : "";
-      const isFastMigrationBuy =
-        triggerSource === "migration_2_4s_immediate";
-      const fastMigrationModeLine = isFastMigrationBuy
-        ? `Special migration buy: <b>2s–4s immediate path</b> · dev transfer-out watch has no 3-minute expiry · ${this.fastMigrationSellMode === "transfer_out_mc_retrace" ? "4s mode waits for +60% TP or MC retrace to transfer-out baseline." : "2s/3s mode sells immediately on dev transfer-out."}`
-        : "";
       void this.sendTelegramSafe(
         [
-          isFastMigrationBuy
-            ? `<b>🟢 ${this.label} Follow-Token Immediate Migration Buy</b>`
-            : buyTitle,
+          buyTitle,
           `Token: <code>${state.mint}</code>`,
-          isFastMigrationBuy
-            ? "Trigger: Create → migrate time was between 2s and 4s and all migration filters passed."
-            : triggerLine,
+          triggerLine,
           gateTierLine,
-          fastMigrationModeLine,
           triggerSource === "valid_wallet_4"
             ? liWatch
               ? this.formatFollowTokenLargeInsiderScrapeWatchTierLine(liWatch)
               : ""
-            : isFastMigrationBuy
-              ? `Reference early bundler: <code>${watchedWallet}</code>`
-              : `Reference wallet: <code>${watchedWallet}</code>`,
+            : `Reference wallet: <code>${watchedWallet}</code>`,
           `Trigger tx: <code>${signature}</code>`,
           `Buy: <b>${buySol} SOL</b>`,
-          isFastMigrationBuy
-            ? `Exit: <b>+${profitExitPercent}% MC TP</b> · special dev transfer-out handling applies`
-            : "",
           triggerSource === "valid_wallet_4"
             ? `Still watching for valid wallet #5.`
             : "",
@@ -3506,8 +3478,6 @@ export class InsiderBot extends EventEmitter {
   ): Promise<boolean> {
     if (this.boughtMints.has(mint)) return false;
     if (!this.isIdleForFunderFirst()) return false;
-    this.fastMigrationSellMode = null;
-    this.fastMigrationTransferOutMc = null;
     if (this.claimMint && !this.claimMint(mint)) {
       this.log.info("Follow-wallet buy delegated but mint is claimed by another bot", {
         mint,
@@ -3609,14 +3579,9 @@ export class InsiderBot extends EventEmitter {
   async startFromFollowTokenMigration(
     mint: string,
     migrationSignature: string,
-    migrationAgeSec?: number,
-    migrationDevWallet?: string,
-    migrationDevCreateTimestamp?: number,
   ): Promise<boolean> {
     if (this.boughtMints.has(mint)) return false;
     if (!this.isIdleForFunderFirst()) return false;
-    this.fastMigrationSellMode = null;
-    this.fastMigrationTransferOutMc = null;
     if (this.claimMint && !this.claimMint(mint)) {
       this.log.info("Follow-token migration delegated but mint is claimed by another bot", {
         mint,
@@ -3666,9 +3631,6 @@ export class InsiderBot extends EventEmitter {
       const flowActive = await this.startInsiderFlowFromMigrationWithIndexingLagRetry(
         mint,
         migrationSignature,
-        migrationAgeSec,
-        migrationDevWallet,
-        migrationDevCreateTimestamp,
       );
       return flowActive;
     } catch (err) {
@@ -3820,33 +3782,6 @@ export class InsiderBot extends EventEmitter {
       ],
       signature,
     );
-  }
-
-  async tryTriggerFastMigrationTransferOutMcSell(
-    currentMc: number,
-  ): Promise<boolean> {
-    if (
-      this.fastMigrationSellMode !== "transfer_out_mc_retrace" ||
-      this.fastMigrationTransferOutMc === null ||
-      !this.activePosition ||
-      this.positionSellTriggered ||
-      currentMc > this.fastMigrationTransferOutMc
-    ) {
-      return false;
-    }
-    await this.triggerPositionSell(
-      this.activePosition.mint,
-      `4s migration transfer-out MC retrace to $${this.fastMigrationTransferOutMc.toLocaleString()}`,
-      [
-        `<b>⛔ ${this.label} 4s Migration Transfer-Out MC Retrace — Selling 100%</b>`,
-        `Token: <code>${this.activePosition.mint}</code>`,
-        `Transfer-out MC: <b>$${this.fastMigrationTransferOutMc.toLocaleString()}</b>`,
-        `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-        "The MC returned to the level recorded when Insider 1 transferred tokens out.",
-      ],
-      "FAST_MIGRATION_TRANSFER_OUT_MC_RETRACE",
-    );
-    return true;
   }
 
   resetBuyAttempt(): void {
@@ -4275,9 +4210,6 @@ export class InsiderBot extends EventEmitter {
   private async startInsiderFlowFromMigrationWithIndexingLagRetry(
     mint: string,
     migrationSignature: string,
-    migrationAgeSec?: number,
-    migrationDevWallet?: string,
-    migrationDevCreateTimestamp?: number,
   ): Promise<boolean> {
     const delaysMs = [0, 4_000, 8_000];
     for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
@@ -4289,9 +4221,6 @@ export class InsiderBot extends EventEmitter {
         return await this.startInsiderFlowFromMigration(
           mint,
           migrationSignature,
-          migrationAgeSec,
-          migrationDevWallet,
-          migrationDevCreateTimestamp,
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -4324,9 +4253,6 @@ export class InsiderBot extends EventEmitter {
   private async startInsiderFlowFromMigration(
     mint: string,
     migrationSignature: string,
-    migrationAgeSec?: number,
-    migrationDevWallet?: string,
-    migrationDevCreateTimestamp?: number,
   ): Promise<boolean> {
     this.flowSource = "follow-token";
     this.flowFollowWallet = null;
@@ -4389,13 +4315,7 @@ export class InsiderBot extends EventEmitter {
     );
 
     this.startPollLoop();
-    await this.startFollowTokenLargeInsiderPreBuyFlow(
-      mint,
-      earlyInsiderBuys,
-      migrationAgeSec,
-      migrationDevWallet,
-      migrationDevCreateTimestamp,
-    );
+    await this.startFollowTokenLargeInsiderPreBuyFlow(mint, earlyInsiderBuys);
     return this.isFollowTokenFlowActive(mint);
   }
 
@@ -4459,9 +4379,6 @@ export class InsiderBot extends EventEmitter {
   private async startFollowTokenLargeInsiderPreBuyFlow(
     mint: string,
     earlyBuys: EarlyInsiderBuy[],
-    migrationAgeSec?: number,
-    migrationDevWallet?: string,
-    migrationDevCreateTimestamp?: number,
   ): Promise<void> {
     const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
     if (firstFour.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
@@ -4473,12 +4390,7 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    if (migrationDevWallet) {
-      this.devWallet = migrationDevWallet;
-      this.devCreateTimestamp = migrationDevCreateTimestamp ?? null;
-    } else {
-      await this.ensureDevWalletLoaded(mint);
-    }
+    await this.ensureDevWalletLoaded(mint);
     if (!this.devCreateTimestamp) {
       this.log.warn(
         "Follow-token pre-buy flow skipped because dev CREATE timestamp is unavailable",
@@ -4490,43 +4402,6 @@ export class InsiderBot extends EventEmitter {
 
     this.bundlerFunderWatch = this.buildFollowTokenStubBundlerWatch(mint, firstFour);
     this.followTokenEarlyInsiderBuys = firstFour;
-    const immediateMigrationBuy =
-      migrationAgeSec !== undefined &&
-      migrationAgeSec >= 2 &&
-      migrationAgeSec <= 4;
-    if (immediateMigrationBuy) {
-      this.fastMigrationSellMode =
-        migrationAgeSec === 4
-          ? "transfer_out_mc_retrace"
-          : "transfer_out_immediate";
-      const firstBuy = firstFour[0];
-      await this.emitFollowTokenLargeInsiderBuy(
-        this.bundlerFunderWatch,
-        firstBuy.wallet,
-        firstBuy.signature,
-        {
-          signature: firstBuy.signature,
-          slot: 0,
-          timestamp: firstBuy.timestamp,
-          type: "SWAP",
-        },
-        {
-          triggerSource: "migration_2_4s_immediate",
-          profitExitPercent: FOLLOW_TOKEN_FAST_MIGRATION_PROFIT_EXIT_PERCENT,
-          buySolOverride: this.followToken16mPostLiBuySol,
-          skipAthGate: true,
-        },
-      );
-      this.log.warn("Follow-token immediate migration buy emitted before normal LI setup", {
-        mint,
-        migrationAgeSec,
-        buySol: this.followToken16mPostLiBuySol,
-        profitExitPercent: FOLLOW_TOKEN_FAST_MIGRATION_PROFIT_EXIT_PERCENT,
-        normalLargeInsiderSetup: "deferred",
-      });
-      void this.startFollowTokenLargeInsiderPreBuyFlow(mint, firstFour);
-      return;
-    }
     if (this.devWallet) {
       this.subscribeDevWalletFullExitWatch();
     }
@@ -9312,7 +9187,6 @@ export class InsiderBot extends EventEmitter {
   private isDevWalletTokenOutWatchActive(mint: string): boolean {
     if (!this.devWallet || this.devTokenOutHandled) return false;
     if (this.activePosition?.mint === mint) {
-      if (this.fastMigrationSellMode !== null) return true;
       return (
         this.devTokenOutWatchUntilMs !== null &&
         Date.now() <= this.devTokenOutWatchUntilMs
@@ -9331,17 +9205,6 @@ export class InsiderBot extends EventEmitter {
 
   private armDevTokenOutPostBuyWatch(mint: string): void {
     this.clearDevTokenOutPostBuyWatchTimer();
-    if (this.fastMigrationSellMode !== null) {
-      this.devTokenOutWatchUntilMs = null;
-      this.log.info(
-        "Special migration buy dev token-out watch armed without 3-minute expiry",
-        {
-          mint,
-          mode: this.fastMigrationSellMode,
-        },
-      );
-      return;
-    }
     this.devTokenOutWatchUntilMs =
       Date.now() + DEV_WALLET_TOKEN_OUT_POST_BUY_WATCH_MS;
     this.devTokenOutPostBuyWatchTimer = setTimeout(() => {
@@ -9564,29 +9427,6 @@ export class InsiderBot extends EventEmitter {
     const hasPosition = !!this.activePosition;
 
     if (hasPosition) {
-      if (this.fastMigrationSellMode === "transfer_out_mc_retrace") {
-        const transferOutMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
-        if (transferOutMc !== null) {
-          this.fastMigrationTransferOutMc = transferOutMc;
-        }
-        this.log.warn(
-          "4s migration dev token transfer-out observed — waiting for +60% TP or MC retrace",
-          { mint, devWallet: this.devWallet, signature: tx.signature, transferOutMc },
-        );
-        void this.sendTelegramSafe(
-          [
-            `<b>⚠️ ${this.label} 4s Migration Dev Transfer-Out Observed</b>`,
-            `Token: <code>${mint}</code>`,
-            `Tx: <code>${tx.signature}</code>`,
-            transferOutMc !== null
-              ? `Transfer-out MC baseline: <b>$${transferOutMc.toLocaleString()}</b>`
-              : "Transfer-out MC baseline unavailable; +60% TP remains active.",
-            "No immediate sell. Selling at +60% TP or if MC retraces to this baseline.",
-          ].join("\n"),
-          "4s migration dev transfer-out observed",
-        );
-        return;
-      }
       this.log.warn("Dev wallet token transfer-out after buy — selling 100%", {
         mint,
         devWallet: this.devWallet,
@@ -13976,8 +13816,6 @@ export class InsiderBot extends EventEmitter {
     this.devCreateTimestamp = null;
     this.devFullExitHandled = false;
     this.devTokenOutHandled = false;
-    this.fastMigrationSellMode = null;
-    this.fastMigrationTransferOutMc = null;
     this.clearDevTokenOutPostBuyWatchTimer();
     this.devTokenOutWatchUntilMs = null;
     this.devFullExitSeenSignatures.clear();
