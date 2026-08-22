@@ -3611,6 +3611,7 @@ export class InsiderBot extends EventEmitter {
     migrationSignature: string,
     migrationAgeSec?: number,
     migrationDevWallet?: string,
+    migrationDevCreateTimestamp?: number,
   ): Promise<boolean> {
     if (this.boughtMints.has(mint)) return false;
     if (!this.isIdleForFunderFirst()) return false;
@@ -3667,6 +3668,7 @@ export class InsiderBot extends EventEmitter {
         migrationSignature,
         migrationAgeSec,
         migrationDevWallet,
+        migrationDevCreateTimestamp,
       );
       return flowActive;
     } catch (err) {
@@ -4275,6 +4277,7 @@ export class InsiderBot extends EventEmitter {
     migrationSignature: string,
     migrationAgeSec?: number,
     migrationDevWallet?: string,
+    migrationDevCreateTimestamp?: number,
   ): Promise<boolean> {
     const delaysMs = [0, 4_000, 8_000];
     for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
@@ -4288,6 +4291,7 @@ export class InsiderBot extends EventEmitter {
           migrationSignature,
           migrationAgeSec,
           migrationDevWallet,
+          migrationDevCreateTimestamp,
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -4322,6 +4326,7 @@ export class InsiderBot extends EventEmitter {
     migrationSignature: string,
     migrationAgeSec?: number,
     migrationDevWallet?: string,
+    migrationDevCreateTimestamp?: number,
   ): Promise<boolean> {
     this.flowSource = "follow-token";
     this.flowFollowWallet = null;
@@ -4389,6 +4394,7 @@ export class InsiderBot extends EventEmitter {
       earlyInsiderBuys,
       migrationAgeSec,
       migrationDevWallet,
+      migrationDevCreateTimestamp,
     );
     return this.isFollowTokenFlowActive(mint);
   }
@@ -4455,6 +4461,7 @@ export class InsiderBot extends EventEmitter {
     earlyBuys: EarlyInsiderBuy[],
     migrationAgeSec?: number,
     migrationDevWallet?: string,
+    migrationDevCreateTimestamp?: number,
   ): Promise<void> {
     const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
     if (firstFour.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
@@ -4468,6 +4475,7 @@ export class InsiderBot extends EventEmitter {
 
     if (migrationDevWallet) {
       this.devWallet = migrationDevWallet;
+      this.devCreateTimestamp = migrationDevCreateTimestamp ?? null;
     } else {
       await this.ensureDevWalletLoaded(mint);
     }

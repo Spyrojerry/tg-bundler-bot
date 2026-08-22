@@ -41,6 +41,7 @@ interface EarlyMigrationFilterContext {
 
 interface CoreMigrationFilterContext {
   devWallet: string;
+  devCreateTimestamp: number;
   migrationAgeSec: number;
   funding: Awaited<ReturnType<HeliusClient['getWalletFundedBy']>>;
   metadata: EarlyMigrationFilterContext;
@@ -296,6 +297,9 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         signature,
         migrationAgeSec,
         migrationAgeSec >= 2 && migrationAgeSec <= 4 ? devWallet : undefined,
+        migrationAgeSec >= 2 && migrationAgeSec <= 4
+          ? coreResult.devCreateTimestamp
+          : undefined,
       );
       this.seenMigrationMints.add(mint);
       if (started) {
@@ -392,7 +396,14 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       return `dev funder is not a Centralized Exchange (${funding?.funderType ?? funding?.funder ?? 'unknown'})`;
     }
 
-    return { devWallet, migrationAgeSec, funding, metadata, devCreateCount };
+    return {
+      devWallet,
+      devCreateTimestamp: createTx.timestamp,
+      migrationAgeSec,
+      funding,
+      metadata,
+      devCreateCount,
+    };
   }
 
   private async fetchCoreFilterWithRetry<T>(
@@ -581,6 +592,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     migrationSignature: string,
     migrationAgeSec: number,
     devWallet?: string,
+    devCreateTimestamp?: number,
   ): Promise<boolean> {
     const targetBot = this.pickIdleInsiderBot();
     if (!targetBot) {
@@ -598,6 +610,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       migrationSignature,
       migrationAgeSec,
       devWallet,
+      devCreateTimestamp,
     );
     if (!started) {
       void this.sendMigrationTelegram([
