@@ -3610,6 +3610,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     migrationSignature: string,
     migrationAgeSec?: number,
+    migrationDevWallet?: string,
   ): Promise<boolean> {
     if (this.boughtMints.has(mint)) return false;
     if (!this.isIdleForFunderFirst()) return false;
@@ -3664,46 +3665,9 @@ export class InsiderBot extends EventEmitter {
       const flowActive = await this.startInsiderFlowFromMigrationWithIndexingLagRetry(
         mint,
         migrationSignature,
+        migrationAgeSec,
+        migrationDevWallet,
       );
-      if (
-        flowActive &&
-        migrationAgeSec !== undefined &&
-        migrationAgeSec >= 2 &&
-        migrationAgeSec <= 4
-      ) {
-        this.fastMigrationSellMode =
-          migrationAgeSec === 4
-            ? "transfer_out_mc_retrace"
-            : "transfer_out_immediate";
-        const firstBuy = this.followTokenEarlyInsiderBuys?.[0];
-        if (this.bundlerFunderWatch && firstBuy) {
-          await this.emitFollowTokenLargeInsiderBuy(
-            this.bundlerFunderWatch,
-            firstBuy.wallet,
-            migrationSignature,
-            {
-              signature: migrationSignature,
-              slot: 0,
-              timestamp: firstBuy.timestamp,
-              type: "SWAP",
-            },
-            {
-              triggerSource: "migration_2_4s_immediate",
-              profitExitPercent: FOLLOW_TOKEN_FAST_MIGRATION_PROFIT_EXIT_PERCENT,
-              buySolOverride: this.followToken16mPostLiBuySol,
-              skipAthGate: true,
-            },
-          );
-          this.log.warn("Follow-token immediate migration buy path evaluated", {
-            mint,
-            migrationAgeSec,
-            mode: this.fastMigrationSellMode,
-            buySol: this.followToken16mPostLiBuySol,
-            profitExitPercent: FOLLOW_TOKEN_FAST_MIGRATION_PROFIT_EXIT_PERCENT,
-            transferOutWatch: "no_expiry",
-          });
-        }
-      }
       return flowActive;
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
@@ -4309,6 +4273,8 @@ export class InsiderBot extends EventEmitter {
   private async startInsiderFlowFromMigrationWithIndexingLagRetry(
     mint: string,
     migrationSignature: string,
+    migrationAgeSec?: number,
+    migrationDevWallet?: string,
   ): Promise<boolean> {
     const delaysMs = [0, 4_000, 8_000];
     for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
@@ -4317,7 +4283,12 @@ export class InsiderBot extends EventEmitter {
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
       try {
-        return await this.startInsiderFlowFromMigration(mint, migrationSignature);
+        return await this.startInsiderFlowFromMigration(
+          mint,
+          migrationSignature,
+          migrationAgeSec,
+          migrationDevWallet,
+        );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const retryable =
@@ -4349,6 +4320,8 @@ export class InsiderBot extends EventEmitter {
   private async startInsiderFlowFromMigration(
     mint: string,
     migrationSignature: string,
+    migrationAgeSec?: number,
+    migrationDevWallet?: string,
   ): Promise<boolean> {
     this.flowSource = "follow-token";
     this.flowFollowWallet = null;
@@ -4411,7 +4384,12 @@ export class InsiderBot extends EventEmitter {
     );
 
     this.startPollLoop();
-    await this.startFollowTokenLargeInsiderPreBuyFlow(mint, earlyInsiderBuys);
+    await this.startFollowTokenLargeInsiderPreBuyFlow(
+      mint,
+      earlyInsiderBuys,
+      migrationAgeSec,
+      migrationDevWallet,
+    );
     return this.isFollowTokenFlowActive(mint);
   }
 
@@ -4475,6 +4453,8 @@ export class InsiderBot extends EventEmitter {
   private async startFollowTokenLargeInsiderPreBuyFlow(
     mint: string,
     earlyBuys: EarlyInsiderBuy[],
+    migrationAgeSec?: number,
+    migrationDevWallet?: string,
   ): Promise<void> {
     const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
     if (firstFour.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
@@ -4486,7 +4466,11 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    await this.ensureDevWalletLoaded(mint);
+    if (migrationDevWallet) {
+      this.devWallet = migrationDevWallet;
+    } else {
+      await this.ensureDevWalletLoaded(mint);
+    }
     if (!this.devCreateTimestamp) {
       this.log.warn(
         "Follow-token pre-buy flow skipped because dev CREATE timestamp is unavailable",
@@ -4498,6 +4482,43 @@ export class InsiderBot extends EventEmitter {
 
     this.bundlerFunderWatch = this.buildFollowTokenStubBundlerWatch(mint, firstFour);
     this.followTokenEarlyInsiderBuys = firstFour;
+    const immediateMigrationBuy =
+      migrationAgeSec !== undefined &&
+      migrationAgeSec >= 2 &&
+      migrationAgeSec <= 4;
+    if (immediateMigrationBuy) {
+      this.fastMigrationSellMode =
+        migrationAgeSec === 4
+          ? "transfer_out_mc_retrace"
+          : "transfer_out_immediate";
+      const firstBuy = firstFour[0];
+      await this.emitFollowTokenLargeInsiderBuy(
+        this.bundlerFunderWatch,
+        firstBuy.wallet,
+        firstBuy.signature,
+        {
+          signature: firstBuy.signature,
+          slot: 0,
+          timestamp: firstBuy.timestamp,
+          type: "SWAP",
+        },
+        {
+          triggerSource: "migration_2_4s_immediate",
+          profitExitPercent: FOLLOW_TOKEN_FAST_MIGRATION_PROFIT_EXIT_PERCENT,
+          buySolOverride: this.followToken16mPostLiBuySol,
+          skipAthGate: true,
+        },
+      );
+      this.log.warn("Follow-token immediate migration buy emitted before normal LI setup", {
+        mint,
+        migrationAgeSec,
+        buySol: this.followToken16mPostLiBuySol,
+        profitExitPercent: FOLLOW_TOKEN_FAST_MIGRATION_PROFIT_EXIT_PERCENT,
+        normalLargeInsiderSetup: "deferred",
+      });
+      void this.startFollowTokenLargeInsiderPreBuyFlow(mint, firstFour);
+      return;
+    }
     if (this.devWallet) {
       this.subscribeDevWalletFullExitWatch();
     }

@@ -295,6 +295,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         mint,
         signature,
         migrationAgeSec,
+        migrationAgeSec >= 2 && migrationAgeSec <= 4 ? devWallet : undefined,
       );
       this.seenMigrationMints.add(mint);
       if (started) {
@@ -579,6 +580,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     mint: string,
     migrationSignature: string,
     migrationAgeSec: number,
+    devWallet?: string,
   ): Promise<boolean> {
     const targetBot = this.pickIdleInsiderBot();
     if (!targetBot) {
@@ -595,6 +597,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       mint,
       migrationSignature,
       migrationAgeSec,
+      devWallet,
     );
     if (!started) {
       void this.sendMigrationTelegram([
