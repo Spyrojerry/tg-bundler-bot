@@ -929,6 +929,21 @@ async function main(): Promise<void> {
           }
           return homeReply(true);
         }
+        if (data.startsWith("insider:followinsider:remove:")) {
+          const address = data.slice("insider:followinsider:remove:".length);
+          try {
+            insiderBots[0].removeFollowInsiderWallet(address);
+            db.removeInsiderFollowWallet(new PublicKey(address).toBase58());
+            await insiderBots[0].startFollowInsiderWalletMonitoring();
+            log.info("[SETTINGS] Follow-insider wallet removed", { address });
+          } catch (err) {
+            return {
+              text: html(err instanceof Error ? err.message : String(err)),
+              editCurrent: true,
+            };
+          }
+          return homeReply(true);
+        }
         if (data === "funderfirst:funder") {
           pendingTelegramActions.set(chatId, { type: "funderFirstFunderAddress" });
           return {
@@ -2695,24 +2710,7 @@ async function main(): Promise<void> {
 
     const monitoredWallet = bot.getMonitoredWallet();
     const funderAddress = funderFirstOrchestrator.getFunderAddress();
-    const funderFirstRunning = funderFirstOrchestrator.isRunning();
     const followTokenRunning = followTokenOrchestrator.isRunning();
-    const watchedPotential = funderFirstOrchestrator.getWatchedPotentialFeePayers();
-    const potentialLines =
-      watchedPotential.length > 0
-        ? watchedPotential.map(
-            (w) =>
-              `  • <code>${html(w.address)}</code> — <b>${w.status}</b>${w.mint ? ` (<code>${html(w.mint)}</code>)` : ""}`,
-          )
-        : ["  • <i>none yet</i>"];
-
-    const funderFirstStartButton =
-      !funderFirstRunning && funderAddress
-        ? { text: "Start Funder-First", callback_data: "funderfirst:start" }
-        : null;
-    const funderFirstPauseButton = funderFirstRunning
-      ? { text: "Pause Funder-First", callback_data: "funderfirst:pause" }
-      : null;
 
     const followTokenStartButton = followTokenRunning
       ? null
@@ -2720,13 +2718,6 @@ async function main(): Promise<void> {
     const followTokenStopButton = followTokenRunning
       ? { text: "Stop Follow-Token", callback_data: "followtoken:stop" }
       : null;
-
-    const feePayerRemoveRows = watchedPotential.map((w, index) => [
-      {
-        text: `🗑 Remove ${w.address.slice(0, 4)}…${w.address.slice(-4)} (${w.status})`,
-        callback_data: `funderfirst:rm:${index}`,
-      },
-    ]);
 
     const followWalletLines =
       followedWallets.length > 0
@@ -2737,6 +2728,17 @@ async function main(): Promise<void> {
       {
         text: `🗑 Remove follow ${w.slice(0, 4)}…${w.slice(-4)}`,
         callback_data: `insider:fr:${index}`,
+      },
+    ]);
+    const followInsiderWallets = bot.getFollowInsiderWallets();
+    const followInsiderWalletLines =
+      followInsiderWallets.length > 0
+        ? followInsiderWallets.map((w) => `  • <code>${html(w)}</code>`)
+        : ["  • <i>none yet</i>"];
+    const followInsiderRemoveRows = followInsiderWallets.map((w) => [
+      {
+        text: `🗑 Remove follow-insider ${w.slice(0, 4)}…${w.slice(-4)}`,
+        callback_data: `insider:followinsider:remove:${w}`,
       },
     ]);
 
@@ -2755,14 +2757,13 @@ async function main(): Promise<void> {
               : ""
         }:`,
         ...followWalletLines,
+        `<b>Follow-insider wallets</b> (logs-only, max ${MAX_FOLLOW_WALLETS}):`,
+        ...followInsiderWalletLines,
         monitoredWallet
           ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
           : "",
         `FeePayer funder: ${funderAddress ? `<code>${html(funderAddress)}</code>` : "<b>Not set</b>"}`,
-        `Funder-first: <b>${funderFirstRunning ? "Running" : "Stopped"}</b>`,
         `Follow-token (Pump migrate): <b>${followTokenRunning ? "Running" : "Stopped"}</b>`,
-        "<b>Watched potential feePayers:</b>",
-        ...potentialLines,
         `Default Buy SOL: <b>${html(String(bot.getBuySol()))}</b> <i>(display only; buys use Normal / 16M fallback)</i>`,
         `Normal Funding Buy SOL: <b>${html(String(bot.getNormalFundingBuySol()))}</b>`,
         `16M Fallback Buy SOL: <b>${html(String(bot.getFollowToken16mPostLiBuySol()))}</b>`,
@@ -2771,7 +2772,7 @@ async function main(): Promise<void> {
         "",
         "<b>Flows (run in parallel)</b>",
         "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
-        "<b>B) Funder-first</b> — watch a feePayer funder; detect potential feePayers funding bundlers.",
+        "<b>B) Follow-insider</b> — tracked wallets → first-four verification → logs-only bundler/recipient observation.",
         "<b>C) Follow-token</b> — PumpPortal migration events → filters → bundler-funder monitoring.",
         insiderBots.length > 1
           ? `Parallel tokens: up to <b>${insiderBots.length}</b> insider bot key(s) — follow-wallet, funder-first, and follow-token can each hold a different token when keys are free.`
@@ -2783,13 +2784,6 @@ async function main(): Promise<void> {
         "3. First four bundler buys must include the follow wallet that bought.",
         "4. Shared feePayer locked → normal-mode tiny transfer-out buy signals.",
         "",
-        "<b>Funder-first steps</b>",
-        "1. Funder sends SOL → potential feePayer watches open (or use <b>Fast-track feePayer</b>).",
-        "2. ≥5 SOL post-balance to 4 wallets in 10s (≤0.5 SOL spread) → silent watch → buy on first-four overlap.",
-        "3. Sub-5 SOL bundler sends are ignored (no alerts).",
-        "4. FeePayer watch continues until SOL → zero; hand off to highest ≥100 SOL out since watch started — or latest ≥100 SOL out if a watched 4-in-10s group was seen — unless recipient is the feePayer funder (then stop only).",
-        "• Rug: dev CLOSE_ACCOUNT, zero SOL, or MC &lt; $3k resumes feePayer watch after a trade.",
-        "",
         "<b>Follow-token steps</b>",
         "1. <b>Start Follow-Token</b> (or set <code>INSIDER_FOLLOW_TOKEN_ENABLED=true</code>).",
         "2. PumpPortal <b>subscribeMigration</b> via <code>PUMPPORTAL_API_KEY</code>.",
@@ -2798,7 +2792,7 @@ async function main(): Promise<void> {
         "",
         "<b>Env auto-start flags</b>",
         `Follow-wallet: <b>${config.insiderFollowWalletEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FOLLOW_WALLET_ENABLED</code>)`,
-        `Funder-first: <b>${config.insiderFunderFirstEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FUNDER_FIRST_ENABLED</code>)`,
+        "Follow-insider mode: <b>logs-only, no buying</b>",
         `Follow-token TG alerts: <b>${config.insiderFollowTokenEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FOLLOW_TOKEN_ENABLED</code>)`,
       ].join("\n"),
       replyMarkup: {
@@ -2806,19 +2800,13 @@ async function main(): Promise<void> {
           [
             { text: "Add follow wallet", callback_data: "insider:follow" },
             { text: "⚡ Fast-track follow-insider", callback_data: "insider:followinsider" },
-            { text: "FeePayer funder", callback_data: "funderfirst:funder" },
           ],
           ...followWalletRemoveRows,
-          [
-            { text: "Fast-track feePayer", callback_data: "funderfirst:fasttrack" },
-          ],
+          ...followInsiderRemoveRows,
           ...(followWalletPauseButton ? [[followWalletPauseButton]] : []),
           ...(followWalletResumeButton ? [[followWalletResumeButton]] : []),
-          ...(funderFirstStartButton ? [[funderFirstStartButton]] : []),
-          ...(funderFirstPauseButton ? [[funderFirstPauseButton]] : []),
           ...(followTokenStartButton ? [[followTokenStartButton]] : []),
           ...(followTokenStopButton ? [[followTokenStopButton]] : []),
-          ...feePayerRemoveRows,
           [
             { text: "Default Buy SOL", callback_data: "insider:buysol" },
             { text: "Normal Buy SOL", callback_data: "insider:normalbuysol" },
