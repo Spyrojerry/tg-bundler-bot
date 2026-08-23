@@ -44,6 +44,8 @@ const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
 const BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL = 15;
 const FOLLOW_INSIDER_MIN_SELECTED_FUNDING_SOL = 4;
 const FOLLOW_INSIDER_MAX_SELECTED_FUNDING_SOL = 15;
+const FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES = 2;
+const FOLLOW_TOKEN_INITIAL_BALANCE_RETRY_DELAY_MS = 500;
 /** Of the BUNDLER_FUNDER_REQUIRED_COUNT (4) early bundler funding records, at least this many must share the exact same feePayer for the shared-feePayer watch to start. Relaxed from requiring all 4 to match, since a single outlier (e.g. one bundler additionally/separately funded from an unrelated wallet) shouldn't block an otherwise-clear shared-feePayer pattern. The majority feePayer's records are used for the watch; any non-matching outlier record is ignored (its bundler wallet is still tracked as an early buyer, just not as a funding source). */
 const BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS = 3;
@@ -195,6 +197,7 @@ interface FollowTokenEarlyBundlerExitState {
   }>;
   preLiFirstBuyObserverPendingWallets: Set<string>;
   preLiFirstBuyObserverSeenWallets: Set<string>;
+  initialSyncComplete: boolean;
 }
 
 interface FollowTokenLargeInsiderScrapeWatch {
@@ -7889,6 +7892,12 @@ export class InsiderBot extends EventEmitter {
     const funderState = this.bundlerFunderWatch;
     const li = this.followTokenLargeInsiderState;
     if (!state?.active || !funderState || state.exitTriggerSignature) return;
+    if (!state.initialSyncComplete) {
+      this.log.debug("Follow-token sold-all evaluation deferred until initial watch sync completes", {
+        mint: state.mint,
+      });
+      return;
+    }
     const over60mWatch = [...state.watches.values()].find(
       (watch) => watch.monitoringActive && watch.maxSingleSellTokenAmount > 60_000_000,
     );
@@ -8520,20 +8529,36 @@ export class InsiderBot extends EventEmitter {
     for (const programId of programIds) {
       const ata = getAssociatedTokenAddressSync(mintPubkey, owner, false, programId);
       const ataKey = ata.toBase58();
-      try {
-        const accountInfo = await this.connection.getAccountInfo(ata, "confirmed");
+      let accountInfo: AccountInfo<Buffer> | null = null;
+      let lastError: unknown = null;
+      for (let attempt = 1; attempt <= FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES; attempt += 1) {
+        try {
+          accountInfo = await this.connection.getAccountInfo(ata, "confirmed");
+          lastError = null;
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt < FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, FOLLOW_TOKEN_INITIAL_BALANCE_RETRY_DELAY_MS),
+            );
+          }
+        }
+      }
+      if (lastError) {
+        balances.set(ataKey, 0n);
+        this.log.warn("Early bundler ATA seed balance fetch failed after retries — defaulting to zero", {
+          mint,
+          wallet,
+          ata: ataKey,
+          attempts: FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES,
+          error: lastError instanceof Error ? lastError.message : String(lastError),
+        });
+      } else {
         balances.set(
           ataKey,
           this.decodeFollowTokenEarlyBundlerExitTokenAtaBalance(accountInfo),
         );
-      } catch (err) {
-        balances.set(ataKey, 0n);
-        this.log.debug("Early bundler ATA seed balance fetch failed — defaulting to zero", {
-          mint,
-          wallet,
-          ata: ataKey,
-          error: err instanceof Error ? err.message : String(err),
-        });
       }
 
       const subId = this.connection.onAccountChange(
@@ -8561,7 +8586,6 @@ export class InsiderBot extends EventEmitter {
         watch,
         totalRaw,
       );
-      this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(watch, null);
     }
 
     this.log.info("Subscribed follow-token early bundler token ATA balance", {
@@ -8681,7 +8705,23 @@ export class InsiderBot extends EventEmitter {
   ): Promise<void> {
     await this.subscribeFollowTokenEarlyBundlerExitTokenAta(wallet, mint);
     try {
-      const raw = await this.gmgnClient.getTokenRawBalance(wallet, mint);
+      let raw: bigint | null = null;
+      let lastError: unknown = null;
+      for (let attempt = 1; attempt <= FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES; attempt += 1) {
+        try {
+          raw = await this.gmgnClient.getTokenRawBalance(wallet, mint);
+          lastError = null;
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt < FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, FOLLOW_TOKEN_INITIAL_BALANCE_RETRY_DELAY_MS),
+            );
+          }
+        }
+      }
+      if (lastError || raw === null) throw lastError ?? new Error("Token balance unavailable");
       const state = this.followTokenEarlyBundlerExitState;
       if (!state) return;
       state.tokenAtaLiveBalanceRaw.set(wallet, raw);
@@ -8945,15 +8985,12 @@ export class InsiderBot extends EventEmitter {
       preLiFirstBuyObserverWallets: new Map(),
       preLiFirstBuyObserverPendingWallets: new Set(),
       preLiFirstBuyObserverSeenWallets: new Set(),
+      initialSyncComplete: false,
     };
 
     for (const wallet of watches.keys()) {
       this.subscribeFollowTokenEarlyBundlerExitWallet(wallet);
     }
-
-    await this.syncAllFollowTokenEarlyBundlerExitWatches(mint);
-
-    await this.maybeEvaluateFollowTokenEarlyBundlerExit();
 
     this.log.info("Started follow-token early bundler exit monitoring", {
       mint,
@@ -8979,6 +9016,14 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "follow-token early bundler exit watch started",
     );
+
+    // Initial history/ATA synchronization must not be mistaken for a live
+    // sold-all event. Only evaluate sell-all after the watcher is announced.
+    await this.syncAllFollowTokenEarlyBundlerExitWatches(mint);
+    const currentState = this.followTokenEarlyBundlerExitState;
+    if (!currentState || currentState.mint !== mint) return;
+    currentState.initialSyncComplete = true;
+    await this.maybeEvaluateFollowTokenEarlyBundlerExit();
   }
 
   private async stopFollowTokenEarlyBundlerExitMonitoring(): Promise<void> {
