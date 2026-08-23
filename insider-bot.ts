@@ -7928,18 +7928,6 @@ export class InsiderBot extends EventEmitter {
       });
       return;
     }
-    if (this.followInsiderObservationMode) {
-      this.log.info("Follow-insider bundler sold-all reached — starting first-buy observer; buy disabled", {
-        mint: state.mint,
-        watchedWalletCount: state.watches.size,
-      });
-      void this.sendTelegramSafe(
-        `<b>✅ ${this.label} Follow-Insider Bundler Sold-All Reached</b>\nToken: <code>${state.mint}</code>\nAll early bundlers/transfer recipients sold all. Starting the logs-only $110–$300 first-buy observer.\n<b>No buying is enabled for this mode.</b>`,
-        "follow-insider bundler sold-all observer started",
-      );
-      this.startPreLiFirstBuyObserver(state.mint);
-      return;
-    }
     const soldAllBlockReason = this.followTokenEarlyBundlerExitSoldAllBlockReason();
     if (soldAllBlockReason) {
       const largestBag = this.getFollowTokenEarlyBundlerExitLargestBagWatch();
@@ -7971,6 +7959,14 @@ export class InsiderBot extends EventEmitter {
     state.allSoldAllComplete = true;
 
     if (this.followInsiderObservationMode) {
+      this.log.info("Follow-insider bundler sold-all reached — starting first-buy observer; buy disabled", {
+        mint: state.mint,
+        watchedWalletCount: state.watches.size,
+      });
+      void this.sendTelegramSafe(
+        `<b>✅ ${this.label} Follow-Insider Bundler Sold-All Reached</b>\nToken: <code>${state.mint}</code>\nAll early bundlers/transfer recipients sold all. Starting the logs-only $110–$300 first-buy observer.\n<b>No buying is enabled for this mode.</b>`,
+        "follow-insider bundler sold-all observer started",
+      );
       const highestWatch = this.getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch({
         activeOnly: false,
       });
@@ -8006,6 +8002,8 @@ export class InsiderBot extends EventEmitter {
         mint: state.mint,
         highestMaxSingleSell,
       });
+      this.startPreLiFirstBuyObserver(state.mint);
+      return;
     }
 
     if (!this.buySubmitted) {
