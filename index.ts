@@ -930,12 +930,24 @@ async function main(): Promise<void> {
           return homeReply(true);
         }
         if (data.startsWith("insider:followinsider:remove:")) {
-          const address = data.slice("insider:followinsider:remove:".length);
+          const index = Number.parseInt(
+            data.slice("insider:followinsider:remove:".length),
+            10,
+          );
+          const address = Number.isFinite(index)
+            ? insiderBots[0]?.getFollowInsiderWallets()[index]
+            : undefined;
+          if (!address) {
+            return {
+              text: "That Follow-Insider wallet is no longer on the list.",
+              editCurrent: true,
+            };
+          }
           try {
             insiderBots[0].removeFollowInsiderWallet(address);
             db.removeInsiderFollowWallet(new PublicKey(address).toBase58());
             await insiderBots[0].startFollowInsiderWalletMonitoring();
-            log.info("[SETTINGS] Follow-insider wallet removed", { address });
+            log.info("[SETTINGS] Follow-insider wallet removed", { address, index });
           } catch (err) {
             return {
               text: html(err instanceof Error ? err.message : String(err)),
@@ -2735,10 +2747,10 @@ async function main(): Promise<void> {
       followInsiderWallets.length > 0
         ? followInsiderWallets.map((w) => `  • <code>${html(w)}</code>`)
         : ["  • <i>none yet</i>"];
-    const followInsiderRemoveRows = followInsiderWallets.map((w) => [
+    const followInsiderRemoveRows = followInsiderWallets.map((w, index) => [
       {
         text: `🗑 Remove follow-insider ${w.slice(0, 4)}…${w.slice(-4)}`,
-        callback_data: `insider:followinsider:remove:${w}`,
+        callback_data: `insider:followinsider:remove:${index}`,
       },
     ]);
 
