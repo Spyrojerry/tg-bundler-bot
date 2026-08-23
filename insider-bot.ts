@@ -42,6 +42,8 @@ const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
 /** Post-zero bundler funding window: selected tx must have incoming SOL above this threshold (most recent qualifying transfer wins; dust-drain latest tx is skipped). */
 const BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL = 15;
+const FOLLOW_INSIDER_MIN_SELECTED_FUNDING_SOL = 4;
+const FOLLOW_INSIDER_MAX_SELECTED_FUNDING_SOL = 15;
 /** Of the BUNDLER_FUNDER_REQUIRED_COUNT (4) early bundler funding records, at least this many must share the exact same feePayer for the shared-feePayer watch to start. Relaxed from requiring all 4 to match, since a single outlier (e.g. one bundler additionally/separately funded from an unrelated wallet) shouldn't block an otherwise-clear shared-feePayer pattern. The majority feePayer's records are used for the watch; any non-matching outlier record is ignored (its bundler wallet is still tracked as an early buyer, just not as a funding source). */
 const BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT = 3;
 const BUNDLER_FUNDER_FUNDING_RECORD_ATTEMPTS = 3;
@@ -288,8 +290,14 @@ const BUNDLER_FUNDER_STARTUP_HANDOFF_HISTORY_LIMIT = 50;
 const BUNDLER_FUNDER_STARTUP_HANDOFF_MAX_CHAIN = 5;
 const ZERO_BALANCE_EPSILON_SOL = 1e-6;
 
-function bundlerFundingIncomingQualifies(amountSol: number): boolean {
-  return amountSol > BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL;
+function bundlerFundingIncomingQualifies(
+  amountSol: number,
+  minSol = BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL,
+  maxSol = Number.POSITIVE_INFINITY,
+): boolean {
+  return minSol === FOLLOW_INSIDER_MIN_SELECTED_FUNDING_SOL
+    ? amountSol >= minSol && amountSol <= maxSol
+    : amountSol > minSol && amountSol <= maxSol;
 }
 
 /** Latest post-zero tx can show dust incoming while wallet balance reflects prior funding (drain/re-wrap). */
@@ -701,6 +709,7 @@ export class InsiderBot extends EventEmitter {
   private followInsiderMonitors = new Map<string, WalletMonitor>();
   private followInsiderObservedMints = new Set<string>();
   private followInsiderObservationMode = false;
+  private followInsiderPreBuyDevOutIgnoredMints = new Set<string>();
   /** User paused follow-wallet via Telegram — blocks auto-resume after token flow reset/complete. */
   private followWalletPaused = false;
   private followWalletTxNotifier: ((tx: HeliusTransaction) => void) | null = null;
@@ -1896,6 +1905,7 @@ export class InsiderBot extends EventEmitter {
 
   private async ensureFollowTokenLargeInsiderFeePayerLocked(
     mint: string,
+    followInsiderMode = false,
   ): Promise<boolean> {
     const earlyBuys = this.followTokenEarlyInsiderBuys;
     const existing = this.bundlerFunderWatch;
@@ -1922,6 +1932,7 @@ export class InsiderBot extends EventEmitter {
       const resolved = await this.resolveBundlerFundingRecordsSequential(
         mint,
         firstFour,
+        followInsiderMode,
       );
       if (resolved === null) return false;
       fundingRecords = resolved;
@@ -1991,6 +2002,7 @@ export class InsiderBot extends EventEmitter {
       const resolved = await this.resolveBundlerFundingRecordsSequential(
         state.mint,
         firstFour,
+        this.followInsiderObservationMode,
       );
       if (resolved) {
         const records = resolved.filter(
@@ -3730,6 +3742,7 @@ export class InsiderBot extends EventEmitter {
   private async handleFollowInsiderFirstBuy(event: NewTokenEvent): Promise<void> {
     if (this.followInsiderObservedMints.has(event.mint)) return;
     this.followInsiderObservedMints.add(event.mint);
+    this.followInsiderPreBuyDevOutIgnoredMints.add(event.mint);
     if (!this.isIdleForFunderFirst()) return;
     this.flowSource = "follow-token";
     this.watchingMint = event.mint;
@@ -3756,7 +3769,7 @@ export class InsiderBot extends EventEmitter {
         earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT),
       );
       this.followTokenEarlyInsiderBuys = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
-      if (!(await this.ensureFollowTokenLargeInsiderFeePayerLocked(event.mint))) {
+      if (!(await this.ensureFollowTokenLargeInsiderFeePayerLocked(event.mint, true))) {
         await this.resetForNewToken(true, { reason: "follow_insider_fee_payer_lock_failed" });
         return;
       }
@@ -4552,7 +4565,7 @@ export class InsiderBot extends EventEmitter {
     if (!watchState) return;
 
     if (followInsiderMode) {
-      const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint);
+      const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint, true);
       if (!locked) {
         this.log.warn("Follow-insider mode skipped — shared feePayer lock failed", {
           mint,
@@ -5802,14 +5815,21 @@ export class InsiderBot extends EventEmitter {
   private async resolveBundlerFundingRecordsSequential(
     mint: string,
     firstFour: EarlyInsiderBuy[],
+    followInsiderMode = false,
   ): Promise<Array<BundlerFundingRecord | null> | null> {
     const records: Array<BundlerFundingRecord | null> = [];
     for (let index = 0; index < firstFour.length; index += 1) {
       const buy = firstFour[index]!;
-      const record = await this.findValidBundlerFundingRecord(mint, buy, index);
+      const record = await this.findValidBundlerFundingRecord(
+        mint,
+        buy,
+        index,
+        followInsiderMode,
+      );
       records.push(record);
       if (!record) continue;
       const normalFundingMinSol = this.getNormalFundingMinSol();
+      if (followInsiderMode) continue;
       if (
         !BUNDLER_FUNDER_LOW_FUNDING_MODE_ENABLED &&
         record.amountSol < normalFundingMinSol
@@ -5841,6 +5861,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     buy: EarlyInsiderBuy,
     preferredClientIndex: number,
+    followInsiderMode = false,
   ): Promise<BundlerFundingRecord | null> {
     const txs = await this.withHeliusFallback(
       (client) =>
@@ -6003,7 +6024,11 @@ export class InsiderBot extends EventEmitter {
     }
 
     const qualifiedCandidates = candidates.filter((candidate) =>
-      bundlerFundingIncomingQualifies(candidate.incoming.amountSol),
+      bundlerFundingIncomingQualifies(
+        candidate.incoming.amountSol,
+        followInsiderMode ? FOLLOW_INSIDER_MIN_SELECTED_FUNDING_SOL : BUNDLER_FUNDER_MIN_SELECTED_FUNDING_SOL,
+        followInsiderMode ? FOLLOW_INSIDER_MAX_SELECTED_FUNDING_SOL : Number.POSITIVE_INFINITY,
+      ),
     );
     if (!qualifiedCandidates.length) {
       this.log.warn(
@@ -9792,6 +9817,21 @@ export class InsiderBot extends EventEmitter {
     const mint = this.getDevTokenOutFlowMint();
     if (!mint || !this.isDevWalletTokenOutWatchActive(mint)) return;
     if (!this.isDevWalletTokenTransferOutTx(tx, mint)) return;
+    if (
+      !this.activePosition &&
+      (this.followInsiderObservationMode ||
+        this.followInsiderPreBuyDevOutIgnoredMints.has(mint))
+    ) {
+      this.log.info(
+        "Follow-insider mode ignored dev wallet token transfer-out before buy",
+        {
+          mint,
+          devWallet: this.devWallet,
+          signature: tx.signature,
+        },
+      );
+      return;
+    }
     await this.handleDevWalletTokenOut(mint, tx);
   }
 
@@ -9810,6 +9850,21 @@ export class InsiderBot extends EventEmitter {
       for (const tx of [...txs].reverse()) {
         if (this.devFullExitSeenSignatures.has(tx.signature)) continue;
         if (!this.isDevWalletTokenTransferOutTx(tx, mint)) continue;
+        if (
+          !this.activePosition &&
+          (this.followInsiderObservationMode ||
+            this.followInsiderPreBuyDevOutIgnoredMints.has(mint))
+        ) {
+          this.log.info(
+            "Follow-insider mode ignored historical dev wallet token transfer-out before buy",
+            {
+              mint,
+              devWallet: this.devWallet,
+              signature: tx.signature,
+            },
+          );
+          continue;
+        }
         this.devFullExitSeenSignatures.add(tx.signature);
         await this.handleDevWalletTokenOut(mint, tx);
         return;

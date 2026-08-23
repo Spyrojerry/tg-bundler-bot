@@ -418,6 +418,34 @@ export interface EarlyBundlerBuyRecord {
   timestamp: number;
 }
 
+/** Estimate SOL spent by a wallet from normalized Helius transaction data. */
+export function estimateEarlyBuySolFromHeliusTx(
+  tx: HeliusTransaction,
+  wallet: string,
+): number | null {
+  let spentLamports = 0;
+  for (const transfer of tx.nativeTransfers ?? []) {
+    if (transfer.fromUserAccount === wallet) spentLamports += transfer.amount ?? 0;
+    if (transfer.toUserAccount === wallet) spentLamports -= transfer.amount ?? 0;
+  }
+  if (spentLamports > 0) {
+    return Number((spentLamports / 1_000_000_000).toFixed(6));
+  }
+
+  const accountEntry = tx.accountData?.find((entry) => entry.account === wallet);
+  if (accountEntry?.nativeBalanceChange !== undefined && accountEntry.nativeBalanceChange < 0) {
+    return Number((-accountEntry.nativeBalanceChange / 1_000_000_000).toFixed(6));
+  }
+
+  if (tx.feePayer && tx.feePayer !== wallet) {
+    const feePayerEntry = tx.accountData?.find((entry) => entry.account === tx.feePayer);
+    if (feePayerEntry?.nativeBalanceChange !== undefined && feePayerEntry.nativeBalanceChange < 0) {
+      return Number((-feePayerEntry.nativeBalanceChange / 1_000_000_000).toFixed(6));
+    }
+  }
+  return null;
+}
+
 /** First N unique token recipients from chronological SWAP txs on a mint. */
 export function extractFirstUniqueEarlyBundlerBuys(
   swaps: HeliusTransaction[],
@@ -442,7 +470,7 @@ export function extractFirstUniqueEarlyBundlerBuys(
         wallet,
         tokenAmount: transfer.tokenAmount ?? 0,
         signature: tx.signature,
-        buySol: estimateBuySol?.(tx, wallet) ?? null,
+        buySol: estimateBuySol?.(tx, wallet) ?? estimateEarlyBuySolFromHeliusTx(tx, wallet),
         feePayer: tx.feePayer ?? null,
         timestamp: tx.timestamp,
       });

@@ -14,7 +14,10 @@ import {
 import type { ServiceConfig } from './types';
 import { TelegramBot } from './telegram-bot';
 import { isExchangeFundedBy } from './pump-migrate-detector';
-import { extractFirstUniqueEarlyBundlerBuys } from './wallet-swap-detector';
+import {
+  extractFirstUniqueEarlyBundlerBuys,
+  estimateEarlyBuySolFromHeliusTx,
+} from './wallet-swap-detector';
 import { PumpPortalWsClient } from './pump-portal-ws';
 import {
   hasRequiredIpfsIoBafUri,
@@ -636,6 +639,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       swaps,
       mint,
       REQUIRED_BUNDLER_COUNT,
+      estimateEarlyBuySolFromHeliusTx,
     );
   }
 
