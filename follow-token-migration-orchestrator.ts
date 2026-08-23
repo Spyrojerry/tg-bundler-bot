@@ -29,7 +29,7 @@ const DEFAULT_MAX_MIGRATION_AGE_SEC = 1;
 const FOLLOW_INSIDER_MIN_MIGRATION_AGE_SEC = 400;
 const FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC = 800;
 const FOLLOW_INSIDER_MIN_EARLY_BUY_SOL = 4;
-const FOLLOW_INSIDER_MAX_EARLY_BUY_SOL = 10;
+const FOLLOW_INSIDER_MAX_EARLY_BUY_SOL = 12;
 const REQUIRED_BUNDLER_COUNT = 4;
 /** Accepted dev CREATE history counts (Helius fee-payer CREATE txs). */
 const FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN = 1;
@@ -308,7 +308,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         );
         if (earlyBuys.length < 4 || invalidEarlyBuys.length > 0) {
           this.seenMigrationMints.add(mint);
-          log.info('Follow-insider migration skipped — first-four buy SOL outside 4-10 SOL range', {
+          log.info('Follow-insider migration skipped — first-four buy SOL outside 4-12 SOL range', {
             mint,
             signature,
             requiredRangeSol: [
@@ -324,7 +324,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
           void this.sendMigrationTelegram([
             '<b>⏭️ Follow-Insider Migration Skipped — Buy SOL Range</b>',
             `Token: <code>${this.html(mint)}</code>`,
-            'All 4 early bundler first buys must be between <b>4 SOL and 10 SOL</b>.',
+            'All 4 early bundler first buys must be between <b>4 SOL and 12 SOL</b>.',
             ...earlyBuys.map(
               (buy, index) =>
                 `${index + 1}. <code>${this.html(buy.wallet)}</code> · ${buy.buySol === null ? 'unknown' : `${buy.buySol} SOL`}`,

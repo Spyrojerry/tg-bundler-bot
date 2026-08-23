@@ -3740,7 +3740,7 @@ export class InsiderBot extends EventEmitter {
       if (
         earlyBuys.length < BUNDLER_FUNDER_REQUIRED_COUNT ||
         earlyBuys.some(
-          (buy) => buy.buySol === null || buy.buySol < 4 || buy.buySol > 10,
+          (buy) => buy.buySol === null || buy.buySol < 4 || buy.buySol > 12,
         )
       ) {
         await this.resetForNewToken(true, { reason: "follow_insider_first_four_buy_sol_gate" });
