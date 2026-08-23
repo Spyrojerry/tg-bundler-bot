@@ -3324,7 +3324,15 @@ export class InsiderBot extends EventEmitter {
         (this.followTokenLargeInsiderState?.validWallets.length ?? 0) > 0;
       const soldAllAfterFirstLi =
         triggerSource === "bundler_sold_all" && hasDiscoveredLi;
-      const displayedPreLiPhase = options.preLiPhase && !soldAllAfterFirstLi;
+      const displayedPreLiPhase = options.preLiPhase && !hasDiscoveredLi;
+      const postLiQualifiedSol = this.summarizeFollowTokenPresentQualifiedSol();
+      const postLiQualifiedSolPass =
+        soldAllAfterFirstLi &&
+        postLiQualifiedSol.some(
+          ({ qualifiedSol }) =>
+            qualifiedSol !== null &&
+            qualifiedSol < FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW,
+        );
       const gateTierLine =
         options.maxSingleSellGateTier === "fallback_16m"
           ? `Max-single-sell gate: <b>16M fallback</b> (failed 8M · ≤16M).`
@@ -3372,6 +3380,9 @@ export class InsiderBot extends EventEmitter {
               : ""
             : `Reference wallet: <code>${watchedWallet}</code>`,
           `Trigger tx: <code>${signature}</code>`,
+          soldAllAfterFirstLi
+            ? `Post-LI Qualified SOL gate: <b>${postLiQualifiedSolPass ? "PASSED" : "FAILED"}</b> · at least 1 present valid wallet must be &lt;${FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} SOL${postLiQualifiedSol.length ? ` · ${postLiQualifiedSol.map(({ wallet, qualifiedSol }) => `${wallet.slice(0, 6)}…=${qualifiedSol === null ? "?" : qualifiedSol.toFixed(2)} SOL`).join(", ")}` : ""}`
+            : "",
           `Buy: <b>${buySol} SOL</b>`,
           triggerSource === "valid_wallet_4"
             ? `Still watching for valid wallet #5.`
@@ -8032,6 +8043,7 @@ export class InsiderBot extends EventEmitter {
       }
       if (!state.preLiExitArmedNotified) {
         state.preLiExitArmedNotified = true;
+        const buyWasPostLi = this.hasFollowTokenLargeInsiderValidWalletDiscovered();
         if (mode === "li_only") {
           void this.sendTelegramSafe(
             [
@@ -8046,9 +8058,11 @@ export class InsiderBot extends EventEmitter {
         } else {
           void this.sendTelegramSafe(
             [
-              `<b>✅ ${this.label} Pre-LI Bundler Buy — +${activeMcTpPercent.toFixed(0)}% MC TP Active${fallbackBuyNote}</b>`,
+              `<b>✅ ${this.label} ${buyWasPostLi ? "Post-LI" : "Pre-LI"} Bundler Buy — +${activeMcTpPercent.toFixed(0)}% MC TP Active${fallbackBuyNote}</b>`,
               `Token: <code>${funderState.mint}</code>`,
-              "All bundlers/recipients sold all before 1st valid LI wallet.",
+              buyWasPostLi
+                ? "All bundlers/recipients sold all after valid LI discovery."
+                : "All bundlers/recipients sold all before 1st valid LI wallet.",
               mode === "mc_tp_and_li"
                 ? `Exit: +${activeMcTpPercent.toFixed(0)}% MC TP or valid LI ≥25% (bundler cumulative $${(FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD / 1000).toFixed(1)}k–$${(FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE / 1000).toFixed(0)}k zone).`
                 : `Exit: +${activeMcTpPercent.toFixed(0)}% MC TP; valid LI ≥25% once discovered.`,
