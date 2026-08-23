@@ -162,6 +162,9 @@ interface FollowTokenEarlyBundlerExitWatch {
   syncComplete: boolean;
   monitoringActive: boolean;
   observedNonZeroTokenBalance: boolean;
+  initialBalanceLookupReliable: boolean;
+  initialBalanceRaw: bigint | null;
+  soldAllReason: "historical_sell_sync" | "live_sell_transaction" | "token_transfer_out" | "live_ata_zero" | null;
 }
 
 interface FollowTokenEarlyBundlerExitState {
@@ -6363,7 +6366,6 @@ export class InsiderBot extends EventEmitter {
     liveRaw: bigint | null,
   ): boolean {
     if (liveRaw === null || liveRaw > 0n) return false;
-    if (watch.source === "early_bundler") return true;
     if (!watch.observedNonZeroTokenBalance) return false;
     return watch.soldAmount > 0;
   }
@@ -6409,11 +6411,27 @@ export class InsiderBot extends EventEmitter {
       watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount;
     const soldAllByAtaBalance =
       watch.syncComplete &&
+      watch.initialBalanceLookupReliable &&
+      watch.initialBalanceRaw !== null &&
+      watch.initialBalanceRaw > 0n &&
       this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, liveRaw);
     if (soldAllByTrackedAmount || soldAllByAtaBalance) {
       watch.soldAll = true;
+      watch.soldAllReason = soldAllByTrackedAmount
+        ? "historical_sell_sync"
+        : "live_ata_zero";
       watch.soldAllSignature = signature ?? watch.soldAllSignature;
       watch.reachedTwentyFivePercentSold = true;
+      this.log.info("Follow-token early bundler watch marked sold-all", {
+        mint: this.followTokenEarlyBundlerExitState?.mint,
+        wallet: watch.wallet,
+        source: watch.source,
+        reason: watch.soldAllReason,
+        signature: watch.soldAllSignature,
+        boughtAmount: watch.boughtAmount,
+        soldAmount: watch.soldAmount,
+        liveBalanceRaw: liveRaw?.toString() ?? null,
+      });
       return;
     }
     if (
@@ -7898,6 +7916,17 @@ export class InsiderBot extends EventEmitter {
       });
       return;
     }
+    const unreliableWatch = [...state.watches.values()].find(
+      (watch) => watch.monitoringActive && !watch.initialBalanceLookupReliable,
+    );
+    if (unreliableWatch) {
+      this.log.info("Follow-token sold-all evaluation deferred because initial balance is unreliable", {
+        mint: state.mint,
+        wallet: unreliableWatch.wallet,
+        source: unreliableWatch.source,
+      });
+      return;
+    }
     const over60mWatch = [...state.watches.values()].find(
       (watch) => watch.monitoringActive && watch.maxSingleSellTokenAmount > 60_000_000,
     );
@@ -8190,6 +8219,17 @@ export class InsiderBot extends EventEmitter {
       if (amount > watch.maxSingleSellTokenAmount) {
         watch.maxSingleSellTokenAmount = amount;
       }
+      if (watch.soldAmount >= watch.boughtAmount && !watch.soldAll) {
+        watch.soldAllReason = "live_sell_transaction";
+        this.log.info("Follow-token early bundler watch marked sold-all from sell transaction", {
+          mint,
+          wallet: watch.wallet,
+          source: watch.source,
+          signature: tx.signature,
+          boughtAmount: watch.boughtAmount,
+          soldAmount: watch.soldAmount,
+        });
+      }
       if (watch.maxSingleSellTokenAmount > 60_000_000) {
         this.log.warn("Follow-token active watch exceeded 60M max-single-sell cap", {
           mint,
@@ -8379,6 +8419,9 @@ export class InsiderBot extends EventEmitter {
       syncComplete: false,
       monitoringActive: true,
       observedNonZeroTokenBalance: false,
+      initialBalanceLookupReliable: false,
+      initialBalanceRaw: null,
+      soldAllReason: null,
     };
     state.watches.set(recipient, childWatch);
 
@@ -8525,6 +8568,7 @@ export class InsiderBot extends EventEmitter {
     const programIds = [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID];
     const subIds = new Map<string, number>();
     const balances = new Map<string, bigint>();
+    let allInitialLookupsReliable = true;
 
     for (const programId of programIds) {
       const ata = getAssociatedTokenAddressSync(mintPubkey, owner, false, programId);
@@ -8546,6 +8590,7 @@ export class InsiderBot extends EventEmitter {
         }
       }
       if (lastError) {
+        allInitialLookupsReliable = false;
         balances.set(ataKey, 0n);
         this.log.warn("Early bundler ATA seed balance fetch failed after retries — defaulting to zero", {
           mint,
@@ -8579,9 +8624,10 @@ export class InsiderBot extends EventEmitter {
     state.tokenAtaBalancesByAccount.set(wallet, balances);
     const totalRaw = [...balances.values()].reduce((sum, value) => sum + value, 0n);
     state.tokenAtaLiveBalanceRaw.set(wallet, totalRaw);
-
     const watch = state.watches.get(wallet);
     if (watch) {
+      watch.initialBalanceLookupReliable = allInitialLookupsReliable;
+      watch.initialBalanceRaw = allInitialLookupsReliable ? totalRaw : null;
       this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
         watch,
         totalRaw,
@@ -8727,6 +8773,10 @@ export class InsiderBot extends EventEmitter {
       state.tokenAtaLiveBalanceRaw.set(wallet, raw);
       const watch = state.watches.get(wallet);
       if (watch) {
+        if (watch.initialBalanceRaw === null && raw > 0n) {
+          watch.initialBalanceLookupReliable = true;
+          watch.initialBalanceRaw = raw;
+        }
         this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
           watch,
           raw,
@@ -8779,6 +8829,7 @@ export class InsiderBot extends EventEmitter {
 
     watch.monitoringActive = false;
     watch.soldAll = true;
+    watch.soldAllReason = "token_transfer_out";
     watch.soldAllSignature = tx.signature;
     watch.reachedTwentyFivePercentSold = true;
     this.unsubscribeFollowTokenEarlyBundlerExitWallet(watch.wallet);
@@ -8955,6 +9006,9 @@ export class InsiderBot extends EventEmitter {
         syncComplete: false,
         monitoringActive: true,
         observedNonZeroTokenBalance: false,
+      initialBalanceLookupReliable: false,
+      initialBalanceRaw: null,
+        soldAllReason: null,
       });
     }
 
