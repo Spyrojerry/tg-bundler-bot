@@ -201,6 +201,7 @@ interface FollowTokenEarlyBundlerExitState {
   preLiFirstBuyObserverPendingWallets: Set<string>;
   preLiFirstBuyObserverSeenWallets: Set<string>;
   initialSyncComplete: boolean;
+  maxSingleSell60mCapExceeded: boolean;
 }
 
 interface FollowTokenLargeInsiderScrapeWatch {
@@ -7927,29 +7928,6 @@ export class InsiderBot extends EventEmitter {
       });
       return;
     }
-    const over60mWatch = [...state.watches.values()].find(
-      (watch) => watch.monitoringActive && watch.maxSingleSellTokenAmount > 60_000_000,
-    );
-    if (over60mWatch) {
-      this.log.warn("Follow-token sold-all gate blocked by 60M active-watch cap", {
-        mint: state.mint,
-        wallet: over60mWatch.wallet,
-        source: over60mWatch.source,
-        maxSingleSellTokenAmount: over60mWatch.maxSingleSellTokenAmount,
-        cap: 60_000_000,
-      });
-      void this.sendTelegramSafe(
-        [
-          `<b>⛔ ${this.label} Sold-All Gate Blocked — 60M Cap</b>`,
-          `Token: <code>${state.mint}</code>`,
-          `Wallet: <code>${over60mWatch.wallet}</code>`,
-          `Highest max-single-sell: <b>${over60mWatch.maxSingleSellTokenAmount.toLocaleString()}</b> tokens`,
-          "No buy or follow-insider continuation will be triggered for this token.",
-        ].join("\n"),
-        "follow-token sold-all 60m cap blocked",
-      );
-      return;
-    }
     if (this.followInsiderObservationMode) {
       this.log.info("Follow-insider bundler sold-all reached — starting first-buy observer; buy disabled", {
         mint: state.mint,
@@ -7991,6 +7969,44 @@ export class InsiderBot extends EventEmitter {
     }
 
     state.allSoldAllComplete = true;
+
+    if (this.followInsiderObservationMode) {
+      const highestWatch = this.getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch({
+        activeOnly: false,
+      });
+      const highestMaxSingleSell = highestWatch?.maxSingleSellTokenAmount ?? 0;
+      this.log.info("Follow-insider sold-all complete — evaluating 60M max-single-sell gate", {
+        mint: state.mint,
+        highestMaxSingleSell,
+        highestWallet: highestWatch?.wallet ?? null,
+        highestSource: highestWatch?.source ?? null,
+        cap: 60_000_000,
+      });
+      if (highestMaxSingleSell > 60_000_000) {
+        if (!state.maxSingleSell60mCapExceeded) {
+          state.maxSingleSell60mCapExceeded = true;
+          void this.sendTelegramSafe(
+            [
+              `<b>⛔ ${this.label} Follow-Insider 60M Gate Failed</b>`,
+              `Token: <code>${state.mint}</code>`,
+              `Highest max-single-sell: <b>${highestMaxSingleSell.toLocaleString()}</b> tokens`,
+              `Wallet: <code>${highestWatch?.wallet ?? "unknown"}</code>`,
+              "All early bundlers/transfer recipients are sold-all, but the 60M gate failed.",
+              "No $110–$300 observer was started.",
+            ].join("\n"),
+            "follow-insider sold-all 60m gate failed",
+          );
+        }
+        await this.resetForNewToken(false, {
+          reason: "follow_insider_sold_all_max_single_sell_over_60m",
+        });
+        return;
+      }
+      this.log.info("Follow-insider 60M gate passed — starting first-buy observer", {
+        mint: state.mint,
+        highestMaxSingleSell,
+      });
+    }
 
     if (!this.buySubmitted) {
       await this.maybeTriggerFollowTokenLargeInsiderPreBuyFromBundlerPath(
@@ -8229,26 +8245,6 @@ export class InsiderBot extends EventEmitter {
           boughtAmount: watch.boughtAmount,
           soldAmount: watch.soldAmount,
         });
-      }
-      if (watch.maxSingleSellTokenAmount > 60_000_000) {
-        this.log.warn("Follow-token active watch exceeded 60M max-single-sell cap", {
-          mint,
-          wallet: watch.wallet,
-          source: watch.source,
-          maxSingleSellTokenAmount: watch.maxSingleSellTokenAmount,
-          cap: 60_000_000,
-          signature: tx.signature,
-        });
-        void this.sendTelegramSafe(
-          [
-            `<b>⛔ ${this.label} Active Watch Exceeded 60M Cap</b>`,
-            `Token: <code>${mint}</code>`,
-            `Wallet: <code>${watch.wallet}</code>`,
-            `Max single sell: <b>${watch.maxSingleSellTokenAmount.toLocaleString()}</b> tokens`,
-            "The active-watch 60M maximum was exceeded; this token will not qualify for the sold-all buy gate.",
-          ].join("\n"),
-          "follow-token active watch 60m cap",
-        );
       }
 
       const liveTokenBalanceRaw =
@@ -9040,6 +9036,7 @@ export class InsiderBot extends EventEmitter {
       preLiFirstBuyObserverPendingWallets: new Set(),
       preLiFirstBuyObserverSeenWallets: new Set(),
       initialSyncComplete: false,
+      maxSingleSell60mCapExceeded: false,
     };
 
     for (const wallet of watches.keys()) {
