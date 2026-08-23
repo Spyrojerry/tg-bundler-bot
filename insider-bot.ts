@@ -4569,18 +4569,18 @@ export class InsiderBot extends EventEmitter {
         });
         return;
       }
-      const wallets = firstFour.map((buy) => buy.wallet);
-      await this.permanentFollowWalletAdder?.(wallets);
+      const earliestWallet = firstFour[0]!.wallet;
+      await this.permanentFollowWalletAdder?.([earliestWallet]);
       void this.sendTelegramSafe(
         [
-          `<b>✅ ${this.label} Follow-Insider Wallet Group Added</b>`,
+          `<b>✅ ${this.label} Follow-Insider Wallet Added</b>`,
           `Token: <code>${mint}</code>`,
           "Migration age: <b>400s–800s route</b>",
           "Shared feePayer lock passed with at least 3 of 4 bundlers.",
-          ...wallets.map((wallet, index) => `${index + 1}. <code>${wallet}</code>`),
-          "These wallets were added permanently to grouped follow-insider tracking.",
+          `Earliest first-buy wallet: <code>${earliestWallet}</code>`,
+          "Only the earliest of the four first-buy bundlers was added permanently to follow-insider tracking.",
         ].join("\n"),
-        "follow-insider wallet group added",
+        "follow-insider earliest wallet added",
       );
       await this.resetForNewToken(true, {
         reason: "follow_insider_wallet_group_added",
