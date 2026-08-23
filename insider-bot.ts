@@ -19,7 +19,7 @@ import {
   HeliusTransaction,
 } from "./helius-client";
 import { GmgnClient } from "./gmgn-client";
-import type { ServiceConfig } from "./types";
+import type { NewTokenEvent, ServiceConfig } from "./types";
 import { TelegramBot } from "./telegram-bot";
 import { WalletMonitor } from "./wallet-monitor";
 import { HeliusEnhancedWsClient } from "./helius-enhanced-ws";
@@ -32,7 +32,7 @@ const NATIVE_SOL_BALANCE_MINT =
 const INSIDER_HISTORY_LIMIT = 21;
 const LOW_FUNDING_DEV_BUY_SYNC_LIMIT = 10;
 /** Proceed with bot buy only while dev has fewer than this many mint buys after create (create tx excluded). */
-const DEV_BUY_COUNT_AFTER_CREATE_MAX_EXCLUSIVE = 2;
+const DEV_BUY_COUNT_AFTER_CREATE_MAX_EXCLUSIVE = 3;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
@@ -669,6 +669,7 @@ export class InsiderBot extends EventEmitter {
   private readonly label: string;
 
   private followedWallets: string[] = [];
+  private followInsiderWallets: string[] = [];
   /** Follow wallet that started the current follow-sourced flow (may differ when delegated to another bot). */
   private flowFollowWallet: string | null = null;
   private followWalletFlowDelegate:
@@ -697,9 +698,14 @@ export class InsiderBot extends EventEmitter {
   private buyDisabled = false;
 
   private followMonitors = new Map<string, WalletMonitor>();
+  private followInsiderMonitors = new Map<string, WalletMonitor>();
+  private followInsiderObservedMints = new Set<string>();
+  private followInsiderObservationMode = false;
   /** User paused follow-wallet via Telegram — blocks auto-resume after token flow reset/complete. */
   private followWalletPaused = false;
   private followWalletTxNotifier: ((tx: HeliusTransaction) => void) | null = null;
+  private permanentFollowWalletAdder: ((wallets: string[]) => Promise<void>) | null = null;
+  private permanentFollowWalletRemover: ((wallet: string) => void) | null = null;
   private watchingMint: string | null = null;
   private phase: FlowPhase | null = null;
 
@@ -3591,6 +3597,7 @@ export class InsiderBot extends EventEmitter {
   async startFromFollowTokenMigration(
     mint: string,
     migrationSignature: string,
+    followInsiderMode = false,
   ): Promise<boolean> {
     if (this.boughtMints.has(mint)) return false;
     if (!this.isIdleForFunderFirst()) return false;
@@ -3643,6 +3650,7 @@ export class InsiderBot extends EventEmitter {
       const flowActive = await this.startInsiderFlowFromMigrationWithIndexingLagRetry(
         mint,
         migrationSignature,
+        followInsiderMode,
       );
       return flowActive;
     } catch (err) {
@@ -3666,6 +3674,111 @@ export class InsiderBot extends EventEmitter {
     notifier: ((tx: HeliusTransaction) => void) | null,
   ): void {
     this.followWalletTxNotifier = notifier;
+  }
+
+  setPermanentFollowWalletAdder(
+    adder: ((wallets: string[]) => Promise<void>) | null,
+  ): void {
+    this.permanentFollowWalletAdder = adder;
+  }
+
+  setPermanentFollowWalletRemover(remover: ((wallet: string) => void) | null): void {
+    this.permanentFollowWalletRemover = remover;
+  }
+
+  addFollowInsiderWallet(address: string): boolean {
+    const normalized = new PublicKey(address.trim()).toBase58();
+    if (this.followInsiderWallets.includes(normalized)) return false;
+    this.followInsiderWallets.push(normalized);
+    return true;
+  }
+
+  getFollowInsiderWallets(): string[] {
+    return [...this.followInsiderWallets];
+  }
+
+  removeFollowInsiderWallet(address: string): void {
+    const normalized = new PublicKey(address.trim()).toBase58();
+    this.followInsiderWallets = this.followInsiderWallets.filter(
+      (wallet) => wallet !== normalized,
+    );
+  }
+
+  async startFollowInsiderWalletMonitoring(): Promise<void> {
+    for (const wallet of this.followInsiderWallets) {
+      if (this.followInsiderMonitors.has(wallet)) continue;
+      const monitor = new WalletMonitor(this.config, wallet, {
+        enforceMinBuySol: false,
+        rpcUrl: this.rpcUrl,
+        wsUrl: this.wsUrl,
+        logLabel: `FOLLOW-INSIDER ${wallet.slice(0, 6)}`,
+        verboseActivityLogs: this.config.insiderFollowWalletVerboseLogs,
+        enhancedWs: this.enhancedWs,
+      });
+      monitor.on("newToken", (event) => {
+        void this.handleFollowInsiderFirstBuy(event);
+      });
+      this.followInsiderMonitors.set(wallet, monitor);
+      await monitor.start();
+    }
+  }
+
+  private async handleFollowInsiderFirstBuy(event: NewTokenEvent): Promise<void> {
+    if (this.followInsiderObservedMints.has(event.mint)) return;
+    if (!this.isIdleForFunderFirst()) return;
+    this.followInsiderObservedMints.add(event.mint);
+    this.flowSource = "follow-token";
+    this.watchingMint = event.mint;
+    this.claimedMint = event.mint;
+    this.boughtMints.add(event.mint);
+    this.followInsiderObservationMode = true;
+    try {
+      const swaps = await this.withHeliusFallback((client) =>
+        client.getEarlyInsiderSwaps(event.mint, BUNDLER_FUNDER_REQUIRED_COUNT),
+      );
+      const earlyBuys = this.extractFirstUniqueEarlyBundlerBuys(swaps, event.mint);
+      if (
+        earlyBuys.length < BUNDLER_FUNDER_REQUIRED_COUNT ||
+        earlyBuys.some(
+          (buy) => buy.buySol === null || buy.buySol < 4 || buy.buySol > 10,
+        )
+      ) {
+        await this.resetForNewToken(true, { reason: "follow_insider_first_four_buy_sol_gate" });
+        return;
+      }
+      await this.ensureDevWalletLoaded(event.mint);
+      this.bundlerFunderWatch = this.buildFollowTokenStubBundlerWatch(
+        event.mint,
+        earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT),
+      );
+      this.followTokenEarlyInsiderBuys = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
+      if (!(await this.ensureFollowTokenLargeInsiderFeePayerLocked(event.mint))) {
+        await this.resetForNewToken(true, { reason: "follow_insider_fee_payer_lock_failed" });
+        return;
+      }
+      void this.startFollowTokenEarlyBundlerExitMonitoring(event.mint);
+      this.log.info("Follow-insider token observation started", {
+        mint: event.mint,
+        triggerWallet: event.walletAddress,
+        firstBuySignature: event.signature,
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>👀 ${this.label} Follow-Insider Token Observation Started</b>`,
+          `Token: <code>${event.mint}</code>`,
+          `First tracked-wallet buy: <code>${event.walletAddress}</code>`,
+          "Buy mode: <b>disabled</b> — logs and Telegram only.",
+          "Waiting for all four early bundlers / transfer recipients to sell all.",
+        ].join("\n"),
+        "follow-insider observation started",
+      );
+    } catch (err) {
+      this.log.warn("Follow-insider token observation failed", {
+        mint: event.mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await this.resetForNewToken(true, { reason: "follow_insider_observation_failed" });
+    }
   }
 
   getFlowSource() {
@@ -3986,6 +4099,7 @@ export class InsiderBot extends EventEmitter {
     }
     this.stopFollowWalletMonitor(normalized);
     this.followedWallets = this.followedWallets.filter((w) => w !== normalized);
+    this.permanentFollowWalletRemover?.(normalized);
     this.log.info("Insider follow wallet removed", {
       followedWallet: normalized,
       remainingFollowWallets: this.followedWallets,
@@ -4018,6 +4132,7 @@ export class InsiderBot extends EventEmitter {
     this.insiderState = null;
     this.bundlerWatch = null;
     this.bundlerFunderWatch = null;
+    this.followInsiderObservationMode = false;
     this.clearBundlerAccumulation();
   }
 
@@ -4222,6 +4337,7 @@ export class InsiderBot extends EventEmitter {
   private async startInsiderFlowFromMigrationWithIndexingLagRetry(
     mint: string,
     migrationSignature: string,
+    followInsiderMode: boolean,
   ): Promise<boolean> {
     const delaysMs = [0, 4_000, 8_000];
     for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
@@ -4233,6 +4349,7 @@ export class InsiderBot extends EventEmitter {
         return await this.startInsiderFlowFromMigration(
           mint,
           migrationSignature,
+          followInsiderMode,
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -4265,6 +4382,7 @@ export class InsiderBot extends EventEmitter {
   private async startInsiderFlowFromMigration(
     mint: string,
     migrationSignature: string,
+    followInsiderMode: boolean,
   ): Promise<boolean> {
     this.flowSource = "follow-token";
     this.flowFollowWallet = null;
@@ -4327,7 +4445,11 @@ export class InsiderBot extends EventEmitter {
     );
 
     this.startPollLoop();
-    await this.startFollowTokenLargeInsiderPreBuyFlow(mint, earlyInsiderBuys);
+    await this.startFollowTokenLargeInsiderPreBuyFlow(
+      mint,
+      earlyInsiderBuys,
+      followInsiderMode,
+    );
     return this.isFollowTokenFlowActive(mint);
   }
 
@@ -4391,7 +4513,9 @@ export class InsiderBot extends EventEmitter {
   private async startFollowTokenLargeInsiderPreBuyFlow(
     mint: string,
     earlyBuys: EarlyInsiderBuy[],
+    followInsiderMode = false,
   ): Promise<void> {
+    this.followInsiderObservationMode = followInsiderMode;
     const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
     if (firstFour.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
       this.log.warn("Follow-token pre-buy flow has fewer than four early bundler buys; resetting", {
@@ -4422,6 +4546,47 @@ export class InsiderBot extends EventEmitter {
 
     const watchState = this.bundlerFunderWatch;
     if (!watchState) return;
+
+    if (followInsiderMode) {
+      const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint);
+      if (!locked) {
+        this.log.warn("Follow-insider mode skipped — shared feePayer lock failed", {
+          mint,
+          firstFourWallets: firstFour.map((buy) => buy.wallet),
+        });
+        void this.sendTelegramSafe(
+          [
+            `<b>⚠️ ${this.label} Follow-Insider Flow Failed To Start</b>`,
+            `Token: <code>${mint}</code>`,
+            "Reason: shared feePayer lock failed.",
+            "Required: at least 3 of the 4 first bundlers funded by the same feePayer.",
+            ...firstFour.map((buy, index) => `${index + 1}. <code>${buy.wallet}</code>`),
+          ].join("\n"),
+          "follow-insider feePayer lock failed",
+        );
+        await this.resetForNewToken(true, {
+          reason: "follow_insider_fee_payer_lock_failed",
+        });
+        return;
+      }
+      const wallets = firstFour.map((buy) => buy.wallet);
+      await this.permanentFollowWalletAdder?.(wallets);
+      void this.sendTelegramSafe(
+        [
+          `<b>✅ ${this.label} Follow-Insider Wallet Group Added</b>`,
+          `Token: <code>${mint}</code>`,
+          "Migration age: <b>400s–800s route</b>",
+          "Shared feePayer lock passed with at least 3 of 4 bundlers.",
+          ...wallets.map((wallet, index) => `${index + 1}. <code>${wallet}</code>`),
+          "These wallets were added permanently to grouped follow-insider tracking.",
+        ].join("\n"),
+        "follow-insider wallet group added",
+      );
+      await this.resetForNewToken(true, {
+        reason: "follow_insider_wallet_group_added",
+      });
+      return;
+    }
 
     const stubSecondGroup =
       this.buildFollowTokenStubSecondGroupFromInitialBundlers(watchState);
@@ -4755,6 +4920,15 @@ export class InsiderBot extends EventEmitter {
           ),
         });
         await this.stopPreLiFirstBuyObserver(state);
+        if (this.followInsiderObservationMode) {
+          void this.sendTelegramSafe(
+            `<b>✅ ${this.label} Follow-Insider Observation Complete</b>\nToken: <code>${mint}</code>\nCollected <b>${state.preLiFirstBuyObserverWallets.size}</b> qualifying first-buy wallets. Unsubscribed and resetting; no buy was submitted.`,
+            "follow-insider observation complete",
+          );
+          await this.resetForNewToken(true, {
+            reason: "follow_insider_observation_complete",
+          });
+        }
         return;
       }
     }
@@ -7526,6 +7700,27 @@ export class InsiderBot extends EventEmitter {
       } as HeliusTransaction);
 
     const waitingGate = await this.getBundlerSoldAllMaxSingleSellGateSnapshot();
+    const activeWatchOver60M = waitingGate.maxSingleSellTokenAmount > 60_000_000;
+    if (activeWatchOver60M) {
+      this.log.warn("Pre-LI sold-all handling stopped — active watch exceeds 60M cap", {
+        mint: funderState.mint,
+        maxSingleSellTokenAmount: waitingGate.maxSingleSellTokenAmount,
+        maxSingleSellWallet: waitingGate.maxSingleSellWallet,
+        cap: 60_000_000,
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>⛔ ${this.label} Pre-LI Sold-All Stopped — 60M Cap</b>`,
+          `Token: <code>${funderState.mint}</code>`,
+          `Highest max-single-sell: <b>${waitingGate.maxSingleSellTokenAmount.toLocaleString()}</b> tokens`,
+          "No Bundler Sold-All observer or $110–$300 wallet observer will run for this token.",
+          "Token is being skipped because an active watch exceeded the 60M maximum.",
+        ].join("\n"),
+        "follow-token pre-li 60m cap stop",
+      );
+      await this.resetForNewToken(false, { reason: "active_watch_max_single_sell_over_60m" });
+      return;
+    }
     if (waitingGate.tier === "fail") {
       await this.skipFollowTokenLargeInsiderFromPreLiMaxSingleSellGate(
         tx,
@@ -7656,6 +7851,41 @@ export class InsiderBot extends EventEmitter {
     const funderState = this.bundlerFunderWatch;
     const li = this.followTokenLargeInsiderState;
     if (!state?.active || !funderState || state.exitTriggerSignature) return;
+    const over60mWatch = [...state.watches.values()].find(
+      (watch) => watch.monitoringActive && watch.maxSingleSellTokenAmount > 60_000_000,
+    );
+    if (over60mWatch) {
+      this.log.warn("Follow-token sold-all gate blocked by 60M active-watch cap", {
+        mint: state.mint,
+        wallet: over60mWatch.wallet,
+        source: over60mWatch.source,
+        maxSingleSellTokenAmount: over60mWatch.maxSingleSellTokenAmount,
+        cap: 60_000_000,
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>⛔ ${this.label} Sold-All Gate Blocked — 60M Cap</b>`,
+          `Token: <code>${state.mint}</code>`,
+          `Wallet: <code>${over60mWatch.wallet}</code>`,
+          `Highest max-single-sell: <b>${over60mWatch.maxSingleSellTokenAmount.toLocaleString()}</b> tokens`,
+          "No buy or follow-insider continuation will be triggered for this token.",
+        ].join("\n"),
+        "follow-token sold-all 60m cap blocked",
+      );
+      return;
+    }
+    if (this.followInsiderObservationMode) {
+      this.log.info("Follow-insider bundler sold-all reached — starting first-buy observer; buy disabled", {
+        mint: state.mint,
+        watchedWalletCount: state.watches.size,
+      });
+      void this.sendTelegramSafe(
+        `<b>✅ ${this.label} Follow-Insider Bundler Sold-All Reached</b>\nToken: <code>${state.mint}</code>\nAll early bundlers/transfer recipients sold all. Starting the logs-only $110–$300 first-buy observer.\n<b>No buying is enabled for this mode.</b>`,
+        "follow-insider bundler sold-all observer started",
+      );
+      this.startPreLiFirstBuyObserver(state.mint);
+      return;
+    }
     const soldAllBlockReason = this.followTokenEarlyBundlerExitSoldAllBlockReason();
     if (soldAllBlockReason) {
       const largestBag = this.getFollowTokenEarlyBundlerExitLargestBagWatch();
@@ -7912,6 +8142,26 @@ export class InsiderBot extends EventEmitter {
       watch.soldAmount += amount;
       if (amount > watch.maxSingleSellTokenAmount) {
         watch.maxSingleSellTokenAmount = amount;
+      }
+      if (watch.maxSingleSellTokenAmount > 60_000_000) {
+        this.log.warn("Follow-token active watch exceeded 60M max-single-sell cap", {
+          mint,
+          wallet: watch.wallet,
+          source: watch.source,
+          maxSingleSellTokenAmount: watch.maxSingleSellTokenAmount,
+          cap: 60_000_000,
+          signature: tx.signature,
+        });
+        void this.sendTelegramSafe(
+          [
+            `<b>⛔ ${this.label} Active Watch Exceeded 60M Cap</b>`,
+            `Token: <code>${mint}</code>`,
+            `Wallet: <code>${watch.wallet}</code>`,
+            `Max single sell: <b>${watch.maxSingleSellTokenAmount.toLocaleString()}</b> tokens`,
+            "The active-watch 60M maximum was exceeded; this token will not qualify for the sold-all buy gate.",
+          ].join("\n"),
+          "follow-token active watch 60m cap",
+        );
       }
 
       const liveTokenBalanceRaw =

@@ -216,6 +216,7 @@ async function main(): Promise<void> {
     | {
         type:
           | "insiderFollowWallet"
+          | "insiderFollowInsiderWallet"
           | "insiderBuySol"
           | "insiderNormalBuySol"
           | "insiderFollowToken16mFallbackBuySol"
@@ -239,6 +240,7 @@ async function main(): Promise<void> {
     { balance: bigint; quote: SellQuote | null; timestamp: number }
   >();
   const activePositionRefreshes = new Set<string>();
+  const positiveMcExitConfirmations = new Set<number>();
   const INSIDER_SELL_RETRY_DELAY_MS = 5_000;
   const insiderDasNoPriceUntil = new Map<string, number>();
   const handledHeliusUsageStops = new Set<number>();
@@ -885,6 +887,14 @@ async function main(): Promise<void> {
             editCurrent: true,
           };
         }
+        if (data === "insider:followinsider") {
+          pendingTelegramActions.set(chatId, { type: "insiderFollowInsiderWallet", index: 0 });
+          return {
+            text: "Send a wallet address to fast-track as a logs-only follow-insider wallet.",
+            trackPrompt: true,
+            editCurrent: true,
+          };
+        }
         if (data.startsWith("insider:fr:")) {
           const index = Number.parseInt(data.slice("insider:fr:".length), 10);
           const wallets = insiderBots[0]?.getFollowedWallets() ?? [];
@@ -1283,6 +1293,22 @@ async function main(): Promise<void> {
             }
             return homeReply();
           }
+          if (pendingAction.type === "insiderFollowInsiderWallet") {
+            try {
+              const wallet = new PublicKey(text.trim()).toBase58();
+              if (insiderBots[0]!.addFollowInsiderWallet(wallet)) {
+                db.addInsiderFollowWallet(wallet);
+                await insiderBots[0]!.startFollowInsiderWalletMonitoring();
+                log.info("Follow-insider wallet fast-tracked", { wallet });
+                void telegramBot?.sendDefault(
+                  `<b>✅ Follow-Insider Wallet Fast-Tracked</b>\nWallet: <code>${html(wallet)}</code>\nMode: <b>logs-only, no buying</b>`,
+                );
+              }
+              return homeReply();
+            } catch (err) {
+              return html(err instanceof Error ? err.message : String(err));
+            }
+          }
           if (pendingAction.type === "insiderBuySol") {
             const bot = insiderBots[pendingAction.index];
             const value = Number(text.trim());
@@ -1536,6 +1562,29 @@ async function main(): Promise<void> {
       }
     }
   });
+  insiderBots[0]?.setPermanentFollowWalletAdder(async (wallets) => {
+    for (const wallet of [...new Set(wallets)]) {
+      if (!insiderBots[0]!.addFollowInsiderWallet(wallet)) continue;
+      db.addInsiderFollowWallet(wallet);
+      log.info("Follow-insider wallet added permanently", { wallet });
+    }
+  });
+  insiderBots[0]?.setPermanentFollowWalletRemover((wallet) => {
+    db.removeInsiderFollowWallet(wallet);
+  });
+  for (const wallet of db.getInsiderFollowWallets()) {
+    try {
+      insiderBots[0]?.addFollowInsiderWallet(wallet);
+    } catch (err) {
+      log.warn("Persisted follow-insider wallet could not be loaded", {
+        wallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  insiderBots[0]?.startFollowInsiderWalletMonitoring().catch((err) =>
+    log.warn("Follow-insider wallet monitoring failed to start", err),
+  );
 
   // Telegram polling is intentionally NOT started yet — it's started further
   // down, once every orchestrator/bot event listener is wired up. Otherwise
@@ -2076,6 +2125,7 @@ async function main(): Promise<void> {
     index: number,
     preFetchedMc?: number | null,
     preFetchedSource?: string,
+    positiveExitConfirmation?: { mint: string; currentMc: number; exitMc: number },
   ): Promise<void> {
     const bot = insiderBots[index];
     const botNumber = getInsiderBotNumber(index);
@@ -2126,6 +2176,36 @@ async function main(): Promise<void> {
           return;
         }
         if (currentMc >= exitMc) {
+          const pnlPct =
+            bot.getEntryMc() > 0
+              ? ((currentMc - bot.getEntryMc()) / bot.getEntryMc()) * 100
+              : 0;
+          if (pnlPct > 0 && !positiveExitConfirmation) {
+            if (positiveMcExitConfirmations.has(index)) return;
+            positiveMcExitConfirmations.add(index);
+            log.info(
+              `[INSIDER ${botNumber} MC EXIT CONFIRM] Positive PnL target reached; waiting 1 second for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+            );
+            setTimeout(() => {
+              positiveMcExitConfirmations.delete(index);
+              if (bot.getActivePosition()?.mint !== mint) return;
+              void checkInsiderMcapFlow(index, undefined, undefined, {
+                mint,
+                currentMc,
+                exitMc,
+              });
+            }, 1_000);
+            return;
+          }
+          if (
+            positiveExitConfirmation &&
+            currentMc < positiveExitConfirmation.exitMc
+          ) {
+            log.info(
+              `[INSIDER ${botNumber} MC EXIT CONFIRM] Positive PnL target fell back below target; waiting for MC to recover to $${positiveExitConfirmation.exitMc.toLocaleString()}.`,
+            );
+            return;
+          }
           if (bot.shouldDeferFollowTokenEarlyBundlerMcTp()) {
             bot.notifyFollowTokenEarlyBundlerMcTpReached(currentMc);
             log.info(
@@ -2713,7 +2793,7 @@ async function main(): Promise<void> {
         "<b>Follow-token steps</b>",
         "1. <b>Start Follow-Token</b> (or set <code>INSIDER_FOLLOW_TOKEN_ENABLED=true</code>).",
         "2. PumpPortal <b>subscribeMigration</b> via <code>PUMPPORTAL_API_KEY</code>.",
-        `3. Filters: mint ends <b>pump</b>, metadata URI <code>https://ipfs.io/ipfs/baf…</code>, dev created <b>1–3</b> tokens (Helius CREATE history), migrate ≤ <b>${config.insiderFollowTokenMaxMigrationAgeSec}s</b> after create, dev funded by <b>Centralized Exchange</b>.`,
+        `3. Routes: normal follow-token migrate <b>0s–1s</b>; follow-insider migrate <b>400s–800s</b>; other ages rejected. Filters: mint ends <b>pump</b>, metadata URI <code>https://ipfs.io/ipfs/baf…</code>, dev created <b>1–3</b> tokens, dev funded by <b>Centralized Exchange</b>.`,
         "4. First-four unique SWAP buys → same bundler-funder monitoring as follow-wallet.",
         "",
         "<b>Env auto-start flags</b>",
@@ -2725,6 +2805,7 @@ async function main(): Promise<void> {
         inline_keyboard: [
           [
             { text: "Add follow wallet", callback_data: "insider:follow" },
+            { text: "⚡ Fast-track follow-insider", callback_data: "insider:followinsider" },
             { text: "FeePayer funder", callback_data: "funderfirst:funder" },
           ],
           ...followWalletRemoveRows,

@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS monitored_wallets (
   added_at    TEXT NOT NULL,
   status      TEXT NOT NULL DEFAULT 'active'
 );
+CREATE TABLE IF NOT EXISTS insider_follow_wallets (
+  address TEXT PRIMARY KEY NOT NULL,
+  added_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS reverse_buy_wallets (
   address     TEXT PRIMARY KEY NOT NULL,
   added_at    TEXT NOT NULL,
@@ -315,6 +319,23 @@ export class MonitorDatabase {
   private run(sql: string, params: (string | number | null)[] = []): void {
     this.db.run(sql, params);
     this.persist();
+  }
+
+  addInsiderFollowWallet(address: string): void {
+    this.run(
+      `INSERT OR IGNORE INTO insider_follow_wallets (address, added_at) VALUES (?, ?)`,
+      [address, new Date().toISOString()],
+    );
+  }
+
+  getInsiderFollowWallets(): string[] {
+    return this.query<{ address: string }>(
+      `SELECT address FROM insider_follow_wallets ORDER BY added_at, address`,
+    ).map((row) => row.address);
+  }
+
+  removeInsiderFollowWallet(address: string): void {
+    this.run(`DELETE FROM insider_follow_wallets WHERE address = ?`, [address]);
   }
 
   // ── tokens table ───────────────────────────────────────────────────────────
