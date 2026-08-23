@@ -3697,6 +3697,10 @@ export class InsiderBot extends EventEmitter {
     return [...this.followInsiderWallets];
   }
 
+  isTrackedFollowInsiderWallet(wallet: string): boolean {
+    return this.followInsiderWallets.includes(wallet);
+  }
+
   removeFollowInsiderWallet(address: string): void {
     const normalized = new PublicKey(address.trim()).toBase58();
     this.followInsiderWallets = this.followInsiderWallets.filter(
@@ -3725,8 +3729,8 @@ export class InsiderBot extends EventEmitter {
 
   private async handleFollowInsiderFirstBuy(event: NewTokenEvent): Promise<void> {
     if (this.followInsiderObservedMints.has(event.mint)) return;
-    if (!this.isIdleForFunderFirst()) return;
     this.followInsiderObservedMints.add(event.mint);
+    if (!this.isIdleForFunderFirst()) return;
     this.flowSource = "follow-token";
     this.watchingMint = event.mint;
     this.claimedMint = event.mint;
@@ -4570,15 +4574,24 @@ export class InsiderBot extends EventEmitter {
         return;
       }
       const earliestWallet = firstFour[0]!.wallet;
-      await this.permanentFollowWalletAdder?.([earliestWallet]);
+      const trackedWalletIsEarlyBundler = firstFour.some((buy) =>
+        this.isTrackedFollowInsiderWallet(buy.wallet),
+      );
+      if (!trackedWalletIsEarlyBundler) {
+        await this.permanentFollowWalletAdder?.([earliestWallet]);
+      }
       void this.sendTelegramSafe(
         [
           `<b>✅ ${this.label} Follow-Insider Wallet Added</b>`,
           `Token: <code>${mint}</code>`,
           "Migration age: <b>400s–800s route</b>",
           "Shared feePayer lock passed with at least 3 of 4 bundlers.",
-          `Earliest first-buy wallet: <code>${earliestWallet}</code>`,
-          "Only the earliest of the four first-buy bundlers was added permanently to follow-insider tracking.",
+          trackedWalletIsEarlyBundler
+            ? "A tracked Follow-Insider wallet is part of this token's first four early bundlers; no early bundler was added to permanent tracking."
+            : `Earliest first-buy wallet: <code>${earliestWallet}</code>`,
+          trackedWalletIsEarlyBundler
+            ? "The four early bundlers remain token-local observation wallets only."
+            : "Only the earliest of the four first-buy bundlers was added permanently to follow-insider tracking.",
         ].join("\n"),
         "follow-insider earliest wallet added",
       );
