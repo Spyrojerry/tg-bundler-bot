@@ -207,7 +207,9 @@ async function main(): Promise<void> {
   let funderFirstOrchestrator: FunderFirstOrchestrator;
   let followTokenOrchestrator: FollowTokenMigrationOrchestrator;
 
-  const healthServer = startHealthServer(config.port);
+  const healthServer = startHealthServer(config.port, () =>
+    followTokenOrchestrator?.getHealthStatus() ?? { ok: true, followTokenEnabled: false },
+  );
   const walletMonitors = new Map<string, WalletMonitor>();
   const pendingTradingBuys = new Map<string, NewTokenEvent>();
   type PendingTelegramAction =
@@ -2799,7 +2801,7 @@ async function main(): Promise<void> {
         "<b>Follow-token steps</b>",
         "1. <b>Start Follow-Token</b> (or set <code>INSIDER_FOLLOW_TOKEN_ENABLED=true</code>).",
         "2. PumpPortal <b>subscribeMigration</b> via <code>PUMPPORTAL_API_KEY</code>.",
-        `3. Routes: normal follow-token migrate <b>0s–1s</b>; follow-insider migrate <b>400s–800s</b>; other ages rejected. Follow-insider first 4 buys: <b>4–12 SOL</b>; only the earliest first-buy bundler is added to tracking. Filters: mint ends <b>pump</b>, metadata URI <code>https://ipfs.io/ipfs/baf…</code>, dev created <b>1–3</b> tokens, dev funded by <b>Centralized Exchange</b>.`,
+        `3. Routes: normal follow-token migrate <b>${config.insiderFollowTokenNormalEnabled ? "enabled" : "disabled"}</b>; follow-insider migrate <b>400s–800s</b>; other ages rejected. Follow-insider first 4 buys: <b>4–12 SOL</b>; only the earliest first-buy bundler is added to tracking. Filters: mint ends <b>pump</b>, metadata URI <code>https://ipfs.io/ipfs/baf…</code>, dev created <b>1–3</b> tokens, dev funded by <b>Centralized Exchange</b>.`,
         "4. First-four unique SWAP buys → same bundler-funder monitoring as follow-wallet.",
         "",
         "<b>Env auto-start flags</b>",

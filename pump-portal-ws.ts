@@ -11,6 +11,9 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const HEARTBEAT_INTERVAL_MS = 20_000;
 const HEARTBEAT_TIMEOUT_MS = 12_000;
+const FEED_STALE_TIMEOUT_MS = 90_000;
+const STATE_LOG_INTERVAL_MS = 60_000;
+const WATCHDOG_INTERVAL_MS = 30_000;
 
 export interface PumpPortalMigrationEvent {
   mint: string;
@@ -20,6 +23,20 @@ export interface PumpPortalMigrationEvent {
 }
 
 type MigrationCallback = (event: PumpPortalMigrationEvent) => void;
+
+export interface PumpPortalWsStatus {
+  connected: boolean;
+  connecting: boolean;
+  migrationSubscribed: boolean;
+  migrationFeedSuspended: boolean;
+  lastMessageAt: number | null;
+  lastMigrationMessageAt: number | null;
+  lastPongAt: number | null;
+  lastActivityAt: number | null;
+  reconnectAttempts: number;
+  reconnectScheduled: boolean;
+  stale: boolean;
+}
 
 export class PumpPortalWsClient {
   private readonly url: string;
@@ -32,7 +49,12 @@ export class PumpPortalWsClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private connectTimeoutTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
-  private lastPongAt = Date.now();
+  private watchdogTimer: NodeJS.Timeout | null = null;
+  private stateLogTimer: NodeJS.Timeout | null = null;
+  private lastPongAt: number | null = null;
+  private lastMessageAt: number | null = null;
+  private lastMigrationMessageAt: number | null = null;
+  private lastActivityAt: number | null = null;
   private migrationCallback: MigrationCallback | null = null;
   private migrationSubscribed = false;
   /** When true, migration feed is torn down (unsubscribe + disconnect) until resumed. */
@@ -48,11 +70,34 @@ export class PumpPortalWsClient {
     this.migrationCallback = callback;
   }
 
+  getStatus(): PumpPortalWsStatus {
+    const now = Date.now();
+    return {
+      connected: this.connected,
+      connecting: this.connecting,
+      migrationSubscribed: this.migrationSubscribed,
+      migrationFeedSuspended: this.migrationFeedSuspended,
+      lastMessageAt: this.lastMessageAt,
+      lastMigrationMessageAt: this.lastMigrationMessageAt,
+      lastPongAt: this.lastPongAt,
+      lastActivityAt: this.lastActivityAt,
+      reconnectAttempts: this.reconnectAttempts,
+      reconnectScheduled: this.reconnectTimer !== null,
+      stale:
+        !this.migrationFeedSuspended &&
+        (!this.lastMigrationMessageAt ||
+          now - this.lastMigrationMessageAt > FEED_STALE_TIMEOUT_MS),
+    };
+  }
+
   connect(): void {
     if (this.connecting) return;
     this.closedByUser = false;
     this.connecting = true;
-    this.log.info('Connecting to PumpPortal WebSocket');
+    this.log.info('Connecting to PumpPortal WebSocket', {
+      reconnectAttempt: this.reconnectAttempts,
+    });
+    this.startWatchdog();
     const ws = new WebSocket(this.url);
     this.ws = ws;
     this.connectTimeoutTimer = setTimeout(() => {
@@ -69,7 +114,7 @@ export class PumpPortalWsClient {
       this.connecting = false;
       this.connected = true;
       this.reconnectAttempts = 0;
-      this.lastPongAt = Date.now();
+      this.markActivity('open');
       this.migrationSubscribed = false;
       this.log.info('Connected to PumpPortal WebSocket');
       this.startHeartbeat();
@@ -79,15 +124,21 @@ export class PumpPortalWsClient {
     });
 
     ws.on('message', (data: WebSocket.Data) => {
+      this.lastMessageAt = Date.now();
+      this.markActivity('message');
       this.handleMessage(data);
     });
 
     ws.on('pong', () => {
       this.lastPongAt = Date.now();
+      this.markActivity('pong');
     });
 
     ws.on('error', (err: Error) => {
-      this.log.warn('PumpPortal WebSocket error', { error: err.message });
+      this.log.error('PumpPortal WebSocket error', {
+        error: err.message,
+        ...this.getStatus(),
+      });
     });
 
     ws.on('close', (code: number, reason: Buffer) => {
@@ -95,6 +146,11 @@ export class PumpPortalWsClient {
       this.connecting = false;
       this.connected = false;
       this.migrationSubscribed = false;
+      this.log.warn('PumpPortal WebSocket close received', {
+        code,
+        reason: reason?.toString?.() || undefined,
+        ...this.getStatus(),
+      });
       if (this.heartbeatTimer) {
         clearInterval(this.heartbeatTimer);
         this.heartbeatTimer = null;
@@ -116,6 +172,10 @@ export class PumpPortalWsClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.clearConnectTimeout();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    if (this.stateLogTimer) clearInterval(this.stateLogTimer);
+    this.watchdogTimer = null;
+    this.stateLogTimer = null;
     this.ws?.close();
     this.ws = null;
   }
@@ -147,6 +207,10 @@ export class PumpPortalWsClient {
       this.ws = null;
       this.connecting = false;
       this.connected = false;
+      this.log.info('PumpPortal migration feed suspended; WebSocket state reset', {
+        reason,
+        ...this.getStatus(),
+      });
       this.clearConnectTimeout();
       if (this.heartbeatTimer) {
         clearInterval(this.heartbeatTimer);
@@ -181,10 +245,15 @@ export class PumpPortalWsClient {
       BASE_RECONNECT_DELAY_MS * 2 ** attempt,
     );
     const jitter = Math.floor(Math.random() * 250);
+    const delayMs = delay + jitter;
+    this.log.warn('Scheduling PumpPortal WebSocket reconnect', {
+      reconnectAttempt: attempt + 1,
+      delayMs,
+    });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
-    }, delay + jitter);
+    }, delayMs);
   }
 
   private clearConnectTimeout(): void {
@@ -197,17 +266,46 @@ export class PumpPortalWsClient {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-      if (Date.now() - this.lastPongAt > HEARTBEAT_INTERVAL_MS + HEARTBEAT_TIMEOUT_MS) {
-        this.log.warn('PumpPortal WebSocket heartbeat timed out, forcing reconnect');
+      if (
+        !this.lastPongAt ||
+        Date.now() - this.lastPongAt > HEARTBEAT_INTERVAL_MS + HEARTBEAT_TIMEOUT_MS
+      ) {
+        this.log.warn('PumpPortal WebSocket heartbeat timed out, forcing reconnect', {
+          ...this.getStatus(),
+        });
         this.ws.terminate();
         return;
       }
       try {
         this.ws.ping();
-      } catch {
-        // close handler will reconnect
+      } catch (err) {
+        this.log.warn('PumpPortal WebSocket heartbeat ping failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  private startWatchdog(): void {
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    if (this.stateLogTimer) clearInterval(this.stateLogTimer);
+    this.watchdogTimer = setInterval(() => {
+      if (this.migrationFeedSuspended || this.closedByUser) return;
+      const status = this.getStatus();
+      if (status.stale && this.ws) {
+        this.log.warn('PumpPortal WebSocket feed is stale, forcing reconnect', status);
+        this.ws.terminate();
+      }
+    }, WATCHDOG_INTERVAL_MS);
+    this.stateLogTimer = setInterval(() => {
+      this.log.info('PumpPortal WebSocket state', this.getStatus());
+    }, STATE_LOG_INTERVAL_MS);
+  }
+
+  private markActivity(source: 'open' | 'message' | 'pong'): void {
+    const now = Date.now();
+    this.lastActivityAt = now;
+    if (source === 'open') this.lastPongAt = now;
   }
 
   private sendUnsubscribeMigration(): void {
@@ -228,6 +326,8 @@ export class PumpPortalWsClient {
     try {
       this.ws.send(JSON.stringify({ method: 'subscribeMigration' }));
       this.migrationSubscribed = true;
+      this.lastMigrationMessageAt = Date.now();
+      this.markActivity('message');
       this.log.info('Sent PumpPortal subscribeMigration');
     } catch (err) {
       this.log.warn('Failed to send PumpPortal subscribeMigration', {
@@ -249,6 +349,7 @@ export class PumpPortalWsClient {
 
     const event = parsePumpPortalMigrationEvent(parsed);
     if (!event) return;
+    this.lastMigrationMessageAt = Date.now();
 
     try {
       this.migrationCallback?.(event);

@@ -184,7 +184,9 @@ export interface ServiceConfig {
   insiderFunderFirstEnabled: boolean;
   /** Enable follow-token Pump.fun migration listener on startup (still requires Start in Telegram unless auto-resumed). */
   insiderFollowTokenEnabled: boolean;
-  /** Normal follow-token route accepts CREATE -> migrate ages up to 1 second. */
+  /** Enable the normal fast follow-token route; disabled by default so only follow-insider runs. */
+  insiderFollowTokenNormalEnabled: boolean;
+  /** Normal follow-token route accepts CREATE -> migrate ages up to 2 seconds. */
   insiderFollowTokenMaxMigrationAgeSec: number;
   /** Follow-token post-LI bundler sold-all: buy SOL when 8M gate fails but 16M fallback passes. */
   insiderFollowToken16mPostLiBuySol: number;

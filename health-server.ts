@@ -3,11 +3,20 @@ import { createLogger } from './logger';
 
 const log = createLogger('HTTP');
 
-export function startHealthServer(port: number): Server {
+export interface HealthStatus {
+  ok: boolean;
+  [key: string]: unknown;
+}
+
+export function startHealthServer(
+  port: number,
+  getStatus: () => HealthStatus = () => ({ ok: true }),
+): Server {
   const server = createServer((req, res) => {
     if (req.url === '/health' || req.url === '/') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
+      const status = getStatus();
+      res.writeHead(status.ok ? 200 : 503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(status));
       return;
     }
 

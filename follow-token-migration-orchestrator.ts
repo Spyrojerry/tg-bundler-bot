@@ -28,7 +28,7 @@ import {
 const log = createLogger('FOLLOW-TOKEN');
 
 const PUMP_MINT_SUFFIX = 'pump';
-const DEFAULT_MAX_MIGRATION_AGE_SEC = 1;
+const DEFAULT_MAX_MIGRATION_AGE_SEC = 2;
 const FOLLOW_INSIDER_MIN_MIGRATION_AGE_SEC = 400;
 const FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC = 800;
 const FOLLOW_INSIDER_MIN_EARLY_BUY_SOL = 4;
@@ -98,6 +98,16 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     return this.isEnabled;
   }
 
+  getHealthStatus(): { ok: boolean; followTokenEnabled: boolean; pumpPortal?: unknown } {
+    if (!this.isEnabled || !this.pumpPortalWs) {
+      return { ok: true, followTokenEnabled: false };
+    }
+    const pumpPortal = this.pumpPortalWs.getStatus();
+    const ok = pumpPortal.migrationFeedSuspended ||
+      (pumpPortal.connected && pumpPortal.migrationSubscribed && !pumpPortal.stale);
+    return { ok, followTokenEnabled: true, pumpPortal };
+  }
+
   async start(): Promise<void> {
     if (this.isEnabled || this.isShuttingDown) return;
     if (!this.config.pumpPortalApiKey) {
@@ -125,7 +135,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     void this.sendTelegram([
       '<b>▶️ Follow-Token: Pump Migration Listener Started</b>',
       'Source: <b>PumpPortal subscribeMigration</b>',
-      `Routes: normal follow-token migrate <b>0s–1s</b>; follow-insider migrate <b>400s–800s</b>. Other ages are rejected. Mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created <b>${FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN}–${FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX}</b> tokens, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
+      `Routes: normal follow-token migrate <b>${this.config.insiderFollowTokenNormalEnabled ? `0s–${this.config.insiderFollowTokenMaxMigrationAgeSec}s enabled` : 'disabled'}</b>; follow-insider migrate <b>400s–800s</b>. Other ages are rejected. Mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created <b>${FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN}–${FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX}</b> tokens, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
       'PumpPortal migration feed unsubscribes while a follow-token bundler-funder flow is active; resubscribes when the token is skipped or reset (not after dev rug alone).',
     ]);
   }
@@ -267,13 +277,26 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       const followInsiderMode =
         migrationAgeSec >= FOLLOW_INSIDER_MIN_MIGRATION_AGE_SEC &&
         migrationAgeSec <= FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC;
-      if (migrationAgeSec > 1 && !followInsiderMode) {
+      if (!followInsiderMode && !this.config.insiderFollowTokenNormalEnabled) {
+        this.seenMigrationMints.add(mint);
+        log.info('Follow-token migration skipped — normal route disabled', {
+          mint,
+          signature,
+          migrationAgeSec,
+          normalRouteEnv: 'INSIDER_FOLLOW_TOKEN_NORMAL_ENABLED',
+        });
+        return;
+      }
+      if (
+        migrationAgeSec > this.config.insiderFollowTokenMaxMigrationAgeSec &&
+        !followInsiderMode
+      ) {
         this.seenMigrationMints.add(mint);
         log.info('Follow-token migration skipped — age is outside configured routes', {
           mint,
           signature,
           migrationAgeSec,
-          acceptedFastRouteMaxSec: 1,
+          acceptedFastRouteMaxSec: this.config.insiderFollowTokenMaxMigrationAgeSec,
           acceptedFollowInsiderRangeSec: [
             FOLLOW_INSIDER_MIN_MIGRATION_AGE_SEC,
             FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC,

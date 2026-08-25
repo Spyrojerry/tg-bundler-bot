@@ -142,10 +142,17 @@ export function loadConfig(): ServiceConfig {
   );
   const insiderFunderFirstEnabled = optionalBoolean('INSIDER_FUNDER_FIRST_ENABLED', false);
   const insiderFollowTokenEnabled = optionalBoolean('INSIDER_FOLLOW_TOKEN_ENABLED', false);
+  const insiderFollowTokenNormalEnabled = optionalBoolean(
+    'INSIDER_FOLLOW_TOKEN_NORMAL_ENABLED',
+    false,
+  );
   const insiderFollowTokenMaxMigrationAgeSec = optionalInt(
     'INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC',
-    1,
+    2,
   );
+  if (insiderFollowTokenMaxMigrationAgeSec > 2) {
+    throw new Error('INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC must be at most 2 seconds');
+  }
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');
   const telegramChatId   = optionalNullable('TELEGRAM_CHAT_ID');
@@ -243,6 +250,7 @@ export function loadConfig(): ServiceConfig {
     insiderFollowWalletVerboseLogs,
     insiderFunderFirstEnabled,
     insiderFollowTokenEnabled,
+    insiderFollowTokenNormalEnabled,
     insiderFollowTokenMaxMigrationAgeSec,
     insiderFollowToken16mPostLiBuySol,
     logLevel: rawLogLevel,

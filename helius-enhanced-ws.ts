@@ -59,6 +59,7 @@ type ParsedProgramCallback = (
   tx: HeliusTransaction,
   raw: RawEnhancedWsTransactionResult,
 ) => void;
+type TokenAccountCallback = (account: string, data: Buffer | null) => void;
 
 interface Watch {
   localId: number;
@@ -75,6 +76,16 @@ interface ParsedProgramWatch {
   programs: string[];
   instructionNames: string[];
   callback: ParsedProgramCallback;
+  serverSubId: number | null;
+}
+
+type AnySubscriptionWatch = Watch | ParsedProgramWatch | TokenProgramWatch;
+
+interface TokenProgramWatch {
+  localId: number;
+  program: string;
+  owner: string;
+  callback: TokenAccountCallback;
   serverSubId: number | null;
 }
 
@@ -101,7 +112,8 @@ export class HeliusEnhancedWsClient {
   private nextRpcId = 1;
   private readonly watches = new Map<number, Watch>();
   private readonly parsedProgramWatches = new Map<number, ParsedProgramWatch>();
-  private readonly watchesByServerSubId = new Map<number, Watch | ParsedProgramWatch>();
+  private readonly tokenProgramWatches = new Map<number, TokenProgramWatch>();
+  private readonly watchesByServerSubId = new Map<number, AnySubscriptionWatch>();
   private readonly pendingRpc = new Map<number, PendingRpc>();
 
   constructor(apiKey: string, label = 'Helius Enhanced WS') {
@@ -172,6 +184,40 @@ export class HeliusEnhancedWsClient {
       this.sendParsedProgramSubscribe(watchEntry);
     }
     return localId;
+  }
+
+  /** Watches token accounts owned by one wallet through programSubscribe. */
+  watchTokenProgram(
+    program: string,
+    owner: string,
+    callback: TokenAccountCallback,
+  ): number {
+    const localId = this.nextLocalId++;
+    const watchEntry: TokenProgramWatch = {
+      localId,
+      program,
+      owner,
+      callback,
+      serverSubId: null,
+    };
+    this.tokenProgramWatches.set(localId, watchEntry);
+    if (this.connected) this.sendTokenProgramSubscribe(watchEntry);
+    return localId;
+  }
+
+  async unwatchTokenProgram(localId: number): Promise<void> {
+    const watchEntry = this.tokenProgramWatches.get(localId);
+    if (!watchEntry) return;
+    this.tokenProgramWatches.delete(localId);
+    if (watchEntry.serverSubId !== null) {
+      this.watchesByServerSubId.delete(watchEntry.serverSubId);
+      if (this.connected) {
+        await this.sendUnsubscribeMethod(
+          'programUnsubscribe',
+          watchEntry.serverSubId,
+        ).catch(() => undefined);
+      }
+    }
   }
 
   /** Stops a `watchParsedProgramInstructions` subscription. */
@@ -292,6 +338,9 @@ export class HeliusEnhancedWsClient {
       for (const watchEntry of this.parsedProgramWatches.values()) {
         watchEntry.serverSubId = null;
       }
+      for (const watchEntry of this.tokenProgramWatches.values()) {
+        watchEntry.serverSubId = null;
+      }
       this.watchesByServerSubId.clear();
       if (!this.closedByUser) {
         this.log.warn('Helius Enhanced WebSocket closed, will reconnect', {
@@ -346,6 +395,9 @@ export class HeliusEnhancedWsClient {
         this.sendParsedProgramSubscribe(watchEntry);
       }
     }
+    for (const watchEntry of this.tokenProgramWatches.values()) {
+      this.sendTokenProgramSubscribe(watchEntry);
+    }
   }
 
   private sendParsedProgramSubscribe(watchEntry: ParsedProgramWatch): void {
@@ -373,6 +425,39 @@ export class HeliusEnhancedWsClient {
       this.log.warn('parsedTransactionSubscribe failed', {
         programs: watchEntry.programs,
         instructionNames: watchEntry.instructionNames,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  private sendTokenProgramSubscribe(watchEntry: TokenProgramWatch): void {
+    const rpcId = this.nextRpcId++;
+    const filters: unknown[] = [
+      { memcmp: { offset: 32, bytes: watchEntry.owner } },
+    ];
+    // Legacy SPL accounts are fixed at 165 bytes. Token-2022 accounts may have
+    // extensions, so owner filtering is used there and the decoded mint filters
+    // notifications in the caller.
+    if (watchEntry.program === 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') {
+      filters.unshift({ dataSize: 165 });
+    }
+    const request = {
+      jsonrpc: '2.0',
+      id: rpcId,
+      method: 'programSubscribe',
+      params: [
+        watchEntry.program,
+        {
+          commitment: 'confirmed',
+          encoding: 'base64',
+          filters,
+        },
+      ],
+    };
+    this.sendRpc(rpcId, request, 'subscribe', watchEntry.localId).catch((err) => {
+      this.log.warn('programSubscribe failed', {
+        program: watchEntry.program,
+        owner: watchEntry.owner,
         error: err instanceof Error ? err.message : String(err),
       });
     });
@@ -433,12 +518,19 @@ export class HeliusEnhancedWsClient {
   }
 
   private async sendUnsubscribe(serverSubId: number): Promise<void> {
+    return this.sendUnsubscribeMethod('transactionUnsubscribe', serverSubId);
+  }
+
+  private async sendUnsubscribeMethod(
+    method: string,
+    serverSubId: number,
+  ): Promise<void> {
     const rpcId = this.nextRpcId;
     this.nextRpcId += 1;
     const request = {
       jsonrpc: '2.0',
       id: rpcId,
-      method: 'transactionUnsubscribe',
+      method,
       params: [serverSubId],
     };
     await this.sendRpc(rpcId, request, 'unsubscribe', -1);
@@ -500,7 +592,8 @@ export class HeliusEnhancedWsClient {
       if (pending.kind === 'subscribe') {
         const watchEntry =
           this.watches.get(pending.localId) ??
-          this.parsedProgramWatches.get(pending.localId);
+          this.parsedProgramWatches.get(pending.localId) ??
+          this.tokenProgramWatches.get(pending.localId);
         if (watchEntry && typeof parsed.result === 'number') {
           watchEntry.serverSubId = parsed.result;
           this.watchesByServerSubId.set(parsed.result, watchEntry);
@@ -549,6 +642,33 @@ export class HeliusEnhancedWsClient {
       } catch (err) {
         this.log.error('parsedTransactionSubscribe callback threw', {
           programs: watchEntry.programs,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      return;
+    }
+
+    if (parsed.method === 'programNotification') {
+      const subscription = parsed.params?.subscription;
+      const result = parsed.params?.result;
+      if (typeof subscription !== 'number' || !result?.pubkey) return;
+        const watchEntry = this.watchesByServerSubId.get(subscription);
+        if (!watchEntry || !('program' in watchEntry) || !('owner' in watchEntry)) return;
+      const encoded = result.account?.data;
+      let accountData: Buffer | null = null;
+      if (Array.isArray(encoded) && typeof encoded[0] === 'string') {
+        try {
+          accountData = Buffer.from(encoded[0], 'base64');
+        } catch {
+          accountData = null;
+        }
+      }
+      try {
+        watchEntry.callback(result.pubkey, accountData);
+      } catch (err) {
+        this.log.error('programSubscribe callback threw', {
+          program: watchEntry.program,
+          owner: watchEntry.owner,
           error: err instanceof Error ? err.message : String(err),
         });
       }

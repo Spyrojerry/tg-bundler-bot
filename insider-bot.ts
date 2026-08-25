@@ -1,12 +1,6 @@
-import {
-  AccountInfo,
-  Connection,
-  LAMPORTS_PER_SOL,
-  PublicKey,
-} from "@solana/web3.js";
+import { Connection, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import {
   AccountLayout,
-  getAssociatedTokenAddressSync,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
@@ -143,6 +137,7 @@ type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
 /** Defer sold-all exit eval when ATA hits zero before the sell tx is processed. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_ATA_SOLD_ALL_EVAL_DEFER_MS = 1000;
+const FOLLOW_TOKEN_BALANCE_RECONCILE_INTERVAL_MS = 5_000;
 const PUMP_FUN_TOKEN_RAW_DECIMALS = 6;
 
 interface FollowTokenEarlyBundlerExitWatch {
@@ -187,9 +182,10 @@ interface FollowTokenEarlyBundlerExitState {
   exitTriggerSignature: string | null;
   enhancedWatchIds: Map<string, number>;
   logsSubIds: Map<string, number>;
-  tokenAtaBalanceSubIds: Map<string, Map<string, number>>;
-  tokenAtaBalancesByAccount: Map<string, Map<string, bigint>>;
-  tokenAtaLiveBalanceRaw: Map<string, bigint>;
+  tokenProgramWatchIds: Map<string, Map<string, number>>;
+  tokenAccountBalancesByAccount: Map<string, Map<string, bigint>>;
+  tokenAccountLiveBalanceRaw: Map<string, bigint>;
+  balanceReconcileTimer: ReturnType<typeof setInterval> | null;
   deferredSoldAllEvalTimer: ReturnType<typeof setTimeout> | null;
   preLiFirstBuyObserverWatchId: number | null;
   preLiFirstBuyObserverWallets: Map<string, {
@@ -6405,7 +6401,7 @@ export class InsiderBot extends EventEmitter {
   ): bigint | null {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state) return null;
-    return state.tokenAtaLiveBalanceRaw.get(wallet) ?? null;
+    return state.tokenAccountLiveBalanceRaw.get(wallet) ?? null;
   }
 
   private applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
@@ -8559,197 +8555,181 @@ export class InsiderBot extends EventEmitter {
       }
     }
 
-    void this.subscribeFollowTokenEarlyBundlerExitTokenAta(wallet, state.mint);
+    void this.subscribeFollowTokenEarlyBundlerExitTokenPrograms(wallet, state.mint);
   }
 
-  private async subscribeFollowTokenEarlyBundlerExitTokenAta(
+  private async subscribeFollowTokenEarlyBundlerExitTokenPrograms(
     wallet: string,
     mint: string,
   ): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active || state.mint !== mint) return;
-    if (state.tokenAtaBalanceSubIds.has(wallet)) return;
+    if (state.tokenProgramWatchIds.has(wallet)) return;
     if (!this.isValidFollowTokenEarlyBundlerWatchWallet(wallet)) return;
 
-    const owner = new PublicKey(wallet);
-    const mintPubkey = new PublicKey(mint);
-    const programIds = [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID];
+    const programIds = [TOKEN_PROGRAM_ID.toBase58(), TOKEN_2022_PROGRAM_ID.toBase58()];
     const subIds = new Map<string, number>();
-    const balances = new Map<string, bigint>();
-    let allInitialLookupsReliable = true;
-
     for (const programId of programIds) {
-      const ata = getAssociatedTokenAddressSync(mintPubkey, owner, false, programId);
-      const ataKey = ata.toBase58();
-      let accountInfo: AccountInfo<Buffer> | null = null;
-      let lastError: unknown = null;
-      for (let attempt = 1; attempt <= FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES; attempt += 1) {
-        try {
-          accountInfo = await this.connection.getAccountInfo(ata, "confirmed");
-          lastError = null;
-          break;
-        } catch (err) {
-          lastError = err;
-          if (attempt < FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES) {
-            await new Promise((resolve) =>
-              setTimeout(resolve, FOLLOW_TOKEN_INITIAL_BALANCE_RETRY_DELAY_MS),
-            );
-          }
-        }
-      }
-      if (lastError) {
-        allInitialLookupsReliable = false;
-        balances.set(ataKey, 0n);
-        this.log.warn("Early bundler ATA seed balance fetch failed after retries — defaulting to zero", {
-          mint,
-          wallet,
-          ata: ataKey,
-          attempts: FOLLOW_TOKEN_INITIAL_BALANCE_RETRIES,
-          error: lastError instanceof Error ? lastError.message : String(lastError),
-        });
-      } else {
-        balances.set(
-          ataKey,
-          this.decodeFollowTokenEarlyBundlerExitTokenAtaBalance(accountInfo),
-        );
-      }
-
-      const subId = this.connection.onAccountChange(
-        ata,
-        (accountInfo) => {
-          this.handleFollowTokenEarlyBundlerExitTokenAtaChange(
+      if (!this.enhancedWs) continue;
+      const watchId = this.enhancedWs.watchTokenProgram(
+        programId,
+        wallet,
+        (account, data) =>
+          this.handleFollowTokenEarlyBundlerExitTokenProgramChange(
             wallet,
-            ataKey,
-            accountInfo,
-          );
-        },
-        "confirmed",
+            account,
+            data,
+          ),
       );
-      subIds.set(ataKey, subId);
+      subIds.set(programId, watchId);
     }
 
-    state.tokenAtaBalanceSubIds.set(wallet, subIds);
-    state.tokenAtaBalancesByAccount.set(wallet, balances);
-    const totalRaw = [...balances.values()].reduce((sum, value) => sum + value, 0n);
-    state.tokenAtaLiveBalanceRaw.set(wallet, totalRaw);
+    state.tokenProgramWatchIds.set(wallet, subIds);
+    state.tokenAccountBalancesByAccount.set(wallet, new Map());
+    const totalRaw = await this.getFollowTokenEarlyBundlerExitReconciledBalance(wallet, mint);
+    state.tokenAccountLiveBalanceRaw.set(wallet, totalRaw);
     const watch = state.watches.get(wallet);
     if (watch) {
-      watch.initialBalanceLookupReliable = allInitialLookupsReliable;
-      watch.initialBalanceRaw = allInitialLookupsReliable ? totalRaw : null;
+      watch.initialBalanceLookupReliable = true;
+      watch.initialBalanceRaw = totalRaw;
       this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
         watch,
         totalRaw,
       );
     }
 
-    this.log.info("Subscribed follow-token early bundler token ATA balance", {
+    this.log.info("Subscribed follow-token token programs for wallet balance changes", {
       mint,
       wallet,
-      ataAccounts: [...subIds.keys()],
+      programs: programIds,
       liveTokenBalanceRaw: totalRaw.toString(),
     });
   }
 
-  private decodeFollowTokenEarlyBundlerExitTokenAtaBalance(
-    accountInfo: AccountInfo<Buffer> | null,
-  ): bigint {
-    if (!accountInfo || accountInfo.data.length < AccountLayout.span) {
-      return 0n;
-    }
+  private async getFollowTokenEarlyBundlerExitReconciledBalance(
+    wallet: string,
+    mint: string,
+  ): Promise<bigint> {
     try {
-      return AccountLayout.decode(accountInfo.data).amount;
-    } catch {
+      return await this.gmgnClient.getTokenRawBalance(wallet, mint);
+    } catch (err) {
+      this.log.warn("Follow-token token-program balance reconciliation failed", {
+        wallet,
+        mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return 0n;
     }
   }
 
-  private handleFollowTokenEarlyBundlerExitTokenAtaChange(
+  private async reconcileFollowTokenEarlyBundlerExitBalances(
+    mint: string,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state?.active || state.mint !== mint) return;
+    for (const watch of state.watches.values()) {
+      if (!watch.monitoringActive) continue;
+      const previousRaw = state.tokenAccountLiveBalanceRaw.get(watch.wallet) ?? null;
+      const currentRaw = await this.getFollowTokenEarlyBundlerExitReconciledBalance(
+        watch.wallet,
+        mint,
+      );
+      state.tokenAccountLiveBalanceRaw.set(watch.wallet, currentRaw);
+      this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(watch, currentRaw);
+      if (
+        currentRaw <= 0n &&
+        previousRaw !== null &&
+        previousRaw > 0n &&
+        watch.syncComplete &&
+        this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, currentRaw)
+      ) {
+        watch.soldAll = true;
+        watch.soldAllReason = 'live_ata_zero';
+        watch.soldAllSignature = watch.soldAllSignature ?? 'balance_reconciliation_zero';
+        watch.reachedTwentyFivePercentSold = true;
+        this.log.info('Follow-token early bundler sold all — balance reconciliation zero', {
+          mint,
+          wallet: watch.wallet,
+          previousBalanceRaw: previousRaw.toString(),
+        });
+        await this.maybeEvaluateFollowTokenEarlyBundlerExit();
+      }
+    }
+  }
+
+  private handleFollowTokenEarlyBundlerExitTokenProgramChange(
     wallet: string,
-    ataKey: string,
-    accountInfo: AccountInfo<Buffer>,
+    accountKey: string,
+    accountData: Buffer | null,
   ): void {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active) return;
     const watch = state.watches.get(wallet);
     if (!watch?.monitoringActive) return;
 
-    const balanceRaw =
-      this.decodeFollowTokenEarlyBundlerExitTokenAtaBalance(accountInfo);
-    let accounts = state.tokenAtaBalancesByAccount.get(wallet);
-    if (!accounts) {
-      accounts = new Map<string, bigint>();
-      state.tokenAtaBalancesByAccount.set(wallet, accounts);
-    }
-    accounts.set(ataKey, balanceRaw);
-
-    const totalRaw = [...accounts.values()].reduce((sum, value) => sum + value, 0n);
-    const previousRaw = state.tokenAtaLiveBalanceRaw.get(wallet) ?? null;
-    state.tokenAtaLiveBalanceRaw.set(wallet, totalRaw);
-    this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
-      watch,
-      totalRaw,
-    );
-
-    this.log.debug("Follow-token early bundler ATA balance updated", {
-      mint: state.mint,
-      wallet,
-      ata: ataKey,
-      ataBalanceRaw: balanceRaw.toString(),
-      liveTokenBalanceRaw: totalRaw.toString(),
-      previousLiveTokenBalanceRaw: previousRaw?.toString() ?? null,
-    });
-
-    if (
-      totalRaw <= 0n &&
-      !watch.soldAll &&
-      watch.syncComplete &&
-      this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, totalRaw)
-    ) {
-      watch.soldAll = true;
-      watch.soldAllSignature = watch.soldAllSignature ?? "ata_zero_balance";
-      watch.reachedTwentyFivePercentSold = true;
-      if (previousRaw !== null && previousRaw > 0n) {
-        this.bumpFollowTokenEarlyBundlerExitWatchMaxSingleSellFromAtaBalanceDrop(
-          watch,
-          previousRaw,
-          totalRaw,
-          state.mint,
-        );
-      }
-      this.log.info("Follow-token early bundler sold all — ATA balance zero", {
-        mint: state.mint,
-        wallet,
-        soldAmount: watch.soldAmount,
-        boughtAmount: watch.boughtAmount,
-        maxSingleSellTokenAmount: watch.maxSingleSellTokenAmount,
-      });
-      this.scheduleFollowTokenEarlyBundlerExitSoldAllEvalFromAta(
-        state.mint,
-        wallet,
-      );
+    if (!accountData || accountData.length < AccountLayout.span) return;
+    let decoded: ReturnType<typeof AccountLayout.decode>;
+    try {
+      decoded = AccountLayout.decode(accountData);
+    } catch {
       return;
     }
-
-    this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(watch, null);
+    if (new PublicKey(decoded.mint).toBase58() !== state.mint) return;
+    this.log.debug("Follow-token token program account changed; reconciling wallet balance", {
+      mint: state.mint,
+      wallet,
+      account: accountKey,
+      accountBalanceRaw: decoded.amount.toString(),
+    });
+    void this.reconcileFollowTokenEarlyBundlerExitBalance(wallet, state.mint);
   }
 
-  private async unsubscribeFollowTokenEarlyBundlerExitTokenAta(
+  private async reconcileFollowTokenEarlyBundlerExitBalance(
+    wallet: string,
+    mint: string,
+  ): Promise<void> {
+    const state = this.followTokenEarlyBundlerExitState;
+    const watch = state?.watches.get(wallet);
+    if (!state?.active || !watch?.monitoringActive || state.mint !== mint) return;
+    const previousRaw = state.tokenAccountLiveBalanceRaw.get(wallet) ?? null;
+    const currentRaw = await this.getFollowTokenEarlyBundlerExitReconciledBalance(wallet, mint);
+    state.tokenAccountLiveBalanceRaw.set(wallet, currentRaw);
+    this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(watch, currentRaw);
+    if (
+      currentRaw <= 0n &&
+      previousRaw !== null &&
+      previousRaw > 0n &&
+      watch.syncComplete &&
+      this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, currentRaw)
+    ) {
+      watch.soldAll = true;
+      watch.soldAllReason = "live_ata_zero";
+      watch.soldAllSignature = watch.soldAllSignature ?? "program_balance_reconciliation_zero";
+      watch.reachedTwentyFivePercentSold = true;
+      this.log.info("Follow-token early bundler sold all — program balance reconciliation zero", {
+        mint,
+        wallet,
+        previousBalanceRaw: previousRaw.toString(),
+      });
+      await this.maybeEvaluateFollowTokenEarlyBundlerExit();
+    }
+  }
+
+  private async unsubscribeFollowTokenEarlyBundlerExitTokenPrograms(
     wallet: string,
   ): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state) return;
 
-    const subIds = state.tokenAtaBalanceSubIds.get(wallet);
+    const subIds = state.tokenProgramWatchIds.get(wallet);
     if (subIds) {
       for (const subId of subIds.values()) {
-        await this.connection
-          .removeAccountChangeListener(subId)
-          .catch(() => undefined);
+        await this.enhancedWs?.unwatchTokenProgram(subId).catch(() => undefined);
       }
-      state.tokenAtaBalanceSubIds.delete(wallet);
+      state.tokenProgramWatchIds.delete(wallet);
     }
-    state.tokenAtaBalancesByAccount.delete(wallet);
-    state.tokenAtaLiveBalanceRaw.delete(wallet);
+    state.tokenAccountBalancesByAccount.delete(wallet);
+    state.tokenAccountLiveBalanceRaw.delete(wallet);
   }
 
   private async refreshFollowTokenEarlyBundlerExitWatchTokenBalanceAfterSync(
@@ -8757,7 +8737,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     options?: { applySoldAll?: boolean },
   ): Promise<void> {
-    await this.subscribeFollowTokenEarlyBundlerExitTokenAta(wallet, mint);
+    await this.subscribeFollowTokenEarlyBundlerExitTokenPrograms(wallet, mint);
     try {
       let raw: bigint | null = null;
       let lastError: unknown = null;
@@ -8778,7 +8758,7 @@ export class InsiderBot extends EventEmitter {
       if (lastError || raw === null) throw lastError ?? new Error("Token balance unavailable");
       const state = this.followTokenEarlyBundlerExitState;
       if (!state) return;
-      state.tokenAtaLiveBalanceRaw.set(wallet, raw);
+      state.tokenAccountLiveBalanceRaw.set(wallet, raw);
       const watch = state.watches.get(wallet);
       if (watch) {
         if (watch.initialBalanceRaw === null && raw > 0n) {
@@ -8826,7 +8806,7 @@ export class InsiderBot extends EventEmitter {
       state.logsSubIds.delete(wallet);
     }
 
-    void this.unsubscribeFollowTokenEarlyBundlerExitTokenAta(wallet);
+    void this.unsubscribeFollowTokenEarlyBundlerExitTokenPrograms(wallet);
   }
 
   private dropFollowTokenEarlyBundlerExitWatchAfterTransfer(
@@ -9039,9 +9019,10 @@ export class InsiderBot extends EventEmitter {
       exitTriggerSignature: null,
       enhancedWatchIds: new Map(),
       logsSubIds: new Map(),
-      tokenAtaBalanceSubIds: new Map(),
-      tokenAtaBalancesByAccount: new Map(),
-      tokenAtaLiveBalanceRaw: new Map(),
+      tokenProgramWatchIds: new Map(),
+      tokenAccountBalancesByAccount: new Map(),
+      tokenAccountLiveBalanceRaw: new Map(),
+      balanceReconcileTimer: null,
       deferredSoldAllEvalTimer: null,
       preLiFirstBuyObserverWatchId: null,
       preLiFirstBuyObserverWallets: new Map(),
@@ -9054,6 +9035,10 @@ export class InsiderBot extends EventEmitter {
     for (const wallet of watches.keys()) {
       this.subscribeFollowTokenEarlyBundlerExitWallet(wallet);
     }
+
+    this.followTokenEarlyBundlerExitState.balanceReconcileTimer = setInterval(() => {
+      void this.reconcileFollowTokenEarlyBundlerExitBalances(mint);
+    }, FOLLOW_TOKEN_BALANCE_RECONCILE_INTERVAL_MS);
 
     this.log.info("Started follow-token early bundler exit monitoring", {
       mint,
@@ -9080,7 +9065,7 @@ export class InsiderBot extends EventEmitter {
       "follow-token early bundler exit watch started",
     );
 
-    // Initial history/ATA synchronization must not be mistaken for a live
+    // Initial history/balance synchronization must not be mistaken for a live
     // sold-all event. Only evaluate sell-all after the watcher is announced.
     await this.syncAllFollowTokenEarlyBundlerExitWatches(mint);
     const currentState = this.followTokenEarlyBundlerExitState;
@@ -9094,6 +9079,11 @@ export class InsiderBot extends EventEmitter {
     if (!state) return;
 
     this.clearFollowTokenEarlyBundlerExitDeferredSoldAllEvalTimer();
+
+    if (state.balanceReconcileTimer) {
+      clearInterval(state.balanceReconcileTimer);
+      state.balanceReconcileTimer = null;
+    }
 
     if (state.preLiFirstBuyObserverWatchId !== null) {
       await this.enhancedWs
@@ -9110,8 +9100,8 @@ export class InsiderBot extends EventEmitter {
       await this.enhancedWs?.unwatch(watchId).catch(() => undefined);
       state.enhancedWatchIds.delete(wallet);
     }
-    for (const wallet of [...state.tokenAtaBalanceSubIds.keys()]) {
-      await this.unsubscribeFollowTokenEarlyBundlerExitTokenAta(wallet);
+    for (const wallet of [...state.tokenProgramWatchIds.keys()]) {
+      await this.unsubscribeFollowTokenEarlyBundlerExitTokenPrograms(wallet);
     }
     this.followTokenEarlyBundlerExitState = null;
   }
