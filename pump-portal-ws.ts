@@ -11,7 +11,6 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
 const CONNECT_TIMEOUT_MS = 10_000;
 const HEARTBEAT_INTERVAL_MS = 20_000;
 const HEARTBEAT_TIMEOUT_MS = 12_000;
-const FEED_STALE_TIMEOUT_MS = 90_000;
 const STATE_LOG_INTERVAL_MS = 60_000;
 const WATCHDOG_INTERVAL_MS = 30_000;
 
@@ -85,8 +84,9 @@ export class PumpPortalWsClient {
       reconnectScheduled: this.reconnectTimer !== null,
       stale:
         !this.migrationFeedSuspended &&
-        (!this.lastMigrationMessageAt ||
-          now - this.lastMigrationMessageAt > FEED_STALE_TIMEOUT_MS),
+        (!this.connected ||
+          !this.lastPongAt ||
+          now - this.lastPongAt > HEARTBEAT_INTERVAL_MS + HEARTBEAT_TIMEOUT_MS),
     };
   }
 
@@ -292,8 +292,8 @@ export class PumpPortalWsClient {
     this.watchdogTimer = setInterval(() => {
       if (this.migrationFeedSuspended || this.closedByUser) return;
       const status = this.getStatus();
-      if (status.stale && this.ws) {
-        this.log.warn('PumpPortal WebSocket feed is stale, forcing reconnect', status);
+      if (status.stale && this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.log.warn('PumpPortal WebSocket transport is stale, forcing reconnect', status);
         this.ws.terminate();
       }
     }, WATCHDOG_INTERVAL_MS);
