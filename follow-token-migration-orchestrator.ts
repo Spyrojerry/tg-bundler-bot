@@ -121,6 +121,16 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.isEnabled = true;
     this.activeFollowTokenMint = null;
     this.pumpPortalWs.onMigration((event) => {
+      for (const bot of this.insiderBots) {
+        if (bot.markTrackedFollowTokenMigrated(event.mint, event.timestamp, event.signature)) {
+          log.info('PumpPortal migration matched active tracked Follow-Insider token', {
+            mint: event.mint,
+            signature: event.signature,
+            migrationTimestamp: event.timestamp,
+          });
+          return;
+        }
+      }
       void this.processMigrationCandidate(
         event.mint,
         event.signature,

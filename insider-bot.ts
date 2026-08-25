@@ -152,6 +152,7 @@ interface FollowTokenEarlyBundlerExitWatch {
   maxSingleSellTokenAmount: number;
   soldAll: boolean;
   soldAllSignature: string | null;
+  soldAllTimestamp: number | null;
   reachedTwentyFivePercentSold: boolean;
   observedTxSignatures: Set<string>;
   syncComplete: boolean;
@@ -165,6 +166,7 @@ interface FollowTokenEarlyBundlerExitWatch {
 interface FollowTokenEarlyBundlerExitState {
   active: boolean;
   mint: string;
+  migrationTimestamp: number;
   watches: Map<string, FollowTokenEarlyBundlerExitWatch>;
   mcTpReachedPending: boolean;
   allSoldAllComplete: boolean;
@@ -712,6 +714,8 @@ export class InsiderBot extends EventEmitter {
   private followInsiderMonitors = new Map<string, WalletMonitor>();
   private followInsiderObservedMints = new Set<string>();
   private followInsiderObservationMode = false;
+  private followTokenMigrationTimestamp = 0;
+  private followTokenStartedFromTrackedWallet = false;
   private followInsiderPreBuyDevOutIgnoredMints = new Set<string>();
   /** User paused follow-wallet via Telegram — blocks auto-resume after token flow reset/complete. */
   private followWalletPaused = false;
@@ -3753,6 +3757,33 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  /** Records a later PumpPortal migration for a token already being tracked from a wallet buy. */
+  markTrackedFollowTokenMigrated(
+    mint: string,
+    migrationTimestamp: number,
+    migrationSignature: string,
+  ): boolean {
+    if (
+      this.flowSource !== "follow-token" ||
+      this.watchingMint !== mint ||
+      !this.followInsiderObservationMode
+    ) {
+      return false;
+    }
+    this.followTokenMigrationTimestamp = migrationTimestamp;
+    this.followTokenStartedFromTrackedWallet = true;
+    if (this.followTokenEarlyBundlerExitState?.mint === mint) {
+      this.followTokenEarlyBundlerExitState.migrationTimestamp = migrationTimestamp;
+      void this.maybeEvaluateFollowTokenEarlyBundlerExit();
+    }
+    this.log.info("Tracked Follow-Insider token migration recorded", {
+      mint,
+      migrationTimestamp,
+      migrationSignature,
+    });
+    return true;
+  }
+
   private async handleFollowInsiderFirstBuy(event: NewTokenEvent): Promise<void> {
     if (this.followInsiderObservedMints.has(event.mint)) return;
     this.followInsiderObservedMints.add(event.mint);
@@ -3763,6 +3794,8 @@ export class InsiderBot extends EventEmitter {
     this.claimedMint = event.mint;
     this.boughtMints.add(event.mint);
     this.followInsiderObservationMode = true;
+    this.followTokenStartedFromTrackedWallet = true;
+    this.followTokenMigrationTimestamp = 0;
     try {
       const swaps = await this.withHeliusFallback((client) =>
         client.getEarlyInsiderSwaps(event.mint, BUNDLER_FUNDER_REQUIRED_COUNT),
@@ -4416,6 +4449,7 @@ export class InsiderBot extends EventEmitter {
     followInsiderMode: boolean,
   ): Promise<boolean> {
     this.flowSource = "follow-token";
+    this.followTokenStartedFromTrackedWallet = false;
     this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
     this.resetHeliusPoolMetricsForMint(mint);
@@ -6325,6 +6359,7 @@ export class InsiderBot extends EventEmitter {
     }
     watch.soldAll = false;
     watch.soldAllSignature = null;
+    watch.soldAllTimestamp = null;
     return true;
   }
 
@@ -6354,6 +6389,16 @@ export class InsiderBot extends EventEmitter {
       return "largest_bag_not_sold_all";
     }
     return null;
+  }
+
+  private followTokenEarlyBundlerExitPostMigrationSoldAllWatch(): FollowTokenEarlyBundlerExitWatch | null {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (!state || state.migrationTimestamp <= 0) return null;
+    return [...state.watches.values()].find(
+      (watch) =>
+        watch.soldAllTimestamp !== null &&
+        watch.soldAllTimestamp > state.migrationTimestamp,
+    ) ?? null;
   }
 
   private allFollowTokenEarlyBundlerExitWatchesSoldAll(): boolean {
@@ -6407,11 +6452,12 @@ export class InsiderBot extends EventEmitter {
   private applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
     watch: FollowTokenEarlyBundlerExitWatch,
     signature: string | null,
+    timestamp?: number,
   ): void {
     if (this.healFollowTokenEarlyBundlerExitWatchErroneousSoldAll(watch)) {
       return;
     }
-    if (watch.soldAll) return;
+      if (watch.soldAll) return;
     const liveRaw = this.getFollowTokenEarlyBundlerExitWatchLiveTokenBalanceRaw(
       watch.wallet,
     );
@@ -6425,6 +6471,7 @@ export class InsiderBot extends EventEmitter {
       this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, liveRaw);
     if (soldAllByTrackedAmount || soldAllByAtaBalance) {
       watch.soldAll = true;
+      watch.soldAllTimestamp = timestamp ?? Date.now() / 1000;
       watch.soldAllReason = soldAllByTrackedAmount
         ? "historical_sell_sync"
         : "live_ata_zero";
@@ -6452,10 +6499,12 @@ export class InsiderBot extends EventEmitter {
   private updateFollowTokenEarlyBundlerExitWatchSoldAll(
     watch: FollowTokenEarlyBundlerExitWatch,
     signature: string | null,
+    timestamp?: number,
   ): void {
     this.applyFollowTokenEarlyBundlerExitWatchSoldAllFromLiveState(
       watch,
       signature,
+      timestamp,
     );
   }
 
@@ -7965,6 +8014,31 @@ export class InsiderBot extends EventEmitter {
 
     state.allSoldAllComplete = true;
 
+    if (this.followTokenStartedFromTrackedWallet && state.migrationTimestamp <= 0) {
+      this.log.info('Tracked Follow-Insider sold-all evaluation deferred until migration is observed', {
+        mint: state.mint,
+      });
+      return;
+    }
+
+    const postMigrationWatch =
+      this.followTokenStartedFromTrackedWallet
+        ? this.followTokenEarlyBundlerExitPostMigrationSoldAllWatch()
+        : null;
+    if (postMigrationWatch) {
+      this.log.warn('Follow-token sold-all occurred after migration — resetting token', {
+        mint: state.mint,
+        migrationTimestamp: state.migrationTimestamp,
+        wallet: postMigrationWatch.wallet,
+        source: postMigrationWatch.source,
+        soldAllTimestamp: postMigrationWatch.soldAllTimestamp,
+      });
+      await this.resetForNewToken(false, {
+        reason: 'early_bundler_sold_all_after_migration',
+      });
+      return;
+    }
+
     if (this.followInsiderObservationMode) {
       this.log.info("Follow-insider bundler sold-all reached — starting first-buy observer; buy disabled", {
         mint: state.mint,
@@ -8245,6 +8319,7 @@ export class InsiderBot extends EventEmitter {
       }
       if (watch.soldAmount >= watch.boughtAmount && !watch.soldAll) {
         watch.soldAllReason = "live_sell_transaction";
+        watch.soldAllTimestamp = tx.timestamp;
         this.log.info("Follow-token early bundler watch marked sold-all from sell transaction", {
           mint,
           wallet: watch.wallet,
@@ -8274,7 +8349,7 @@ export class InsiderBot extends EventEmitter {
         tx,
         wallet,
       );
-      this.updateFollowTokenEarlyBundlerExitWatchSoldAll(watch, tx.signature);
+      this.updateFollowTokenEarlyBundlerExitWatchSoldAll(watch, tx.signature, tx.timestamp);
       this.clearFollowTokenEarlyBundlerExitDeferredSoldAllEvalTimer();
       await this.maybeEvaluateFollowTokenEarlyBundlerExit(tx);
     }
@@ -8417,6 +8492,7 @@ export class InsiderBot extends EventEmitter {
       cumulativeSellUsd: 0,
       maxSingleSellTokenAmount: 0,
       soldAll: false,
+      soldAllTimestamp: null,
       soldAllSignature: null,
       reachedTwentyFivePercentSold: false,
       observedTxSignatures: new Set([transferReceiveSignature]),
@@ -8644,6 +8720,7 @@ export class InsiderBot extends EventEmitter {
         this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, currentRaw)
       ) {
         watch.soldAll = true;
+        watch.soldAllTimestamp = Date.now() / 1000;
         watch.soldAllReason = 'live_ata_zero';
         watch.soldAllSignature = watch.soldAllSignature ?? 'balance_reconciliation_zero';
         watch.reachedTwentyFivePercentSold = true;
@@ -8703,6 +8780,7 @@ export class InsiderBot extends EventEmitter {
       this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, currentRaw)
     ) {
       watch.soldAll = true;
+      watch.soldAllTimestamp = Date.now() / 1000;
       watch.soldAllReason = "live_ata_zero";
       watch.soldAllSignature = watch.soldAllSignature ?? "program_balance_reconciliation_zero";
       watch.reachedTwentyFivePercentSold = true;
@@ -8817,6 +8895,7 @@ export class InsiderBot extends EventEmitter {
 
     watch.monitoringActive = false;
     watch.soldAll = true;
+    watch.soldAllTimestamp = tx.timestamp;
     watch.soldAllReason = "token_transfer_out";
     watch.soldAllSignature = tx.signature;
     watch.reachedTwentyFivePercentSold = true;
@@ -8988,6 +9067,7 @@ export class InsiderBot extends EventEmitter {
         cumulativeSellUsd: 0,
         maxSingleSellTokenAmount: 0,
         soldAll: false,
+        soldAllTimestamp: null,
         soldAllSignature: null,
         reachedTwentyFivePercentSold: false,
         observedTxSignatures: new Set(),
@@ -9003,6 +9083,7 @@ export class InsiderBot extends EventEmitter {
     this.followTokenEarlyBundlerExitState = {
       active: true,
       mint,
+      migrationTimestamp: this.followTokenMigrationTimestamp,
       watches,
       mcTpReachedPending: false,
       allSoldAllComplete: false,
@@ -14513,6 +14594,8 @@ export class InsiderBot extends EventEmitter {
     this.followTokenEarlyInsiderBuys = null;
     this.followTokenEarlyBundlerExitState = null;
     this.followTokenLargeInsiderState = null;
+    this.followTokenMigrationTimestamp = 0;
+    this.followTokenStartedFromTrackedWallet = false;
     this.flowSource = null;
     this.flowFollowWallet = null;
     this.funderFirstFeePayer = null;
