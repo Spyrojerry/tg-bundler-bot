@@ -6293,10 +6293,15 @@ export class InsiderBot extends EventEmitter {
     context: "insider" | "bundler" | "early_bundler_exit",
     bundlerWallet?: string,
   ): void {
-    if (this.processedSignatures.has(tx.signature)) return;
     const mint = this.watchingMint ?? this.activePosition?.mint;
     if (!mint || !this.isRelevantMintTx(tx, mint)) return;
-    this.processedSignatures.add(tx.signature);
+    // A single transaction can touch multiple watched early bundlers. Those
+    // watches perform their own per-wallet de-duplication, so do not suppress
+    // later wallet callbacks with the process-wide signature set.
+    if (context !== "early_bundler_exit") {
+      if (this.processedSignatures.has(tx.signature)) return;
+      this.processedSignatures.add(tx.signature);
+    }
     if (context === "insider") {
       void this.handleInsiderTransaction(tx, mint);
     } else if (context === "bundler" && bundlerWallet) {
@@ -7997,6 +8002,8 @@ export class InsiderBot extends EventEmitter {
           wallet: watch.wallet,
           source: watch.source,
           boughtAmount: watch.boughtAmount,
+          soldAmount: watch.soldAmount,
+          sellTxCount: watch.sellTxCount,
           soldAll: watch.soldAll,
           syncComplete: watch.syncComplete,
         }));
@@ -8329,6 +8336,17 @@ export class InsiderBot extends EventEmitter {
           soldAmount: watch.soldAmount,
         });
       }
+      this.log.info("Follow-token early bundler partial/full sell accounted", {
+        mint,
+        wallet: watch.wallet,
+        source: watch.source,
+        signature: tx.signature,
+        sellAmount: amount,
+        soldAmount: watch.soldAmount,
+        boughtAmount: watch.boughtAmount,
+        sellTxCount: watch.sellTxCount,
+        remainingAmount: Math.max(0, watch.boughtAmount - watch.soldAmount),
+      });
 
       const liveTokenBalanceRaw =
         this.getFollowTokenEarlyBundlerExitWatchLiveTokenBalanceRaw(wallet);
@@ -8616,6 +8634,11 @@ export class InsiderBot extends EventEmitter {
           this.handleEnhancedWsMintTx(tx, "early_bundler_exit", wallet);
         });
         state.enhancedWatchIds.set(wallet, watchId);
+        this.log.info("Subscribed early bundler exit wallet via Enhanced WSS", {
+          mint: state.mint,
+          wallet,
+          watchId,
+        });
       } else {
         const pubkey = new PublicKey(wallet);
         const subId = this.connection.onLogs(
@@ -8628,6 +8651,11 @@ export class InsiderBot extends EventEmitter {
           "processed",
         );
         state.logsSubIds.set(wallet, subId);
+        this.log.info("Subscribed early bundler exit wallet via onLogs", {
+          mint: state.mint,
+          wallet,
+          subscriptionId: subId,
+        });
       }
     }
 
