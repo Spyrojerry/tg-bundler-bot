@@ -298,7 +298,7 @@ export class PumpPortalWsClient {
       }
     }, WATCHDOG_INTERVAL_MS);
     this.stateLogTimer = setInterval(() => {
-      this.log.info('PumpPortal WebSocket state', this.getStatus());
+      this.log.debug('PumpPortal WebSocket state', this.getStatus());
     }, STATE_LOG_INTERVAL_MS);
   }
 
