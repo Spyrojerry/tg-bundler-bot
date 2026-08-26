@@ -132,6 +132,8 @@ const FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW = 30;
 const PRE_LI_FIRST_BUY_OBSERVER_MAX_WALLETS = 10;
 const PRE_LI_FIRST_BUY_OBSERVER_MIN_USD = 110;
 const PRE_LI_FIRST_BUY_OBSERVER_MAX_USD = 300;
+const PRE_LI_FIRST_BUY_OBSERVER_BASELINE_WALLETS = 3;
+const PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -198,6 +200,8 @@ interface FollowTokenEarlyBundlerExitState {
   }>;
   preLiFirstBuyObserverPendingWallets: Set<string>;
   preLiFirstBuyObserverSeenWallets: Set<string>;
+  preLiFirstBuyObserverBaselineBuyUsd: number | null;
+  preLiFirstBuyObserverBaselineWallets: number;
   initialSyncComplete: boolean;
   maxSingleSell60mCapExceeded: boolean;
 }
@@ -4916,6 +4920,8 @@ export class InsiderBot extends EventEmitter {
       maxWallets: PRE_LI_FIRST_BUY_OBSERVER_MAX_WALLETS,
       minUsd: PRE_LI_FIRST_BUY_OBSERVER_MIN_USD,
       maxUsd: PRE_LI_FIRST_BUY_OBSERVER_MAX_USD,
+      baselineWallets: PRE_LI_FIRST_BUY_OBSERVER_BASELINE_WALLETS,
+      closeToleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
     });
   }
 
@@ -4955,6 +4961,26 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
+
+      const baselineWalletCount = state.preLiFirstBuyObserverWallets.size;
+      if (baselineWalletCount >= PRE_LI_FIRST_BUY_OBSERVER_BASELINE_WALLETS) {
+        const baselineBuyUsd = state.preLiFirstBuyObserverBaselineBuyUsd;
+        if (
+          baselineBuyUsd === null ||
+          Math.abs(buyUsd - baselineBuyUsd) >
+            PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD
+        ) {
+          this.log.info("Pre-LI first-buy observer wallet rejected — buy amount outside close-fee range", {
+            mint,
+            wallet,
+            buyUsd,
+            baselineBuyUsd,
+            toleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
+          });
+          continue;
+        }
+      }
+
       state.preLiFirstBuyObserverPendingWallets.add(wallet);
       const observed = {
         buySol,
@@ -4963,6 +4989,22 @@ export class InsiderBot extends EventEmitter {
         timestamp: tx.timestamp,
       };
       state.preLiFirstBuyObserverWallets.set(wallet, observed);
+      if (
+        state.preLiFirstBuyObserverWallets.size ===
+        PRE_LI_FIRST_BUY_OBSERVER_BASELINE_WALLETS
+      ) {
+        const baselineWallets = [...state.preLiFirstBuyObserverWallets.values()];
+        state.preLiFirstBuyObserverBaselineBuyUsd =
+          baselineWallets.reduce((sum, value) => sum + value.buyUsd, 0) /
+          baselineWallets.length;
+        state.preLiFirstBuyObserverBaselineWallets = baselineWallets.length;
+        this.log.info("Pre-LI first-buy observer close-fee baseline established", {
+          mint,
+          baselineWalletCount: baselineWallets.length,
+          baselineBuyUsd: state.preLiFirstBuyObserverBaselineBuyUsd,
+          toleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
+        });
+      }
       this.log.info("Pre-LI first-buy observer qualifying wallet", {
         mint,
         wallet,
@@ -4970,8 +5012,11 @@ export class InsiderBot extends EventEmitter {
         solPriceUsd,
         walletCount: state.preLiFirstBuyObserverWallets.size,
         approximatelySameBuyFee:
-          buyUsd >= PRE_LI_FIRST_BUY_OBSERVER_MIN_USD &&
-          buyUsd <= PRE_LI_FIRST_BUY_OBSERVER_MAX_USD,
+          state.preLiFirstBuyObserverBaselineBuyUsd === null ||
+          Math.abs(buyUsd - state.preLiFirstBuyObserverBaselineBuyUsd) <=
+            PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
+        baselineBuyUsd: state.preLiFirstBuyObserverBaselineBuyUsd,
+        closeToleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
       });
       void this.sendTelegramSafe(
         [
@@ -4982,6 +5027,9 @@ export class InsiderBot extends EventEmitter {
           `Buy tx: <code>${tx.signature}</code>`,
           `Observed wallets: <b>${state.preLiFirstBuyObserverWallets.size}/${PRE_LI_FIRST_BUY_OBSERVER_MAX_WALLETS}</b>`,
           `Approximate buy-fee band: <b>$${PRE_LI_FIRST_BUY_OBSERVER_MIN_USD}–$${PRE_LI_FIRST_BUY_OBSERVER_MAX_USD}</b>`,
+          state.preLiFirstBuyObserverBaselineBuyUsd === null
+            ? "Close-fee baseline: being established from the first 3 qualifying wallets."
+            : `Close-fee baseline: <b>$${state.preLiFirstBuyObserverBaselineBuyUsd.toFixed(3)}</b> ± <b>$${PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD.toFixed(3)}</b>`,
         ].join("\n"),
         "pre-li first-buy observer wallet",
       );
@@ -9137,6 +9185,8 @@ export class InsiderBot extends EventEmitter {
       preLiFirstBuyObserverWallets: new Map(),
       preLiFirstBuyObserverPendingWallets: new Set(),
       preLiFirstBuyObserverSeenWallets: new Set(),
+      preLiFirstBuyObserverBaselineBuyUsd: null,
+      preLiFirstBuyObserverBaselineWallets: 0,
       initialSyncComplete: false,
       maxSingleSell60mCapExceeded: false,
     };
