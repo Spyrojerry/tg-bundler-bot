@@ -1601,6 +1601,9 @@ async function main(): Promise<void> {
   insiderBots[0]?.setPermanentFollowWalletRemover((wallet) => {
     db.removeInsiderFollowWallet(wallet);
   });
+  insiderBots[0]?.setMigrationTimestampLookup((mint) =>
+    followTokenOrchestrator?.getMigrationTimestamp(mint) ?? null,
+  );
   for (const wallet of db.getInsiderFollowWallets()) {
     try {
       insiderBots[0]?.addFollowInsiderWallet(wallet);

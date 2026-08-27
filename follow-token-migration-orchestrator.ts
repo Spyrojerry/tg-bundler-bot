@@ -66,6 +66,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private readonly seenMigrationMints = new Set<string>();
   private readonly seenMigrationSignatures = new Set<string>();
   private readonly inFlightMints = new Set<string>();
+  private readonly migrationTimestamps = new Map<string, number>();
 
   constructor(
     private readonly config: ServiceConfig,
@@ -121,6 +122,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.isEnabled = true;
     this.activeFollowTokenMint = null;
     this.pumpPortalWs.onMigration((event) => {
+      this.migrationTimestamps.set(event.mint, event.timestamp);
       for (const bot of this.insiderBots) {
         if (bot.markTrackedFollowTokenMigrated(event.mint, event.timestamp, event.signature)) {
           log.info('PumpPortal migration matched active tracked Follow-Insider token', {
@@ -148,6 +150,10 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       `Routes: normal follow-token migrate <b>${this.config.insiderFollowTokenNormalEnabled ? `0s–${this.config.insiderFollowTokenMaxMigrationAgeSec}s enabled` : 'disabled'}</b>; follow-insider migrate <b>400s–800s</b>. Other ages are rejected. Mint ends <b>${PUMP_MINT_SUFFIX}</b>, metadata URI via <b>${REQUIRED_IPFS_IO_BAF_URI_PREFIX}…</b>, dev created <b>${FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN}–${FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX}</b> tokens, dev funded by <b>Centralized Exchange</b>, first-four bundler logic.`,
       'PumpPortal migration feed unsubscribes while a follow-token bundler-funder flow is active; resubscribes when the token is skipped or reset (not after dev rug alone).',
     ]);
+  }
+
+  getMigrationTimestamp(mint: string): number | null {
+    return this.migrationTimestamps.get(mint) ?? null;
   }
 
   stop(reason = 'Stopped'): void {

@@ -731,6 +731,7 @@ export class InsiderBot extends EventEmitter {
   private followInsiderObservationMode = false;
   private followTokenMigrationTimestamp = 0;
   private followTokenStartedFromTrackedWallet = false;
+  private migrationTimestampLookup: ((mint: string) => number | null) | null = null;
   private followInsiderPreBuyDevOutIgnoredMints = new Set<string>();
   /** User paused follow-wallet via Telegram — blocks auto-resume after token flow reset/complete. */
   private followWalletPaused = false;
@@ -3772,6 +3773,12 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  setMigrationTimestampLookup(
+    lookup: ((mint: string) => number | null) | null,
+  ): void {
+    this.migrationTimestampLookup = lookup;
+  }
+
   /** Records a later PumpPortal migration for a token already being tracked from a wallet buy. */
   markTrackedFollowTokenMigrated(
     mint: string,
@@ -3803,6 +3810,18 @@ export class InsiderBot extends EventEmitter {
     if (this.followInsiderObservedMints.has(event.mint)) return;
     this.followInsiderObservedMints.add(event.mint);
     this.followInsiderPreBuyDevOutIgnoredMints.add(event.mint);
+    const migrationTimestamp = this.migrationTimestampLookup?.(event.mint) ?? null;
+    const buyTimestamp = event.timestamp ?? event.detectedAt;
+    if (migrationTimestamp !== null && buyTimestamp > migrationTimestamp) {
+      this.log.info("Tracked Follow-Insider buy skipped — token already migrated", {
+        mint: event.mint,
+        wallet: event.walletAddress,
+        buyTimestamp,
+        migrationTimestamp,
+        signature: event.signature ?? null,
+      });
+      return;
+    }
     if (!this.isIdleForFunderFirst()) return;
     this.flowSource = "follow-token";
     this.watchingMint = event.mint;
@@ -8347,6 +8366,7 @@ export class InsiderBot extends EventEmitter {
     tx: HeliusTransaction,
     mint: string,
     wallet: string,
+    historical = false,
   ): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active || state.mint !== mint || state.exitTriggerSignature) {
@@ -8409,7 +8429,9 @@ export class InsiderBot extends EventEmitter {
       if (watch.soldAmount >= watch.boughtAmount && !watch.soldAll) {
         watch.balanceState = "sold_all";
         watch.soldAll = true;
-        watch.soldAllReason = "live_sell_transaction";
+        watch.soldAllReason = historical
+          ? "historical_sell_sync"
+          : "live_sell_transaction";
         watch.soldAllTimestamp = tx.timestamp;
         this.log.info("Follow-token early bundler watch marked sold-all from sell transaction", {
           mint,
@@ -8888,7 +8910,7 @@ export class InsiderBot extends EventEmitter {
       );
       for (const tx of [...txs].reverse()) {
         if (watch.observedTxSignatures.has(tx.signature)) continue;
-        await this.applyFollowTokenEarlyBundlerExitTx(tx, mint, watch.wallet);
+        await this.applyFollowTokenEarlyBundlerExitTx(tx, mint, watch.wallet, true);
       }
     } catch (err) {
       this.log.warn("Follow-token early bundler transaction backstop failed", {
