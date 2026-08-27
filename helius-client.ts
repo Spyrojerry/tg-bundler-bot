@@ -627,6 +627,25 @@ export class HeliusClient {
     return await response.json() as HeliusTransaction[];
   }
 
+  async getAddressTransactionsDesc(
+    address: string,
+    limit: number = 50,
+  ): Promise<HeliusTransaction[]> {
+    const params = new URLSearchParams({
+      'token-accounts': 'none',
+      'sort-order': 'desc',
+      'api-key': this.apiKey,
+      limit: String(limit),
+    });
+    const url = `${this.baseUrl}/v0/addresses/${address}/transactions?${params.toString()}`;
+    const response = await this.fetchWithCreditCheck(url);
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Helius API error: ${response.status} ${response.statusText} - ${text}`);
+    }
+    return await response.json() as HeliusTransaction[];
+  }
+
   /**
    * Fetches PUMP_FUN SWAP txs for a mint within an inclusive unix-second window.
    * Uses sort-order=asc and after-signature pagination: each page walks forward in

@@ -8624,6 +8624,28 @@ export class InsiderBot extends EventEmitter {
       state.earlyBundlerTransferOutObserved = true;
     }
 
+    const transferredAmount = [...recipients.values()].reduce(
+      (sum, amount) => sum + amount,
+      0,
+    );
+    const trackedRemainingAmount = Math.max(
+      0,
+      parentWatch.boughtAmount - parentWatch.soldAmount,
+    );
+    const liveRemainingRaw = state.tokenAccountLiveBalanceRaw.get(parentWatch.wallet);
+    const liveRemainingAmount =
+      liveRemainingRaw !== undefined
+        ? Number(liveRemainingRaw) / 10 ** PUMP_FUN_TOKEN_RAW_DECIMALS
+        : null;
+    const remainingBeforeTransfer =
+      liveRemainingAmount !== null && Number.isFinite(liveRemainingAmount)
+        ? Math.max(trackedRemainingAmount, liveRemainingAmount)
+        : trackedRemainingAmount;
+    const parentTransferIsFull =
+      recipients.size > 0 &&
+      remainingBeforeTransfer > 0 &&
+      transferredAmount >= remainingBeforeTransfer;
+
     for (const [recipient, transferAmount] of recipients) {
       await this.ensureFollowTokenEarlyBundlerTransferRecipientWatch(
         parentWatch,
@@ -8634,15 +8656,31 @@ export class InsiderBot extends EventEmitter {
       );
     }
 
-    const dropParent = recipients.size > 0;
+    const dropParent = parentTransferIsFull;
     if (dropParent) {
       this.dropFollowTokenEarlyBundlerExitWatchAfterTransfer(parentWatch, tx);
+    }
+
+    if (recipients.size > 0 && !parentTransferIsFull) {
+      this.log.info(
+        "Follow-token early bundler partial token transfer — parent remains monitored",
+        {
+          mint,
+          parentWallet: parentWatch.wallet,
+          transferredAmount,
+          trackedRemainingAmount,
+          liveRemainingAmount,
+          remainingBeforeTransfer,
+          recipientCount: recipients.size,
+          signature: tx.signature,
+        },
+      );
     }
 
     const telegramLines = [
       `<b>🔗 ${this.label} Early Bundler Token Transfer</b>`,
       `Token: <code>${mint}</code>`,
-      `From: <code>${parentWatch.wallet}</code>${dropParent ? " (dropped from monitoring)" : hasUnresolvedPoolOutbound ? " (pool leg unresolved — still monitored)" : ""}`,
+      `From: <code>${parentWatch.wallet}</code>${dropParent ? " (dropped from monitoring; full transfer)" : hasUnresolvedPoolOutbound ? " (pool leg unresolved — still monitored)" : recipients.size > 0 ? " (partial transfer; still monitored)" : ""}`,
     ];
     if (recipients.size > 0) {
       telegramLines.push(`Recipients: <b>${recipients.size}</b>`);
@@ -8661,6 +8699,8 @@ export class InsiderBot extends EventEmitter {
       "",
       dropParent
         ? "Sender unsubscribed; every recipient synced and monitored for individual sell txs."
+        : recipients.size > 0
+          ? "Partial transfer: sender and every recipient remain monitored; transferred amount is tracked as the recipient's bought amount."
         : "Sender kept until remaining balance is zero.",
     );
     void this.sendTelegramSafe(
@@ -8739,29 +8779,30 @@ export class InsiderBot extends EventEmitter {
     state.tokenProgramWatchIds.set(wallet, subIds);
     state.tokenAccountBalancesByAccount.set(wallet, new Map());
     const totalRaw = await this.getFollowTokenEarlyBundlerExitReconciledBalance(wallet, mint);
-    state.tokenAccountLiveBalanceRaw.set(wallet, totalRaw);
+    if (totalRaw !== null) {
+      state.tokenAccountLiveBalanceRaw.set(wallet, totalRaw);
+    }
     const watch = state.watches.get(wallet);
     if (watch) {
-      watch.initialBalanceLookupReliable = true;
+      watch.initialBalanceLookupReliable = totalRaw !== null;
       watch.initialBalanceRaw = totalRaw;
-      this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(
-        watch,
-        totalRaw,
-      );
+      if (totalRaw !== null) {
+        this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(watch, totalRaw);
+      }
     }
 
     this.log.info("Subscribed follow-token token programs for wallet balance changes", {
       mint,
       wallet,
       programs: programIds,
-      liveTokenBalanceRaw: totalRaw.toString(),
+      liveTokenBalanceRaw: totalRaw?.toString() ?? null,
     });
   }
 
   private async getFollowTokenEarlyBundlerExitReconciledBalance(
     wallet: string,
     mint: string,
-  ): Promise<bigint> {
+  ): Promise<bigint | null> {
     try {
       return await this.gmgnClient.getTokenRawBalance(wallet, mint);
     } catch (err) {
@@ -8770,7 +8811,28 @@ export class InsiderBot extends EventEmitter {
         mint,
         error: err instanceof Error ? err.message : String(err),
       });
-      return 0n;
+      return null;
+    }
+  }
+
+  private async replayFollowTokenEarlyBundlerExitRecentTransactions(
+    watch: FollowTokenEarlyBundlerExitWatch,
+    mint: string,
+  ): Promise<void> {
+    try {
+      const txs = await this.withHeliusFallback((client) =>
+        client.getAddressTransactionsDesc(watch.wallet, 50),
+      );
+      for (const tx of [...txs].reverse()) {
+        if (watch.observedTxSignatures.has(tx.signature)) continue;
+        await this.applyFollowTokenEarlyBundlerExitTx(tx, mint, watch.wallet);
+      }
+    } catch (err) {
+      this.log.warn("Follow-token early bundler transaction backstop failed", {
+        mint,
+        wallet: watch.wallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -8786,6 +8848,8 @@ export class InsiderBot extends EventEmitter {
         watch.wallet,
         mint,
       );
+      await this.replayFollowTokenEarlyBundlerExitRecentTransactions(watch, mint);
+      if (currentRaw === null) continue;
       state.tokenAccountLiveBalanceRaw.set(watch.wallet, currentRaw);
       this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(watch, currentRaw);
       if (
@@ -8846,6 +8910,7 @@ export class InsiderBot extends EventEmitter {
     if (!state?.active || !watch?.monitoringActive || state.mint !== mint) return;
     const previousRaw = state.tokenAccountLiveBalanceRaw.get(wallet) ?? null;
     const currentRaw = await this.getFollowTokenEarlyBundlerExitReconciledBalance(wallet, mint);
+    if (currentRaw === null) return;
     state.tokenAccountLiveBalanceRaw.set(wallet, currentRaw);
     this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(watch, currentRaw);
     if (

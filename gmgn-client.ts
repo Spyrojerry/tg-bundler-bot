@@ -2253,19 +2253,48 @@ private async sendRawTransactionAndAssertSuccess(
     let total = 0n;
 
     for (const programId of TOKEN_PROGRAM_IDS) {
-      const accounts = await this.connection.getParsedTokenAccountsByOwner(
-        pubkey,
-        { programId, mint: mintPubkey },
-      );
-      for (const { account } of accounts.value) {
-        const parsed = account.data as ParsedAccountData;
-        const amount = parsed?.parsed?.info?.tokenAmount?.amount;
-        if (typeof amount === "string" && /^\d+$/.test(amount)) {
-          total += BigInt(amount);
-        }
+      try {
+        const accounts = await this.connection.getParsedTokenAccountsByOwner(
+          pubkey,
+          { programId, mint: mintPubkey },
+        );
+        total += this.sumParsedTokenAccountsForMint(accounts.value, mint);
+      } catch (err) {
+        if (!this.isMissingMintTokenAccountLookup(err)) throw err;
+        log.warn("Mint-filtered token balance lookup failed; scanning owner token accounts", {
+          wallet,
+          mint,
+          programId: programId.toBase58(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+        const accounts = await this.connection.getParsedTokenAccountsByOwner(
+          pubkey,
+          { programId },
+        );
+        total += this.sumParsedTokenAccountsForMint(accounts.value, mint);
       }
     }
 
+    return total;
+  }
+
+  private sumParsedTokenAccountsForMint(
+    accounts: Array<{ account: { data: ParsedAccountData } }>,
+    mint: string,
+  ): bigint {
+    let total = 0n;
+    for (const { account } of accounts) {
+      const parsed = account.data as ParsedAccountData;
+      const accountMint = parsed?.parsed?.info?.mint;
+      const amount = parsed?.parsed?.info?.tokenAmount?.amount;
+      if (
+        accountMint === mint &&
+        typeof amount === "string" &&
+        /^\d+$/.test(amount)
+      ) {
+        total += BigInt(amount);
+      }
+    }
     return total;
   }
 
