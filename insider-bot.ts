@@ -731,7 +731,6 @@ export class InsiderBot extends EventEmitter {
   private followInsiderObservationMode = false;
   private followTokenMigrationTimestamp = 0;
   private followTokenStartedFromTrackedWallet = false;
-  private migrationTimestampLookup: ((mint: string) => number | null) | null = null;
   private followInsiderPreBuyDevOutIgnoredMints = new Set<string>();
   /** User paused follow-wallet via Telegram — blocks auto-resume after token flow reset/complete. */
   private followWalletPaused = false;
@@ -3773,11 +3772,6 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  setMigrationTimestampLookup(
-    lookup: ((mint: string) => number | null) | null,
-  ): void {
-    this.migrationTimestampLookup = lookup;
-  }
 
   /** Records a later PumpPortal migration for a token already being tracked from a wallet buy. */
   markTrackedFollowTokenMigrated(
@@ -3810,14 +3804,15 @@ export class InsiderBot extends EventEmitter {
     if (this.followInsiderObservedMints.has(event.mint)) return;
     this.followInsiderObservedMints.add(event.mint);
     this.followInsiderPreBuyDevOutIgnoredMints.add(event.mint);
-    const migrationTimestamp = this.migrationTimestampLookup?.(event.mint) ?? null;
     const buyTimestamp = event.timestamp ?? event.detectedAt;
-    if (migrationTimestamp !== null && buyTimestamp > migrationTimestamp) {
+    const athMarketCapUsd = this.highestObservedMarketCapUsd;
+    if (athMarketCapUsd !== null && athMarketCapUsd >= 45_000) {
       this.log.info("Tracked Follow-Insider buy skipped — token already migrated", {
         mint: event.mint,
         wallet: event.walletAddress,
         buyTimestamp,
-        migrationTimestamp,
+        athMarketCapUsd,
+        migrationProxyMarketCapUsd: 45_000,
         signature: event.signature ?? null,
       });
       return;
