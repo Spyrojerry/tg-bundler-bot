@@ -140,18 +140,25 @@ const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
 /** Defer sold-all exit eval when ATA hits zero before the sell tx is processed. */
 const FOLLOW_TOKEN_EARLY_BUNDLER_ATA_SOLD_ALL_EVAL_DEFER_MS = 1000;
 const FOLLOW_TOKEN_BALANCE_RECONCILE_INTERVAL_MS = 5_000;
+const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_EVAL_WAIT_MS = 15 * 60 * 1_000;
+const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_CHAIN_DEPTH = 3;
 const PUMP_FUN_TOKEN_RAW_DECIMALS = 6;
+
+type FollowTokenEarlyBundlerExitBalanceState = "unresolved" | "holding" | "sold_all";
 
 interface FollowTokenEarlyBundlerExitWatch {
   wallet: string;
   source: "early_bundler" | "transfer_recipient";
   parentWallet: string | null;
+  rootWallet: string;
+  chainDepth: number;
   syncAfterSignature: string;
   boughtAmount: number;
   soldAmount: number;
   sellTxCount: number;
   cumulativeSellUsd: number;
   maxSingleSellTokenAmount: number;
+  balanceState: FollowTokenEarlyBundlerExitBalanceState;
   soldAll: boolean;
   soldAllSignature: string | null;
   soldAllTimestamp: number | null;
@@ -159,6 +166,8 @@ interface FollowTokenEarlyBundlerExitWatch {
   observedTxSignatures: Set<string>;
   syncComplete: boolean;
   monitoringActive: boolean;
+  lastBalancePollAt: number | null;
+  lastBalancePollError: string | null;
   observedNonZeroTokenBalance: boolean;
   initialBalanceLookupReliable: boolean;
   initialBalanceRaw: bigint | null;
@@ -204,6 +213,8 @@ interface FollowTokenEarlyBundlerExitState {
   preLiFirstBuyObserverBaselineWallets: number;
   initialSyncComplete: boolean;
   maxSingleSell60mCapExceeded: boolean;
+  evalDeadlineAt: number | null;
+  deadlineExcludedWallets: Set<string>;
 }
 
 interface FollowTokenLargeInsiderScrapeWatch {
@@ -6411,6 +6422,7 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
     watch.soldAll = false;
+    watch.balanceState = "unresolved";
     watch.soldAllSignature = null;
     watch.soldAllTimestamp = null;
     return true;
@@ -6419,6 +6431,8 @@ export class InsiderBot extends EventEmitter {
   private followTokenEarlyBundlerExitSoldAllBlockReason(): string | null {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active || state.watches.size === 0) return "inactive";
+    const deadlinePassed =
+      state.evalDeadlineAt !== null && Date.now() >= state.evalDeadlineAt;
     const activeWatches = [...state.watches.values()].filter(
       (watch) => watch.monitoringActive,
     );
@@ -6428,15 +6442,28 @@ export class InsiderBot extends EventEmitter {
         return "active_watch_never_sold";
       }
       if (!watch.syncComplete) return "sync_incomplete";
-      if (this.followTokenEarlyBundlerExitWatchHasNeverSold(watch)) {
-        return "active_watch_never_sold";
+      if (
+        deadlinePassed &&
+        watch.balanceState === "unresolved" &&
+        !state.deadlineExcludedWallets.has(watch.wallet)
+      ) {
+        state.deadlineExcludedWallets.add(watch.wallet);
+        this.log.warn("Follow-token watch excluded from sold-all gate — balance unresolved past deadline", {
+          mint: state.mint,
+          wallet: watch.wallet,
+          source: watch.source,
+          lastBalancePollAt: watch.lastBalancePollAt,
+          lastBalancePollError: watch.lastBalancePollError,
+        });
       }
-      if (!watch.soldAll) return "watch_not_sold_all";
+      if (state.deadlineExcludedWallets.has(watch.wallet)) continue;
+      if (watch.balanceState !== "sold_all") return "watch_not_sold_all";
     }
     const largestBag = this.getFollowTokenEarlyBundlerExitLargestBagWatch();
     if (
       largestBag &&
-      (!largestBag.soldAll ||
+      (!largestBag || state.deadlineExcludedWallets.has(largestBag.wallet) ||
+        largestBag.balanceState !== "sold_all" ||
         this.followTokenEarlyBundlerExitWatchHasNeverSold(largestBag))
     ) {
       return "largest_bag_not_sold_all";
@@ -6524,6 +6551,7 @@ export class InsiderBot extends EventEmitter {
       this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, liveRaw);
     if (soldAllByTrackedAmount || soldAllByAtaBalance) {
       watch.soldAll = true;
+      watch.balanceState = "sold_all";
       watch.soldAllTimestamp = timestamp ?? Date.now() / 1000;
       watch.soldAllReason = soldAllByTrackedAmount
         ? "historical_sell_sync"
@@ -8026,15 +8054,21 @@ export class InsiderBot extends EventEmitter {
       });
       return;
     }
-    const unreliableWatch = [...state.watches.values()].find(
-      (watch) => watch.monitoringActive && !watch.initialBalanceLookupReliable,
-    );
-    if (unreliableWatch) {
-      this.log.info("Follow-token sold-all evaluation deferred because initial balance is unreliable", {
+    if (
+      state.evalDeadlineAt !== null &&
+      Date.now() >= state.evalDeadlineAt &&
+      [...state.watches.values()].some(
+        (watch) =>
+          watch.monitoringActive &&
+          !state.deadlineExcludedWallets.has(watch.wallet) &&
+          watch.balanceState === "holding",
+      )
+    ) {
+      this.log.warn("Follow-token sold-all evaluation timed out while wallets still hold tokens", {
         mint: state.mint,
-        wallet: unreliableWatch.wallet,
-        source: unreliableWatch.source,
+        evalDeadlineAt: state.evalDeadlineAt,
       });
+      await this.resetForNewToken(false, { reason: "sold_all_eval_timeout" });
       return;
     }
     const soldAllBlockReason = this.followTokenEarlyBundlerExitSoldAllBlockReason();
@@ -8373,6 +8407,8 @@ export class InsiderBot extends EventEmitter {
         watch.maxSingleSellTokenAmount = amount;
       }
       if (watch.soldAmount >= watch.boughtAmount && !watch.soldAll) {
+        watch.balanceState = "sold_all";
+        watch.soldAll = true;
         watch.soldAllReason = "live_sell_transaction";
         watch.soldAllTimestamp = tx.timestamp;
         this.log.info("Follow-token early bundler watch marked sold-all from sell transaction", {
@@ -8433,6 +8469,7 @@ export class InsiderBot extends EventEmitter {
     watch.boughtAmount += amount;
     if (watch.soldAll && watch.soldAmount < watch.boughtAmount) {
       watch.soldAll = false;
+      watch.balanceState = "holding";
       watch.soldAllSignature = null;
       if (!watch.monitoringActive) {
         watch.monitoringActive = true;
@@ -8524,6 +8561,7 @@ export class InsiderBot extends EventEmitter {
       existing.observedTxSignatures.add(transferReceiveSignature);
       if (existing.soldAll) {
         existing.soldAll = false;
+        existing.balanceState = "holding";
         existing.soldAllSignature = null;
         existing.reachedTwentyFivePercentSold = false;
         if (!existing.monitoringActive) {
@@ -8551,6 +8589,8 @@ export class InsiderBot extends EventEmitter {
       wallet: recipient,
       source: "transfer_recipient",
       parentWallet: parentWatch.wallet,
+      rootWallet: parentWatch.rootWallet,
+      chainDepth: parentWatch.chainDepth + 1,
       syncAfterSignature: transferReceiveSignature,
       boughtAmount: transferAmount,
       soldAmount: 0,
@@ -8558,6 +8598,9 @@ export class InsiderBot extends EventEmitter {
       cumulativeSellUsd: 0,
       maxSingleSellTokenAmount: 0,
       soldAll: false,
+      balanceState: "unresolved",
+      lastBalancePollAt: null,
+      lastBalancePollError: null,
       soldAllTimestamp: null,
       soldAllSignature: null,
       reachedTwentyFivePercentSold: false,
@@ -8608,6 +8651,23 @@ export class InsiderBot extends EventEmitter {
           transfer.toUserAccount === UNKNOWN_COUNTERPARTY,
       );
     if (recipients.size === 0 && !hasUnresolvedPoolOutbound) return;
+    if (
+      recipients.size > 0 &&
+      parentWatch.chainDepth >= FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_CHAIN_DEPTH
+    ) {
+      this.log.warn("Follow-token transfer-recipient chain depth limit reached; resetting flow", {
+        mint,
+        wallet: parentWatch.wallet,
+        rootWallet: parentWatch.rootWallet,
+        chainDepth: parentWatch.chainDepth,
+        maxChainDepth: FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_CHAIN_DEPTH,
+        signature: tx.signature,
+      });
+      await this.resetForNewToken(false, {
+        reason: "early_bundler_transfer_recipient_chain_depth_limit",
+      });
+      return;
+    }
 
     if (hasUnresolvedPoolOutbound) {
       this.log.info(
@@ -8786,6 +8846,9 @@ export class InsiderBot extends EventEmitter {
     if (watch) {
       watch.initialBalanceLookupReliable = totalRaw !== null;
       watch.initialBalanceRaw = totalRaw;
+      watch.lastBalancePollAt = totalRaw === null ? watch.lastBalancePollAt : Date.now();
+      watch.lastBalancePollError = totalRaw === null ? "balance lookup failed" : null;
+      if (totalRaw !== null) watch.balanceState = totalRaw > 0n ? "holding" : "unresolved";
       if (totalRaw !== null) {
         this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(watch, totalRaw);
       }
@@ -8851,6 +8914,9 @@ export class InsiderBot extends EventEmitter {
       await this.replayFollowTokenEarlyBundlerExitRecentTransactions(watch, mint);
       if (currentRaw === null) continue;
       state.tokenAccountLiveBalanceRaw.set(watch.wallet, currentRaw);
+      watch.lastBalancePollAt = Date.now();
+      watch.lastBalancePollError = null;
+      if (currentRaw > 0n) watch.balanceState = "holding";
       this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(watch, currentRaw);
       if (
         currentRaw <= 0n &&
@@ -8860,6 +8926,7 @@ export class InsiderBot extends EventEmitter {
         this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, currentRaw)
       ) {
         watch.soldAll = true;
+        watch.balanceState = "sold_all";
         watch.soldAllTimestamp = Date.now() / 1000;
         watch.soldAllReason = 'live_ata_zero';
         watch.soldAllSignature = watch.soldAllSignature ?? 'balance_reconciliation_zero';
@@ -8872,6 +8939,7 @@ export class InsiderBot extends EventEmitter {
         await this.maybeEvaluateFollowTokenEarlyBundlerExit();
       }
     }
+    await this.maybeEvaluateFollowTokenEarlyBundlerExit();
   }
 
   private handleFollowTokenEarlyBundlerExitTokenProgramChange(
@@ -8912,6 +8980,9 @@ export class InsiderBot extends EventEmitter {
     const currentRaw = await this.getFollowTokenEarlyBundlerExitReconciledBalance(wallet, mint);
     if (currentRaw === null) return;
     state.tokenAccountLiveBalanceRaw.set(wallet, currentRaw);
+    watch.lastBalancePollAt = Date.now();
+    watch.lastBalancePollError = null;
+    if (currentRaw > 0n) watch.balanceState = "holding";
     this.markFollowTokenEarlyBundlerExitWatchObservedNonZeroBalance(watch, currentRaw);
     if (
       currentRaw <= 0n &&
@@ -8921,6 +8992,7 @@ export class InsiderBot extends EventEmitter {
       this.followTokenEarlyBundlerExitWatchSoldAllByAtaBalance(watch, currentRaw)
     ) {
       watch.soldAll = true;
+      watch.balanceState = "sold_all";
       watch.soldAllTimestamp = Date.now() / 1000;
       watch.soldAllReason = "live_ata_zero";
       watch.soldAllSignature = watch.soldAllSignature ?? "program_balance_reconciliation_zero";
@@ -9035,7 +9107,8 @@ export class InsiderBot extends EventEmitter {
     if (!watch.monitoringActive) return;
 
     watch.monitoringActive = false;
-    watch.soldAll = true;
+      watch.soldAll = true;
+      watch.balanceState = "sold_all";
     watch.soldAllTimestamp = tx.timestamp;
     watch.soldAllReason = "token_transfer_out";
     watch.soldAllSignature = tx.signature;
@@ -9214,6 +9287,8 @@ export class InsiderBot extends EventEmitter {
         wallet: buy.wallet,
         source: "early_bundler",
         parentWallet: null,
+        rootWallet: buy.wallet,
+        chainDepth: 0,
         syncAfterSignature: buy.signature,
         boughtAmount: buy.tokenAmount,
         soldAmount: 0,
@@ -9221,6 +9296,9 @@ export class InsiderBot extends EventEmitter {
         cumulativeSellUsd: 0,
         maxSingleSellTokenAmount: 0,
         soldAll: false,
+        balanceState: "unresolved",
+        lastBalancePollAt: null,
+        lastBalancePollError: null,
         soldAllTimestamp: null,
         soldAllSignature: null,
         reachedTwentyFivePercentSold: false,
@@ -9267,6 +9345,8 @@ export class InsiderBot extends EventEmitter {
       preLiFirstBuyObserverBaselineWallets: 0,
       initialSyncComplete: false,
       maxSingleSell60mCapExceeded: false,
+      evalDeadlineAt: Date.now() + FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_EVAL_WAIT_MS,
+      deadlineExcludedWallets: new Set(),
     };
 
     for (const wallet of watches.keys()) {
