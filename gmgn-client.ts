@@ -2091,13 +2091,26 @@ private async sendRawTransactionAndAssertSuccess(
   // ── Utils ─────────────────────────────────────────────────────────────────
 
   async getParsedTokenAccountsForMint(owner: PublicKey, mint: PublicKey) {
-    const accounts = [];
+    const accounts: Array<{ pubkey: PublicKey; account: { data: ParsedAccountData } }> = [];
     for (const programId of TOKEN_PROGRAM_IDS) {
-      const { value } = await this.connection.getParsedTokenAccountsByOwner(
-        owner,
-        { programId, mint },
-      );
-      accounts.push(...value);
+      try {
+        const { value } = await this.connection.getParsedTokenAccountsByOwner(owner, {
+          programId,
+        });
+        accounts.push(
+          ...value.filter(({ account }) => {
+            const parsed = account.data as ParsedAccountData;
+            return parsed?.parsed?.info?.mint === mint.toBase58();
+          }),
+        );
+      } catch (err) {
+        log.warn("Parsed token-account lookup failed; skipping program", {
+          owner: owner.toBase58(),
+          mint: mint.toBase58(),
+          programId: programId.toBase58(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
     return accounts;
   }
@@ -2249,29 +2262,24 @@ private async sendRawTransactionAndAssertSuccess(
 
   private async getTokenBalance(wallet: string, mint: string): Promise<bigint> {
     const pubkey = new PublicKey(wallet);
-    const mintPubkey = new PublicKey(mint);
     let total = 0n;
 
     for (const programId of TOKEN_PROGRAM_IDS) {
       try {
-        const accounts = await this.connection.getParsedTokenAccountsByOwner(
-          pubkey,
-          { programId, mint: mintPubkey },
-        );
+        // getTokenAccountsByOwner accepts one filter only. Query by program and
+        // filter the target mint locally so fresh/unindexed mints do not make
+        // every balance lookup fail with "could not find mint".
+        const accounts = await this.connection.getParsedTokenAccountsByOwner(pubkey, {
+          programId,
+        });
         total += this.sumParsedTokenAccountsForMint(accounts.value, mint);
       } catch (err) {
-        if (!this.isMissingMintTokenAccountLookup(err)) throw err;
-        log.warn("Mint-filtered token balance lookup failed; scanning owner token accounts", {
+        log.warn("Token balance lookup failed for owner/program; continuing", {
           wallet,
           mint,
           programId: programId.toBase58(),
           error: err instanceof Error ? err.message : String(err),
         });
-        const accounts = await this.connection.getParsedTokenAccountsByOwner(
-          pubkey,
-          { programId },
-        );
-        total += this.sumParsedTokenAccountsForMint(accounts.value, mint);
       }
     }
 
@@ -2311,20 +2319,21 @@ private async sendRawTransactionAndAssertSuccess(
   ): Promise<PublicKey[]> {
     const programs: PublicKey[] = [];
     for (const programId of TOKEN_PROGRAM_IDS) {
-      const { value } = await this.connection.getParsedTokenAccountsByOwner(
-        owner,
-        { programId, mint },
-      );
-      const hasBalance = value.some(({ account }) => {
-        const parsed = account.data as ParsedAccountData;
-        const amount = parsed?.parsed?.info?.tokenAmount?.amount;
-        return (
-          typeof amount === "string" &&
-          /^\d+$/.test(amount) &&
-          BigInt(amount) > 0n
-        );
-      });
-      if (hasBalance) programs.push(programId);
+      try {
+        const { value } = await this.connection.getParsedTokenAccountsByOwner(owner, {
+          programId,
+        });
+        if (this.sumParsedTokenAccountsForMint(value, mint.toBase58()) > 0n) {
+          programs.push(programId);
+        }
+      } catch (err) {
+        log.warn("Token program balance lookup failed; skipping program", {
+          owner: owner.toBase58(),
+          mint: mint.toBase58(),
+          programId: programId.toBase58(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
     return programs;
   }
@@ -2341,23 +2350,36 @@ private async sendRawTransactionAndAssertSuccess(
       balance: bigint;
     }> = [];
     for (const programId of TOKEN_PROGRAM_IDS) {
-      const { value } = await this.connection.getParsedTokenAccountsByOwner(
-        owner,
-        { programId, mint },
-      );
-      for (const entry of value) {
-        const parsed = entry.account.data as ParsedAccountData;
-        const amount = parsed?.parsed?.info?.tokenAmount?.amount;
-        if (typeof amount === "string" && /^\d+$/.test(amount)) {
-          const balance = BigInt(amount);
-          if (balance > 0n) {
-            tokenAccounts.push({
-              tokenProgram: programId,
-              account: entry.pubkey,
-              balance,
-            });
+      try {
+        const { value } = await this.connection.getParsedTokenAccountsByOwner(owner, {
+          programId,
+        });
+        for (const entry of value) {
+          const parsed = entry.account.data as ParsedAccountData;
+          const accountMint = parsed?.parsed?.info?.mint;
+          const amount = parsed?.parsed?.info?.tokenAmount?.amount;
+          if (
+            accountMint === mint.toBase58() &&
+            typeof amount === "string" &&
+            /^\d+$/.test(amount)
+          ) {
+            const balance = BigInt(amount);
+            if (balance > 0n) {
+              tokenAccounts.push({
+                tokenProgram: programId,
+                account: entry.pubkey,
+                balance,
+              });
+            }
           }
         }
+      } catch (err) {
+        log.warn("Token accounts lookup failed; skipping program", {
+          owner: owner.toBase58(),
+          mint: mint.toBase58(),
+          programId: programId.toBase58(),
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
     return tokenAccounts;

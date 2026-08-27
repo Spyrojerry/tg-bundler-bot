@@ -9115,6 +9115,17 @@ export class InsiderBot extends EventEmitter {
     }
     if (syncSucceeded) {
       watch.syncComplete = true;
+      this.log.info("Follow-token early bundler exit wallet sync completed", {
+        mint,
+        wallet,
+        source: watch.source,
+      });
+    } else {
+      this.log.warn("Follow-token early bundler exit wallet sync did not complete", {
+        mint,
+        wallet,
+        source: watch.source,
+      });
     }
     await this.refreshFollowTokenEarlyBundlerExitWatchTokenBalanceAfterSync(
       wallet,
@@ -9129,6 +9140,7 @@ export class InsiderBot extends EventEmitter {
     cursor: string | undefined,
   ): Promise<boolean> {
     let pageCursor: string | undefined = cursor;
+    let fetchedPage = false;
     for (let page = 0; page < 50; page++) {
       const batch = await this.withHeliusFallback((client) =>
         client.getAddressTransactionsAsc(
@@ -9138,6 +9150,7 @@ export class InsiderBot extends EventEmitter {
         ),
       );
       if (batch.length === 0) break;
+      fetchedPage = true;
 
       for (const tx of batch) {
         if (!tx.signature || watch.observedTxSignatures.has(tx.signature)) {
@@ -9155,7 +9168,7 @@ export class InsiderBot extends EventEmitter {
       }
       pageCursor = lastSignature;
     }
-    return true;
+    return fetchedPage;
   }
 
   /** Paginated sync for every watch, including recipients chained mid-sync. */
