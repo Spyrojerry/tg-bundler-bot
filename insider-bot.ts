@@ -1965,9 +1965,15 @@ export class InsiderBot extends EventEmitter {
         );
       }
     }
-    if (fundingRecords.some((record) => !record)) return false;
-
-    const allRecords = fundingRecords as BundlerFundingRecord[];
+    // A null record means that one wallet's funding-window scan failed to resolve
+    // (e.g. no zero-balance boundary found), not that its funder differs. Filter
+    // nulls out and let the majority-group check below decide, per
+    // BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT's documented intent: a single
+    // outlier/failure should not block an otherwise-clear shared-feePayer pattern.
+    const allRecords = fundingRecords.filter(
+      (record): record is BundlerFundingRecord => record !== null,
+    );
+    if (allRecords.length < BUNDLER_FUNDER_MIN_MATCHING_FEEPAYER_COUNT) return false;
     const feePayerGroups = new Map<string, BundlerFundingRecord[]>();
     for (const record of allRecords) {
       const group = feePayerGroups.get(record.fundingFeePayer);
