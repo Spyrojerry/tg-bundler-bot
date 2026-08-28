@@ -8426,7 +8426,12 @@ export class InsiderBot extends EventEmitter {
           wallet,
           source: watch.source,
           signature: tx.signature,
-          tokenTransfers: tx.tokenTransfers,
+          tokenTransfers: tx.tokenTransfers?.map((transfer) => ({
+            mint: transfer.mint,
+            from: transfer.fromUserAccount,
+            to: transfer.toUserAccount,
+            amount: transfer.tokenAmount,
+          })),
           tokenBalanceChanges: (tx.accountData ?? []).flatMap(
             (entry) => entry.tokenBalanceChanges ?? [],
           ),
