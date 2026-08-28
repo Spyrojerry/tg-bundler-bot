@@ -8420,7 +8420,19 @@ export class InsiderBot extends EventEmitter {
 
     if (kind === "sell") {
       const amount = this.extractTokenAmountForWallet(tx, wallet, mint, "sell");
-      if (amount <= 0) return;
+      if (amount <= 0) {
+        this.log.warn("Follow-token early bundler sell classified but amount extraction found nothing", {
+          mint,
+          wallet,
+          source: watch.source,
+          signature: tx.signature,
+          tokenTransfers: tx.tokenTransfers,
+          tokenBalanceChanges: (tx.accountData ?? []).flatMap(
+            (entry) => entry.tokenBalanceChanges ?? [],
+          ),
+        });
+        return;
+      }
 
       watch.sellTxCount += 1;
       watch.soldAmount += amount;
@@ -14151,7 +14163,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     action: "buy" | "sell",
   ): number {
-    return (tx.tokenTransfers ?? [])
+    const fromTransfers = (tx.tokenTransfers ?? [])
       .filter((transfer) => {
         if (transfer.mint !== mint) return false;
         return action === "buy"
@@ -14159,6 +14171,23 @@ export class InsiderBot extends EventEmitter {
           : transfer.fromUserAccount === wallet;
       })
       .reduce((sum, transfer) => sum + (transfer.tokenAmount ?? 0), 0);
+
+    if (fromTransfers > 0) return fromTransfers;
+
+    // tokenTransfers is a derived route summary and can omit the wallet's own
+    // leg during multi-hop or AMM-internal routing. Balance changes use the
+    // wallet owner directly and reflect the signed delta for this transaction.
+    const delta = (tx.accountData ?? [])
+      .flatMap((entry) => entry.tokenBalanceChanges ?? [])
+      .filter((change) => change.userAccount === wallet && change.mint === mint)
+      .reduce((sum, change) => {
+        const raw = Number(change.rawTokenAmount?.tokenAmount ?? 0);
+        const decimals = change.rawTokenAmount?.decimals ?? 0;
+        return sum + raw / 10 ** decimals;
+      }, 0);
+
+    if (action === "buy") return delta > 0 ? delta : 0;
+    return delta < 0 ? Math.abs(delta) : 0;
   }
 
   private queueSignature(
