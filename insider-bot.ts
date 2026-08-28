@@ -8563,6 +8563,19 @@ export class InsiderBot extends EventEmitter {
       addRecipient(recipient, transfer.tokenAmount ?? 0);
     }
 
+    // Enhanced WS/REST balance deltas can identify the recipient even when the
+    // enriched transfer list omitted the wallet-to-recipient leg.
+    if (recipients.size === 0) {
+      for (const change of (tx.accountData ?? []).flatMap(
+        (entry) => entry.tokenBalanceChanges ?? [],
+      )) {
+        if (change.mint !== mint || change.userAccount === wallet) continue;
+        const raw = Number(change.rawTokenAmount?.tokenAmount ?? 0);
+        const decimals = change.rawTokenAmount?.decimals ?? 0;
+        if (raw > 0) addRecipient(change.userAccount ?? "", raw / 10 ** decimals);
+      }
+    }
+
     // Enhanced WSS delta reconstruction emits wallet→__pool__ outbound legs; pair with
     // __pool__→recipient inbound legs in the same tx (same pattern as SOL transfers).
     const hasPoolOutbound = (tx.tokenTransfers ?? []).some(
@@ -14293,7 +14306,12 @@ export class InsiderBot extends EventEmitter {
   }
 
   private isRelevantMintTx(tx: HeliusTransaction, mint: string): boolean {
-    return (tx.tokenTransfers ?? []).some((t) => t.mint === mint);
+    return (
+      (tx.tokenTransfers ?? []).some((transfer) => transfer.mint === mint) ||
+      (tx.accountData ?? []).some((entry) =>
+        (entry.tokenBalanceChanges ?? []).some((change) => change.mint === mint),
+      )
+    );
   }
 
   private classifyTx(
@@ -14307,6 +14325,16 @@ export class InsiderBot extends EventEmitter {
         if (transfer.fromUserAccount === wallet) return "transfer_out";
         if (transfer.toUserAccount === wallet) return "transfer_in";
       }
+      const delta = (tx.accountData ?? [])
+        .flatMap((entry) => entry.tokenBalanceChanges ?? [])
+        .filter((change) => change.userAccount === wallet && change.mint === mint)
+        .reduce((sum, change) => {
+          const raw = Number(change.rawTokenAmount?.tokenAmount ?? 0);
+          const decimals = change.rawTokenAmount?.decimals ?? 0;
+          return sum + raw / 10 ** decimals;
+        }, 0);
+      if (delta < 0) return "transfer_out";
+      if (delta > 0) return "transfer_in";
       return null;
     }
 
@@ -14321,6 +14349,20 @@ export class InsiderBot extends EventEmitter {
         if (transfer.mint === mint && transfer.fromUserAccount === wallet)
           return "sell";
       }
+
+      // Helius can omit the target-mint transfer while retaining the wallet's
+      // owner-keyed signed balance delta. Keep classification aligned with
+      // amount extraction for routed swaps and ATA representation changes.
+      const tokenDelta = (tx.accountData ?? [])
+        .flatMap((entry) => entry.tokenBalanceChanges ?? [])
+        .filter((change) => change.userAccount === wallet && change.mint === mint)
+        .reduce((sum, change) => {
+          const raw = Number(change.rawTokenAmount?.tokenAmount ?? 0);
+          const decimals = change.rawTokenAmount?.decimals ?? 0;
+          return sum + raw / 10 ** decimals;
+        }, 0);
+      if (tokenDelta > 0) return "buy";
+      if (tokenDelta < 0) return "sell";
     }
     return null;
   }

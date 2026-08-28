@@ -220,10 +220,38 @@ function reconstructAccountData(
   for (let i = 0; i < len; i += 1) {
     const account = accountKeys[i];
     if (!account) continue;
+    const tokenBalanceChanges = [...(meta?.preTokenBalances ?? []), ...(meta?.postTokenBalances ?? [])]
+      .filter((balance) => balance.accountIndex === i && Boolean(balance.owner))
+      .reduce((changes, balance) => {
+        const key = `${balance.mint}|${balance.owner}`;
+        const existing = changes.get(key);
+        const rawAmount = BigInt(balance.uiTokenAmount?.amount ?? '0');
+        const signedAmount = existing?.rawAmount ?? 0n;
+        const isPost = (meta?.postTokenBalances ?? []).includes(balance);
+        changes.set(key, {
+          mint: balance.mint,
+          owner: balance.owner!,
+          decimals: balance.uiTokenAmount?.decimals ?? existing?.decimals ?? 0,
+          rawAmount: signedAmount + (isPost ? rawAmount : -rawAmount),
+        });
+        return changes;
+      }, new Map<string, { mint: string; owner: string; decimals: number; rawAmount: bigint }>());
+
     out.push({
       account,
       nativePostBalance: post[i],
       nativeBalanceChange: post[i] - pre[i],
+      tokenBalanceChanges: [...tokenBalanceChanges.values()]
+        .filter((change) => change.rawAmount !== 0n)
+        .map((change) => ({
+          userAccount: change.owner,
+          tokenAccount: account,
+          mint: change.mint,
+          rawTokenAmount: {
+            tokenAmount: change.rawAmount.toString(),
+            decimals: change.decimals,
+          },
+        })),
     });
   }
   return out;
