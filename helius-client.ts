@@ -151,7 +151,7 @@ export class HeliusClient {
 
   constructor(apiKey: string, options: HeliusClientOptions = {}) {
     this.apiKey = apiKey;
-    this.baseUrl = 'https://mainnet.helius-rpc.com';
+    this.baseUrl = 'https://api-mainnet.helius-rpc.com';
     this.projectId = options.projectId?.trim() || null;
     this.label = options.label?.trim() || 'Helius';
     this.onCreditsExhausted = options.onCreditsExhausted ?? null;
