@@ -133,6 +133,7 @@ const PRE_LI_FIRST_BUY_OBSERVER_MAX_WALLETS = 10;
 const PRE_LI_FIRST_BUY_OBSERVER_MIN_USD = 110;
 const PRE_LI_FIRST_BUY_OBSERVER_MAX_USD = 300;
 const PRE_LI_FIRST_BUY_OBSERVER_BASELINE_WALLETS = 3;
+const PRE_LI_FIRST_BUY_OBSERVER_BUY_TRIGGER_WALLETS = 2;
 const PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
@@ -216,6 +217,8 @@ interface FollowTokenEarlyBundlerExitState {
   preLiFirstBuyObserverSeenWallets: Set<string>;
   preLiFirstBuyObserverBaselineBuyUsd: number | null;
   preLiFirstBuyObserverBaselineWallets: number;
+  smallestBundlerSellGateCompleted: boolean;
+  smallestBundlerSellGateRootWallet: string | null;
   initialSyncComplete: boolean;
   maxSingleSell60mCapExceeded: boolean;
   evalDeadlineAt: number | null;
@@ -3228,7 +3231,8 @@ export class InsiderBot extends EventEmitter {
     options: {
       triggerSource?:
         | "valid_wallet_4"
-        | "bundler_sold_all";
+        | "bundler_sold_all"
+        | "smallest_bundler_sell_gate";
       bundlerExitBranch?:
         | "low_tx_immediate"
         | "low_usd_immediate"
@@ -4967,6 +4971,56 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private tryCompleteFollowInsiderSmallestBundlerSellGate(): boolean {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (
+      !state?.active ||
+      !this.followInsiderObservationMode ||
+      state.smallestBundlerSellGateCompleted
+    ) {
+      return false;
+    }
+
+    const roots = [...state.watches.values()].filter(
+      (watch) => watch.source === "early_bundler" && watch.rootWallet === watch.wallet,
+    );
+    const smallestRoot = roots.reduce<FollowTokenEarlyBundlerExitWatch | null>(
+      (smallest, watch) =>
+        !smallest || watch.boughtAmount < smallest.boughtAmount ? watch : smallest,
+      null,
+    );
+    if (!smallestRoot) return false;
+
+    const chain = [...state.watches.values()].filter(
+      (watch) => watch.rootWallet === smallestRoot.wallet,
+    );
+    const sellTxCount = chain.reduce((sum, watch) => sum + watch.sellTxCount, 0);
+    const soldAmount = chain.reduce((sum, watch) => sum + watch.soldAmount, 0);
+    const remainingAmount = Math.max(0, smallestRoot.boughtAmount - soldAmount);
+    if (sellTxCount <= 1 || remainingAmount >= 60_000_000) return false;
+
+    state.smallestBundlerSellGateCompleted = true;
+    state.smallestBundlerSellGateRootWallet = smallestRoot.wallet;
+    for (const watch of chain) {
+      if (!watch.monitoringActive) continue;
+      watch.monitoringActive = false;
+      if (watch.balanceState !== "sold_all") watch.balanceState = "transferred_out";
+      this.unsubscribeFollowTokenEarlyBundlerExitWallet(watch.wallet);
+    }
+
+    this.log.info("Follow-insider smallest early bundler sell gate passed", {
+      mint: state.mint,
+      rootWallet: smallestRoot.wallet,
+      boughtAmount: smallestRoot.boughtAmount,
+      soldAmount,
+      remainingAmount,
+      sellTxCount,
+      maxRemainingAmount: 60_000_000,
+    });
+    this.startPreLiFirstBuyObserver(state.mint);
+    return true;
+  }
+
   private async observePreLiFirstBuy(
     mint: string,
     tx: HeliusTransaction,
@@ -5032,6 +5086,13 @@ export class InsiderBot extends EventEmitter {
       };
       state.preLiFirstBuyObserverWallets.set(wallet, observed);
       if (
+        this.followTokenLargeInsiderState?.active &&
+        !this.followTokenLargeInsiderState.validWallets.includes(wallet)
+      ) {
+        this.followTokenLargeInsiderState.validWallets.push(wallet);
+        this.registerFollowTokenLargeInsiderValidWalletForExitMonitoring(wallet);
+      }
+      if (
         state.preLiFirstBuyObserverWallets.size ===
         PRE_LI_FIRST_BUY_OBSERVER_BASELINE_WALLETS
       ) {
@@ -5075,6 +5136,22 @@ export class InsiderBot extends EventEmitter {
         ].join("\n"),
         "pre-li first-buy observer wallet",
       );
+      if (
+        state.preLiFirstBuyObserverWallets.size >=
+        PRE_LI_FIRST_BUY_OBSERVER_BUY_TRIGGER_WALLETS &&
+        !this.buySubmitted
+      ) {
+        const funderState = this.bundlerFunderWatch;
+        if (funderState) {
+          await this.emitFollowTokenLargeInsiderBuy(
+            funderState,
+            wallet,
+            tx.signature,
+            tx,
+            { triggerSource: "smallest_bundler_sell_gate" },
+          );
+        }
+      }
       if (state.preLiFirstBuyObserverWallets.size >= PRE_LI_FIRST_BUY_OBSERVER_MAX_WALLETS) {
         this.log.info("Pre-LI first-buy observer reached wallet cap", {
           mint,
@@ -5086,7 +5163,7 @@ export class InsiderBot extends EventEmitter {
         await this.stopPreLiFirstBuyObserver(state);
         if (this.followInsiderObservationMode) {
           void this.sendTelegramSafe(
-            `<b>✅ ${this.label} Follow-Insider Observation Complete</b>\nToken: <code>${mint}</code>\nCollected <b>${state.preLiFirstBuyObserverWallets.size}</b> qualifying first-buy wallets. Unsubscribed and resetting; no buy was submitted.`,
+            `<b>✅ ${this.label} Follow-Insider Observation Complete</b>\nToken: <code>${mint}</code>\nCollected <b>${state.preLiFirstBuyObserverWallets.size}</b> qualifying first-buy wallets.`,
             "follow-insider observation complete",
           );
           await this.resetForNewToken(true, {
@@ -6468,6 +6545,17 @@ export class InsiderBot extends EventEmitter {
       (watch) => watch.monitoringActive,
     );
     if (activeWatches.length === 0) return "no_active_watches";
+    const rootWallets = [...state.watches.values()]
+      .filter((watch) => watch.source === "early_bundler")
+      .map((watch) => watch.rootWallet);
+    for (const rootWallet of new Set(rootWallets)) {
+      const rootWatches = [...state.watches.values()].filter(
+        (watch) => watch.rootWallet === rootWallet,
+      );
+      if (!rootWatches.some((watch) => watch.sellTxCount > 0)) {
+        return "root_sell_evidence_missing";
+      }
+    }
     for (const watch of activeWatches) {
       if (this.healFollowTokenEarlyBundlerExitWatchErroneousSoldAll(watch)) {
         return "active_watch_never_sold";
@@ -6740,7 +6828,7 @@ export class InsiderBot extends EventEmitter {
 
   private async skipFollowTokenLargeInsiderFromValidWalletTwentyFivePercentAlreadySold(
     mint: string,
-    triggerSource: "valid_wallet_4" | "bundler_sold_all",
+    triggerSource: "valid_wallet_4" | "bundler_sold_all" | "smallest_bundler_sell_gate",
     triggerTx?: HeliusTransaction,
   ): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
@@ -6757,7 +6845,9 @@ export class InsiderBot extends EventEmitter {
     const triggerLabel =
       triggerSource === "bundler_sold_all"
         ? "bundler sold-all"
-        : "valid wallet #4";
+        : triggerSource === "smallest_bundler_sell_gate"
+          ? "smallest bundler sell gate"
+          : "valid wallet #4";
 
     this.followTokenLargeInsiderLog(
       "buy skipped — valid LI wallet already sold ≥25% before buy",
@@ -8085,6 +8175,7 @@ export class InsiderBot extends EventEmitter {
       });
       return;
     }
+    if (this.tryCompleteFollowInsiderSmallestBundlerSellGate()) return;
     if (
       state.evalDeadlineAt !== null &&
       Date.now() >= state.evalDeadlineAt &&
@@ -8622,7 +8713,6 @@ export class InsiderBot extends EventEmitter {
     const existing = state.watches.get(recipient);
     if (existing) {
       existing.boughtAmount += transferAmount;
-      existing.syncAfterSignature = transferReceiveSignature;
       existing.observedTxSignatures.add(transferReceiveSignature);
       if (existing.soldAll) {
         existing.soldAll = false;
@@ -8634,7 +8724,6 @@ export class InsiderBot extends EventEmitter {
           this.subscribeFollowTokenEarlyBundlerExitWallet(recipient);
         }
       }
-      existing.syncComplete = false;
       this.log.info(
         "Follow-token early bundler transfer — added inbound amount to existing recipient watch",
         {
@@ -8646,7 +8735,6 @@ export class InsiderBot extends EventEmitter {
           transferReceiveSignature,
         },
       );
-      await this.syncFollowTokenEarlyBundlerExitWallet(recipient, mint);
       return;
     }
 
@@ -8948,27 +9036,6 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
-  private async replayFollowTokenEarlyBundlerExitRecentTransactions(
-    watch: FollowTokenEarlyBundlerExitWatch,
-    mint: string,
-  ): Promise<void> {
-    try {
-      const txs = await this.withHeliusFallback((client) =>
-        client.getAddressTransactionsDesc(watch.wallet, 50),
-      );
-      for (const tx of [...txs].reverse()) {
-        if (watch.observedTxSignatures.has(tx.signature)) continue;
-        await this.applyFollowTokenEarlyBundlerExitTx(tx, mint, watch.wallet, true);
-      }
-    } catch (err) {
-      this.log.warn("Follow-token early bundler transaction backstop failed", {
-        mint,
-        wallet: watch.wallet,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
   private async reconcileFollowTokenEarlyBundlerExitBalances(
     mint: string,
   ): Promise<void> {
@@ -8981,7 +9048,6 @@ export class InsiderBot extends EventEmitter {
         watch.wallet,
         mint,
       );
-      await this.replayFollowTokenEarlyBundlerExitRecentTransactions(watch, mint);
       if (currentRaw === null) continue;
       state.tokenAccountLiveBalanceRaw.set(watch.wallet, currentRaw);
       watch.lastBalancePollAt = Date.now();
@@ -9283,7 +9349,7 @@ export class InsiderBot extends EventEmitter {
     cursor: string | undefined,
   ): Promise<boolean> {
     let pageCursor: string | undefined = cursor;
-    let fetchedPage = false;
+    let apiCallSucceeded = false;
     for (let page = 0; page < 50; page++) {
       const batch = await this.withHeliusFallback((client) =>
         client.getAddressTransactionsAsc(
@@ -9292,8 +9358,8 @@ export class InsiderBot extends EventEmitter {
           FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT,
         ),
       );
+      apiCallSucceeded = true;
       if (batch.length === 0) break;
-      fetchedPage = true;
 
       for (const tx of batch) {
         if (!tx.signature || watch.observedTxSignatures.has(tx.signature)) {
@@ -9314,7 +9380,7 @@ export class InsiderBot extends EventEmitter {
       }
       pageCursor = lastSignature;
     }
-    return fetchedPage;
+    return apiCallSucceeded;
   }
 
   /** Paginated sync for every watch, including recipients chained mid-sync. */
@@ -9324,26 +9390,23 @@ export class InsiderBot extends EventEmitter {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active) return;
 
-    const maxSyncPasses = 20;
-    let syncPass = 0;
-    while (
-      [...state.watches.values()].some((watch) => !watch.syncComplete) &&
-      syncPass < maxSyncPasses
-    ) {
-      syncPass += 1;
-      for (const [wallet, watch] of [...state.watches.entries()]) {
-        if (!watch.syncComplete) {
-          await this.syncFollowTokenEarlyBundlerExitWallet(wallet, mint);
-        }
-      }
+    const syncedWallets = new Set<string>();
+    for (;;) {
+      const pending = [...state.watches.entries()].find(
+        ([wallet]) => !syncedWallets.has(wallet),
+      );
+      if (!pending) break;
+      const [wallet, watch] = pending;
+      syncedWallets.add(wallet);
+      await this.syncFollowTokenEarlyBundlerExitWallet(wallet, mint);
+      if (watch.syncComplete) continue;
     }
     const incompleteWallets = [...state.watches.values()]
       .filter((watch) => !watch.syncComplete)
       .map((watch) => watch.wallet);
     if (incompleteWallets.length > 0) {
-      this.log.warn("Follow-token early bundler watch sync pass limit reached", {
+      this.log.warn("Follow-token early bundler watch initial sync incomplete", {
         mint,
-        maxSyncPasses,
         incompleteWallets,
       });
     }
@@ -9433,6 +9496,8 @@ export class InsiderBot extends EventEmitter {
       preLiFirstBuyObserverSeenWallets: new Set(),
       preLiFirstBuyObserverBaselineBuyUsd: null,
       preLiFirstBuyObserverBaselineWallets: 0,
+      smallestBundlerSellGateCompleted: false,
+      smallestBundlerSellGateRootWallet: null,
       initialSyncComplete: false,
       maxSingleSell60mCapExceeded: false,
       evalDeadlineAt: Date.now() + FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_EVAL_WAIT_MS,
