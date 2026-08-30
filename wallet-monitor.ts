@@ -22,6 +22,9 @@ import { NewTokenEvent, ServiceConfig, TokenHolding } from './types';
 
 const WALLET_COMMITMENT = 'processed';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const MAX_SEEN_SIGNATURES = 10_000;
+const MAX_KNOWN_MINTS = 10_000;
+const MAX_UNKNOWN_BUY_LOG_KEYS = 2_000;
 
 const TOKEN_PROGRAM_IDS = [
   new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
@@ -42,6 +45,7 @@ export class WalletMonitor extends EventEmitter {
 
   /** All mints we've emitted a newToken event for (to avoid duplicates) */
   private knownMints: Set<string> = new Set();
+  private readonly knownMintsOrder: string[] = [];
   /** Mints currently held with positive balance. */
   private heldMints: Set<string> = new Set();
 
@@ -52,10 +56,12 @@ export class WalletMonitor extends EventEmitter {
   private readonly enhancedWs: HeliusEnhancedWsClient | null;
   private readonly verboseActivityLogs: boolean;
   private readonly enhancedSeenSignatures = new Set<string>();
+  private readonly enhancedSeenSignaturesOrder: string[] = [];
 
   /** Signatures currently being parsed from websocket notifications. */
   private pendingSignatures = new Set<string>();
   private minBuyUnknownLogged = new Set<string>();
+  private readonly minBuyUnknownLoggedOrder: string[] = [];
 
   private running = false;
   private activeProcessingCount = 0;
@@ -125,7 +131,7 @@ export class WalletMonitor extends EventEmitter {
     for (const h of initial) {
       if (!this.hasPositiveBalance(h)) continue;
       this.existingTokens.add(h.mint);
-      this.knownMints.add(h.mint);
+      this.addBounded(this.knownMints, this.knownMintsOrder, h.mint, MAX_KNOWN_MINTS);
       this.heldMints.add(h.mint);
     }
 
@@ -146,6 +152,11 @@ export class WalletMonitor extends EventEmitter {
 
   stop(): void {
     this.running = false;
+    this.enhancedSeenSignatures.clear();
+    this.enhancedSeenSignaturesOrder.length = 0;
+    this.pendingSignatures.clear();
+    this.minBuyUnknownLogged.clear();
+    this.minBuyUnknownLoggedOrder.length = 0;
     if (this.enhancedWatchId !== null && this.enhancedWs) {
       const id = this.enhancedWatchId;
       this.enhancedWatchId = null;
@@ -180,7 +191,12 @@ export class WalletMonitor extends EventEmitter {
 
   private async handleEnhancedWsTx(tx: HeliusTransaction): Promise<void> {
     if (!this.running || this.enhancedSeenSignatures.has(tx.signature)) return;
-    this.enhancedSeenSignatures.add(tx.signature);
+    this.addBounded(
+      this.enhancedSeenSignatures,
+      this.enhancedSeenSignaturesOrder,
+      tx.signature,
+      MAX_SEEN_SIGNATURES,
+    );
 
     const wallet = this.walletPubkey.toBase58();
     this.emit('transaction', { walletAddress: wallet, tx });
@@ -455,7 +471,12 @@ export class WalletMonitor extends EventEmitter {
             `[WAIT TOKEN] Mint: ${mint}  Source: ${source}  ` +
               `Reason: buy SOL unknown, waiting for tx parse to check min ${this.minBuySol} SOL`,
           );
-          this.minBuyUnknownLogged.add(mint);
+          this.addBounded(
+            this.minBuyUnknownLogged,
+            this.minBuyUnknownLoggedOrder,
+            mint,
+            MAX_UNKNOWN_BUY_LOG_KEYS,
+          );
         }
         return;
       }
@@ -464,12 +485,12 @@ export class WalletMonitor extends EventEmitter {
           `[SKIP TOKEN] Mint: ${mint}  Buy: ${buySol} SOL  ` +
             `Min: ${this.minBuySol} SOL  Source: ${source}`,
         );
-        this.knownMints.add(mint);
+        this.addBounded(this.knownMints, this.knownMintsOrder, mint, MAX_KNOWN_MINTS);
         return;
       }
     }
 
-    this.knownMints.add(mint);
+    this.addBounded(this.knownMints, this.knownMintsOrder, mint, MAX_KNOWN_MINTS);
     this.log.info(
       `[NEW TOKEN] Mint: ${mint}  Amount: ${amount}  Source: ${source}  BuySOL: ${buySol ?? 'unknown'}`,
     );
@@ -487,5 +508,15 @@ export class WalletMonitor extends EventEmitter {
 
   private hasPositiveBalance(holding: TokenHolding): boolean {
     return BigInt(holding.amount) > 0n;
+  }
+
+  private addBounded<T>(set: Set<T>, order: T[], value: T, maxSize: number): void {
+    if (set.has(value)) return;
+    set.add(value);
+    order.push(value);
+    while (order.length > maxSize) {
+      const oldest = order.shift();
+      if (oldest !== undefined) set.delete(oldest);
+    }
   }
 }

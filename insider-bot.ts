@@ -1737,7 +1737,12 @@ export class InsiderBot extends EventEmitter {
 
     this.clearFollowTokenLargeInsiderWindowTimer();
 
-    for (const wallet of [...state.scrapeEnhancedWatchIds.keys()]) {
+    const scrapeWallets = new Set([
+      ...state.scrapeEnhancedWatchIds.keys(),
+      ...state.scrapeSolBalanceSubIds.keys(),
+      ...state.scrapeWatches.keys(),
+    ]);
+    for (const wallet of scrapeWallets) {
       this.unsubscribeFollowTokenLargeInsiderScrapeWallet(wallet);
     }
 
@@ -3831,6 +3836,7 @@ export class InsiderBot extends EventEmitter {
     this.followInsiderObservationMode = true;
     this.followTokenStartedFromTrackedWallet = true;
     this.followTokenMigrationTimestamp = 0;
+    this.phase = "pre_buy";
     try {
       const swaps = await this.withHeliusFallback((client) =>
         client.getEarlyInsiderSwaps(event.mint, BUNDLER_FUNDER_REQUIRED_COUNT),
