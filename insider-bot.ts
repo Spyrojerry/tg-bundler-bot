@@ -144,7 +144,11 @@ const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_EVAL_WAIT_MS = 15 * 60 * 1_000;
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_CHAIN_DEPTH = 3;
 const PUMP_FUN_TOKEN_RAW_DECIMALS = 6;
 
-type FollowTokenEarlyBundlerExitBalanceState = "unresolved" | "holding" | "sold_all";
+type FollowTokenEarlyBundlerExitBalanceState =
+  | "unresolved"
+  | "holding"
+  | "sold_all"
+  | "transferred_out";
 
 interface FollowTokenEarlyBundlerExitWatch {
   wallet: string;
@@ -155,6 +159,7 @@ interface FollowTokenEarlyBundlerExitWatch {
   syncAfterSignature: string;
   boughtAmount: number;
   soldAmount: number;
+  transferredOutAmount: number;
   sellTxCount: number;
   cumulativeSellUsd: number;
   maxSingleSellTokenAmount: number;
@@ -8617,6 +8622,7 @@ export class InsiderBot extends EventEmitter {
     const existing = state.watches.get(recipient);
     if (existing) {
       existing.boughtAmount += transferAmount;
+      existing.syncAfterSignature = transferReceiveSignature;
       existing.observedTxSignatures.add(transferReceiveSignature);
       if (existing.soldAll) {
         existing.soldAll = false;
@@ -8653,6 +8659,7 @@ export class InsiderBot extends EventEmitter {
       syncAfterSignature: transferReceiveSignature,
       boughtAmount: transferAmount,
       soldAmount: 0,
+      transferredOutAmount: 0,
       sellTxCount: 0,
       cumulativeSellUsd: 0,
       maxSingleSellTokenAmount: 0,
@@ -8747,9 +8754,10 @@ export class InsiderBot extends EventEmitter {
       (sum, amount) => sum + amount,
       0,
     );
+    const transferredBefore = parentWatch.transferredOutAmount;
     const trackedRemainingAmount = Math.max(
       0,
-      parentWatch.boughtAmount - parentWatch.soldAmount,
+      parentWatch.boughtAmount - parentWatch.soldAmount - transferredBefore,
     );
     const liveRemainingRaw = state.tokenAccountLiveBalanceRaw.get(parentWatch.wallet);
     const liveRemainingAmount =
@@ -8764,6 +8772,8 @@ export class InsiderBot extends EventEmitter {
       recipients.size > 0 &&
       remainingBeforeTransfer > 0 &&
       transferredAmount >= remainingBeforeTransfer;
+
+    parentWatch.transferredOutAmount += transferredAmount;
 
     for (const [recipient, transferAmount] of recipients) {
       await this.ensureFollowTokenEarlyBundlerTransferRecipientWatch(
@@ -8787,6 +8797,7 @@ export class InsiderBot extends EventEmitter {
           mint,
           parentWallet: parentWatch.wallet,
           transferredAmount,
+          transferredOutAmount: parentWatch.transferredOutAmount,
           trackedRemainingAmount,
           liveRemainingAmount,
           remainingBeforeTransfer,
@@ -9166,12 +9177,12 @@ export class InsiderBot extends EventEmitter {
     if (!watch.monitoringActive) return;
 
     watch.monitoringActive = false;
-      watch.soldAll = true;
-      watch.balanceState = "sold_all";
-    watch.soldAllTimestamp = tx.timestamp;
-    watch.soldAllReason = "token_transfer_out";
-    watch.soldAllSignature = tx.signature;
-    watch.reachedTwentyFivePercentSold = true;
+    watch.balanceState = "transferred_out";
+    watch.soldAll = false;
+    watch.soldAllTimestamp = null;
+    watch.soldAllReason = null;
+    watch.soldAllSignature = null;
+    watch.reachedTwentyFivePercentSold = false;
     this.unsubscribeFollowTokenEarlyBundlerExitWallet(watch.wallet);
 
     this.log.info(
@@ -9292,6 +9303,9 @@ export class InsiderBot extends EventEmitter {
       }
 
       const lastSignature = batch[batch.length - 1]?.signature;
+      if (lastSignature) {
+        watch.syncAfterSignature = lastSignature;
+      }
       if (
         !lastSignature ||
         batch.length < FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SYNC_PAGE_LIMIT
@@ -9310,12 +9324,28 @@ export class InsiderBot extends EventEmitter {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active) return;
 
-    while ([...state.watches.values()].some((watch) => !watch.syncComplete)) {
+    const maxSyncPasses = 20;
+    let syncPass = 0;
+    while (
+      [...state.watches.values()].some((watch) => !watch.syncComplete) &&
+      syncPass < maxSyncPasses
+    ) {
+      syncPass += 1;
       for (const [wallet, watch] of [...state.watches.entries()]) {
         if (!watch.syncComplete) {
           await this.syncFollowTokenEarlyBundlerExitWallet(wallet, mint);
         }
       }
+    }
+    const incompleteWallets = [...state.watches.values()]
+      .filter((watch) => !watch.syncComplete)
+      .map((watch) => watch.wallet);
+    if (incompleteWallets.length > 0) {
+      this.log.warn("Follow-token early bundler watch sync pass limit reached", {
+        mint,
+        maxSyncPasses,
+        incompleteWallets,
+      });
     }
   }
 
@@ -9351,6 +9381,7 @@ export class InsiderBot extends EventEmitter {
         syncAfterSignature: buy.signature,
         boughtAmount: buy.tokenAmount,
         soldAmount: 0,
+        transferredOutAmount: 0,
         sellTxCount: 0,
         cumulativeSellUsd: 0,
         maxSingleSellTokenAmount: 0,
