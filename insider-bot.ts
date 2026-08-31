@@ -8338,24 +8338,6 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    const postMigrationWatch =
-      this.followTokenStartedFromTrackedWallet
-        ? this.followTokenEarlyBundlerExitPostMigrationSoldAllWatch()
-        : null;
-    if (postMigrationWatch) {
-      this.log.warn('Follow-token sold-all occurred after migration — resetting token', {
-        mint: state.mint,
-        migrationTimestamp: state.migrationTimestamp,
-        wallet: postMigrationWatch.wallet,
-        source: postMigrationWatch.source,
-        soldAllTimestamp: postMigrationWatch.soldAllTimestamp,
-      });
-      await this.resetForNewToken(false, {
-        reason: 'early_bundler_sold_all_after_migration',
-      });
-      return;
-    }
-
     if (this.followInsiderObservationMode) {
       this.log.info("Follow-insider bundler sold-all reached — starting first-buy observer; buy disabled", {
         mint: state.mint,
