@@ -3765,6 +3765,14 @@ export class InsiderBot extends EventEmitter {
   addFollowInsiderWallet(address: string): boolean {
     const normalized = new PublicKey(address.trim()).toBase58();
     if (this.followInsiderWallets.includes(normalized)) return false;
+    if (this.followInsiderWallets.length >= MAX_FOLLOW_WALLETS) {
+      this.log.info("Follow-insider wallet not added — maximum already reached", {
+        wallet: normalized,
+        maxWallets: MAX_FOLLOW_WALLETS,
+        wallets: [...this.followInsiderWallets],
+      });
+      return false;
+    }
     this.followInsiderWallets.push(normalized);
     return true;
   }

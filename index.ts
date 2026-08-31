@@ -892,7 +892,7 @@ async function main(): Promise<void> {
         if (data === "insider:followinsider") {
           pendingTelegramActions.set(chatId, { type: "insiderFollowInsiderWallet", index: 0 });
           return {
-            text: "Send a wallet address to fast-track as a logs-only follow-insider wallet.",
+            text: `Send a wallet address to fast-track as an active follow-insider wallet (max ${MAX_FOLLOW_WALLETS}).`,
             trackPrompt: true,
             editCurrent: true,
           };
@@ -1330,7 +1330,7 @@ async function main(): Promise<void> {
                 await insiderBots[0]!.startFollowInsiderWalletMonitoring();
                 log.info("Follow-insider wallet fast-tracked", { wallet });
                 void telegramBot?.sendDefault(
-                  `<b>✅ Follow-Insider Wallet Fast-Tracked</b>\nWallet: <code>${html(wallet)}</code>\nMode: <b>logs-only, no buying</b>`,
+                `<b>✅ Follow-Insider Wallet Fast-Tracked</b>\nWallet: <code>${html(wallet)}</code>\nMode: <b>active buy/monitoring flow</b>\nMaximum tracked wallets: <b>${MAX_FOLLOW_WALLETS}</b>`,
                 );
               }
               return homeReply();
@@ -2764,7 +2764,7 @@ async function main(): Promise<void> {
               : ""
         }:`,
         ...followWalletLines,
-        `<b>Follow-insider wallets</b> (logs-only, max ${MAX_FOLLOW_WALLETS}):`,
+        `<b>Follow-insider wallets</b> (active buy/monitoring flow, max ${MAX_FOLLOW_WALLETS}):`,
         ...followInsiderWalletLines,
         monitoredWallet
           ? `Insider wallet: <code>${html(monitoredWallet)}</code>`
@@ -2779,7 +2779,7 @@ async function main(): Promise<void> {
         "",
         "<b>Flows (run in parallel)</b>",
         "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
-        "<b>B) Follow-insider</b> — tracked wallets → first-four verification → logs-only bundler/recipient observation.",
+        "<b>B) Follow-insider</b> — up to 4 tracked wallets → first-four verification → active bundler/recipient observation and buy flow.",
         "<b>C) Follow-token</b> — PumpPortal migration events → filters → bundler-funder monitoring.",
         insiderBots.length > 1
           ? `Parallel tokens: up to <b>${insiderBots.length}</b> insider bot key(s) — follow-wallet, funder-first, and follow-token can each hold a different token when keys are free.`
@@ -2799,7 +2799,7 @@ async function main(): Promise<void> {
         "",
         "<b>Env auto-start flags</b>",
         `Follow-wallet: <b>${config.insiderFollowWalletEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FOLLOW_WALLET_ENABLED</code>)`,
-        "Follow-insider mode: <b>logs-only, no buying</b>",
+        `Follow-insider mode: <b>active buying/monitoring</b> (maximum ${MAX_FOLLOW_WALLETS} tracked wallets)`,
         `Follow-token TG alerts: <b>${config.insiderFollowTokenEnabled ? "enabled" : "disabled"}</b> (<code>INSIDER_FOLLOW_TOKEN_ENABLED</code>)`,
       ].join("\n"),
       replyMarkup: {
