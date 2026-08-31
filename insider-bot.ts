@@ -8291,23 +8291,6 @@ export class InsiderBot extends EventEmitter {
       return;
     }
     if (this.tryCompleteFollowInsiderSmallestBundlerSellGate()) return;
-    if (
-      state.evalDeadlineAt !== null &&
-      Date.now() >= state.evalDeadlineAt &&
-      [...state.watches.values()].some(
-        (watch) =>
-          watch.monitoringActive &&
-          !state.deadlineExcludedWallets.has(watch.wallet) &&
-          watch.balanceState === "holding",
-      )
-    ) {
-      this.log.warn("Follow-token sold-all evaluation timed out while wallets still hold tokens", {
-        mint: state.mint,
-        evalDeadlineAt: state.evalDeadlineAt,
-      });
-      await this.resetForNewToken(false, { reason: "sold_all_eval_timeout" });
-      return;
-    }
     const soldAllBlockReason = this.followTokenEarlyBundlerExitSoldAllBlockReason();
     if (soldAllBlockReason) {
       const largestBag = this.getFollowTokenEarlyBundlerExitLargestBagWatch();
@@ -15074,7 +15057,11 @@ export class InsiderBot extends EventEmitter {
       );
     }
 
-    if (!options?.skipTelegram && endedMint) {
+    if (
+      !options?.skipTelegram &&
+      resetReason !== "sold_all_eval_timeout" &&
+      endedMint
+    ) {
       const flowLabel =
         endedSource === "follow-token"
           ? "Follow-Token"
