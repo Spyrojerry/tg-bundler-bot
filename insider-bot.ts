@@ -167,6 +167,7 @@ interface FollowTokenEarlyBundlerExitWatch {
   cumulativeSellUsd: number;
   maxSingleSellTokenAmount: number;
   lastSellFeeLamports: number | null;
+  lastSellTimestamp: number | null;
   balanceState: FollowTokenEarlyBundlerExitBalanceState;
   soldAll: boolean;
   soldAllSignature: string | null;
@@ -5014,9 +5015,17 @@ export class InsiderBot extends EventEmitter {
 
     state.smallestBundlerSellGateCompleted = true;
     state.smallestBundlerSellGateRootWallet = smallestRoot.wallet;
-    state.smallestBundlerSellFeeLamports = chain
-      .map((watch) => watch.lastSellFeeLamports)
-      .find((fee): fee is number => fee !== null) ?? null;
+    const lastChainSell = chain
+      .filter(
+        (watch) =>
+          watch.lastSellFeeLamports !== null &&
+          watch.lastSellTimestamp !== null,
+      )
+      .sort(
+        (a, b) => (b.lastSellTimestamp ?? 0) - (a.lastSellTimestamp ?? 0),
+      )[0];
+    state.smallestBundlerSellFeeLamports =
+      lastChainSell?.lastSellFeeLamports ?? null;
     this.followInsiderMatchingFeeExcludedWallets = new Set(
       chain.map((watch) => watch.wallet),
     );
@@ -8650,6 +8659,7 @@ export class InsiderBot extends EventEmitter {
       watch.sellTxCount += 1;
       watch.soldAmount += amount;
       watch.lastSellFeeLamports = tx.fee ?? null;
+      watch.lastSellTimestamp = tx.timestamp;
       if (amount > watch.maxSingleSellTokenAmount) {
         watch.maxSingleSellTokenAmount = amount;
       }
@@ -8859,6 +8869,7 @@ export class InsiderBot extends EventEmitter {
       cumulativeSellUsd: 0,
       maxSingleSellTokenAmount: 0,
       lastSellFeeLamports: null,
+      lastSellTimestamp: null,
       soldAll: false,
       balanceState: "unresolved",
       lastBalancePollAt: null,
@@ -9557,6 +9568,7 @@ export class InsiderBot extends EventEmitter {
         cumulativeSellUsd: 0,
       maxSingleSellTokenAmount: 0,
       lastSellFeeLamports: null,
+      lastSellTimestamp: null,
         soldAll: false,
         balanceState: "unresolved",
         lastBalancePollAt: null,
