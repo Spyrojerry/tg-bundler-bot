@@ -135,6 +135,8 @@ const PRE_LI_FIRST_BUY_OBSERVER_MAX_USD = 300;
 const PRE_LI_FIRST_BUY_OBSERVER_BASELINE_WALLETS = 3;
 const PRE_LI_FIRST_BUY_OBSERVER_BUY_TRIGGER_WALLETS = 2;
 const PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
+const FOLLOW_INSIDER_MATCHING_FEE_SELL_WINDOW_MS = 180_000;
+const FOLLOW_INSIDER_MATCHING_FEE_TOLERANCE_USD = 0.005;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -164,6 +166,7 @@ interface FollowTokenEarlyBundlerExitWatch {
   sellTxCount: number;
   cumulativeSellUsd: number;
   maxSingleSellTokenAmount: number;
+  lastSellFeeLamports: number | null;
   balanceState: FollowTokenEarlyBundlerExitBalanceState;
   soldAll: boolean;
   soldAllSignature: string | null;
@@ -219,6 +222,7 @@ interface FollowTokenEarlyBundlerExitState {
   preLiFirstBuyObserverBaselineWallets: number;
   smallestBundlerSellGateCompleted: boolean;
   smallestBundlerSellGateRootWallet: string | null;
+  smallestBundlerSellFeeLamports: number | null;
   initialSyncComplete: boolean;
   maxSingleSell60mCapExceeded: boolean;
   evalDeadlineAt: number | null;
@@ -822,6 +826,11 @@ export class InsiderBot extends EventEmitter {
     null;
   private followTokenLargeInsiderWindowTimer: ReturnType<typeof setTimeout> | null =
     null;
+  private followInsiderMatchingFeeSellTimer: ReturnType<typeof setTimeout> | null = null;
+  private followInsiderMatchingFeeSellWatchId: number | null = null;
+  private followInsiderMatchingFeeLamports: number | null = null;
+  private followInsiderMatchingFeeExcludedWallets = new Set<string>();
+  private followInsiderMatchingFeeSellWindowActive = false;
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
   private bundlerFunderLogsSubId: number | null = null;
   private bundlerFunderParallelLogsSubId: number | null = null;
@@ -1744,6 +1753,7 @@ export class InsiderBot extends EventEmitter {
     if (!state?.active) return;
 
     this.clearFollowTokenLargeInsiderWindowTimer();
+    this.stopFollowInsiderMatchingFeeSellWindow();
 
     const scrapeWallets = new Set([
       ...state.scrapeEnhancedWatchIds.keys(),
@@ -4297,6 +4307,9 @@ export class InsiderBot extends EventEmitter {
     this.phase = "holding";
     this.profitExitDisabled = this.disableProfitExitAfterBuy;
     this.disableProfitExitAfterBuy = false;
+    if (this.followInsiderObservationMode) {
+      this.startFollowInsiderMatchingFeeSellWindow(trigger.mint);
+    }
 
     if (this.followTokenTopBuyerWallet && this.followTokenTopBuyerMint === trigger.mint) {
       this.ensureFollowTokenTopBuyerWatchSubscribed();
@@ -4997,10 +5010,16 @@ export class InsiderBot extends EventEmitter {
     const sellTxCount = chain.reduce((sum, watch) => sum + watch.sellTxCount, 0);
     const soldAmount = chain.reduce((sum, watch) => sum + watch.soldAmount, 0);
     const remainingAmount = Math.max(0, smallestRoot.boughtAmount - soldAmount);
-    if (sellTxCount <= 1 || remainingAmount >= 60_000_000) return false;
+    if (sellTxCount < 1 || remainingAmount >= 60_000_000) return false;
 
     state.smallestBundlerSellGateCompleted = true;
     state.smallestBundlerSellGateRootWallet = smallestRoot.wallet;
+    state.smallestBundlerSellFeeLamports = chain
+      .map((watch) => watch.lastSellFeeLamports)
+      .find((fee): fee is number => fee !== null) ?? null;
+    this.followInsiderMatchingFeeExcludedWallets = new Set(
+      chain.map((watch) => watch.wallet),
+    );
     for (const watch of chain) {
       if (!watch.monitoringActive) continue;
       watch.monitoringActive = false;
@@ -5017,8 +5036,92 @@ export class InsiderBot extends EventEmitter {
       sellTxCount,
       maxRemainingAmount: 60_000_000,
     });
+    void this.sendTelegramSafe(
+      [
+        `<b>✅ ${this.label} Smallest Early Bundler Sell Gate Passed</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `Root wallet: <code>${smallestRoot.wallet}</code>`,
+        `Bought amount: <b>${smallestRoot.boughtAmount.toLocaleString()}</b>`,
+        `Sold across root/recipient chain: <b>${soldAmount.toLocaleString()}</b>`,
+        `Remaining: <b>${remainingAmount.toLocaleString()}</b> tokens (under 60M)`,
+        `Sell transactions: <b>${sellTxCount}</b>`,
+        "The smallest-root chain has met the sell requirement. Its watches were unsubscribed.",
+        "Starting the logs-only $110–$300 first-buy observer; buy remains disabled until two qualifying wallets are observed.",
+      ].join("\n"),
+      "follow-insider smallest bundler sell gate passed",
+    );
     this.startPreLiFirstBuyObserver(state.mint);
     return true;
+  }
+
+  private startFollowInsiderMatchingFeeSellWindow(mint: string): void {
+    const state = this.followTokenEarlyBundlerExitState;
+    const fee = state?.smallestBundlerSellFeeLamports;
+    if (!state?.active || state.mint !== mint || fee === null || fee === undefined) return;
+    this.stopFollowInsiderMatchingFeeSellWindow();
+    this.followInsiderMatchingFeeLamports = fee;
+    this.followInsiderMatchingFeeSellWindowActive = true;
+    if (this.enhancedWs) {
+      this.followInsiderMatchingFeeSellWatchId = this.enhancedWs.watch(mint, (tx) => {
+        void this.handleFollowInsiderMatchingFeeSellTx(tx, mint);
+      });
+    }
+    this.followInsiderMatchingFeeSellTimer = setTimeout(() => {
+      this.stopFollowInsiderMatchingFeeSellWindow();
+      this.log.info("Follow-insider matching-fee sell window expired", { mint, fee });
+    }, FOLLOW_INSIDER_MATCHING_FEE_SELL_WINDOW_MS);
+    this.log.info("Started follow-insider matching-fee sell window", {
+      mint,
+      feeLamports: fee,
+      durationMs: FOLLOW_INSIDER_MATCHING_FEE_SELL_WINDOW_MS,
+    });
+  }
+
+  private stopFollowInsiderMatchingFeeSellWindow(): void {
+    if (this.followInsiderMatchingFeeSellTimer) clearTimeout(this.followInsiderMatchingFeeSellTimer);
+    this.followInsiderMatchingFeeSellTimer = null;
+    if (this.followInsiderMatchingFeeSellWatchId !== null) {
+      void this.enhancedWs?.unwatch(this.followInsiderMatchingFeeSellWatchId).catch(() => undefined);
+      this.followInsiderMatchingFeeSellWatchId = null;
+    }
+    this.followInsiderMatchingFeeSellWindowActive = false;
+    this.followInsiderMatchingFeeLamports = null;
+    this.followInsiderMatchingFeeExcludedWallets.clear();
+  }
+
+  private async handleFollowInsiderMatchingFeeSellTx(
+    tx: HeliusTransaction,
+    mint: string,
+  ): Promise<void> {
+    if (!this.followInsiderMatchingFeeSellWindowActive || tx.type !== "SWAP") return;
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    if (solPriceUsd === null || tx.fee === undefined) return;
+    const feeDifferenceUsd =
+      (Math.abs(tx.fee - (this.followInsiderMatchingFeeLamports ?? 0)) * solPriceUsd) /
+      1_000_000_000;
+    if (feeDifferenceUsd > FOLLOW_INSIDER_MATCHING_FEE_TOLERANCE_USD) return;
+    const hasTargetOut = (tx.tokenTransfers ?? []).some(
+      (transfer) =>
+        transfer.mint === mint &&
+        transfer.fromUserAccount !== UNKNOWN_COUNTERPARTY &&
+        !this.followInsiderMatchingFeeExcludedWallets.has(transfer.fromUserAccount),
+    );
+    const hasSolIn = (tx.tokenTransfers ?? []).some(
+      (transfer) => transfer.mint === SOL_MINT && transfer.toUserAccount !== UNKNOWN_COUNTERPARTY,
+    );
+    if (!hasTargetOut && !hasSolIn) return;
+    this.stopFollowInsiderMatchingFeeSellWindow();
+    await this.triggerPositionSell(
+      mint,
+      "matching smallest-root sell fee within first three minutes after buy",
+      [
+        `<b>🚨 ${this.label} Matching Bundler Fee Sell</b>`,
+        `Token: <code>${mint}</code>`,
+        `A sell with an approximately matching fee was detected within the first three minutes after buy (difference $${feeDifferenceUsd.toFixed(3)}).`,
+        "Selling the held position.",
+      ],
+      tx.signature,
+    );
   }
 
   private async observePreLiFirstBuy(
@@ -5148,7 +5251,10 @@ export class InsiderBot extends EventEmitter {
             wallet,
             tx.signature,
             tx,
-            { triggerSource: "smallest_bundler_sell_gate" },
+            {
+              triggerSource: "smallest_bundler_sell_gate",
+              buySolOverride: this.getBuySolForFundingMode(false),
+            },
           );
         }
       }
@@ -8543,6 +8649,7 @@ export class InsiderBot extends EventEmitter {
 
       watch.sellTxCount += 1;
       watch.soldAmount += amount;
+      watch.lastSellFeeLamports = tx.fee ?? null;
       if (amount > watch.maxSingleSellTokenAmount) {
         watch.maxSingleSellTokenAmount = amount;
       }
@@ -8751,6 +8858,7 @@ export class InsiderBot extends EventEmitter {
       sellTxCount: 0,
       cumulativeSellUsd: 0,
       maxSingleSellTokenAmount: 0,
+      lastSellFeeLamports: null,
       soldAll: false,
       balanceState: "unresolved",
       lastBalancePollAt: null,
@@ -9447,7 +9555,8 @@ export class InsiderBot extends EventEmitter {
         transferredOutAmount: 0,
         sellTxCount: 0,
         cumulativeSellUsd: 0,
-        maxSingleSellTokenAmount: 0,
+      maxSingleSellTokenAmount: 0,
+      lastSellFeeLamports: null,
         soldAll: false,
         balanceState: "unresolved",
         lastBalancePollAt: null,
@@ -9498,6 +9607,7 @@ export class InsiderBot extends EventEmitter {
       preLiFirstBuyObserverBaselineWallets: 0,
       smallestBundlerSellGateCompleted: false,
       smallestBundlerSellGateRootWallet: null,
+      smallestBundlerSellFeeLamports: null,
       initialSyncComplete: false,
       maxSingleSell60mCapExceeded: false,
       evalDeadlineAt: Date.now() + FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_EVAL_WAIT_MS,
