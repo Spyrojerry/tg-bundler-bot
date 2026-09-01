@@ -301,6 +301,7 @@ export function normalizeEnhancedWsTransaction(
       timestamp: raw.blockTime ?? Math.floor(Date.now() / 1000),
       type: finalType,
       source,
+      fee: meta.fee,
       feePayer: accountKeys[0],
       tokenTransfers,
       nativeTransfers,

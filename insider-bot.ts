@@ -219,6 +219,18 @@ interface FollowTokenEarlyBundlerExitState {
   }>;
   preLiFirstBuyObserverPendingWallets: Set<string>;
   preLiFirstBuyObserverSeenWallets: Set<string>;
+  preLiFirstBuyObserverCandidates: Map<string, {
+    buySol: number;
+    buyUsd: number;
+    feeLamports: number;
+    signature: string;
+    timestamp: number;
+    tx: HeliusTransaction;
+  }>;
+  preLiFirstBuyObserverCandidateOrder: string[];
+  preLiFirstBuyObserverBaselineFeeLamports: number | null;
+  preLiFirstBuyObserverFeePairResolved: boolean;
+  preLiFirstBuyObserverStarted: boolean;
   smallestBundlerSellGateCompleted: boolean;
   smallestBundlerSellGateRootWallet: string | null;
   smallestBundlerSellFeeLamports: number | null;
@@ -4969,7 +4981,11 @@ export class InsiderBot extends EventEmitter {
 
   private startPreLiFirstBuyObserver(mint: string): void {
     const state = this.followTokenEarlyBundlerExitState;
-    if (!state?.active || state.mint !== mint || state.preLiFirstBuyObserverWatchId !== null) {
+    if (
+      !state?.active ||
+      state.mint !== mint ||
+      state.preLiFirstBuyObserverStarted
+    ) {
       return;
     }
     if (!this.enhancedWs) {
@@ -4978,6 +4994,7 @@ export class InsiderBot extends EventEmitter {
       });
       return;
     }
+    state.preLiFirstBuyObserverStarted = true;
     state.preLiFirstBuyObserverWatchId = this.enhancedWs.watch(mint, (tx) => {
       void this.observePreLiFirstBuy(mint, tx);
     });
@@ -5019,8 +5036,6 @@ export class InsiderBot extends EventEmitter {
     const remainingAmount = Math.max(0, smallestRoot.boughtAmount - soldAmount);
     if (sellTxCount < 1 || remainingAmount >= 60_000_000) return false;
 
-    state.smallestBundlerSellGateCompleted = true;
-    state.smallestBundlerSellGateRootWallet = smallestRoot.wallet;
     const lastChainSell = chain
       .filter(
         (watch) =>
@@ -5030,8 +5045,30 @@ export class InsiderBot extends EventEmitter {
       .sort(
         (a, b) => (b.lastSellTimestamp ?? 0) - (a.lastSellTimestamp ?? 0),
       )[0];
-    state.smallestBundlerSellFeeLamports =
-      lastChainSell?.lastSellFeeLamports ?? null;
+    const referenceFeeLamports = lastChainSell?.lastSellFeeLamports ?? null;
+    if (referenceFeeLamports === null) {
+      this.log.warn("Follow-insider smallest early bundler sell gate reached without a transaction fee", {
+        mint: state.mint,
+        rootWallet: smallestRoot.wallet,
+        soldAmount,
+        remainingAmount,
+        sellTxCount,
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>⚠️ ${this.label} First-Buy Observer Not Started</b>`,
+          `Token: <code>${state.mint}</code>`,
+          "The smallest-root sell gate passed, but the last sell transaction did not include Helius <code>fee</code> data.",
+          "The fee-matching observer was not started because it cannot safely identify matching-fee wallets.",
+        ].join("\n"),
+        "follow-insider observer missing reference fee",
+      );
+      return false;
+    }
+
+    state.smallestBundlerSellGateCompleted = true;
+    state.smallestBundlerSellGateRootWallet = smallestRoot.wallet;
+    state.smallestBundlerSellFeeLamports = referenceFeeLamports;
     this.followInsiderMatchingFeeExcludedWallets = new Set(
       chain.map((watch) => watch.wallet),
     );
@@ -5178,31 +5215,73 @@ export class InsiderBot extends EventEmitter {
         continue;
       }
 
-      const referenceFee = state.smallestBundlerSellFeeLamports;
-      if (
-        referenceFee === null ||
-        (Math.abs(feeLamports - referenceFee) * solPriceUsd) / 1_000_000_000 >
-          PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD
-      ) {
-        this.log.info("Pre-LI first-buy observer wallet rejected — transaction fee outside smallest-root sell fee range", {
-          mint,
-          wallet,
-          buyUsd,
-          feeLamports,
-          referenceFeeLamports: referenceFee,
-          toleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
-        });
-        continue;
-      }
-
-      state.preLiFirstBuyObserverPendingWallets.add(wallet);
       const observed = {
         buySol,
         buyUsd,
         feeLamports,
         signature: tx.signature,
         timestamp: tx.timestamp,
+        tx,
       };
+      if (!state.preLiFirstBuyObserverFeePairResolved) {
+        state.preLiFirstBuyObserverCandidates.set(wallet, observed);
+        state.preLiFirstBuyObserverCandidateOrder.push(wallet);
+        if (state.preLiFirstBuyObserverCandidateOrder.length < 3) continue;
+
+        const candidates = state.preLiFirstBuyObserverCandidateOrder.map(
+          (candidateWallet) => ({
+            wallet: candidateWallet,
+            value: state.preLiFirstBuyObserverCandidates.get(candidateWallet)!,
+          }),
+        );
+        let matchingPair: [typeof candidates[number], typeof candidates[number]] | null = null;
+        for (let i = 0; i < candidates.length && !matchingPair; i += 1) {
+          for (let j = i + 1; j < candidates.length; j += 1) {
+            const feeDifferenceUsd =
+              (Math.abs(candidates[i].value.feeLamports - candidates[j].value.feeLamports) * solPriceUsd) /
+              1_000_000_000;
+            if (feeDifferenceUsd <= PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD) {
+              matchingPair = [candidates[i], candidates[j]];
+              break;
+            }
+          }
+        }
+        if (!matchingPair) {
+          void this.sendTelegramSafe(
+            `<b>⛔ ${this.label} Follow-Insider Observer Skipped</b>\nToken: <code>${mint}</code>\nThe first three $110–$300 observer buys did not contain two transaction fees within the $${PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD.toFixed(3)} tolerance. Token reset.`,
+            "follow-insider observer fee pair missing",
+          );
+          await this.resetForNewToken(true, { reason: "follow_insider_observer_fee_pair_missing" });
+          return;
+        }
+        state.preLiFirstBuyObserverBaselineFeeLamports = matchingPair[0].value.feeLamports;
+        state.preLiFirstBuyObserverFeePairResolved = true;
+        const baselineFeeLamports = state.preLiFirstBuyObserverBaselineFeeLamports;
+        for (const candidate of candidates) {
+          const differenceUsd =
+            (Math.abs(candidate.value.feeLamports - baselineFeeLamports) * solPriceUsd) /
+            1_000_000_000;
+          if (differenceUsd <= PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD) {
+            state.preLiFirstBuyObserverPendingWallets.add(candidate.wallet);
+            state.preLiFirstBuyObserverWallets.set(candidate.wallet, {
+              buySol: candidate.value.buySol,
+              buyUsd: candidate.value.buyUsd,
+              feeLamports: candidate.value.feeLamports,
+              signature: candidate.value.signature,
+              timestamp: candidate.value.timestamp,
+            });
+            this.registerFollowTokenLargeInsiderValidWalletForExitMonitoring(candidate.wallet);
+          }
+        }
+        continue;
+      }
+
+      const referenceFee = state.preLiFirstBuyObserverBaselineFeeLamports;
+      const differenceUsd = referenceFee === null
+        ? Infinity
+        : (Math.abs(feeLamports - referenceFee) * solPriceUsd) / 1_000_000_000;
+      if (differenceUsd > PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD) continue;
+      state.preLiFirstBuyObserverPendingWallets.add(wallet);
       state.preLiFirstBuyObserverWallets.set(wallet, observed);
       if (
         this.followTokenLargeInsiderState?.active &&
@@ -5217,10 +5296,7 @@ export class InsiderBot extends EventEmitter {
         ...observed,
         solPriceUsd,
         walletCount: state.preLiFirstBuyObserverWallets.size,
-        approximatelySameBuyFee:
-          referenceFee !== null &&
-          (Math.abs(feeLamports - referenceFee) * solPriceUsd) /
-            1_000_000_000 <= PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
+        approximatelySameBuyFee: differenceUsd <= PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
         feeLamports,
         referenceFeeLamports: referenceFee,
         closeToleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
@@ -8280,7 +8356,10 @@ export class InsiderBot extends EventEmitter {
       });
       return;
     }
-    if (this.tryCompleteFollowInsiderSmallestBundlerSellGate()) return;
+    if (this.followInsiderObservationMode) {
+      this.tryCompleteFollowInsiderSmallestBundlerSellGate();
+      return;
+    }
     const soldAllBlockReason = this.followTokenEarlyBundlerExitSoldAllBlockReason();
     if (soldAllBlockReason) {
       const largestBag = this.getFollowTokenEarlyBundlerExitLargestBagWatch();
@@ -8317,54 +8396,6 @@ export class InsiderBot extends EventEmitter {
       this.log.info('Tracked Follow-Insider sold-all evaluation deferred until migration is observed', {
         mint: state.mint,
       });
-      return;
-    }
-
-    if (this.followInsiderObservationMode) {
-      this.log.info("Follow-insider bundler sold-all reached — starting first-buy observer; buy disabled", {
-        mint: state.mint,
-        watchedWalletCount: state.watches.size,
-      });
-      void this.sendTelegramSafe(
-        `<b>✅ ${this.label} Follow-Insider Bundler Sold-All Reached</b>\nToken: <code>${state.mint}</code>\nAll early bundlers/transfer recipients sold all. Starting the logs-only $110–$300 first-buy observer.\n<b>No buying is enabled for this mode.</b>`,
-        "follow-insider bundler sold-all observer started",
-      );
-      const highestWatch = this.getFollowTokenEarlyBundlerExitHighestMaxSingleSellWatch({
-        activeOnly: false,
-      });
-      const highestMaxSingleSell = highestWatch?.maxSingleSellTokenAmount ?? 0;
-      this.log.info("Follow-insider sold-all complete — evaluating 60M max-single-sell gate", {
-        mint: state.mint,
-        highestMaxSingleSell,
-        highestWallet: highestWatch?.wallet ?? null,
-        highestSource: highestWatch?.source ?? null,
-        cap: 60_000_000,
-      });
-      if (highestMaxSingleSell > 60_000_000) {
-        if (!state.maxSingleSell60mCapExceeded) {
-          state.maxSingleSell60mCapExceeded = true;
-          void this.sendTelegramSafe(
-            [
-              `<b>⛔ ${this.label} Follow-Insider 60M Gate Failed</b>`,
-              `Token: <code>${state.mint}</code>`,
-              `Highest max-single-sell: <b>${highestMaxSingleSell.toLocaleString()}</b> tokens`,
-              `Wallet: <code>${highestWatch?.wallet ?? "unknown"}</code>`,
-              "All early bundlers/transfer recipients are sold-all, but the 60M gate failed.",
-              "No $110–$300 observer was started.",
-            ].join("\n"),
-            "follow-insider sold-all 60m gate failed",
-          );
-        }
-        await this.resetForNewToken(false, {
-          reason: "follow_insider_sold_all_max_single_sell_over_60m",
-        });
-        return;
-      }
-      this.log.info("Follow-insider 60M gate passed — starting first-buy observer", {
-        mint: state.mint,
-        highestMaxSingleSell,
-      });
-      this.startPreLiFirstBuyObserver(state.mint);
       return;
     }
 
@@ -9570,6 +9601,11 @@ export class InsiderBot extends EventEmitter {
       preLiFirstBuyObserverWallets: new Map(),
       preLiFirstBuyObserverPendingWallets: new Set(),
       preLiFirstBuyObserverSeenWallets: new Set(),
+      preLiFirstBuyObserverCandidates: new Map(),
+      preLiFirstBuyObserverCandidateOrder: [],
+      preLiFirstBuyObserverBaselineFeeLamports: null,
+      preLiFirstBuyObserverFeePairResolved: false,
+      preLiFirstBuyObserverStarted: false,
       smallestBundlerSellGateCompleted: false,
       smallestBundlerSellGateRootWallet: null,
       smallestBundlerSellFeeLamports: null,

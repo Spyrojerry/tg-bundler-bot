@@ -9,6 +9,7 @@ import { createLogger } from './logger';
 import { HeliusClient } from './helius-client';
 import {
   InsiderBot,
+  MAX_FOLLOW_WALLETS,
   type InsiderTokenFlowEndedEvent,
 } from './insider-bot';
 import type { ServiceConfig } from './types';
@@ -371,6 +372,28 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
               (buy, index) =>
                 `${index + 1}. <code>${this.html(buy.wallet)}</code> · ${buy.buySol === null ? 'unknown' : `${buy.buySol} SOL`}`,
             ),
+          ]);
+          return;
+        }
+
+        const followInsiderWalletCount = this.insiderBots.reduce(
+          (count, bot) => count + bot.getFollowInsiderWallets().length,
+          0,
+        );
+        if (followInsiderWalletCount >= MAX_FOLLOW_WALLETS) {
+          this.seenMigrationMints.add(mint);
+          log.info('Follow-insider migration skipped — wallet capacity already full', {
+            mint,
+            signature,
+            followInsiderWalletCount,
+            maxFollowInsiderWallets: MAX_FOLLOW_WALLETS,
+          });
+          void this.sendMigrationTelegram([
+            '<b>⏭️ Follow-Insider Migration Skipped — Wallet Capacity Full</b>',
+            `Token: <code>${this.html(mint)}</code>`,
+            `Already tracking <b>${followInsiderWalletCount}/${MAX_FOLLOW_WALLETS}</b> follow-insider wallets.`,
+            'This migration will not start another follow-insider flow.',
+            'Existing tracked follow-insider token flows remain unaffected.',
           ]);
           return;
         }
