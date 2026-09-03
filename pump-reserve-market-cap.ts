@@ -10,6 +10,7 @@ import {
   canonicalPumpPoolPda,
 } from "@pump-fun/pump-swap-sdk";
 import { createLogger } from "./logger";
+import { PythSolPrice } from "./pyth-sol-price";
 
 const BN = require("bn.js");
 
@@ -64,6 +65,7 @@ export class PumpReserveMarketCapClient {
   private readonly pumpAmmSdk: OnlinePumpAmmSdk;
   private readonly watches = new Map<string, Promise<MintWatch>>();
   private solPrice: { value: number; expiresAt: number } | null = null;
+  private readonly pythSolPrice: PythSolPrice;
 
   constructor(
     rpcUrl: string,
@@ -75,6 +77,7 @@ export class PumpReserveMarketCapClient {
       commitment: "processed",
     });
     this.pumpAmmSdk = new OnlinePumpAmmSdk(this.connection);
+    this.pythSolPrice = new PythSolPrice(heliusApiKey?.trim() ?? "");
     const key = heliusApiKey?.trim();
     this.heliusDasEndpoint = key
       ? `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`
@@ -140,7 +143,7 @@ export class PumpReserveMarketCapClient {
   }
 
   async getSolPriceUsd(): Promise<number | null> {
-    return this.fetchSolPriceUsd();
+    return this.pythSolPrice.getPriceUsd();
   }
 
   async stopWatch(mint: string): Promise<void> {
@@ -323,10 +326,10 @@ export class PumpReserveMarketCapClient {
   }
 
   private async fetchSolPriceUsd(): Promise<number | null> {
+    const livePrice = this.pythSolPrice.getPriceUsd();
+    if (livePrice !== null) return livePrice;
     const now = Date.now();
-    if (this.solPrice && this.solPrice.expiresAt > now) {
-      return this.solPrice.value;
-    }
+    if (this.solPrice && this.solPrice.expiresAt > now) return this.solPrice.value;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
