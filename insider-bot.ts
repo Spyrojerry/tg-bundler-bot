@@ -1923,8 +1923,10 @@ export class InsiderBot extends EventEmitter {
     };
 
     watchState.discoveryStopped = false;
-    this.subscribeBundlerFunder(watchState.funderWallet);
-    await this.syncFollowTokenLargeInsiderFeePayerTransactions();
+    if (!fromNewTokenStream) {
+      this.subscribeBundlerFunder(watchState.funderWallet);
+      await this.syncFollowTokenLargeInsiderFeePayerTransactions();
+    }
 
     this.followTokenLargeInsiderLog("flow started", {
       mint: funderState.mint,
