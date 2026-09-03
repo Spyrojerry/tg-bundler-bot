@@ -231,14 +231,14 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       }
       if (marketCapUsd === null || marketCapUsd < 7_000 || marketCapUsd > 16_000) {
         await this.reserveMarketCap.stopWatch(mint);
-        log.info('PumpPortal new token skipped — MC outside follow-insider range', {
-          mint,
-          marketCapUsd,
-          minMarketCapUsd: 7_000,
-          maxMarketCapUsd: 16_000,
-        });
         return;
       }
+      log.info('PumpPortal new token passed follow-insider MC filter', {
+        mint,
+        marketCapUsd,
+        minMarketCapUsd: 7_000,
+        maxMarketCapUsd: 16_000,
+      });
       await this.reserveMarketCap.stopWatch(mint);
       const bot = this.pickIdleInsiderBot();
       if (!bot) return;
