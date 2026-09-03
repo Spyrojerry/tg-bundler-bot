@@ -259,6 +259,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         mint,
         `pumpportal-new-token:${mint}:${Date.now()}`,
         true,
+        true,
       );
       if (!started) {
         this.activeFollowTokenMint = null;

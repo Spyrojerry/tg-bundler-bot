@@ -3684,6 +3684,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     migrationSignature: string,
     followInsiderMode = false,
+    fromNewTokenStream = false,
   ): Promise<boolean> {
     if (this.boughtMints.has(mint)) return false;
     if (!this.isIdleForFunderFirst()) return false;
@@ -3737,6 +3738,7 @@ export class InsiderBot extends EventEmitter {
         mint,
         migrationSignature,
         followInsiderMode,
+        fromNewTokenStream,
       );
       return flowActive;
     } catch (err) {
@@ -3803,6 +3805,11 @@ export class InsiderBot extends EventEmitter {
   }
 
   async startFollowInsiderWalletMonitoring(): Promise<void> {
+    this.log.info("Follow-insider wallet monitoring disabled; using PumpPortal NewToken flow only", {
+      configuredWalletCount: this.followInsiderWallets.length,
+    });
+    return;
+    /*
     for (const wallet of this.followInsiderWallets) {
       if (this.followInsiderMonitors.has(wallet)) continue;
       const monitor = new WalletMonitor(this.config, wallet, {
@@ -3819,6 +3826,7 @@ export class InsiderBot extends EventEmitter {
       this.followInsiderMonitors.set(wallet, monitor);
       await monitor.start();
     }
+    */
   }
 
 
@@ -4484,6 +4492,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     migrationSignature: string,
     followInsiderMode: boolean,
+    fromNewTokenStream = false,
   ): Promise<boolean> {
     const delaysMs = [0, 4_000, 8_000];
     for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
@@ -4496,6 +4505,7 @@ export class InsiderBot extends EventEmitter {
           mint,
           migrationSignature,
           followInsiderMode,
+          fromNewTokenStream,
         );
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -4529,6 +4539,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     migrationSignature: string,
     followInsiderMode: boolean,
+    fromNewTokenStream = false,
   ): Promise<boolean> {
     this.flowSource = "follow-token";
     this.followTokenStartedFromTrackedWallet = false;
@@ -4596,6 +4607,7 @@ export class InsiderBot extends EventEmitter {
       mint,
       earlyInsiderBuys,
       followInsiderMode,
+      fromNewTokenStream,
     );
     return this.isFollowTokenFlowActive(mint);
   }
@@ -4661,6 +4673,7 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     earlyBuys: EarlyInsiderBuy[],
     followInsiderMode = false,
+    fromNewTokenStream = false,
   ): Promise<void> {
     this.followInsiderObservationMode = followInsiderMode;
     const firstFour = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
@@ -4716,6 +4729,9 @@ export class InsiderBot extends EventEmitter {
         });
         return;
       }
+      if (fromNewTokenStream) {
+        this.log.info("Follow-insider NewToken flow accepted — skipping permanent wallet add", { mint });
+      } else {
       const earliestWallet = firstFour[0]!.wallet;
       const trackedWalletIsEarlyBundler = firstFour.some((buy) =>
         this.isTrackedFollowInsiderWallet(buy.wallet),
@@ -4742,6 +4758,7 @@ export class InsiderBot extends EventEmitter {
         reason: "follow_insider_wallet_group_added",
       });
       return;
+      }
     }
 
     const stubSecondGroup =
