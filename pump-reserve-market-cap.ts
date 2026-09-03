@@ -139,6 +139,19 @@ export class PumpReserveMarketCapClient {
     }
   }
 
+  async stopWatch(mint: string): Promise<void> {
+    const watchPromise = this.watches.get(mint);
+    if (!watchPromise) return;
+    this.watches.delete(mint);
+    const watch = await watchPromise.catch(() => null);
+    if (!watch) return;
+    await Promise.all(
+      watch.subscriptionIds.map((id) =>
+        this.connection.removeAccountChangeListener(id).catch(() => undefined),
+      ),
+    );
+  }
+
   private ensureWatch(mint: string): Promise<MintWatch> {
     const existing = this.watches.get(mint);
     if (existing) return existing;

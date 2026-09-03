@@ -1631,6 +1631,7 @@ async function main(): Promise<void> {
   followTokenOrchestrator = new FollowTokenMigrationOrchestrator(
     config,
     insiderBots,
+    insiderPumpReserveMarketCapClient,
     telegramBot,
   );
   insiderBots.forEach((bot) => {

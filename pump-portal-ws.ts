@@ -21,7 +21,14 @@ export interface PumpPortalMigrationEvent {
   raw: unknown;
 }
 
+export interface PumpPortalNewTokenEvent {
+  mint: string;
+  marketCapSol: number | null;
+  raw: unknown;
+}
+
 type MigrationCallback = (event: PumpPortalMigrationEvent) => void;
+type NewTokenCallback = (event: PumpPortalNewTokenEvent) => void;
 
 export interface PumpPortalWsStatus {
   connected: boolean;
@@ -55,7 +62,9 @@ export class PumpPortalWsClient {
   private lastMigrationMessageAt: number | null = null;
   private lastActivityAt: number | null = null;
   private migrationCallback: MigrationCallback | null = null;
+  private newTokenCallback: NewTokenCallback | null = null;
   private migrationSubscribed = false;
+  private newTokenSubscribed = false;
   /** When true, migration feed is torn down (unsubscribe + disconnect) until resumed. */
   private migrationFeedSuspended = false;
 
@@ -67,6 +76,10 @@ export class PumpPortalWsClient {
 
   onMigration(callback: MigrationCallback): void {
     this.migrationCallback = callback;
+  }
+
+  onNewToken(callback: NewTokenCallback): void {
+    this.newTokenCallback = callback;
   }
 
   getStatus(): PumpPortalWsStatus {
@@ -120,6 +133,7 @@ export class PumpPortalWsClient {
       this.startHeartbeat();
       if (!this.migrationFeedSuspended) {
         this.sendSubscribeMigration();
+        this.sendSubscribeNewToken();
       }
     });
 
@@ -256,6 +270,19 @@ export class PumpPortalWsClient {
     }, delayMs);
   }
 
+  suspendNewTokenFeed(reason: string): void {
+    if (!this.newTokenSubscribed) return;
+    this.sendUnsubscribeNewToken();
+    this.newTokenSubscribed = false;
+    this.log.info('PumpPortal new-token feed suspended', { reason });
+  }
+
+  resumeNewTokenFeed(reason: string): void {
+    if (this.newTokenSubscribed || !this.connected) return;
+    this.sendSubscribeNewToken();
+    this.log.info('PumpPortal new-token feed resumed', { reason });
+  }
+
   private clearConnectTimeout(): void {
     if (!this.connectTimeoutTimer) return;
     clearTimeout(this.connectTimeoutTimer);
@@ -336,6 +363,19 @@ export class PumpPortalWsClient {
     }
   }
 
+  private sendSubscribeNewToken(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    this.newTokenSubscribed = true;
+    this.log.info('Sent PumpPortal subscribeNewToken');
+  }
+
+  private sendUnsubscribeNewToken(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ method: 'unsubscribeNewToken' }));
+    this.log.info('Sent PumpPortal unsubscribeNewToken');
+  }
+
   private handleMessage(data: WebSocket.Data): void {
     let parsed: unknown;
     try {
@@ -348,11 +388,13 @@ export class PumpPortalWsClient {
     if (this.migrationFeedSuspended) return;
 
     const event = parsePumpPortalMigrationEvent(parsed);
-    if (!event) return;
+    const newToken = parsePumpPortalNewTokenEvent(parsed);
+    if (!event && !newToken) return;
     this.lastMigrationMessageAt = Date.now();
 
     try {
-      this.migrationCallback?.(event);
+      if (event) this.migrationCallback?.(event);
+      if (newToken) this.newTokenCallback?.(newToken);
     } catch (err) {
       this.log.error('PumpPortal migration callback threw', {
         error: err instanceof Error ? err.message : String(err),
@@ -380,6 +422,7 @@ export function parsePumpPortalMigrationEvent(
     pickString(source, ['mint', 'token', 'mintAddress', 'tokenAddress']) ??
     pickString(obj, ['mint', 'token', 'mintAddress', 'tokenAddress']);
   if (!mint) return null;
+  if (source.txType && source.txType !== 'migrate') return null;
 
   const signature =
     pickString(source, ['signature', 'tx', 'transactionSignature']) ??
@@ -389,6 +432,23 @@ export function parsePumpPortalMigrationEvent(
   const timestamp = pickTimestamp(source) ?? pickTimestamp(obj) ?? Math.floor(Date.now() / 1000);
 
   return { mint, signature, timestamp, raw: data };
+}
+
+export function parsePumpPortalNewTokenEvent(data: unknown): PumpPortalNewTokenEvent | null {
+  if (!data || typeof data !== 'object') return null;
+  const obj = data as Record<string, unknown>;
+  if (obj.method || obj.message === 'subscribed' || obj.status === 'subscribed') return null;
+  const nested = obj.data && typeof obj.data === 'object' ? obj.data as Record<string, unknown> : null;
+  const source = nested ?? obj;
+  const mint = pickString(source, ['mint', 'token', 'mintAddress', 'tokenAddress']);
+  if (!mint || source.txType === 'migrate' || source.type === 'migrate') return null;
+  const rawMarketCap = source.marketCapSol ?? source.marketCap;
+  const numericMarketCap = Number(rawMarketCap);
+  return {
+    mint,
+    marketCapSol: Number.isFinite(numericMarketCap) ? numericMarketCap : null,
+    raw: data,
+  };
 }
 
 function pickString(obj: Record<string, unknown>, keys: string[]): string | null {

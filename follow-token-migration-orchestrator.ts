@@ -20,6 +20,7 @@ import {
   estimateEarlyBuySolFromHeliusTx,
 } from './wallet-swap-detector';
 import { PumpPortalWsClient } from './pump-portal-ws';
+import { PumpReserveMarketCapClient } from './pump-reserve-market-cap';
 import {
   hasRequiredIpfsIoBafUri,
   REQUIRED_IPFS_IO_BAF_URI_PREFIX,
@@ -60,6 +61,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
   private readonly metadataClient: TokenMetaplexMetadataClient;
   private readonly insiderBots: InsiderBot[];
   private readonly maxMigrationAgeSec: number;
+  private readonly reserveMarketCap: PumpReserveMarketCapClient;
   private pumpPortalWs: PumpPortalWsClient | null = null;
   private isEnabled = false;
   private isShuttingDown = false;
@@ -72,10 +74,12 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
   constructor(
     private readonly config: ServiceConfig,
     insiderBots: InsiderBot[],
+    reserveMarketCap: PumpReserveMarketCapClient,
     private readonly telegramBot: TelegramBot | null = null,
   ) {
     super();
     this.insiderBots = insiderBots;
+    this.reserveMarketCap = reserveMarketCap;
     const heliusKey = config.insiderHeliusApiKey || config.heliusApiKey;
     this.heliusClient = new HeliusClient(heliusKey, {
       label: 'Follow-Token Helius',
@@ -140,6 +144,9 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         event.timestamp,
       );
     });
+    this.pumpPortalWs.onNewToken((event) => {
+      void this.processNewTokenCandidate(event.mint, event.marketCapSol);
+    });
     this.pumpPortalWs.connect();
     log.info('Follow-token migration listener started', {
       source: 'PumpPortal subscribeMigration',
@@ -192,6 +199,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.pumpPortalWs.resumeMigrationFeed(
       `follow-token flow ended (${event.reason}${event.hadPosition ? ', had position' : ''})`,
     );
+    this.pumpPortalWs.resumeNewTokenFeed(`follow-token flow ended (${event.reason})`);
     log.info(
       'Follow-token flow ended — token watches torn down; PumpPortal migration feed resubscribed',
       {
@@ -201,6 +209,62 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         feePayer: event.feePayer,
       },
     );
+  }
+
+  private async processNewTokenCandidate(
+    mint: string,
+    marketCapSol: number | null,
+  ): Promise<void> {
+    if (!this.isEnabled || this.activeFollowTokenMint || this.inFlightMints.has(mint)) return;
+    if (!mint.endsWith(PUMP_MINT_SUFFIX) || this.seenMigrationMints.has(mint)) return;
+    this.seenMigrationMints.add(mint);
+    this.inFlightMints.add(mint);
+    try {
+      let marketCapUsd = marketCapSol === null ? null : marketCapSol * (await this.getSolPriceUsd());
+      if (marketCapUsd === null) {
+        const result = await this.reserveMarketCap.fetchMarketCapUsd(mint);
+        marketCapUsd = result.ok ? result.marketCap : null;
+      }
+      if (marketCapUsd === null || marketCapUsd < 7_000 || marketCapUsd > 16_000) {
+        await this.reserveMarketCap.stopWatch(mint);
+        log.info('PumpPortal new token skipped — MC outside follow-insider range', {
+          mint,
+          marketCapUsd,
+          minMarketCapUsd: 7_000,
+          maxMarketCapUsd: 16_000,
+        });
+        return;
+      }
+      await this.reserveMarketCap.stopWatch(mint);
+      const bot = this.pickIdleInsiderBot();
+      if (!bot) return;
+      this.activeFollowTokenMint = mint;
+      this.pumpPortalWs?.suspendNewTokenFeed('new-token candidate handed to InsiderBot');
+      const started = await bot.startFromFollowTokenMigration(
+        mint,
+        `pumpportal-new-token:${mint}:${Date.now()}`,
+        true,
+      );
+      if (!started) {
+        this.activeFollowTokenMint = null;
+        this.pumpPortalWs?.resumeNewTokenFeed('new-token handoff rejected');
+      }
+    } catch (err) {
+      await this.reserveMarketCap.stopWatch(mint);
+      this.activeFollowTokenMint = null;
+      this.pumpPortalWs?.resumeNewTokenFeed('new-token candidate failed');
+      log.warn('PumpPortal new-token candidate processing failed', {
+        mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      this.inFlightMints.delete(mint);
+    }
+  }
+
+  private async getSolPriceUsd(): Promise<number> {
+    const result = await this.reserveMarketCap.fetchMarketCapUsd('So11111111111111111111111111111111111111112');
+    return result.ok && result.priceUsd > 0 ? result.priceUsd : 0;
   }
 
   suspendMigrationFeedForActiveFlow(mint: string): void {
