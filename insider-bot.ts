@@ -5399,9 +5399,6 @@ export class InsiderBot extends EventEmitter {
             `<b>✅ ${this.label} Follow-Insider Observation Complete</b>\nToken: <code>${mint}</code>\nCollected <b>${state.preLiFirstBuyObserverWallets.size}</b> qualifying first-buy wallets.`,
             "follow-insider observation complete",
           );
-          await this.resetForNewToken(true, {
-            reason: "follow_insider_observation_complete",
-          });
         }
         return;
       }
