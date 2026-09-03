@@ -3658,6 +3658,27 @@ export class InsiderBot extends EventEmitter {
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
       this.releaseMint?.(mint);
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      if (errorMessage.includes("fewer than four first unique bundler buys")) {
+        this.log.warn("Follow-token skipped after Helius indexing window expired", {
+          mint,
+          error: errorMessage,
+        });
+        void this.sendTelegramSafe(
+          [
+            `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
+            `Token: <code>${mint}</code>`,
+            "Helius did not index four unique early-bundler buys within the retry window.",
+            "No flow or buy was started.",
+          ].join("\n"),
+          "follow-token indexing-window skip",
+        );
+        await this.resetForNewToken(true, {
+          reason: "follow_insider_helius_indexing_window_expired",
+          skipTelegram: true,
+        });
+        return false;
+      }
       if (err instanceof InsiderMinBuySolFilterError) {
         this.log.info("Insider flow skipped by min-buy SOL filter; resetting", {
           mint,
@@ -4486,7 +4507,7 @@ export class InsiderBot extends EventEmitter {
     followInsiderMode: boolean,
     fromNewTokenStream = false,
   ): Promise<boolean> {
-    const delaysMs = [0, 4_000, 8_000];
+    const delaysMs = [0, 4_000, 8_000, 12_000, 16_000, 20_000];
     for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
       const delayMs = delaysMs[attempt] ?? 0;
       if (delayMs > 0) {
