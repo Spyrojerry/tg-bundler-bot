@@ -232,6 +232,7 @@ interface FollowTokenEarlyBundlerExitState {
   smallestBundlerSellGateCompleted: boolean;
   smallestBundlerSellGateRootWallet: string | null;
   smallestBundlerSellFeeLamports: number | null;
+  fromNewTokenStream: boolean;
   initialSyncComplete: boolean;
   maxSingleSell60mCapExceeded: boolean;
   evalDeadlineAt: number | null;
@@ -4568,6 +4569,27 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (
+      followInsiderMode &&
+      (earlyInsiderBuys.length < BUNDLER_FUNDER_REQUIRED_COUNT ||
+        new Set(earlyInsiderBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT).map((buy) => buy.wallet)).size <
+          BUNDLER_FUNDER_REQUIRED_COUNT ||
+        earlyInsiderBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT).some(
+          (buy) => buy.buySol === null || buy.buySol < 4 || buy.buySol > 12,
+        ))
+    ) {
+      this.log.warn("Follow-insider NewToken validation failed — four unique early buys must be 4-12 SOL", {
+        mint,
+        earlyBuys: earlyInsiderBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT).map((buy) => ({
+          wallet: buy.wallet,
+          buySol: buy.buySol,
+          signature: buy.signature,
+        })),
+      });
+      await this.resetForNewToken(true, { reason: "follow_insider_new_token_early_buy_validation_failed" });
+      return false;
+    }
+
+    if (
       await this.trySkipLowFundingDisabledFromEarlyBuys(mint, earlyInsiderBuys)
     ) {
       return false;
@@ -4693,7 +4715,7 @@ export class InsiderBot extends EventEmitter {
       this.subscribeDevWalletFullExitWatch();
     }
 
-    void this.startFollowTokenEarlyBundlerExitMonitoring(mint);
+    void this.startFollowTokenEarlyBundlerExitMonitoring(mint, fromNewTokenStream);
 
     const watchState = this.bundlerFunderWatch;
     if (!watchState) return;
@@ -5045,6 +5067,23 @@ export class InsiderBot extends EventEmitter {
     const soldAmount = chain.reduce((sum, watch) => sum + watch.soldAmount, 0);
     const remainingAmount = Math.max(0, smallestRoot.boughtAmount - soldAmount);
     if (sellTxCount < 1 || remainingAmount >= 60_000_000) return false;
+    if (
+      state.fromNewTokenStream &&
+      (smallestRoot.boughtAmount <= 60_000_000 || remainingAmount <= 0)
+    ) {
+      this.log.info("Follow-insider NewToken rejected — smallest-root sell gate amount criteria failed", {
+        mint: state.mint,
+        rootWallet: smallestRoot.wallet,
+        boughtAmount: smallestRoot.boughtAmount,
+        remainingAmount,
+        minimumBoughtAmount: 60_000_000,
+        remainingMustBeGreaterThan: 0,
+      });
+      void this.resetForNewToken(true, {
+        reason: "follow_insider_new_token_smallest_root_gate_failed",
+      });
+      return false;
+    }
 
     const lastChainSell = chain
       .filter(
@@ -5195,6 +5234,7 @@ export class InsiderBot extends EventEmitter {
         state.preLiFirstBuyObserverBaselineFeeLamports = matchingPair[0].value.feeLamports;
         state.preLiFirstBuyObserverFeePairResolved = true;
         const baselineFeeLamports = state.preLiFirstBuyObserverBaselineFeeLamports;
+        const matchingWallets = new Set(matchingPair.map((candidate) => candidate.wallet));
         for (const candidate of candidates) {
           const differenceUsd =
             (Math.abs(candidate.value.feeLamports - baselineFeeLamports) * solPriceUsd) /
@@ -5208,7 +5248,61 @@ export class InsiderBot extends EventEmitter {
               signature: candidate.value.signature,
               timestamp: candidate.value.timestamp,
             });
+            if (
+              this.followTokenLargeInsiderState?.active &&
+              !this.followTokenLargeInsiderState.validWallets.includes(candidate.wallet)
+            ) {
+              this.followTokenLargeInsiderState.validWallets.push(candidate.wallet);
+            }
             this.registerFollowTokenLargeInsiderValidWalletForExitMonitoring(candidate.wallet);
+            const walletNumber = state.preLiFirstBuyObserverWallets.size;
+            this.log.info("Pre-LI first-buy observer qualifying wallet", {
+              mint,
+              wallet: candidate.wallet,
+              ...candidate.value,
+              solPriceUsd,
+              walletCount: walletNumber,
+              approximatelySameBuyFee: true,
+              referenceFeeLamports: baselineFeeLamports,
+              closeToleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
+            });
+            void this.sendTelegramSafe(
+              [
+                `<b>👀 ${this.label} Pre-LI First-Buy Observer Wallet #${walletNumber}</b>`,
+                `Token: <code>${mint}</code>`,
+                `Wallet: <code>${candidate.wallet}</code>`,
+                `First buy: <b>$${candidate.value.buyUsd.toFixed(2)}</b> · <b>${candidate.value.buySol.toFixed(4)} SOL</b>`,
+                `Buy tx: <code>${candidate.value.signature}</code>`,
+                `Observed wallets: <b>${walletNumber}/${PRE_LI_FIRST_BUY_OBSERVER_MAX_WALLETS}</b>`,
+                `Transaction fee: <b>${candidate.value.feeLamports.toLocaleString()}</b> lamports`,
+                `Observer fee reference: <b>${baselineFeeLamports.toLocaleString()}</b> lamports ± <b>$${PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD.toFixed(3)}</b>`,
+              ].join("\n"),
+              "pre-li first-buy observer wallet",
+            );
+          } else if (!matchingWallets.has(candidate.wallet)) {
+            this.log.info("Pre-LI first-buy observer candidate rejected — first-three fee outlier", {
+              mint,
+              wallet: candidate.wallet,
+              feeLamports: candidate.value.feeLamports,
+              referenceFeeLamports: baselineFeeLamports,
+              toleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
+            });
+          }
+        }
+        if (!this.buySubmitted) {
+          const funderState = this.bundlerFunderWatch;
+          const buyCandidate = matchingPair[1];
+          if (funderState) {
+            await this.emitFollowTokenLargeInsiderBuy(
+              funderState,
+              buyCandidate.wallet,
+              buyCandidate.value.signature,
+              buyCandidate.value.tx,
+              {
+                triggerSource: "smallest_bundler_sell_gate",
+                buySolOverride: this.getBuySolForFundingMode(false),
+              },
+            );
           }
         }
         continue;
@@ -9457,6 +9551,7 @@ export class InsiderBot extends EventEmitter {
 
   private async startFollowTokenEarlyBundlerExitMonitoring(
     mint: string,
+    fromNewTokenStream = false,
   ): Promise<void> {
     const earlyBuys = this.followTokenEarlyInsiderBuys;
     const funderState = this.bundlerFunderWatch;
@@ -9547,6 +9642,7 @@ export class InsiderBot extends EventEmitter {
       smallestBundlerSellGateCompleted: false,
       smallestBundlerSellGateRootWallet: null,
       smallestBundlerSellFeeLamports: null,
+      fromNewTokenStream,
       initialSyncComplete: false,
       maxSingleSell60mCapExceeded: false,
       evalDeadlineAt: Date.now() + FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MAX_EVAL_WAIT_MS,
@@ -14978,6 +15074,15 @@ export class InsiderBot extends EventEmitter {
     clearPosition: boolean,
     options?: { reason?: string; skipTelegram?: boolean },
   ): Promise<void> {
+    if (this.buySubmitted && !this.positionSellTriggered) {
+      this.log.warn("Ignoring token reset while buy is pending or position is held", {
+        mint: this.watchingMint ?? this.activePosition?.mint ?? null,
+        reason: options?.reason ?? "flow_reset",
+        buySubmitted: this.buySubmitted,
+        activePosition: this.activePosition?.mint ?? null,
+      });
+      return;
+    }
     const endedMint = this.watchingMint ?? this.activePosition?.mint ?? null;
     const endedFeePayer =
       this.funderFirstFeePayer ?? this.bundlerFunderWatch?.funderWallet ?? null;
