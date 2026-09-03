@@ -37,7 +37,7 @@ const FOLLOW_INSIDER_MIN_EARLY_BUY_SOL = 4;
 const FOLLOW_INSIDER_MAX_EARLY_BUY_SOL = 12;
 const REQUIRED_BUNDLER_COUNT = 4;
 const NEW_TOKEN_MC_CHECK_DELAY_MS = 500;
-const LOG_NEW_TOKEN_MC_PASSES = false;
+const LOG_NEW_TOKEN_MC_FILTER = true;
 /** Accepted dev CREATE history counts (Helius fee-payer CREATE txs). */
 const FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN = 1;
 const FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX = 3;
@@ -234,16 +234,22 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       }
       if (marketCapUsd === null || marketCapUsd < 7_000 || marketCapUsd > 16_000) {
         await this.reserveMarketCap.stopWatch(mint);
+        if (LOG_NEW_TOKEN_MC_FILTER) {
+          log.info('PumpPortal new token skipped — MC outside follow-insider range', {
+            mint,
+            marketCapUsd,
+            minMarketCapUsd: 7_000,
+            maxMarketCapUsd: 16_000,
+          });
+        }
         return;
       }
-      if (LOG_NEW_TOKEN_MC_PASSES) {
-        log.info('PumpPortal new token passed follow-insider MC filter', {
-          mint,
-          marketCapUsd,
-          minMarketCapUsd: 7_000,
-          maxMarketCapUsd: 16_000,
-        });
-      }
+      log.info('PumpPortal new token passed follow-insider MC filter', {
+        mint,
+        marketCapUsd,
+        minMarketCapUsd: 7_000,
+        maxMarketCapUsd: 16_000,
+      });
       await this.reserveMarketCap.stopWatch(mint);
       const bot = this.pickIdleInsiderBot();
       if (!bot) return;
