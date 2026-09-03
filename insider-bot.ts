@@ -4595,25 +4595,25 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
 
+    if (followInsiderMode) {
+      const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint, true);
+      if (!locked) {
+        this.log.warn("Follow-insider flow rejected before monitoring — shared feePayer lock failed", {
+          mint,
+          earlyBundlerWallets,
+        });
+        await this.resetForNewToken(true, {
+          reason: "follow_insider_fee_payer_lock_failed",
+        });
+        return false;
+      }
+    }
+
     this.preBuyStopped = false;
     this.positionSellTriggered = false;
     this.monitoredWallet = null;
     this.insiderState = null;
     this.phase = "pre_buy";
-
-    void this.sendTelegramSafe(
-      [
-        `<b>🔍 ${this.label} Follow-Token Large Insider Flow Started</b>`,
-        `Token: <code>${mint}</code>`,
-        `Migration tx: <code>${migrationSignature}</code>`,
-        `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
-        "",
-        `Buy trigger: Large Insider flow (valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all path).`,
-        "Early bundler / transfer-recipient watch started (pre–1st-LI sold-all buy gate active).",
-        "Bundler feePayer backtrack skipped for follow-token (Helius early-buy anchor).",
-      ].join("\n"),
-      "follow-token flow-start notification",
-    );
 
     this.startPollLoop();
     await this.startFollowTokenLargeInsiderPreBuyFlow(
@@ -4622,6 +4622,21 @@ export class InsiderBot extends EventEmitter {
       followInsiderMode,
       fromNewTokenStream,
     );
+    if (this.isFollowTokenFlowActive(mint)) {
+      void this.sendTelegramSafe(
+        [
+          `<b>🔍 ${this.label} Follow-Token Large Insider Flow Started</b>`,
+          `Token: <code>${mint}</code>`,
+          `Migration tx: <code>${migrationSignature}</code>`,
+          `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
+          "",
+          `Buy trigger: Large Insider flow (valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all path).`,
+          "Early bundler / transfer-recipient watch started (pre–1st-LI sold-all buy gate active).",
+          "Four early buys and shared feePayer validation passed before flow start.",
+        ].join("\n"),
+        "follow-token flow-start notification",
+      );
+    }
     return this.isFollowTokenFlowActive(mint);
   }
 
@@ -4715,14 +4730,11 @@ export class InsiderBot extends EventEmitter {
       this.subscribeDevWalletFullExitWatch();
     }
 
-    void this.startFollowTokenEarlyBundlerExitMonitoring(mint, fromNewTokenStream);
-
     const watchState = this.bundlerFunderWatch;
     if (!watchState) return;
 
     if (followInsiderMode) {
-      const locked = fromNewTokenStream ||
-        await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint, true);
+      const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint, true);
       if (!locked) {
         this.log.warn("Follow-insider mode skipped — shared feePayer lock failed", {
           mint,
@@ -4774,6 +4786,8 @@ export class InsiderBot extends EventEmitter {
       return;
       }
     }
+
+    void this.startFollowTokenEarlyBundlerExitMonitoring(mint, fromNewTokenStream);
 
     const stubSecondGroup =
       this.buildFollowTokenStubSecondGroupFromInitialBundlers(watchState);
