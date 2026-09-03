@@ -4503,7 +4503,8 @@ export class InsiderBot extends EventEmitter {
         const message = err instanceof Error ? err.message : String(err);
         const retryable =
           message.includes("No SWAP transactions found") ||
-          message.includes("Failed to fetch early insider swaps");
+          message.includes("Failed to fetch early insider swaps") ||
+          message.includes("fewer than four first unique bundler buys");
         if (!retryable || attempt === delaysMs.length - 1) {
           throw err;
         }
@@ -4556,6 +4557,11 @@ export class InsiderBot extends EventEmitter {
     for (const wallet of earlyBundlerWallets) this.initialInsiderWallets.add(wallet);
 
     if (earlyBundlerWallets.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
+      if (fromNewTokenStream) {
+        throw new Error(
+          `Waiting for Helius indexing: fewer than four first unique bundler buys (${earlyBundlerWallets.length}/${BUNDLER_FUNDER_REQUIRED_COUNT})`,
+        );
+      }
       this.log.warn(
         "Follow-token migration has fewer than four first unique bundler buys; resetting",
         {
