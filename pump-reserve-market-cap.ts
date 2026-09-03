@@ -139,6 +139,10 @@ export class PumpReserveMarketCapClient {
     }
   }
 
+  async getSolPriceUsd(): Promise<number | null> {
+    return this.fetchSolPriceUsd();
+  }
+
   async stopWatch(mint: string): Promise<void> {
     const watchPromise = this.watches.get(mint);
     if (!watchPromise) return;

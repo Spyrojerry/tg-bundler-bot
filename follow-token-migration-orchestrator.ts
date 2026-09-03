@@ -220,7 +220,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.seenMigrationMints.add(mint);
     this.inFlightMints.add(mint);
     try {
-      let marketCapUsd = marketCapSol === null ? null : marketCapSol * (await this.getSolPriceUsd());
+      const solPriceUsd = await this.reserveMarketCap.getSolPriceUsd();
+      let marketCapUsd =
+        marketCapSol === null || solPriceUsd === null
+          ? null
+          : marketCapSol * solPriceUsd;
       if (marketCapUsd === null) {
         const result = await this.reserveMarketCap.fetchMarketCapUsd(mint);
         marketCapUsd = result.ok ? result.marketCap : null;
@@ -262,10 +266,6 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     }
   }
 
-  private async getSolPriceUsd(): Promise<number> {
-    const result = await this.reserveMarketCap.fetchMarketCapUsd('So11111111111111111111111111111111111111112');
-    return result.ok && result.priceUsd > 0 ? result.priceUsd : 0;
-  }
 
   suspendMigrationFeedForActiveFlow(mint: string): void {
     this.unsubscribeMigrationFeedForActiveFlow(mint);
