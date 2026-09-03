@@ -371,7 +371,7 @@ const BUNDLER_FUNDER_RECIPIENT_SYNC_INTERVAL_MS = 1_500;
 const BUNDLER_FUNDER_RECIPIENT_BATCH_SIZE = 2;
 const HELIUS_POOL_MAX_CONCURRENT = 2;
 const HELIUS_POOL_MIN_TIME_MS = 150;
-const HELIUS_POOL_REQUEST_TIMEOUT_MS = 10_000;
+const HELIUS_POOL_REQUEST_TIMEOUT_MS = 30_000;
 const HELIUS_POOL_BASE_BACKOFF_MS = 2_000;
 const HELIUS_POOL_MAX_BACKOFF_MS = 60_000;
 const HELIUS_POOL_METRICS_INTERVAL_MS = 30_000;
@@ -1873,6 +1873,7 @@ export class InsiderBot extends EventEmitter {
     funderState: BundlerFunderWatchState,
     secondGroup: FollowTokenBundlerAnchorGroup,
     triggerReason: string,
+    fromNewTokenStream = false,
   ): Promise<boolean> {
     if (
       this.followTokenLargeInsiderState?.active &&
@@ -1881,9 +1882,8 @@ export class InsiderBot extends EventEmitter {
       return true;
     }
 
-    const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(
-      funderState.mint,
-    );
+    const locked = fromNewTokenStream ||
+      await this.ensureFollowTokenLargeInsiderFeePayerLocked(funderState.mint);
     if (!locked) {
       this.followTokenLargeInsiderLog(
         "feePayer lock failed — large insider flow not started",
@@ -4697,7 +4697,8 @@ export class InsiderBot extends EventEmitter {
     if (!watchState) return;
 
     if (followInsiderMode) {
-      const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint, true);
+      const locked = fromNewTokenStream ||
+        await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint, true);
       if (!locked) {
         this.log.warn("Follow-insider mode skipped — shared feePayer lock failed", {
           mint,
@@ -4756,6 +4757,7 @@ export class InsiderBot extends EventEmitter {
       watchState,
       stubSecondGroup,
       "large_insider_pre_buy_started",
+      fromNewTokenStream,
     );
     if (!largeInsiderStarted) {
       await this.resetFollowTokenAfterLargeInsiderStartFailed(
