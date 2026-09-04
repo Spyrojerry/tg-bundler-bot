@@ -3660,22 +3660,12 @@ export class InsiderBot extends EventEmitter {
       this.releaseMint?.(mint);
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (errorMessage.includes("fewer than four first unique bundler buys")) {
-        this.log.warn("Follow-token skipped after Helius indexing window expired", {
+        this.log.warn("Follow-token reset after Helius indexing window expired", {
           mint,
           error: errorMessage,
         });
-        void this.sendTelegramSafe(
-          [
-            `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
-            `Token: <code>${mint}</code>`,
-            "Helius did not index four unique early-bundler buys within the retry window.",
-            "No flow or buy was started.",
-          ].join("\n"),
-          "follow-token indexing-window skip",
-        );
         await this.resetForNewToken(true, {
-          reason: "follow_insider_helius_indexing_window_expired",
-          skipTelegram: true,
+          reason: "follow_insider_new_token_early_buy_validation_failed",
         });
         return false;
       }
@@ -3919,10 +3909,6 @@ export class InsiderBot extends EventEmitter {
         earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT),
       );
       this.followTokenEarlyInsiderBuys = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
-      if (!(await this.ensureFollowTokenLargeInsiderFeePayerLocked(event.mint, true))) {
-        await this.resetForNewToken(true, { reason: "follow_insider_fee_payer_lock_failed" });
-        return;
-      }
       void this.startFollowTokenEarlyBundlerExitMonitoring(event.mint);
       this.log.info("Follow-insider token observation started", {
         mint: event.mint,
@@ -4525,8 +4511,7 @@ export class InsiderBot extends EventEmitter {
         const retryable =
           message.includes("No SWAP transactions found") ||
           message.includes("Failed to fetch early insider swaps") ||
-          message.includes("fewer than four first unique bundler buys") ||
-          message.includes("fewer than five early swap transactions");
+          message.includes("fewer than four first unique bundler buys");
         if (!retryable || attempt === delaysMs.length - 1) {
           throw err;
         }
@@ -4567,19 +4552,9 @@ export class InsiderBot extends EventEmitter {
     this.highestObservedMarketCapUsd = null;
     this.clearBundlerAccumulation();
 
-    const requiredSwapCount = followInsiderMode ? 5 : 4;
     const swaps = await this.withHeliusFallback((client) =>
-      client.getEarlyInsiderSwaps(mint, requiredSwapCount),
+      client.getEarlyInsiderSwaps(mint, 4),
     );
-    if (followInsiderMode && swaps.length < 5) {
-      if (fromNewTokenStream) {
-        throw new Error(
-          `Waiting for Helius indexing: fewer than five early swap transactions (${swaps.length}/5)`,
-        );
-      }
-      await this.resetForNewToken(true);
-      return false;
-    }
     const earlyInsiderBuys = this.extractFirstUniqueEarlyBundlerBuys(
       swaps,
       mint,
@@ -4626,39 +4601,6 @@ export class InsiderBot extends EventEmitter {
       await this.resetForNewToken(true, { reason: "follow_insider_new_token_early_buy_validation_failed" });
       return false;
     }
-    if (followInsiderMode) {
-      const fifthSwap = swaps[4];
-      const fifthBuy = fifthSwap
-        ? (fifthSwap.tokenTransfers ?? []).find(
-            (transfer) =>
-              transfer.mint === mint &&
-              transfer.toUserAccount !== UNKNOWN_COUNTERPARTY &&
-              transfer.tokenAmount > 0,
-          )
-        : undefined;
-      const fifthBuySol = fifthBuy
-        ? this.estimateEarlyBuySol(fifthSwap!, fifthBuy.toUserAccount)
-        : null;
-      if (
-        !fifthSwap ||
-        fifthSwap.type !== "SWAP" ||
-        !fifthBuy ||
-        fifthBuySol === null ||
-        fifthBuySol >= 1
-      ) {
-        this.log.warn("Follow-insider validation failed — fifth swap must be a buy under 1 SOL", {
-          mint,
-          fifthSwapSignature: fifthSwap?.signature ?? null,
-          fifthSwapType: fifthSwap?.type ?? null,
-          fifthBuySol,
-        });
-        await this.resetForNewToken(true, {
-          reason: "follow_insider_fifth_swap_buy_gate_failed",
-        });
-        return false;
-      }
-    }
-
     if (
       await this.trySkipLowFundingDisabledFromEarlyBuys(mint, earlyInsiderBuys)
     ) {
