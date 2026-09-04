@@ -229,7 +229,9 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
           ? null
           : marketCapSol * solPriceUsd;
       if (marketCapUsd === null) {
-        const result = await this.reserveMarketCap.fetchMarketCapUsd(mint);
+        const result = await this.reserveMarketCap.fetchMarketCapUsd(mint, {
+          logSubscription: LOG_NEW_TOKEN_MC_FILTER,
+        });
         marketCapUsd = result.ok ? result.marketCap : null;
       }
       if (marketCapUsd === null || marketCapUsd < 7_000 || marketCapUsd > 16_000) {

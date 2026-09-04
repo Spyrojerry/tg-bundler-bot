@@ -88,9 +88,10 @@ export class PumpReserveMarketCapClient {
 
   async fetchMarketCapUsd(
     mint: string,
+    options: { logSubscription?: boolean } = {},
   ): Promise<PumpReserveMarketCapResult> {
     try {
-      const watch = await this.ensureWatch(mint);
+      const watch = await this.ensureWatch(mint, options.logSubscription ?? true);
       const solPrice = await this.fetchSolPriceUsd();
       if (solPrice === null) {
         return { ok: false, reason: "No SOL/USD price available" };
@@ -159,11 +160,11 @@ export class PumpReserveMarketCapClient {
     );
   }
 
-  private ensureWatch(mint: string): Promise<MintWatch> {
+  private ensureWatch(mint: string, logSubscription: boolean): Promise<MintWatch> {
     const existing = this.watches.get(mint);
     if (existing) return existing;
 
-    const watchPromise = this.createWatch(mint).catch((err) => {
+    const watchPromise = this.createWatch(mint, logSubscription).catch((err) => {
       this.watches.delete(mint);
       throw err;
     });
@@ -171,7 +172,7 @@ export class PumpReserveMarketCapClient {
     return watchPromise;
   }
 
-  private async createWatch(mint: string): Promise<MintWatch> {
+  private async createWatch(mint: string, logSubscription: boolean): Promise<MintWatch> {
     const mintPk = new PublicKey(mint);
     const bondingCurve = bondingCurvePda(mintPk);
     const pumpSwapPool = canonicalPumpPoolPda(mintPk, new PublicKey(SOL_MINT));
@@ -200,7 +201,7 @@ export class PumpReserveMarketCapClient {
           "processed",
         );
         watch.subscriptionIds.push(subId);
-        log.info("Subscribed to Pump bonding-curve reserve changes", {
+        if (logSubscription) log.info("Subscribed to Pump bonding-curve reserve changes", {
           mint,
           bondingCurve: bondingCurve.toBase58(),
           supply,
@@ -252,7 +253,7 @@ export class PumpReserveMarketCapClient {
       "processed",
     );
     watch.subscriptionIds.push(baseSubId, quoteSubId);
-    log.info("Subscribed to PumpSwap vault reserve changes", {
+    if (logSubscription) log.info("Subscribed to PumpSwap vault reserve changes", {
       mint,
       pool: pumpSwapPool.toBase58(),
       baseVault: watch.baseVault.toBase58(),
