@@ -282,6 +282,8 @@ interface FollowTokenLargeInsiderState {
     string,
     { firstBuyUsd: number; buySol: number | null; signature: string }
   >;
+  validWalletReconcileTimer: ReturnType<typeof setInterval> | null;
+  validWalletReconcileInFlight: boolean;
 }
 
 function readHeliusTxFeeLamports(tx: HeliusTransaction): number | null {
@@ -1758,6 +1760,10 @@ export class InsiderBot extends EventEmitter {
     if (!state?.active) return;
 
     this.clearFollowTokenLargeInsiderWindowTimer();
+    if (state.validWalletReconcileTimer) {
+      clearInterval(state.validWalletReconcileTimer);
+      state.validWalletReconcileTimer = null;
+    }
 
     const scrapeWallets = new Set([
       ...state.scrapeEnhancedWatchIds.keys(),
@@ -1921,6 +1927,8 @@ export class InsiderBot extends EventEmitter {
       scrapeSolBalanceSubIds: new Map<string, number>(),
       seenFeePayerOutSignatures: new Set<string>(),
       firstBuyBelowMinUsdWallets: new Map(),
+      validWalletReconcileTimer: null,
+      validWalletReconcileInFlight: false,
     };
 
     watchState.discoveryStopped = false;
@@ -2395,6 +2403,50 @@ export class InsiderBot extends EventEmitter {
         "processed",
       );
       li.scrapeSolBalanceSubIds.set(wallet, balanceSubId);
+    }
+    this.log.info("Subscribed valid wallet for 25% sell monitoring", {
+      mint: li.mint,
+      wallet,
+      enhancedWatchId: li.scrapeEnhancedWatchIds.get(wallet) ?? null,
+      solBalanceSubscriptionId: li.scrapeSolBalanceSubIds.get(wallet) ?? null,
+    });
+  }
+
+  private startValidWalletReconciliation(): void {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active || li.validWalletReconcileTimer) return;
+    li.validWalletReconcileTimer = setInterval(() => {
+      void this.reconcileValidWalletSellActivity();
+    }, 5_000);
+    void this.reconcileValidWalletSellActivity();
+  }
+
+  private async reconcileValidWalletSellActivity(): Promise<void> {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active || li.validWalletReconcileInFlight) return;
+    li.validWalletReconcileInFlight = true;
+    try {
+      for (const wallet of li.validWallets) {
+        const watch = li.scrapeWatches.get(wallet);
+        if (!watch) {
+          this.subscribeFollowTokenLargeInsiderScrapeWallet(wallet);
+          continue;
+        }
+        const txs = await this.withHeliusFallback((client) =>
+          client.getAddressTransactionsDesc(wallet, 50),
+        );
+        for (const tx of [...txs].reverse()) {
+          if (watch.observedTxSignatures.has(tx.signature)) continue;
+          await this.applyFollowTokenLargeInsiderScrapeNotificationTx(wallet, tx);
+        }
+      }
+    } catch (err) {
+      this.log.warn("Valid wallet sell reconciliation failed", {
+        mint: li.mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      li.validWalletReconcileInFlight = false;
     }
   }
 
@@ -5140,6 +5192,7 @@ export class InsiderBot extends EventEmitter {
       "follow-insider smallest bundler sell gate passed",
     );
     this.startPreLiFirstBuyObserver(state.mint);
+    this.startValidWalletReconciliation();
     return true;
   }
 
