@@ -4507,7 +4507,7 @@ export class InsiderBot extends EventEmitter {
     followInsiderMode: boolean,
     fromNewTokenStream = false,
   ): Promise<boolean> {
-    const delaysMs = [0, 4_000, 8_000, 12_000, 16_000, 20_000];
+    const delaysMs = [0, 4_000, 8_000];
     for (let attempt = 0; attempt < delaysMs.length; attempt += 1) {
       const delayMs = delaysMs[attempt] ?? 0;
       if (delayMs > 0) {
@@ -4525,7 +4525,8 @@ export class InsiderBot extends EventEmitter {
         const retryable =
           message.includes("No SWAP transactions found") ||
           message.includes("Failed to fetch early insider swaps") ||
-          message.includes("fewer than four first unique bundler buys");
+          message.includes("fewer than four first unique bundler buys") ||
+          message.includes("fewer than five early swap transactions");
         if (!retryable || attempt === delaysMs.length - 1) {
           throw err;
         }
@@ -4566,9 +4567,19 @@ export class InsiderBot extends EventEmitter {
     this.highestObservedMarketCapUsd = null;
     this.clearBundlerAccumulation();
 
+    const requiredSwapCount = followInsiderMode ? 5 : 4;
     const swaps = await this.withHeliusFallback((client) =>
-      client.getEarlyInsiderSwaps(mint, 4),
+      client.getEarlyInsiderSwaps(mint, requiredSwapCount),
     );
+    if (followInsiderMode && swaps.length < 5) {
+      if (fromNewTokenStream) {
+        throw new Error(
+          `Waiting for Helius indexing: fewer than five early swap transactions (${swaps.length}/5)`,
+        );
+      }
+      await this.resetForNewToken(true);
+      return false;
+    }
     const earlyInsiderBuys = this.extractFirstUniqueEarlyBundlerBuys(
       swaps,
       mint,
@@ -4615,25 +4626,43 @@ export class InsiderBot extends EventEmitter {
       await this.resetForNewToken(true, { reason: "follow_insider_new_token_early_buy_validation_failed" });
       return false;
     }
+    if (followInsiderMode) {
+      const fifthSwap = swaps[4];
+      const fifthBuy = fifthSwap
+        ? (fifthSwap.tokenTransfers ?? []).find(
+            (transfer) =>
+              transfer.mint === mint &&
+              transfer.toUserAccount !== UNKNOWN_COUNTERPARTY &&
+              transfer.tokenAmount > 0,
+          )
+        : undefined;
+      const fifthBuySol = fifthBuy
+        ? this.estimateEarlyBuySol(fifthSwap!, fifthBuy.toUserAccount)
+        : null;
+      if (
+        !fifthSwap ||
+        fifthSwap.type !== "SWAP" ||
+        !fifthBuy ||
+        fifthBuySol === null ||
+        fifthBuySol >= 1
+      ) {
+        this.log.warn("Follow-insider validation failed — fifth swap must be a buy under 1 SOL", {
+          mint,
+          fifthSwapSignature: fifthSwap?.signature ?? null,
+          fifthSwapType: fifthSwap?.type ?? null,
+          fifthBuySol,
+        });
+        await this.resetForNewToken(true, {
+          reason: "follow_insider_fifth_swap_buy_gate_failed",
+        });
+        return false;
+      }
+    }
 
     if (
       await this.trySkipLowFundingDisabledFromEarlyBuys(mint, earlyInsiderBuys)
     ) {
       return false;
-    }
-
-    if (followInsiderMode) {
-      const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint, true);
-      if (!locked) {
-        this.log.warn("Follow-insider flow rejected before monitoring — shared feePayer lock failed", {
-          mint,
-          earlyBundlerWallets,
-        });
-        await this.resetForNewToken(true, {
-          reason: "follow_insider_fee_payer_lock_failed",
-        });
-        return false;
-      }
     }
 
     this.preBuyStopped = false;
@@ -4761,27 +4790,6 @@ export class InsiderBot extends EventEmitter {
     if (!watchState) return;
 
     if (followInsiderMode) {
-      const locked = await this.ensureFollowTokenLargeInsiderFeePayerLocked(mint, true);
-      if (!locked) {
-        this.log.warn("Follow-insider mode skipped — shared feePayer lock failed", {
-          mint,
-          firstFourWallets: firstFour.map((buy) => buy.wallet),
-        });
-        void this.sendTelegramSafe(
-          [
-            `<b>⚠️ ${this.label} Follow-Insider Flow Failed To Start</b>`,
-            `Token: <code>${mint}</code>`,
-            "Reason: shared feePayer lock failed.",
-            "Required: at least 3 of the 4 first bundlers funded by the same feePayer.",
-            ...firstFour.map((buy, index) => `${index + 1}. <code>${buy.wallet}</code>`),
-          ].join("\n"),
-          "follow-insider feePayer lock failed",
-        );
-        await this.resetForNewToken(true, {
-          reason: "follow_insider_fee_payer_lock_failed",
-        });
-        return;
-      }
       if (fromNewTokenStream) {
         this.log.info("Follow-insider NewToken flow accepted — skipping permanent wallet add", { mint });
       } else {
