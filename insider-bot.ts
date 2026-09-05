@@ -163,6 +163,7 @@ interface FollowTokenEarlyBundlerExitWatch {
   sellTxCount: number;
   cumulativeSellUsd: number;
   maxSingleSellTokenAmount: number;
+  firstSellTimestamp: number | null;
   lastSellFeeLamports: number | null;
   lastSellTimestamp: number | null;
   balanceState: FollowTokenEarlyBundlerExitBalanceState;
@@ -5119,6 +5120,12 @@ export class InsiderBot extends EventEmitter {
       chainsByRoot.set(watch.rootWallet, rootChain);
     }
     const chain = chainsByRoot.get(smallestRoot.wallet) ?? [];
+    const smallestRootFirstSellTimestamp = Math.min(
+      ...chain
+        .filter((watch) => watch.firstSellTimestamp !== null)
+        .map((watch) => watch.firstSellTimestamp as number),
+      Number.POSITIVE_INFINITY,
+    );
     const nonSmallestRootSellCounts = roots
       .filter((root) => root.wallet !== smallestRoot.wallet)
       .map((root) => {
@@ -5127,13 +5134,24 @@ export class InsiderBot extends EventEmitter {
           (sum, watch) => sum + watch.sellTxCount,
           0,
         );
+        const firstSellTimestamp = Math.min(
+          ...rootChain
+            .filter((watch) => watch.firstSellTimestamp !== null)
+            .map((watch) => watch.firstSellTimestamp as number),
+          Number.POSITIVE_INFINITY,
+        );
         const latestSellTimestamp = Math.max(
           ...rootChain
             .filter((watch) => watch.sellTxCount > 0)
             .map((watch) => watch.lastSellTimestamp ?? 0),
           0,
         );
-        return { rootWallet: root.wallet, sellTxCount, latestSellTimestamp };
+        return {
+          rootWallet: root.wallet,
+          sellTxCount,
+          firstSellTimestamp,
+          latestSellTimestamp,
+        };
       });
     const allNonSmallestRootsSold = nonSmallestRootSellCounts.every(
       ({ sellTxCount }) => sellTxCount > 0,
@@ -5143,12 +5161,17 @@ export class InsiderBot extends EventEmitter {
           (a, b) => b.latestSellTimestamp - a.latestSellTimestamp,
         )[0] ?? null
       : null;
+    const nonSmallestRootSoldAfterSmallestRoot = nonSmallestRootSellCounts.some(
+      ({ firstSellTimestamp }) =>
+        firstSellTimestamp > smallestRootFirstSellTimestamp,
+    );
     const sellTxCount = chain.reduce((sum, watch) => sum + watch.sellTxCount, 0);
     const soldAmount = chain.reduce((sum, watch) => sum + watch.soldAmount, 0);
     const remainingAmount = Math.max(0, smallestRoot.boughtAmount - soldAmount);
     if (
       sellTxCount < 1 ||
       !latestNonSmallestRoot ||
+      !nonSmallestRootSoldAfterSmallestRoot ||
       latestNonSmallestRoot.sellTxCount < 2 ||
       remainingAmount >= 60_000_000
     ) {
@@ -8759,6 +8782,9 @@ export class InsiderBot extends EventEmitter {
 
       watch.sellTxCount += 1;
       watch.soldAmount += amount;
+      if (watch.firstSellTimestamp === null) {
+        watch.firstSellTimestamp = tx.timestamp;
+      }
       watch.lastSellFeeLamports = tx.fee ?? null;
       watch.lastSellTimestamp = tx.timestamp;
       if (amount > watch.maxSingleSellTokenAmount) {
@@ -8969,6 +8995,7 @@ export class InsiderBot extends EventEmitter {
       sellTxCount: 0,
       cumulativeSellUsd: 0,
       maxSingleSellTokenAmount: 0,
+      firstSellTimestamp: null,
       lastSellFeeLamports: null,
       lastSellTimestamp: null,
       soldAll: false,
@@ -9669,6 +9696,7 @@ export class InsiderBot extends EventEmitter {
         sellTxCount: 0,
         cumulativeSellUsd: 0,
       maxSingleSellTokenAmount: 0,
+      firstSellTimestamp: null,
       lastSellFeeLamports: null,
       lastSellTimestamp: null,
         soldAll: false,
