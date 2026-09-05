@@ -3800,16 +3800,27 @@ export class InsiderBot extends EventEmitter {
     } catch (err) {
       void this.heliusClient.handlePossibleRateLimitError(err);
       this.releaseMint?.(mint);
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      const waitingForIndexing = errorMessage.includes(
+        "fewer than four first unique bundler buys",
+      );
       if (err instanceof InsiderMinBuySolFilterError) {
         this.log.info("Follow-token flow skipped by min-buy SOL filter; resetting", {
           mint,
           reason: err.message,
         });
+      } else if (waitingForIndexing) {
+        this.log.info("Follow-token flow reset after Helius indexing retries; waiting for next token", {
+          mint,
+          reason: errorMessage,
+        });
       } else {
         this.log.error("Failed to start follow-token flow; resetting", err);
         this.emit("error", err instanceof Error ? err : new Error(String(err)));
       }
-      await this.resetForNewToken(true);
+      await this.resetForNewToken(true, {
+        skipTelegram: waitingForIndexing,
+      });
       return false;
     }
   }
@@ -5101,23 +5112,58 @@ export class InsiderBot extends EventEmitter {
     );
     if (!smallestRoot) return false;
 
-    const chain = [...state.watches.values()].filter(
-      (watch) => watch.rootWallet === smallestRoot.wallet,
+    const chainsByRoot = new Map<string, FollowTokenEarlyBundlerExitWatch[]>();
+    for (const watch of state.watches.values()) {
+      const rootChain = chainsByRoot.get(watch.rootWallet) ?? [];
+      rootChain.push(watch);
+      chainsByRoot.set(watch.rootWallet, rootChain);
+    }
+    const chain = chainsByRoot.get(smallestRoot.wallet) ?? [];
+    const nonSmallestRootSellCounts = roots
+      .filter((root) => root.wallet !== smallestRoot.wallet)
+      .map((root) => {
+        const rootChain = chainsByRoot.get(root.wallet) ?? [];
+        const sellTxCount = rootChain.reduce(
+          (sum, watch) => sum + watch.sellTxCount,
+          0,
+        );
+        const latestSellTimestamp = Math.max(
+          ...rootChain
+            .filter((watch) => watch.sellTxCount > 0)
+            .map((watch) => watch.lastSellTimestamp ?? 0),
+          0,
+        );
+        return { rootWallet: root.wallet, sellTxCount, latestSellTimestamp };
+      });
+    const allNonSmallestRootsSold = nonSmallestRootSellCounts.every(
+      ({ sellTxCount }) => sellTxCount > 0,
     );
+    const latestNonSmallestRoot = allNonSmallestRootsSold
+      ? nonSmallestRootSellCounts.sort(
+          (a, b) => b.latestSellTimestamp - a.latestSellTimestamp,
+        )[0] ?? null
+      : null;
     const sellTxCount = chain.reduce((sum, watch) => sum + watch.sellTxCount, 0);
     const soldAmount = chain.reduce((sum, watch) => sum + watch.soldAmount, 0);
     const remainingAmount = Math.max(0, smallestRoot.boughtAmount - soldAmount);
-    if (sellTxCount < 1 || remainingAmount >= 60_000_000) return false;
+    if (
+      sellTxCount < 1 ||
+      !latestNonSmallestRoot ||
+      latestNonSmallestRoot.sellTxCount < 2 ||
+      remainingAmount >= 60_000_000
+    ) {
+      return false;
+    }
     if (
       state.fromNewTokenStream &&
-      (smallestRoot.boughtAmount <= 60_000_000 || remainingAmount <= 0)
+      (smallestRoot.boughtAmount <= 50_000_000 || remainingAmount <= 0)
     ) {
       this.log.info("Follow-insider NewToken rejected — smallest-root sell gate amount criteria failed", {
         mint: state.mint,
         rootWallet: smallestRoot.wallet,
         boughtAmount: smallestRoot.boughtAmount,
         remainingAmount,
-        minimumBoughtAmount: 60_000_000,
+        minimumBoughtAmount: 50_000_000,
         remainingMustBeGreaterThan: 0,
       });
       void this.resetForNewToken(true, {
@@ -5127,11 +5173,7 @@ export class InsiderBot extends EventEmitter {
     }
 
     const lastChainSell = chain
-      .filter(
-        (watch) =>
-          watch.lastSellFeeLamports !== null &&
-          watch.lastSellTimestamp !== null,
-      )
+      .filter((watch) => watch.lastSellTimestamp !== null)
       .sort(
         (a, b) => (b.lastSellTimestamp ?? 0) - (a.lastSellTimestamp ?? 0),
       )[0];
@@ -5171,9 +5213,10 @@ export class InsiderBot extends EventEmitter {
       rootWallet: smallestRoot.wallet,
       boughtAmount: smallestRoot.boughtAmount,
       soldAmount,
-      remainingAmount,
-      sellTxCount,
-      maxRemainingAmount: 60_000_000,
+        remainingAmount,
+        sellTxCount,
+        latestNonSmallestRoot,
+        maxRemainingAmount: 60_000_000,
     });
     void this.sendTelegramSafe(
       [
@@ -5184,6 +5227,7 @@ export class InsiderBot extends EventEmitter {
         `Sold across root/recipient chain: <b>${soldAmount.toLocaleString()}</b>`,
         `Remaining: <b>${remainingAmount.toLocaleString()}</b> tokens (under 60M)`,
         `Sell transactions: <b>${sellTxCount}</b>`,
+        `Latest non-smallest early-bundler chain: <b>${latestNonSmallestRoot.sellTxCount}</b> sells`,
         "The smallest-root chain has met the sell requirement. Its watches were unsubscribed.",
         "Starting the logs-only $110–$300 first-buy observer; buy remains disabled until two qualifying wallets are observed.",
       ].join("\n"),
