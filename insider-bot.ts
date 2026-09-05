@@ -3716,9 +3716,7 @@ export class InsiderBot extends EventEmitter {
           mint,
           error: errorMessage,
         });
-        await this.resetForNewToken(true, {
-          reason: "follow_insider_new_token_early_buy_validation_failed",
-        });
+      await this.resetForNewToken(true, { skipTelegram: true });
         return false;
       }
       if (err instanceof InsiderMinBuySolFilterError) {
@@ -3730,7 +3728,7 @@ export class InsiderBot extends EventEmitter {
         this.log.error("Failed to start insider flow; resetting", err);
         this.emit("error", err instanceof Error ? err : new Error(String(err)));
       }
-      await this.resetForNewToken(true);
+      await this.resetForNewToken(true, { skipTelegram: true });
       return false;
     }
   }
@@ -4650,7 +4648,7 @@ export class InsiderBot extends EventEmitter {
           signature: buy.signature,
         })),
       });
-      await this.resetForNewToken(true, { reason: "follow_insider_new_token_early_buy_validation_failed" });
+      await this.resetForNewToken(true, { skipTelegram: true });
       return false;
     }
     if (
@@ -10981,6 +10979,13 @@ export class InsiderBot extends EventEmitter {
             : "dev-zero-balance",
       );
     } else {
+      if (signal.kind === "zero_balance") {
+        this.log.info("Dev wallet native SOL reached zero before buy; continuing flow without reset", {
+          mint,
+          devWallet: this.devWallet,
+        });
+        return;
+      }
       void this.sendTelegramSafe(
         (
           signal.kind === "close_account"
@@ -10992,15 +10997,7 @@ export class InsiderBot extends EventEmitter {
                 "Dev wallet closed its WSOL token account before we bought — treated as a full exit/rug signal.",
                 "Flow reset — waiting for the next token.",
               ]
-            : signal.kind === "zero_balance"
-              ? [
-                  "<b>🧹 Dev Zero-Balance Reset — Token Skipped</b>",
-                  `Token: <code>${mint}</code>`,
-                  `Dev wallet: <code>${this.devWallet}</code>`,
-                  "Dev wallet native SOL reached zero before we bought — treated as a full exit/rug signal.",
-                  "Flow reset — waiting for the next token.",
-                ]
-              : [
+            : [
                   "<b>🧹 MC Rug Reset — Token Skipped</b>",
                   `Token: <code>${mint}</code>`,
                   `Current MC: <b>$${signal.currentMc.toLocaleString()}</b>`,
@@ -11011,11 +11008,13 @@ export class InsiderBot extends EventEmitter {
         ).join("\n"),
         signal.kind === "close_account"
           ? "dev full-exit reset notification"
-          : signal.kind === "mc_floor"
-            ? "MC rug reset notification"
-            : "dev zero-balance reset notification",
+          : "MC rug reset notification",
       );
-      await this.resetForNewToken(true);
+      await this.resetForNewToken(true, {
+        reason: signal.kind === "close_account"
+          ? "dev_close_account_before_buy"
+          : "mc_rug_reset_before_buy",
+      });
     }
   }
 
