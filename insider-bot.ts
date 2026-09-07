@@ -100,6 +100,7 @@ const FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT = 4;
 const FOLLOW_TOKEN_LARGE_INSIDER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW = 20;
 const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION = 0.25;
 const FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT = 80;
+const NEW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT = 40;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
 /** Scrape wallets (tier1 or chain) with first buy above this SOL are not valid Large Insider buyers. */
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLET_FIRST_BUY_SOL = 10;
@@ -3417,7 +3418,9 @@ export class InsiderBot extends EventEmitter {
       this.disableProfitExitAfterBuy = false;
       this.profitExitDisabled = false;
       const profitExitPercent =
-        options.profitExitPercent ?? FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT;
+        ebState?.fromNewTokenStream
+          ? NEW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT
+          : (options.profitExitPercent ?? FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT);
       if (
         options.maxSingleSellGateTier === "fallback_16m"
       ) {
@@ -4951,7 +4954,7 @@ export class InsiderBot extends EventEmitter {
         `Initial bundlers: <b>${firstFour.length}</b>`,
         "",
         `Large Insider active — buy on valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all.`,
-        `Exit: +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit.`,
+         `Exit: +${fromNewTokenStream ? NEW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT : FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit.`,
       ].join("\n"),
       "follow-token large insider watch started notification",
     );
