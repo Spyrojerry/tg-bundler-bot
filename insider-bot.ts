@@ -134,6 +134,7 @@ const PRE_LI_FIRST_BUY_OBSERVER_MIN_USD = 110;
 const PRE_LI_FIRST_BUY_OBSERVER_MAX_USD = 300;
 const PRE_LI_FIRST_BUY_OBSERVER_BUY_TRIGGER_WALLETS = 2;
 const PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
+const NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS = 3;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -836,6 +837,18 @@ export class InsiderBot extends EventEmitter {
     null;
   private followTokenEarlyBundlerExitState: FollowTokenEarlyBundlerExitState | null =
     null;
+  private newTokenBuyClusterWatchId: number | null = null;
+  private newTokenBuyClusterMint: string | null = null;
+  private newTokenBuyClusterCount = 0;
+  private newTokenBuyClusterLastCandidate: {
+    wallet: string;
+    signature: string;
+    timestamp: number;
+    feeLamports: number;
+    buyUsd: number;
+    tx: HeliusTransaction;
+  } | null = null;
+  private newTokenBuyClusterSeenSignatures = new Set<string>();
   private followTokenLargeInsiderWindowTimer: ReturnType<typeof setTimeout> | null =
     null;
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
@@ -4761,6 +4774,9 @@ export class InsiderBot extends EventEmitter {
       fromNewTokenStream,
     );
     if (this.isFollowTokenFlowActive(mint)) {
+      if (fromNewTokenStream) {
+        this.startNewTokenBuyClusterLogger(mint);
+      }
       void this.sendTelegramSafe(
         [
           `<b>🔍 ${this.label} Follow-Token Large Insider Flow Started</b>`,
@@ -5171,6 +5187,125 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  private startNewTokenBuyClusterLogger(mint: string): void {
+    if (!this.enhancedWs || this.newTokenBuyClusterWatchId !== null) return;
+    this.newTokenBuyClusterMint = mint;
+    this.newTokenBuyClusterCount = 0;
+    this.newTokenBuyClusterLastCandidate = null;
+    this.newTokenBuyClusterSeenSignatures.clear();
+    this.newTokenBuyClusterWatchId = this.enhancedWs.watch(mint, (tx) => {
+      void this.observeNewTokenBuyCluster(mint, tx);
+    });
+    this.log.info("Started NewToken logs-only buy-cluster logger", {
+      mint,
+      minUsd: PRE_LI_FIRST_BUY_OBSERVER_MIN_USD,
+      maxUsd: PRE_LI_FIRST_BUY_OBSERVER_MAX_USD,
+      closeToleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
+      maxClusters: NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS,
+    });
+  }
+
+  private async observeNewTokenBuyCluster(
+    mint: string,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    if (
+      this.newTokenBuyClusterMint !== mint ||
+      this.newTokenBuyClusterCount >= NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS ||
+      this.newTokenBuyClusterSeenSignatures.has(tx.signature)
+    ) {
+      return;
+    }
+    this.newTokenBuyClusterSeenSignatures.add(tx.signature);
+    const feeLamports = tx.fee;
+    if (feeLamports === undefined) return;
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    if (solPriceUsd === null) return;
+    const recipients = new Set(
+      (tx.tokenTransfers ?? [])
+        .filter((transfer) => transfer.mint === mint && transfer.tokenAmount > 0)
+        .map((transfer) => transfer.toUserAccount)
+        .filter(Boolean),
+    );
+    for (const wallet of recipients) {
+      if (this.classifyTx(tx, wallet, mint) !== "buy") continue;
+      const buySol = this.estimateEarlyBuySol(tx, wallet);
+      if (buySol === null) continue;
+      const buyUsd = buySol * solPriceUsd;
+      if (
+        buyUsd < PRE_LI_FIRST_BUY_OBSERVER_MIN_USD ||
+        buyUsd > PRE_LI_FIRST_BUY_OBSERVER_MAX_USD
+      ) {
+        continue;
+      }
+      const candidate = {
+        wallet,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+        feeLamports,
+        buyUsd,
+        tx,
+      };
+      const previous = this.newTokenBuyClusterLastCandidate;
+      if (previous && previous.wallet !== wallet) {
+        const feeDifferenceUsd =
+          (Math.abs(previous.feeLamports - feeLamports) * solPriceUsd) /
+          1_000_000_000;
+        if (
+          candidate.timestamp > previous.timestamp &&
+          feeDifferenceUsd <= PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD
+        ) {
+          this.newTokenBuyClusterCount += 1;
+          this.log.info("NewToken buy cluster found", {
+            mint,
+            clusterNumber: this.newTokenBuyClusterCount,
+            wallets: [previous.wallet, wallet],
+            signatures: [previous.signature, candidate.signature],
+            buyUsd: [previous.buyUsd, candidate.buyUsd],
+            feeLamports: [previous.feeLamports, candidate.feeLamports],
+            feeDifferenceUsd,
+            closeToleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
+          });
+          void this.sendTelegramSafe(
+            [
+              `<b>👀 ${this.label} NewToken Buy Cluster #${this.newTokenBuyClusterCount}</b>`,
+              `Token: <code>${mint}</code>`,
+              `Wallet 1: <code>${previous.wallet}</code> · $${previous.buyUsd.toFixed(2)}`,
+              `Wallet 2: <code>${wallet}</code> · $${buyUsd.toFixed(2)}`,
+              `Fee difference: <b>$${feeDifferenceUsd.toFixed(5)}</b> (within $${PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD.toFixed(3)})`,
+              `Buy txs: <code>${previous.signature}</code> → <code>${candidate.signature}</code>`,
+              "Logs-only cluster detection; no buy or sell action was triggered.",
+            ].join("\n"),
+            "new-token buy cluster found",
+          );
+          if (this.newTokenBuyClusterCount >= NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS) {
+            await this.stopNewTokenBuyClusterLogger("three clusters found");
+            return;
+          }
+        }
+      }
+      this.newTokenBuyClusterLastCandidate = candidate;
+    }
+  }
+
+  private async stopNewTokenBuyClusterLogger(reason: string): Promise<void> {
+    if (this.newTokenBuyClusterWatchId !== null) {
+      const watchId = this.newTokenBuyClusterWatchId;
+      this.newTokenBuyClusterWatchId = null;
+      await this.enhancedWs?.unwatch(watchId).catch(() => undefined);
+    }
+    if (this.newTokenBuyClusterMint !== null) {
+      this.log.info("Stopped NewToken logs-only buy-cluster logger", {
+        mint: this.newTokenBuyClusterMint,
+        clustersFound: this.newTokenBuyClusterCount,
+        reason,
+      });
+    }
+    this.newTokenBuyClusterMint = null;
+    this.newTokenBuyClusterLastCandidate = null;
+    this.newTokenBuyClusterSeenSignatures.clear();
+  }
+
   private tryCompleteFollowInsiderSmallestBundlerSellGate(): boolean {
     const state = this.followTokenEarlyBundlerExitState;
     if (
@@ -5214,14 +5349,13 @@ export class InsiderBot extends EventEmitter {
     if (
       sellTxCount < 1 ||
       !allNonSmallestRootsSold ||
-      remainingAmount >= 10_000_000
+      remainingAmount >= 60_000_000
     ) {
       return false;
     }
     if (
       state.fromNewTokenStream &&
-      (smallestRoot.boughtAmount <= 50_000_000 ||
-        (sellTxCount === 1 && remainingAmount <= 0))
+      (smallestRoot.boughtAmount <= 50_000_000 || remainingAmount <= 0)
     ) {
       this.log.info("Follow-insider NewToken rejected — smallest-root sell gate amount criteria failed", {
         mint: state.mint,
@@ -5229,7 +5363,7 @@ export class InsiderBot extends EventEmitter {
         boughtAmount: smallestRoot.boughtAmount,
         remainingAmount,
         minimumBoughtAmount: 50_000_000,
-        remainingMustBeGreaterThan: sellTxCount === 1 ? 0 : null,
+        remainingMustBeGreaterThan: 0,
       });
       void this.resetForNewToken(true, {
         reason: "follow_insider_new_token_smallest_root_gate_failed",
@@ -5280,7 +5414,7 @@ export class InsiderBot extends EventEmitter {
       soldAmount,
       remainingAmount,
       sellTxCount,
-      maxRemainingAmount: 10_000_000,
+      maxRemainingAmount: 60_000_000,
     });
     void this.sendTelegramSafe(
       [
@@ -5289,7 +5423,7 @@ export class InsiderBot extends EventEmitter {
         `Root wallet: <code>${smallestRoot.wallet}</code>`,
         `Bought amount: <b>${smallestRoot.boughtAmount.toLocaleString()}</b>`,
         `Sold across root/recipient chain: <b>${soldAmount.toLocaleString()}</b>`,
-        `Remaining: <b>${remainingAmount.toLocaleString()}</b> tokens (under 10M)`,
+        `Remaining: <b>${remainingAmount.toLocaleString()}</b> tokens (under 60M)`,
         "The smallest-root chain has met the sell requirement. Its watches were unsubscribed.",
         "Starting the logs-only $110–$300 first-buy observer; buy remains disabled until two qualifying wallets are observed.",
       ].join("\n"),
@@ -15225,6 +15359,7 @@ export class InsiderBot extends EventEmitter {
       });
       return;
     }
+    await this.stopNewTokenBuyClusterLogger("token flow reset");
     const endedMint = this.watchingMint ?? this.activePosition?.mint ?? null;
     const endedFeePayer =
       this.funderFirstFeePayer ?? this.bundlerFunderWatch?.funderWallet ?? null;
