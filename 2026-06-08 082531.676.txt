@@ -2085,3 +2085,4 @@ info*
 [2026-06-30T10:18:22Z] [INFO ] [MAIN] [INSIDER 1 MC CHECK] Token: 9wAK5SgX1pQrEZnZvEK2mHSdRE88dhwUujZV2G99pump MC: $44,882.809 (Source: PumpSwap vault reserves)
 2026-06-30 11:18:20.718	
 [2026-06-30T10:18:20Z] [IhiNFO ] [MAIN] [INSIDER 1 MC CHECK] Token: 9wAK5SgX1pQrEZnZvEK2mHSdRE88dhwUujZV2G99pump MC: $46,264.206 (Source: PumpSwap vault reserves)
+hi
