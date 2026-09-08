@@ -286,6 +286,8 @@ interface FollowTokenLargeInsiderState {
   >;
   validWalletReconcileTimer: ReturnType<typeof setInterval> | null;
   validWalletReconcileInFlight: boolean;
+  /** Unix seconds when the bot buy completed; historical sells before this are not exit signals. */
+  observerSellMonitoringStartedAt: number | null;
 }
 
 function readHeliusTxFeeLamports(tx: HeliusTransaction): number | null {
@@ -1943,6 +1945,7 @@ export class InsiderBot extends EventEmitter {
       firstBuyBelowMinUsdWallets: new Map(),
       validWalletReconcileTimer: null,
       validWalletReconcileInFlight: false,
+      observerSellMonitoringStartedAt: null,
     };
 
     watchState.discoveryStopped = false;
@@ -2699,6 +2702,26 @@ export class InsiderBot extends EventEmitter {
     if (!this.isRelevantMintTx(tx, funderState.mint)) return;
     const action = this.classifyTx(tx, wallet, funderState.mint);
     if (action !== "buy" && action !== "sell") return;
+
+    const earlyExitState = this.followTokenEarlyBundlerExitState;
+    const observerSellMonitoringStartedAt = li.observerSellMonitoringStartedAt;
+    if (
+      action === "sell" &&
+      earlyExitState?.fromNewTokenStream &&
+      earlyExitState.smallestBundlerSellGateCompleted &&
+      (observerSellMonitoringStartedAt === null ||
+        observerSellMonitoringStartedAt === undefined ||
+        tx.timestamp < observerSellMonitoringStartedAt)
+    ) {
+      this.log.info("NewToken observer wallet sell ignored — sell predates bot buy", {
+        mint: funderState.mint,
+        wallet,
+        signature: tx.signature,
+        txTimestamp: tx.timestamp,
+        observerSellMonitoringStartedAt,
+      });
+      return;
+    }
 
     if (action === "buy") {
       if (
@@ -3612,6 +3635,27 @@ export class InsiderBot extends EventEmitter {
     const action = this.classifyTx(tx, wallet, mint);
     if (action !== "buy" && action !== "sell") return;
 
+    const earlyExitState = this.followTokenEarlyBundlerExitState;
+    const observerSellMonitoringStartedAt =
+      this.followTokenLargeInsiderState?.observerSellMonitoringStartedAt;
+    if (
+      action === "sell" &&
+      earlyExitState?.fromNewTokenStream &&
+      earlyExitState.smallestBundlerSellGateCompleted &&
+      (observerSellMonitoringStartedAt === null ||
+        observerSellMonitoringStartedAt === undefined ||
+        tx.timestamp < observerSellMonitoringStartedAt)
+    ) {
+      this.log.info("NewToken observer wallet sell ignored — sell predates bot buy", {
+        mint,
+        wallet,
+        signature: tx.signature,
+        txTimestamp: tx.timestamp,
+        observerSellMonitoringStartedAt,
+      });
+      return;
+    }
+
     this.followTokenTopBuyerWatchBackend("Follow-token watched wallet tx observed", {
       mint,
       wallet,
@@ -4481,6 +4525,13 @@ export class InsiderBot extends EventEmitter {
 
   markPositionBought(trigger: InsiderBuyTrigger): void {
     void this.stopPreBuyMonitoring();
+    const earlyExitState = this.followTokenEarlyBundlerExitState;
+    if (earlyExitState?.fromNewTokenStream && earlyExitState.smallestBundlerSellGateCompleted) {
+      const largeInsiderState = this.followTokenLargeInsiderState;
+      if (largeInsiderState) {
+        largeInsiderState.observerSellMonitoringStartedAt = Math.floor(Date.now() / 1000);
+      }
+    }
     this.activePosition = {
       followedWallet: trigger.followedWallet,
       mint: trigger.mint,
