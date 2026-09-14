@@ -1293,7 +1293,16 @@ export class InsiderBot extends EventEmitter {
   }
 
   setBuyDisabled(value: boolean): void {
+    const wasDisabled = this.buyDisabled;
     this.buyDisabled = value;
+    if (value && !wasDisabled && this.watchingMint && !this.buySubmitted && !this.activePosition) {
+      this.log.info("Buy disabled via Telegram — resetting current token flow", {
+        mint: this.watchingMint,
+      });
+      void this.resetForNewToken(false, {
+        reason: "buy_disabled_via_telegram",
+      });
+    }
   }
 
   getFollowedWallet() {
@@ -5574,7 +5583,6 @@ export class InsiderBot extends EventEmitter {
               timestamp: candidate.value.timestamp,
             });
             if (
-              this.buySubmitted &&
               this.followTokenLargeInsiderState?.active &&
               !this.followTokenLargeInsiderState.validWallets.includes(candidate.wallet)
             ) {
@@ -5649,7 +5657,6 @@ export class InsiderBot extends EventEmitter {
       state.preLiFirstBuyObserverPendingWallets.add(wallet);
       state.preLiFirstBuyObserverWallets.set(wallet, observed);
       if (
-        this.buySubmitted &&
         this.followTokenLargeInsiderState?.active &&
         !this.followTokenLargeInsiderState.validWallets.includes(wallet)
       ) {
