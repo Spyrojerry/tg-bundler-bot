@@ -136,6 +136,8 @@ const PRE_LI_FIRST_BUY_OBSERVER_MAX_USD = 300;
 const PRE_LI_FIRST_BUY_OBSERVER_BUY_TRIGGER_WALLETS = 2;
 const PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 const NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS = 3;
+/** Smallest-root chain remaining at/above this amount triggers an immediate buy instead of waiting for observer wallets. */
+const FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING = 40_000_000;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -852,6 +854,13 @@ export class InsiderBot extends EventEmitter {
     tx: HeliusTransaction;
   } | null = null;
   private newTokenBuyClusterSeenSignatures = new Set<string>();
+  /** Cluster wallets (per logs-only NewToken buy cluster) eligible as ≥25% sell triggers when no observer wallet exists. */
+  private newTokenBuyClusterWallets = new Map<
+    string,
+    { tx: HeliusTransaction; signature: string; timestamp: number }
+  >();
+  /** True when the current token was bought via the smallest-root ≥40M immediate trigger. */
+  private smallestRootImmediateBuy = false;
   private followTokenLargeInsiderWindowTimer: ReturnType<typeof setTimeout> | null =
     null;
   private bundlerFunderWatch: BundlerFunderWatchState | null = null;
@@ -4562,6 +4571,10 @@ export class InsiderBot extends EventEmitter {
     void this.syncFunderRecipientBatch(true);
     void this.auditFunderRecipientsAfterBuy();
 
+    if (this.smallestRootImmediateBuy) {
+      this.registerNewTokenBuyClusterWalletsForExitMonitoring();
+    }
+
     void this.executeFollowTokenEarlyBundlerPostBuyExitPlan();
   }
 
@@ -5245,6 +5258,7 @@ export class InsiderBot extends EventEmitter {
     this.newTokenBuyClusterCount = 0;
     this.newTokenBuyClusterLastCandidate = null;
     this.newTokenBuyClusterSeenSignatures.clear();
+    this.newTokenBuyClusterWallets.clear();
     this.newTokenBuyClusterWatchId = this.enhancedWs.watch(mint, (tx) => {
       void this.observeNewTokenBuyCluster(mint, tx);
     });
@@ -5308,6 +5322,15 @@ export class InsiderBot extends EventEmitter {
           feeDifferenceUsd <= PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD
         ) {
           this.newTokenBuyClusterCount += 1;
+          const clusterCandidates = [previous, candidate];
+          for (const clusterCandidate of clusterCandidates) {
+            if (clusterCandidate.wallet === "__pool__") continue;
+            this.newTokenBuyClusterWallets.set(clusterCandidate.wallet, {
+              tx: clusterCandidate.tx,
+              signature: clusterCandidate.signature,
+              timestamp: clusterCandidate.timestamp,
+            });
+          }
           this.log.info("NewToken buy cluster found", {
             mint,
             clusterNumber: this.newTokenBuyClusterCount,
@@ -5356,6 +5379,43 @@ export class InsiderBot extends EventEmitter {
     this.newTokenBuyClusterMint = null;
     this.newTokenBuyClusterLastCandidate = null;
     this.newTokenBuyClusterSeenSignatures.clear();
+    this.newTokenBuyClusterWallets.clear();
+  }
+
+  /**
+   * After an immediate ≥40M smallest-root buy: when no observer wallet has been
+   * found yet, promote the logs-only cluster wallets (excluding "__pool__") into
+   * the ≥25% sell-exit pool so any post-buy ≥25% sell on them can trigger the exit.
+   */
+  private registerNewTokenBuyClusterWalletsForExitMonitoring(): void {
+    const li = this.followTokenLargeInsiderState;
+    if (!li?.active) return;
+    if (li.validWallets.length > 0) {
+      this.log.info(
+        "NewToken cluster wallets not promoted — observer/valid wallet already found",
+        { mint: li.mint, validWalletCount: li.validWallets.length },
+      );
+      return;
+    }
+    let promoted = 0;
+    for (const [wallet, buy] of this.newTokenBuyClusterWallets) {
+      if (wallet === "__pool__") continue;
+      if (li.validWallets.length >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS) break;
+      if (li.validWallets.includes(wallet)) continue;
+      li.validWallets.push(wallet);
+      this.registerFollowTokenLargeInsiderValidWalletForExitMonitoring(wallet, {
+        tx: buy.tx,
+        signature: buy.signature,
+        timestamp: buy.timestamp,
+      });
+      promoted += 1;
+    }
+    this.log.info("NewToken cluster wallets promoted to ≥25% exit pool", {
+      mint: li.mint,
+      clusterWalletCount: this.newTokenBuyClusterWallets.size,
+      promoted,
+      exitPoolSize: li.validWallets.length,
+    });
   }
 
   private tryCompleteFollowInsiderSmallestBundlerSellGate(): boolean {
@@ -5468,6 +5528,9 @@ export class InsiderBot extends EventEmitter {
       sellTxCount,
       maxRemainingAmount: 60_000_000,
     });
+    const immediateBuyTriggered =
+      state.fromNewTokenStream &&
+      remainingAmount >= FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING;
     void this.sendTelegramSafe(
       [
         `<b>✅ ${this.label} Smallest Early Bundler Sell Gate Passed</b>`,
@@ -5477,12 +5540,35 @@ export class InsiderBot extends EventEmitter {
         `Sold across root/recipient chain: <b>${soldAmount.toLocaleString()}</b>`,
         `Remaining: <b>${remainingAmount.toLocaleString()}</b> tokens (under 60M)`,
         "The smallest-root chain has met the sell requirement. Its watches were unsubscribed.",
-        "Starting the logs-only $110–$300 first-buy observer; buy remains disabled until two qualifying wallets are observed.",
+        immediateBuyTriggered
+          ? `Remaining ≥ <b>${FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING.toLocaleString()}</b> tokens — buying immediately instead of waiting for observer wallets. The $110–$300 observer still runs and can trigger the ≥25% exit.`
+          : "Starting the logs-only $110–$300 first-buy observer; buy remains disabled until two qualifying wallets are observed.",
       ].join("\n"),
       "follow-insider smallest bundler sell gate passed",
     );
     this.startPreLiFirstBuyObserver(state.mint);
     this.startValidWalletReconciliation();
+    if (immediateBuyTriggered && !this.buySubmitted) {
+      const funderState = this.bundlerFunderWatch;
+      const immediateSignature = `SMALLEST_ROOT_40M:${state.mint}`;
+      if (funderState) {
+        this.smallestRootImmediateBuy = true;
+        void this.emitFollowTokenLargeInsiderBuy(
+          funderState,
+          smallestRoot.wallet,
+          immediateSignature,
+          {
+            signature: immediateSignature,
+            timestamp: Math.floor(Date.now() / 1000),
+            type: "SWAP",
+          } as HeliusTransaction,
+          {
+            triggerSource: "smallest_bundler_sell_gate",
+            buySolOverride: this.getBuySolForFundingMode(false),
+          },
+        );
+      }
+    }
     return true;
   }
 
@@ -15402,6 +15488,34 @@ export class InsiderBot extends EventEmitter {
     clearPosition: boolean,
     options?: { reason?: string; skipTelegram?: boolean },
   ): Promise<void> {
+    // Sell-first on any reset: a reset that would tear down a held position
+    // must trigger the exit sell before the flow is cleared, otherwise the
+    // position is abandoned without selling. The sell executor calls back into
+    // resetForNewToken once the sell completes.
+    if (
+      this.activePosition &&
+      !this.positionSellTriggered &&
+      this.phase === "holding"
+    ) {
+      const sellReason = options?.reason ?? "flow_reset";
+      this.log.warn("Reset requested while holding — selling position before reset", {
+        mint: this.activePosition.mint,
+        reason: sellReason,
+      });
+      await this.triggerPositionSell(
+        this.activePosition.mint,
+        `Reset (${sellReason}) while holding — selling 100% before reset`,
+        [
+          `<b>🚨 ${this.label} Reset While Holding — Selling 100%</b>`,
+          `Token: <code>${this.activePosition.mint}</code>`,
+          `Reason: <code>${sellReason}</code>`,
+          "",
+          "A reset/exit trigger fired while a position was held — dumping the position first.",
+        ],
+        options?.reason ?? "reset_while_holding",
+      );
+      return;
+    }
     if (this.buySubmitted && !this.positionSellTriggered) {
       this.log.warn("Ignoring token reset while buy is pending or position is held", {
         mint: this.watchingMint ?? this.activePosition?.mint ?? null,
@@ -15497,6 +15611,8 @@ export class InsiderBot extends EventEmitter {
     this.bundlerMatchesReady = false;
     this.buySubmitted = false;
     this.isBuyGateEvaluating = false;
+    this.smallestRootImmediateBuy = false;
+    this.newTokenBuyClusterWallets.clear();
     this.profitExitDisabled = false;
     this.disableProfitExitAfterBuy = false;
     this.heliusPoolMetricsMint = null;
