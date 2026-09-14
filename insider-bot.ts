@@ -4945,32 +4945,21 @@ export class InsiderBot extends EventEmitter {
       if (fromNewTokenStream) {
         this.log.info("Follow-insider NewToken flow accepted — skipping permanent wallet add", { mint });
       } else {
-      const earliestWallet = firstFour[0]!.wallet;
-      const trackedWalletIsEarlyBundler = firstFour.some((buy) =>
-        this.isTrackedFollowInsiderWallet(buy.wallet),
-      );
-      if (!trackedWalletIsEarlyBundler) {
-        await this.permanentFollowWalletAdder?.([earliestWallet]);
-      }
-      void this.sendTelegramSafe(
-        [
-          `<b>✅ ${this.label} Follow-Insider Wallet Added</b>`,
-          `Token: <code>${mint}</code>`,
-          "Migration age: <b>400s–800s route</b>",
-          "Shared feePayer lock passed with at least 3 of 4 bundlers.",
-          trackedWalletIsEarlyBundler
-            ? "A tracked Follow-Insider wallet is part of this token's first four early bundlers; no early bundler was added to permanent tracking."
-            : `Earliest first-buy wallet: <code>${earliestWallet}</code>`,
-          trackedWalletIsEarlyBundler
-            ? "The four early bundlers remain token-local observation wallets only."
-            : "Only the earliest of the four first-buy bundlers was added permanently to follow-insider tracking.",
-        ].join("\n"),
-        "follow-insider earliest wallet added",
-      );
-      await this.resetForNewToken(true, {
-        reason: "follow_insider_wallet_group_added",
-      });
-      return;
+        this.log.info("Follow-insider permanent wallet group add paused — bundlers stay token-local", {
+          mint,
+          earliestWallet: firstFour[0]!.wallet,
+        });
+        void this.sendTelegramSafe(
+          [
+            `<b>⏸️ ${this.label} Follow-Insider Wallet Group Add Paused</b>`,
+            `Token: <code>${mint}</code>`,
+            "Migration age: <b>400s–800s route</b>",
+            "Shared feePayer lock passed with at least 3 of 4 bundlers.",
+            "No wallet was added to permanent follow-insider tracking (wallet group adds are paused).",
+            "The four early bundlers remain token-local observation wallets only.",
+          ].join("\n"),
+          "follow-insider wallet group add paused",
+        );
       }
     }
 
@@ -5585,6 +5574,7 @@ export class InsiderBot extends EventEmitter {
               timestamp: candidate.value.timestamp,
             });
             if (
+              this.buySubmitted &&
               this.followTokenLargeInsiderState?.active &&
               !this.followTokenLargeInsiderState.validWallets.includes(candidate.wallet)
             ) {
@@ -5659,6 +5649,7 @@ export class InsiderBot extends EventEmitter {
       state.preLiFirstBuyObserverPendingWallets.add(wallet);
       state.preLiFirstBuyObserverWallets.set(wallet, observed);
       if (
+        this.buySubmitted &&
         this.followTokenLargeInsiderState?.active &&
         !this.followTokenLargeInsiderState.validWallets.includes(wallet)
       ) {
