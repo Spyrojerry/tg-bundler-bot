@@ -65,6 +65,9 @@ const JUPITER_SELL_RETRIES = 5;
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade";
 const PUMPPORTAL_STATUS_CHECKPOINTS_MS = [300, 800, 1_500, 3_000, 5_000];
+/** Retry transient "minimum context slot has not been reached" preflight errors. */
+const PUMPPORTAL_SLOT_RETRY_MAX_ATTEMPTS = 4;
+const PUMPPORTAL_SLOT_RETRY_BASE_DELAY_MS = 400;
 const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const TOKEN_PROGRAM_IDS = [
@@ -1200,6 +1203,58 @@ export class GmgnClient {
       action === "buy"
         ? (options as BuyOptions).solAmount
         : `${Math.min(Math.max((options as SellOptions).percent, 0), 100)}%`;
+
+    let lastError: unknown = null;
+    for (
+      let attempt = 1;
+      attempt <= PUMPPORTAL_SLOT_RETRY_MAX_ATTEMPTS;
+      attempt++
+    ) {
+      try {
+        return await this.submitPumpPortalLightningTradeOnce(
+          action,
+          mint,
+          options,
+          venue,
+          amount,
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (
+          !this.isTransientPumpPortalSlotError(message) ||
+          attempt === PUMPPORTAL_SLOT_RETRY_MAX_ATTEMPTS
+        ) {
+          throw err;
+        }
+        lastError = err;
+        const delayMs =
+          PUMPPORTAL_SLOT_RETRY_BASE_DELAY_MS * attempt;
+        log.warn(
+          `PumpPortal Lightning ${action} hit transient slot lag; retrying`,
+          {
+            mint,
+            attempt,
+            maxAttempts: PUMPPORTAL_SLOT_RETRY_MAX_ATTEMPTS,
+            delayMs,
+            error: message,
+          },
+        );
+        await sleep(delayMs);
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(String(lastError));
+  }
+
+  private async submitPumpPortalLightningTradeOnce(
+    action: PumpPortalTradeAction,
+    mint: string,
+    options: BuyOptions | SellOptions,
+    venue: PumpTradeVenue,
+    amount: string | number,
+  ): Promise<string> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
@@ -1319,6 +1374,15 @@ export class GmgnClient {
     return typeof message === "string"
       ? message.slice(0, 500)
       : JSON.stringify(message).slice(0, 500);
+  }
+
+  /**
+   * True for the transient PumpPortal preflight simulation error where the
+   * simulation ran against a slot behind the transaction blockhash. The pool
+   * state is not stale forever — re-submitting a moment later succeeds.
+   */
+  private isTransientPumpPortalSlotError(message: string): boolean {
+    return /minimum context slot has not been reached/i.test(message);
   }
 
   private pumpPortalResult(

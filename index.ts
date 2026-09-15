@@ -45,8 +45,8 @@ const log = createLogger("MAIN");
 const followWalletLog = createLogger("FOLLOW-WALLET");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
-const MCAP_CHECK_INTERVAL_MS = 1_000;
-const MCAP_FETCH_GRACE_MS = 1_000;
+const MCAP_CHECK_INTERVAL_MS = 500;
+const MCAP_FETCH_GRACE_MS = 500;
 const INSIDER_DAS_NO_PRICE_COOLDOWN_MS = 10_000;
 const isHeliusUsageExhaustionError = (err: unknown): boolean => {
   const message =
