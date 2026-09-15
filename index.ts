@@ -2210,11 +2210,11 @@ async function main(): Promise<void> {
             bot.getEntryMc() > 0
               ? ((currentMc - bot.getEntryMc()) / bot.getEntryMc()) * 100
               : 0;
-          if (pnlPct > 0 && !positiveExitConfirmation) {
+          if (pnlPct > -20 && !positiveExitConfirmation) {
             if (positiveMcExitConfirmations.has(index)) return;
             positiveMcExitConfirmations.add(index);
             log.info(
-              `[INSIDER ${botNumber} MC EXIT CONFIRM] Positive PnL target reached; waiting 1 second for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% (above -20% floor) target reached; waiting 1 second for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
             );
             setTimeout(() => {
               positiveMcExitConfirmations.delete(index);
