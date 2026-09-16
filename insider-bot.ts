@@ -263,6 +263,8 @@ interface FollowTokenLargeInsiderScrapeWatch {
   observedTxSignatures: Set<string>;
   soldAllSignature: string | null;
   lastSolTransferOutTo: string | null;
+  /** Unix seconds when the bot flow first discovered this wallet (observer/cluster). */
+  discoveredAt: number | null;
 }
 
 interface FollowTokenLargeInsiderState {
@@ -2279,6 +2281,7 @@ export class InsiderBot extends EventEmitter {
       observedTxSignatures: new Set<string>(),
       soldAllSignature: null,
       lastSolTransferOutTo: null,
+      discoveredAt: Math.floor(Date.now() / 1000),
     };
     li.scrapeWatches.set(wallet, watch);
     this.subscribeFollowTokenLargeInsiderScrapeWallet(wallet);
@@ -2362,6 +2365,7 @@ export class InsiderBot extends EventEmitter {
       observedTxSignatures: new Set<string>(),
       soldAllSignature: null,
       lastSolTransferOutTo: null,
+      discoveredAt: Math.floor(Date.now() / 1000),
     };
     li.scrapeWatches.set(wallet, watch);
     parent.childWallets.push(wallet);
@@ -2590,6 +2594,7 @@ export class InsiderBot extends EventEmitter {
         observedTxSignatures: new Set<string>([firstBuy.signature]),
         soldAllSignature: null,
         lastSolTransferOutTo: null,
+        discoveredAt: Math.floor(Date.now() / 1000),
       });
     }
 
@@ -2723,19 +2728,26 @@ export class InsiderBot extends EventEmitter {
 
     const earlyExitState = this.followTokenEarlyBundlerExitState;
     const observerSellMonitoringStartedAt = li.observerSellMonitoringStartedAt;
+    // A sell counts toward the ≥25% exit only if it happened after the flow
+    // discovered this specific wallet (observer or cluster) — sells that
+    // predate discovery can never trigger the exit. When the wallet's own
+    // discovery time is unknown, fall back to the bot-buy boundary.
+    const sellCountsFrom =
+      watch.discoveredAt ?? observerSellMonitoringStartedAt;
     if (
       action === "sell" &&
       earlyExitState?.fromNewTokenStream &&
       earlyExitState.smallestBundlerSellGateCompleted &&
-      (observerSellMonitoringStartedAt === null ||
-        observerSellMonitoringStartedAt === undefined ||
-        tx.timestamp < observerSellMonitoringStartedAt)
+      (sellCountsFrom === null ||
+        sellCountsFrom === undefined ||
+        tx.timestamp < sellCountsFrom)
     ) {
-      this.log.info("NewToken observer wallet sell ignored — sell predates bot buy", {
+      this.log.info("NewToken wallet sell ignored — sell predates wallet discovery", {
         mint: funderState.mint,
         wallet,
         signature: tx.signature,
         txTimestamp: tx.timestamp,
+        discoveredAt: watch.discoveredAt,
         observerSellMonitoringStartedAt,
       });
       return;
@@ -3654,21 +3666,29 @@ export class InsiderBot extends EventEmitter {
     if (action !== "buy" && action !== "sell") return;
 
     const earlyExitState = this.followTokenEarlyBundlerExitState;
+    const largeInsiderState = this.followTokenLargeInsiderState;
     const observerSellMonitoringStartedAt =
-      this.followTokenLargeInsiderState?.observerSellMonitoringStartedAt;
+      largeInsiderState?.observerSellMonitoringStartedAt;
+    // Count a sell only if it happened after the flow discovered this wallet
+    // (observer or cluster); fall back to the bot-buy boundary when unknown.
+    const watchedWalletDiscoveredAt =
+      largeInsiderState?.scrapeWatches.get(wallet)?.discoveredAt ?? null;
+    const sellCountsFrom =
+      watchedWalletDiscoveredAt ?? observerSellMonitoringStartedAt;
     if (
       action === "sell" &&
       earlyExitState?.fromNewTokenStream &&
       earlyExitState.smallestBundlerSellGateCompleted &&
-      (observerSellMonitoringStartedAt === null ||
-        observerSellMonitoringStartedAt === undefined ||
-        tx.timestamp < observerSellMonitoringStartedAt)
+      (sellCountsFrom === null ||
+        sellCountsFrom === undefined ||
+        tx.timestamp < sellCountsFrom)
     ) {
-      this.log.info("NewToken observer wallet sell ignored — sell predates bot buy", {
+      this.log.info("NewToken wallet sell ignored — sell predates wallet discovery", {
         mint,
         wallet,
         signature: tx.signature,
         txTimestamp: tx.timestamp,
+        discoveredAt: watchedWalletDiscoveredAt,
         observerSellMonitoringStartedAt,
       });
       return;
