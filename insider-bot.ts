@@ -3415,6 +3415,61 @@ export class InsiderBot extends EventEmitter {
     }
   }
 
+  /**
+   * At buy time: among the four early insider (bundler) wallets, find the one
+   * holding the largest token amount and report how many sell txs it has for
+   * this mint so far. Returns null when no early-insider list is available.
+   */
+  private async summarizeLargestEarlyInsiderSellTxs(
+    mint: string,
+  ): Promise<{
+    wallet: string;
+    tokenAmount: number;
+    sellTxCount: number;
+    buyTxCount: number;
+    scannedTxCount: number;
+  } | null> {
+    const earlyBuys = this.followTokenEarlyInsiderBuys;
+    if (!earlyBuys?.length) return null;
+
+    const largest = earlyBuys.reduce(
+      (biggest, buy) =>
+        !biggest || buy.tokenAmount > biggest.tokenAmount ? buy : biggest,
+      null as EarlyInsiderBuy | null,
+    );
+    if (!largest) return null;
+
+    let sellTxCount = 0;
+    let buyTxCount = 0;
+    let scannedTxCount = 0;
+    try {
+      const history = await this.withHeliusFallback((client) =>
+        client.getWalletTransactionsDesc(largest.wallet, INSIDER_HISTORY_LIMIT),
+      );
+      for (const tx of history) {
+        if (!this.isRelevantMintTx(tx, mint)) continue;
+        scannedTxCount += 1;
+        const kind = this.classifyTx(tx, largest.wallet, mint);
+        if (kind === "sell") sellTxCount += 1;
+        else if (kind === "buy") buyTxCount += 1;
+      }
+    } catch (err) {
+      this.log.warn("Largest early insider sell-tx scan failed at buy time", {
+        mint,
+        wallet: largest.wallet,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    return {
+      wallet: largest.wallet,
+      tokenAmount: largest.tokenAmount,
+      sellTxCount,
+      buyTxCount,
+      scannedTxCount,
+    };
+  }
+
   private async emitFollowTokenLargeInsiderBuy(
     state: BundlerFunderWatchState,
     watchedWallet: string,
@@ -3597,6 +3652,25 @@ export class InsiderBot extends EventEmitter {
           : bundlerBranch === "normal_mc_tp"
             ? `Post-buy: +${profitExitPercent}% MC TP or valid LI ≥25%.`
             : "";
+      const largestEarlyInsiderSells =
+        await this.summarizeLargestEarlyInsiderSellTxs(state.mint);
+      const largestEarlyInsiderLine = largestEarlyInsiderSells
+        ? `Largest early insider (<code>${largestEarlyInsiderSells.wallet}</code>, ${largestEarlyInsiderSells.tokenAmount.toLocaleString()} tokens): <b>${largestEarlyInsiderSells.sellTxCount}</b> sell tx(s) at buy time`
+        : "";
+      this.log.info("Buy-time largest early insider sell-tx count", {
+        mint: state.mint,
+        triggerSource: options.triggerSource ?? "valid_wallet_4",
+        earlyInsiderCount: this.followTokenEarlyInsiderBuys?.length ?? 0,
+        largestEarlyInsiderWallet: largestEarlyInsiderSells?.wallet ?? null,
+        largestEarlyInsiderTokenAmount:
+          largestEarlyInsiderSells?.tokenAmount ?? null,
+        largestEarlyInsiderSellTxCount:
+          largestEarlyInsiderSells?.sellTxCount ?? null,
+        largestEarlyInsiderBuyTxCount:
+          largestEarlyInsiderSells?.buyTxCount ?? null,
+        largestEarlyInsiderScannedTxCount:
+          largestEarlyInsiderSells?.scannedTxCount ?? null,
+      });
       void this.sendTelegramSafe(
         [
           buyTitle,
@@ -3612,6 +3686,7 @@ export class InsiderBot extends EventEmitter {
           soldAllAfterFirstLi
             ? `Post-LI Qualified SOL gate: <b>${postLiQualifiedSolPass ? "PASSED" : "FAILED"}</b> · at least 1 present valid wallet must be &lt;${FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} SOL${postLiQualifiedSol.length ? ` · ${postLiQualifiedSol.map(({ wallet, qualifiedSol }) => `${wallet.slice(0, 6)}…=${qualifiedSol === null ? "?" : qualifiedSol.toFixed(2)} SOL`).join(", ")}` : ""}`
             : "",
+          largestEarlyInsiderLine,
           `Buy: <b>${buySol} SOL</b>`,
           triggerSource === "valid_wallet_4"
             ? `Still watching for valid wallet #5.`
