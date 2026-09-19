@@ -879,6 +879,7 @@ export class InsiderBot extends EventEmitter {
       feeLamports: number;
       signature: string;
       timestamp: number;
+      tx: HeliusTransaction;
       timer: ReturnType<typeof setTimeout>;
     }
   >();
@@ -890,6 +891,7 @@ export class InsiderBot extends EventEmitter {
       feeLamports: number;
       signature: string;
       timestamp: number;
+      tx: HeliusTransaction;
     }
   >();
   private normalRouteObserverRejected = new Set<string>();
@@ -5609,6 +5611,7 @@ export class InsiderBot extends EventEmitter {
       feeLamports,
       signature: tx.signature,
       timestamp: tx.timestamp,
+      tx,
       timer,
     });
     this.log.info("Normal-route observer wallet held for 5-minute confirmation", {
@@ -5652,7 +5655,22 @@ export class InsiderBot extends EventEmitter {
       feeLamports: pending.feeLamports,
       signature: pending.signature,
       timestamp: pending.timestamp,
+      tx: pending.tx,
     });
+    // Join the Large Insider ≥25% exit pool with a scrape watch so this
+    // wallet's post-buy sells can trigger the exit — same as the NewToken
+    // observer wallets.
+    const li = this.followTokenLargeInsiderState;
+    if (li?.active) {
+      if (!li.validWallets.includes(wallet)) {
+        li.validWallets.push(wallet);
+      }
+      this.registerFollowTokenLargeInsiderValidWalletForExitMonitoring(wallet, {
+        tx: pending.tx,
+        signature: pending.signature,
+        timestamp: pending.timestamp,
+      });
+    }
     const count = this.normalRouteObserverQualified.size;
     this.log.info("Normal-route observer qualifying wallet", {
       mint,
@@ -5687,16 +5705,11 @@ export class InsiderBot extends EventEmitter {
     const entry = [...this.normalRouteObserverQualified.entries()].at(-1);
     if (!entry) return;
     const [wallet, info] = entry;
-    const triggerTx = {
-      signature: info.signature,
-      timestamp: info.timestamp,
-      type: "SWAP",
-    } as HeliusTransaction;
     await this.emitFollowTokenLargeInsiderBuy(
       funderState,
       wallet,
       info.signature,
-      triggerTx,
+      info.tx,
       {
         triggerSource: "smallest_bundler_sell_gate",
         buySolOverride: this.getBuySolForFundingMode(false),
