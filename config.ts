@@ -146,6 +146,10 @@ export function loadConfig(): ServiceConfig {
     'INSIDER_FOLLOW_TOKEN_NORMAL_ENABLED',
     false,
   );
+  const insiderNewTokenPathEnabled = optionalBoolean(
+    'INSIDER_NEW_TOKEN_PATH_ENABLED',
+    true,
+  );
   const insiderFollowTokenMaxMigrationAgeSec = optionalInt(
     'INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC',
     5,
@@ -251,6 +255,7 @@ export function loadConfig(): ServiceConfig {
     insiderFunderFirstEnabled,
     insiderFollowTokenEnabled,
     insiderFollowTokenNormalEnabled,
+    insiderNewTokenPathEnabled,
     insiderFollowTokenMaxMigrationAgeSec,
     insiderFollowToken16mPostLiBuySol,
     logLevel: rawLogLevel,

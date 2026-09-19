@@ -67,11 +67,18 @@ export class PumpPortalWsClient {
   private newTokenSubscribed = false;
   /** When true, migration feed is torn down (unsubscribe + disconnect) until resumed. */
   private migrationFeedSuspended = false;
+  /** When true, the NewToken feed is never subscribed (path disabled via config). */
+  private readonly newTokenFeedEnabled: boolean;
 
-  constructor(apiKey: string, label = 'PumpPortal WS') {
+  constructor(
+    apiKey: string,
+    label = 'PumpPortal WS',
+    options: { newTokenFeedEnabled?: boolean } = {},
+  ) {
     const key = apiKey.trim();
     this.url = `${PUMPPORTAL_WS_BASE}?api-key=${encodeURIComponent(key)}`;
     this.log = createLogger(label.toUpperCase());
+    this.newTokenFeedEnabled = options.newTokenFeedEnabled ?? true;
   }
 
   onMigration(callback: MigrationCallback): void {
@@ -133,7 +140,9 @@ export class PumpPortalWsClient {
       this.startHeartbeat();
       if (!this.migrationFeedSuspended) {
         this.sendSubscribeMigration();
-        this.sendSubscribeNewToken();
+        if (this.newTokenFeedEnabled) {
+          this.sendSubscribeNewToken();
+        }
       }
     });
 
@@ -278,6 +287,7 @@ export class PumpPortalWsClient {
   }
 
   resumeNewTokenFeed(reason: string): void {
+    if (!this.newTokenFeedEnabled) return;
     if (this.newTokenSubscribed || !this.connected) return;
     this.sendSubscribeNewToken();
     this.log.info('PumpPortal new-token feed resumed', { reason });
@@ -364,6 +374,7 @@ export class PumpPortalWsClient {
   }
 
   private sendSubscribeNewToken(): void {
+    if (!this.newTokenFeedEnabled) return;
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
     this.newTokenSubscribed = true;

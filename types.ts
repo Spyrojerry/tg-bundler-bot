@@ -186,6 +186,8 @@ export interface ServiceConfig {
   insiderFollowTokenEnabled: boolean;
   /** Enable the normal fast follow-token route; disabled by default so only follow-insider runs. */
   insiderFollowTokenNormalEnabled: boolean;
+  /** Subscribe to the PumpPortal NewToken feed. When false, no new-token events are received. */
+  insiderNewTokenPathEnabled: boolean;
   /** Normal follow-token route accepts CREATE -> migrate ages up to 5 seconds. */
   insiderFollowTokenMaxMigrationAgeSec: number;
   /** Follow-token post-LI bundler sold-all: buy SOL when 8M gate fails but 16M fallback passes. */

@@ -41,7 +41,7 @@ const FOLLOW_TOKEN_NORMAL_MIN_EARLY_BUY_SOL = 10;
 const FOLLOW_TOKEN_NORMAL_MAX_EARLY_BUY_SOL = 25;
 const REQUIRED_BUNDLER_COUNT = 4;
 const NEW_TOKEN_MC_CHECK_DELAY_MS = 1_000;
-const LOG_NEW_TOKEN_MC_FILTER = false;
+const LOG_NEW_TOKEN_MC_FILTER = true;
 /** Accepted dev CREATE history counts (Helius fee-payer CREATE txs). */
 const FOLLOW_TOKEN_DEV_CREATE_COUNT_MIN = 1;
 const FOLLOW_TOKEN_DEV_CREATE_COUNT_MAX = 3;
@@ -130,6 +130,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     this.pumpPortalWs = new PumpPortalWsClient(
       this.config.pumpPortalApiKey,
       'Follow-Token PumpPortal',
+      { newTokenFeedEnabled: this.config.insiderNewTokenPathEnabled },
     );
     this.isEnabled = true;
     this.activeFollowTokenMint = null;
@@ -151,9 +152,11 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         event.timestamp,
       );
     });
-    this.pumpPortalWs.onNewToken((event) => {
-      void this.processNewTokenCandidate(event.mint, event.marketCapSol);
-    });
+    if (this.config.insiderNewTokenPathEnabled) {
+      this.pumpPortalWs.onNewToken((event) => {
+        void this.processNewTokenCandidate(event.mint, event.marketCapSol);
+      });
+    }
     this.pumpPortalWs.connect();
     log.info('Follow-token migration listener started', {
       source: 'PumpPortal subscribeMigration',
@@ -222,6 +225,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     mint: string,
     marketCapSol: number | null,
   ): Promise<void> {
+    if (!this.config.insiderNewTokenPathEnabled) return;
     if (!this.isEnabled || this.activeFollowTokenMint || this.inFlightMints.has(mint)) return;
     if (!mint.endsWith(PUMP_MINT_SUFFIX) || this.seenMigrationMints.has(mint)) return;
     this.seenMigrationMints.add(mint);
