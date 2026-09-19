@@ -146,7 +146,7 @@ const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
 /** Normal follow-token route: max wallets held (pending) at once while finding the valid ones. */
 const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 20;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
-const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 3;
+const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 2;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
 const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 /** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
@@ -213,6 +213,10 @@ interface FollowTokenEarlyBundlerExitState {
   preLiWaitingForValidLiNotified: boolean;
   preLiBundlerSoldAllBuyBlockedNotified: boolean;
   postLiBundlerSoldAllBuyBlockedNotified: boolean;
+  /** One-shot guard for the "all sold all — normal exit active" notification. */
+  normalExitNotified: boolean;
+  /** One-shot guard for the high cumulative sell-USD wait notification. */
+  highSellUsdWaitNotified: boolean;
   validWalletTwentyFivePercentDeferred: boolean;
   /** Set when bundler sold-all buy fires — used for LI ≥25% exit logging (8M standard vs 16M fallback). */
   maxSingleSellGateTierAtBuy: FollowTokenMaxSingleSellGateTier | null;
@@ -1912,41 +1916,23 @@ export class InsiderBot extends EventEmitter {
       secondGroupWalletCount?: number;
     } = {},
   ): void {
+    // Backend-log only: these flow-start banners are informational and do not
+    // affect any bot action.
     if (outcome === "started") {
-      void this.sendTelegramSafe(
-        [
-          `<b>🔎 ${this.label} Follow-Token Large Insider Flow Started</b>`,
-          `Token: <code>${mint}</code>`,
-          `Trigger: <code>${triggerReason}</code>`,
-          options.feePayer
-            ? `FeePayer: <code>${options.feePayer}</code>`
-            : "",
-          options.bundlerFirstBuyAnchorTimestamp !== undefined &&
-          options.feePayerWindowEndsAt !== undefined
-            ? `Window: first <b>${FOLLOW_TOKEN_LARGE_INSIDER_FEEPAYER_WINDOW_SEC / 60}m</b> after initial bundler first buy · ≥<b>${FOLLOW_TOKEN_LARGE_INSIDER_MIN_FEEPAYER_OUT_SOL} SOL</b> outs`
-            : "",
-          `Chain: each scrape wallet may spawn ≤${FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET} downstream watches only on **≥${FOLLOW_TOKEN_LARGE_INSIDER_MIN_CHAIN_OUT_SOL} SOL** outs (tier1 → chain → chain…)`,
-          options.secondGroupWalletCount !== undefined
-            ? `Initial bundlers: <b>${options.secondGroupWalletCount}</b>`
-            : "",
-          `Buy on valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all path (up to <b>${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}</b> LI tracked · first buy &gt; $${FOLLOW_TOKEN_LARGE_INSIDER_VALID_WALLET_FIRST_BUY_MIN_USD} · +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit).`,
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        "follow-token large insider flow started",
-      );
+      this.followTokenLargeInsiderLog("flow started", {
+        mint,
+        triggerReason,
+        feePayer: options.feePayer ?? null,
+        feePayerWindowEndsAt: options.feePayerWindowEndsAt ?? null,
+        initialBundlers: options.secondGroupWalletCount ?? null,
+      });
       return;
     }
 
-    void this.sendTelegramSafe(
-      [
-        `<b>⚠️ ${this.label} Follow-Token Large Insider Flow Failed To Start</b>`,
-        `Token: <code>${mint}</code>`,
-        `Trigger: <code>${triggerReason}</code>`,
-        "Reason: <b>shared feePayer lock failed</b> (need ≥3/4 bundlers funded by same feePayer).",
-      ].join("\n"),
-      "follow-token large insider flow failed to start",
-    );
+    this.followTokenLargeInsiderLog("flow failed to start — shared feePayer lock failed", {
+      mint,
+      triggerReason,
+    });
   }
 
   private buildFollowTokenStubSecondGroupFromInitialBundlers(
@@ -3240,10 +3226,6 @@ export class InsiderBot extends EventEmitter {
       ?.earlyBundlerTransferOutObserved;
   }
 
-  private canTriggerFollowTokenLargeInsiderBuyOnValidWalletFourth(): boolean {
-    return !this.followTokenEarlyBundlerUsesTransferRecipientSellPath();
-  }
-
   private applyPreLiBundlerBuyExitModeFromBundlerStats(): {
     mode: "mc_tp_retained_low_stats" | "mc_tp_and_li" | "li_only";
     meetsSellTxGate: boolean;
@@ -3392,99 +3374,19 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
-    li.validWallets.push(wallet);
-    const validIndex = li.validWallets.length;
-    if (validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS) {
-      li.validWalletSearchComplete = true;
-      this.pruneFollowTokenLargeInsiderScrapeWalletsExcept(li.validWallets);
-    }
-
-    this.followTokenLargeInsiderLog("valid wallet found", {
+    // Large-insider valid-wallet discovery removed. The normal-route observer
+    // is the sole buy trigger and the ≥25% exit pool is populated from its
+    // qualified wallets. Log only; do not add to validWallets, notify, or buy.
+    this.followTokenLargeInsiderLog("valid wallet candidate observed (discovery removed)", {
       mint: li.mint,
       wallet,
-      validIndex,
-      validWalletCount: li.validWallets.length,
       qualifiedSol: watch.qualifiedReceivedSol,
       tier: watch.tier1DirectFromFeePayer
         ? "tier1"
         : `chain-${this.resolveFollowTokenLargeInsiderScrapeWatchChainDepth(watch)}`,
       signature: tx.signature,
+      validWalletCount: li.validWallets.length,
     });
-
-    const liExitLine = `Exit: <b>+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP</b> · any valid wallet (up to ${FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS}) ≥25% sell early exit.`;
-    const statusLine =
-      validIndex === FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT
-        ? this.canTriggerFollowTokenLargeInsiderBuyOnValidWalletFourth()
-          ? `Valid wallet #4 found — buy trigger armed (or early bundler sold-all path).`
-          : `Valid wallet #4 found — buy only via early bundler/recipient sold-all path (transfer-out observed).`
-        : validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS
-          ? `Valid wallet #5 found — search complete.`
-          : validIndex < FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT
-            ? this.buySubmitted
-              ? `Valid wallet #${validIndex} added while holding — included in ≥25% exit pool.`
-              : `Waiting for valid wallet <b>#${validIndex + 1}</b> of <b>${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> before buy.`
-            : `Valid wallet #${validIndex} added while holding — included in ≥25% exit pool; still watching for #5.`;
-
-    void this.sendTelegramSafe(
-      [
-        `<b>🎯 ${this.label} Follow-Token Large Insider Valid Wallet #${validIndex}</b>`,
-        `Token: <code>${li.mint}</code>`,
-        `Wallet: <code>${wallet}</code>`,
-        this.formatFollowTokenLargeInsiderScrapeWatchTierLine(watch),
-        `Qualified SOL: <b>${watch.qualifiedReceivedSol.toFixed(4)}</b>`,
-        `Buy tx: <code>${tx.signature}</code>`,
-        statusLine,
-        validIndex >= FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT ||
-        validIndex === FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT - 1 ||
-        this.buySubmitted
-          ? liExitLine
-          : `Planned exit after buy: ${liExitLine}`,
-        this.buySubmitted
-          ? this.formatFollowTokenLargeInsiderExitValidWalletsLine()
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      "follow-token large insider valid wallet",
-    );
-
-    this.registerFollowTokenLargeInsiderValidWalletForExitMonitoring(wallet);
-
-    if (validIndex === 1) {
-      if (this.buySubmitted && this.followTokenEarlyBundlerExitState?.preLiBundlerSoldAllBuy) {
-        this.preservePreLiBundlerBuyMcTpExitAfterFirstValidWallet();
-      }
-      void this.maybeEvaluateFollowTokenEarlyBundlerExit();
-    }
-
-    if (
-      this.buySubmitted &&
-      this.phase === "holding" &&
-      !this.positionSellTriggered &&
-      this.isFollowTokenLargeInsiderBuyExitMode()
-    ) {
-      void this.triggerFollowTokenLargeInsiderValidWalletTwentyFivePercentExitIfReady();
-    }
-
-    if (this.buySubmitted) return;
-
-    // Normal follow-token route: the observer is the sole buy trigger, so the
-    // valid-wallet-#4 branch must not buy here.
-    if (!this.followInsiderObservationMode && !this.fromNewTokenStreamActive()) {
-      return;
-    }
-
-    if (validIndex === FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT) {
-      if (this.canTriggerFollowTokenLargeInsiderBuyOnValidWalletFourth()) {
-        await this.emitFollowTokenLargeInsiderBuy(
-          funderState,
-          wallet,
-          tx.signature,
-          tx,
-          { triggerSource: "valid_wallet_4" },
-        );
-      }
-    }
   }
 
   /**
@@ -5023,19 +4925,14 @@ export class InsiderBot extends EventEmitter {
       if (fromNewTokenStream) {
         this.startNewTokenBuyClusterLogger(mint);
       }
-      void this.sendTelegramSafe(
-        [
-          `<b>🔍 ${this.label} Follow-Token Large Insider Flow Started</b>`,
-          `Token: <code>${mint}</code>`,
-          `Migration tx: <code>${migrationSignature}</code>`,
-          `First unique bundler wallets: <b>${earlyBundlerWallets.length}</b>`,
-          "",
-          `Buy trigger: Large Insider flow (valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all path).`,
-          "Early bundler / transfer-recipient watch started (pre–1st-LI sold-all buy gate active).",
-          "Four early buys and shared feePayer validation passed before flow start.",
-        ].join("\n"),
-        "follow-token flow-start notification",
-      );
+      // Backend-log only: flow-start banner is informational.
+      this.log.info("Follow-token Large Insider pre-buy flow started", {
+        mint,
+        migrationSignature,
+        firstUniqueBundlerWallets: earlyBundlerWallets.length,
+        followInsiderMode,
+        fromNewTokenStream,
+      });
     }
     return this.isFollowTokenFlowActive(mint);
   }
@@ -5184,19 +5081,13 @@ export class InsiderBot extends EventEmitter {
     if (!followInsiderMode && !fromNewTokenStream) {
       this.startNormalRouteObserver(mint);
     }
-    void this.sendTelegramSafe(
-      [
-        `<b>✅ ${this.label} Follow-Token Large Insider Watch Started</b>`,
-        `Token: <code>${mint}</code>`,
-        `Dev CREATE: <b>${this.devCreateTimestamp}</b>`,
-        `Initial bundlers: <b>${firstFour.length}</b>`,
-        "",
-        `Large Insider active — buy on valid wallet <b>#${FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT}</b> or early bundler sold-all.`,
-         `Exit: +${fromNewTokenStream ? NEW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT : FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP · any valid wallet ≥25% sell early exit.`,
-      ].join("\n"),
-      "follow-token large insider watch started notification",
-    );
-
+    // Backend-log only: watch-start banner is informational.
+    this.log.info("Follow-token Large Insider watch started", {
+      mint,
+      devCreateTimestamp: this.devCreateTimestamp,
+      initialBundlers: firstFour.length,
+      fromNewTokenStream,
+    });
   }
 
   private async startInsiderFlow(
@@ -9376,14 +9267,6 @@ export class InsiderBot extends EventEmitter {
       this.profitExitDisabled = true;
     }
 
-    const walletLines = watches.map((watch) => {
-      const soldPercent =
-        watch.boughtAmount > 0
-          ? ((watch.soldAmount / watch.boughtAmount) * 100).toFixed(1)
-          : "?";
-      return `• <code>${watch.wallet}</code> (${watch.source}): cumulative sell <b>$${watch.cumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b> (${watch.sellTxCount} txs), ${soldPercent}% sold`;
-    });
-
     this.log.warn("Follow-token early bundler all sold all — evaluating LI exit", {
       mint: funderState.mint,
       highSellUsd,
@@ -9422,22 +9305,20 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (highSellUsd) {
-      void this.sendTelegramSafe(
-        [
-          `<b>⏳ ${this.label} Early Bundler All Sold All — Valid LI ≥25% Only</b>`,
-          `Token: <code>${funderState.mint}</code>`,
-          ...walletLines,
-          "",
-          `A bundler/recipient cumulative sell exceeded $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; max <b>${maxSellTxCount}</b> sell txs) — +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP disabled.`,
-          "Waiting for ≥25% sold on any valid Large Insider wallet.",
-          state.validWalletTwentyFivePercentDeferred
-            ? "Valid wallet ≥25% was seen during wait — will sell on next qualifying sell."
-            : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
-        "follow-token early bundler high sell-usd wait valid li",
-      );
+      // Backend-log only, one-shot: +MC TP disabled, waiting for valid LI ≥25%.
+      if (!state.highSellUsdWaitNotified) {
+        state.highSellUsdWaitNotified = true;
+        this.log.info(
+          "Early bundler all sold all — high cumulative sell USD; valid LI ≥25% only",
+          {
+            mint: funderState.mint,
+            maxCumulativeSellUsd,
+            maxSellTxCount,
+            validWalletTwentyFivePercentDeferred:
+              state.validWalletTwentyFivePercentDeferred,
+          },
+        );
+      }
       return;
     }
 
@@ -9450,25 +9331,24 @@ export class InsiderBot extends EventEmitter {
       );
     }
 
-    void this.sendTelegramSafe(
-      [
-        `<b>✅ ${this.label} Early Bundler All Sold All — Normal Exit Active</b>`,
-        `Token: <code>${funderState.mint}</code>`,
-        ...walletLines,
-        "",
-        `Max cumulative bundler sell ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; max <b>${maxSellTxCount}</b> sell txs).`,
-        `Exit: +${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}% MC TP or ≥25% sold on any valid LI wallet.`,
-        state.mcTpReachedPending
-          ? `MC TP (+${FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT}%) was deferred — re-armed.`
-          : "",
-        state.validWalletTwentyFivePercentDeferred
-          ? "Valid wallet ≥25% was seen during wait — will sell on next qualifying sell."
-          : "Waiting for ≥25% sold on any valid Large Insider wallet.",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      "follow-token early bundler normal exit armed",
-    );
+    // Backend-log only, one-shot: this branch is informational and does not
+    // affect any bot action, so it must not spam Telegram on every evaluation.
+    if (!state.normalExitNotified) {
+      state.normalExitNotified = true;
+      this.log.info("Early bundler all sold all — normal exit active (+MC TP / valid LI ≥25%)", {
+        mint: funderState.mint,
+        maxCumulativeSellUsd,
+        maxSellTxCount,
+        mcTpReachedPending: state.mcTpReachedPending,
+        validWalletTwentyFivePercentDeferred: state.validWalletTwentyFivePercentDeferred,
+        wallets: watches.map((watch) => ({
+          wallet: watch.wallet,
+          source: watch.source,
+          cumulativeSellUsd: watch.cumulativeSellUsd,
+          sellTxCount: watch.sellTxCount,
+        })),
+      });
+    }
   }
 
   private async applyFollowTokenEarlyBundlerExitTx(
@@ -10503,6 +10383,8 @@ export class InsiderBot extends EventEmitter {
       preLiWaitingForValidLiNotified: false,
       preLiBundlerSoldAllBuyBlockedNotified: false,
       postLiBundlerSoldAllBuyBlockedNotified: false,
+      normalExitNotified: false,
+      highSellUsdWaitNotified: false,
       validWalletTwentyFivePercentDeferred: false,
       maxSingleSellGateTierAtBuy: null,
       exitTriggerSignature: null,
