@@ -138,9 +138,9 @@ const PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 const NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS = 3;
 /** Smallest-root chain remaining at/above this amount triggers an immediate buy instead of waiting for observer wallets. */
 const FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING = 40_000_000;
-/** Normal follow-token route: wallet first-buy SOL band for the observer buy trigger. */
-const NORMAL_ROUTE_OBSERVER_MIN_BUY_SOL = 0.11;
-const NORMAL_ROUTE_OBSERVER_MAX_BUY_SOL = 0.3;
+/** Normal follow-token route: wallet first-buy USD band for the observer buy trigger. */
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 110;
+const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 300;
 /** Normal follow-token route: collect up to this many qualifying observer wallets. */
 const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
@@ -573,7 +573,6 @@ export interface InsiderBot {
   resumeFollowWalletMonitoring(): Promise<void>;
   isBuyInProgress(): boolean;
   setBuyExecuting(executing: boolean): void;
-  isDevTokenOutBuyBlocked(mint: string): boolean;
   triggerDevTokenOutRecoverySell(mint: string, signature: string): void;
   resetBuyAttempt(): void;
   seedSeenMints(mints: Set<string>): void;
@@ -802,8 +801,6 @@ export class InsiderBot extends EventEmitter {
   private devFullExitHandled = false;
   /** Set when dev token-out is acted on for the current flow (pre-buy reset or post-buy sell). */
   private devTokenOutHandled = false;
-  /** Mints blocked from buy completion after dev token-out (race recovery). */
-  private devTokenOutBlockedMints = new Set<string>();
   /** Post-buy dev token-out watch expires at this timestamp (ms). */
   private devTokenOutWatchUntilMs: number | null = null;
   private devTokenOutPostBuyWatchTimer: ReturnType<typeof setTimeout> | null =
@@ -876,6 +873,7 @@ export class InsiderBot extends EventEmitter {
     string,
     {
       buySol: number;
+      buyUsd: number;
       feeLamports: number;
       signature: string;
       timestamp: number;
@@ -4441,10 +4439,6 @@ export class InsiderBot extends EventEmitter {
     this.isBuyExecuting = executing;
   }
 
-  isDevTokenOutBuyBlocked(mint: string): boolean {
-    return this.devTokenOutBlockedMints.has(mint);
-  }
-
   triggerDevTokenOutRecoverySell(mint: string, signature: string): void {
     void this.triggerPositionSell(
       mint,
@@ -5473,8 +5467,8 @@ export class InsiderBot extends EventEmitter {
     });
     this.log.info("Started normal-route observer", {
       mint,
-      minBuySol: NORMAL_ROUTE_OBSERVER_MIN_BUY_SOL,
-      maxBuySol: NORMAL_ROUTE_OBSERVER_MAX_BUY_SOL,
+      minBuyUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_USD,
+      maxBuyUsd: NORMAL_ROUTE_OBSERVER_MAX_BUY_USD,
       maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
       buyTriggerWallets: NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS,
       referenceFeeLamports,
@@ -5484,7 +5478,7 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>👀 ${this.label} Normal-Route Observer Started</b>`,
         `Token: <code>${mint}</code>`,
-        `Watching for wallets with first buy <b>${NORMAL_ROUTE_OBSERVER_MIN_BUY_SOL}–${NORMAL_ROUTE_OBSERVER_MAX_BUY_SOL} SOL</b>.`,
+        `Watching for wallets with first buy <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD}</b>.`,
         `Buy when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> qualifying wallets found (up to ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}).`,
       ].join("\n"),
       "normal-route observer started",
@@ -5573,13 +5567,14 @@ export class InsiderBot extends EventEmitter {
       this.normalRouteObserverSeenWallets.add(wallet);
       const buySol = this.estimateEarlyBuySol(tx, wallet);
       if (buySol === null) continue;
+      const buyUsd = buySol * solPriceUsd;
       if (
-        buySol < NORMAL_ROUTE_OBSERVER_MIN_BUY_SOL ||
-        buySol > NORMAL_ROUTE_OBSERVER_MAX_BUY_SOL
+        buyUsd < NORMAL_ROUTE_OBSERVER_MIN_BUY_USD ||
+        buyUsd > NORMAL_ROUTE_OBSERVER_MAX_BUY_USD
       ) {
         continue;
       }
-      this.holdNormalRouteObserverWallet(mint, wallet, tx, buySol, feeLamports);
+      this.holdNormalRouteObserverWallet(mint, wallet, tx, buySol, buyUsd, feeLamports);
     }
   }
 
@@ -5593,6 +5588,7 @@ export class InsiderBot extends EventEmitter {
     wallet: string,
     tx: HeliusTransaction,
     buySol: number,
+    buyUsd: number,
     feeLamports: number,
   ): void {
     const timer = setTimeout(() => {
@@ -5600,6 +5596,7 @@ export class InsiderBot extends EventEmitter {
     }, NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS);
     this.normalRouteObserverPending.set(wallet, {
       buySol,
+      buyUsd,
       feeLamports,
       signature: tx.signature,
       timestamp: tx.timestamp,
@@ -5609,6 +5606,7 @@ export class InsiderBot extends EventEmitter {
       mint,
       wallet,
       buySol,
+      buyUsd,
       feeLamports,
       windowMs: NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS,
       pendingCount: this.normalRouteObserverPending.size,
@@ -5618,7 +5616,7 @@ export class InsiderBot extends EventEmitter {
         `<b>⏳ ${this.label} Normal-Route Observer — Wallet Held</b>`,
         `Token: <code>${mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
-        `First buy: <b>${buySol.toFixed(4)} SOL</b>`,
+        `First buy: <b>$${buyUsd.toFixed(2)}</b> · <b>${buySol.toFixed(4)} SOL</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
         "Held for <b>5 minutes</b>; any buy or sell after this buy drops the wallet.",
       ].join("\n"),
@@ -5641,7 +5639,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverPending.delete(wallet);
     this.normalRouteObserverQualified.set(wallet, {
       buySol: pending.buySol,
-      buyUsd: 0,
+      buyUsd: pending.buyUsd,
       feeLamports: pending.feeLamports,
       signature: pending.signature,
       timestamp: pending.timestamp,
@@ -5660,7 +5658,7 @@ export class InsiderBot extends EventEmitter {
         `<b>👀 ${this.label} Normal-Route Observer Wallet #${count}</b>`,
         `Token: <code>${mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
-        `First buy: <b>${pending.buySol.toFixed(4)} SOL</b>`,
+        `First buy: <b>$${pending.buyUsd.toFixed(2)}</b> · <b>${pending.buySol.toFixed(4)} SOL</b>`,
         `Buy tx: <code>${pending.signature}</code>`,
         "Passed the 5-minute confirmation window with no further buy or sell.",
         `Qualifying wallets: <b>${count}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> needed (max ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS})`,
@@ -11271,10 +11269,8 @@ export class InsiderBot extends EventEmitter {
     return sorted[0] ?? null;
   }
 
-  private isBuyBlockedByDevTokenOut(mint?: string | null): boolean {
-    if (this.devTokenOutHandled) return true;
-    if (mint && this.devTokenOutBlockedMints.has(mint)) return true;
-    return false;
+  private isBuyBlockedByDevTokenOut(_mint?: string | null): boolean {
+    return this.devTokenOutHandled;
   }
 
   private getDevTokenOutFlowMint(): string | null {
@@ -11552,42 +11548,17 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     tx: HeliusTransaction,
   ): Promise<void> {
-    if (this.devTokenOutHandled || !this.isDevWalletTokenOutWatchActive(mint)) {
+    if (!this.isDevWalletTokenOutWatchActive(mint)) {
       return;
     }
-    this.devTokenOutHandled = true;
-    const hasPosition = !!this.activePosition;
-
-    if (hasPosition) {
-      this.log.info("Dev wallet token transfer-out after buy ignored", {
-        mint,
-        devWallet: this.devWallet,
-        signature: tx.signature,
-      });
-      return;
-    }
-
-    this.log.warn("Dev wallet token transfer-out before buy — skipping token", {
+    // Dev token transfer-out is informational only — it no longer skips,
+    // resets, or blocks the buy, before or after buy. Do NOT set
+    // devTokenOutHandled here: that flag blocks every buy gate.
+    this.log.info("Dev wallet token transfer-out ignored — continuing flow", {
       mint,
       devWallet: this.devWallet,
       signature: tx.signature,
-    });
-    void this.sendTelegramSafe(
-      [
-        `<b>⛔ ${this.label} Dev Wallet Token Transfer-Out Before Buy</b>`,
-        `Token: <code>${mint}</code>`,
-        `Dev: <code>${this.devWallet}</code>`,
-        `Tx: <code>${tx.signature}</code>`,
-        `Action: <b>transfer_out</b>`,
-        "",
-        "Dev transferred tokens out before bot buy — skipping token and resetting flow.",
-      ].join("\n"),
-      "dev wallet token transfer-out before buy",
-    );
-    // Teardown must not wait on Telegram. The transfer-out is terminal for
-    // this pre-buy flow, and pending watcher callbacks must be stopped first.
-    await this.resetForNewToken(false, {
-      reason: "dev_wallet_token_out_before_buy",
+      hasPosition: !!this.activePosition,
     });
   }
 

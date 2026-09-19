@@ -271,6 +271,21 @@ export function normalizeEnhancedWsTransaction(
     const meta = raw.transaction?.meta;
     const message = raw.transaction?.transaction?.message;
     if (!meta || !message) {
+      // The RPC reports a per-notification `error` (e.g. unsupported
+      // transaction version) instead of a transaction payload. This is an
+      // expected, un-actionable skip — the REST backstop catches these — so it
+      // must not spam warnings. Only genuinely unknown shapes warrant a warning.
+      if (raw.error !== undefined) {
+        log.debug('transactionSubscribe notification skipped — RPC returned error', {
+          signature: raw.signature ?? null,
+          slot: raw.slot ?? null,
+          error:
+            typeof raw.error === 'string'
+              ? raw.error
+              : JSON.stringify(raw.error).slice(0, 200),
+        });
+        return null;
+      }
       log.warn('Unrecognized transactionSubscribe result shape (missing transaction/meta)', {
         sample: JSON.stringify(raw).slice(0, 500),
       });

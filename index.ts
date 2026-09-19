@@ -1667,15 +1667,6 @@ async function main(): Promise<void> {
       void (async () => {
         const tradersListStr = trigger.tradersListStr || "";
 
-        if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
-          log.warn(
-            `[INSIDER ${botNumber} BUY SKIP] Dev token-out blocked mint before submit`,
-            trigger,
-          );
-          bot.resetBuyAttempt();
-          return;
-        }
-
         void telegramBot
           ?.sendDefault(
             [
@@ -1702,15 +1693,6 @@ async function main(): Promise<void> {
         try {
           bot.setBuyExecuting(true);
 
-          if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
-            log.warn(
-              `[INSIDER ${botNumber} BUY SKIP] Dev token-out blocked mint at submit gate`,
-              trigger,
-            );
-            bot.resetBuyAttempt();
-            return;
-          }
-
           const result = await client.buyTokenWithSol(
             config.tradingWalletAddress!,
             trigger.mint,
@@ -1721,35 +1703,6 @@ async function main(): Promise<void> {
               priorityFeeSol: config.sellPriorityFeeSol,
             },
           );
-
-          if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
-            log.warn(
-              `[INSIDER ${botNumber} BUY ABORT] Dev token-out blocked mint after submit — selling immediately`,
-              {
-                mint: trigger.mint,
-                hash: result.hash,
-              },
-            );
-            bot.markPositionBought(trigger);
-            const recoveryBalance =
-              parseConfirmedBuyBalance(result) ??
-              (await getTokenRawBalance(
-                new PublicKey(config.tradingWalletAddress!),
-                new PublicKey(trigger.mint),
-              ).catch(() => null));
-            if (recoveryBalance !== null) {
-              seedActivePositionCacheFromBuy(trigger.mint, recoveryBalance);
-            }
-            if (config.tradingWalletAddress) {
-              db.addSeenMint(config.tradingWalletAddress, trigger.mint);
-            }
-            bot.triggerDevTokenOutRecoverySell(
-              trigger.mint,
-              result.hash ?? trigger.signature,
-            );
-            bot.setBuyExecuting(false);
-            return;
-          }
 
           bot.markPositionBought(trigger);
           const confirmedBuyBalance = parseConfirmedBuyBalance(result);
@@ -1845,26 +1798,6 @@ async function main(): Promise<void> {
                 );
                 reconcileCallCount++;
                 if (state.tokenBalance > 0n) {
-                  if (bot.isDevTokenOutBuyBlocked(trigger.mint)) {
-                    log.warn(
-                      `[INSIDER ${botNumber} BUY ABORT] Dev token-out blocked mint on balance reconcile — selling immediately`,
-                      {
-                        mint: trigger.mint,
-                        signature: submittedSignature,
-                      },
-                    );
-                    bot.markPositionBought(trigger);
-                    seedActivePositionCacheFromBuy(
-                      trigger.mint,
-                      state.tokenBalance,
-                    );
-                    db.addSeenMint(config.tradingWalletAddress!, trigger.mint);
-                    bot.triggerDevTokenOutRecoverySell(
-                      trigger.mint,
-                      submittedSignature,
-                    );
-                    return;
-                  }
                   bot.markPositionBought(trigger);
                   seedActivePositionCacheFromBuy(
                     trigger.mint,
@@ -2210,11 +2143,11 @@ async function main(): Promise<void> {
             bot.getEntryMc() > 0
               ? ((currentMc - bot.getEntryMc()) / bot.getEntryMc()) * 100
               : 0;
-          if (pnlPct > -20 && !positiveExitConfirmation) {
+          if (pnlPct > -30 && !positiveExitConfirmation) {
             if (positiveMcExitConfirmations.has(index)) return;
             positiveMcExitConfirmations.add(index);
             log.info(
-              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% (above -20% floor) target reached; waiting 1 second for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% (above -30% floor) target reached; waiting 1 second for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
             );
             setTimeout(() => {
               positiveMcExitConfirmations.delete(index);

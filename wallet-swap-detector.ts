@@ -38,6 +38,8 @@ export interface RawEnhancedWsTransactionResult {
   };
   signature?: string;
   blockTime?: number | null;
+  /** Present when the RPC could not return the transaction (e.g. unsupported version). */
+  error?: unknown;
 }
 
 /** Known swap/DEX program IDs (bonding curves, AMMs, routers). */
