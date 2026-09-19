@@ -8119,77 +8119,6 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private async triggerFollowTokenEarlyBundlerLowSellTxCountExit(
-    signature: string,
-    maxSellTxCount: number,
-  ): Promise<void> {
-    const state = this.followTokenEarlyBundlerExitState;
-    const funderState = this.bundlerFunderWatch;
-    if (!state?.active || !funderState || state.exitTriggerSignature) return;
-    if (this.phase !== "holding" || this.positionSellTriggered) return;
-
-    state.exitTriggerSignature = signature;
-
-    this.log.warn(
-      "Follow-token early bundler low sell-tx count exit — selling immediately",
-      {
-        mint: funderState.mint,
-        maxSellTxCount,
-        minSellTxCountForUsdGate:
-          FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE,
-        signature,
-      },
-    );
-
-    await this.triggerPositionSell(
-      funderState.mint,
-      "follow-token early bundler low sell-tx count exit",
-      [
-        `<b>🚨 ${this.label} Follow-Token Early Bundler Exit</b>`,
-        `Token: <code>${funderState.mint}</code>`,
-        `All bundlers sold all; max sell txs &lt; ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE} (max <b>${maxSellTxCount}</b> txs).`,
-        "",
-        "No valid LI ≥25% — selling full position immediately (cumulative-USD rules skipped).",
-      ],
-      signature,
-    );
-  }
-
-  private async triggerFollowTokenEarlyBundlerLowCumulativeSellUsdExit(
-    signature: string,
-  ): Promise<void> {
-    const state = this.followTokenEarlyBundlerExitState;
-    const funderState = this.bundlerFunderWatch;
-    if (!state?.active || !funderState || state.exitTriggerSignature) return;
-    if (this.phase !== "holding" || this.positionSellTriggered) return;
-
-    state.exitTriggerSignature = signature;
-    const maxCumulativeSellUsd =
-      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
-
-    this.log.warn(
-      "Follow-token early bundler low cumulative sell-usd exit — selling immediately",
-      {
-        mint: funderState.mint,
-        maxCumulativeSellUsd,
-        signature,
-      },
-    );
-
-    await this.triggerPositionSell(
-      funderState.mint,
-      "follow-token early bundler low cumulative sell-usd exit",
-      [
-        `<b>🚨 ${this.label} Follow-Token Early Bundler Exit</b>`,
-        `Token: <code>${funderState.mint}</code>`,
-        `All bundlers sold all; max cumulative sell ≤ $${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_LOW_SELL_USD_THRESHOLD.toLocaleString()} (max <b>$${maxCumulativeSellUsd.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>; max <b>${this.getFollowTokenEarlyBundlerExitMaxSellTxCount()}</b> sell txs ≥ ${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_MIN_SELL_TX_COUNT_FOR_USD_GATE}).`,
-        "",
-        "No valid LI ≥25% — selling full position immediately.",
-      ],
-      signature,
-    );
-  }
-
   private async estimateWalletSellUsd(
     tx: HeliusTransaction,
     wallet: string,
@@ -9471,13 +9400,12 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (!meetsSellTxGate) {
-      if (!postLiBundlerMcTpBuy) {
-        await this.triggerFollowTokenEarlyBundlerLowSellTxCountExit(
-          triggerTx?.signature ?? "EARLY_BUNDLER_LOW_SELL_TX_COUNT",
-          maxSellTxCount,
-        );
-        return;
-      }
+      // Trigger removed: low sell-tx-count no longer sells. Fall through to the
+      // normal exit path (+MC TP / valid LI ≥25%).
+      this.log.info(
+        "Early bundler low sell-tx-count exit trigger removed — continuing",
+        { mint: funderState.mint, maxSellTxCount, postLiBundlerMcTpBuy },
+      );
     }
 
     if (highSellUsd) {
@@ -9501,12 +9429,12 @@ export class InsiderBot extends EventEmitter {
     }
 
     if (this.noFollowTokenEarlyBundlerExitWatchExceedsLowSellUsd()) {
-      if (!postLiBundlerMcTpBuy) {
-        await this.triggerFollowTokenEarlyBundlerLowCumulativeSellUsdExit(
-          triggerTx?.signature ?? "EARLY_BUNDLER_LOW_CUMULATIVE_SELL_USD",
-        );
-        return;
-      }
+      // Trigger removed: low cumulative sell-usd no longer sells. Fall through
+      // to the normal exit path (+MC TP / valid LI ≥25%).
+      this.log.info(
+        "Early bundler low cumulative sell-usd exit trigger removed — continuing",
+        { mint: funderState.mint, maxCumulativeSellUsd, postLiBundlerMcTpBuy },
+      );
     }
 
     void this.sendTelegramSafe(
