@@ -840,6 +840,12 @@ export class InsiderBot extends EventEmitter {
   private followTokenTopBuyerWatchBackfillPending = false;
   /** Early bundler buys retained for follow-token large-insider feePayer backtrack. */
   private followTokenEarlyInsiderBuys: EarlyInsiderBuy[] | null = null;
+  /**
+   * Snapshot of the four early bundler buys taken at flow start. Unlike
+   * followTokenEarlyInsiderBuys (cleared by mid-flow resets), this survives so
+   * the buy-time largest-early-insider sell-tx scan can always report.
+   */
+  private followTokenEarlyInsiderBuySnapshot: EarlyInsiderBuy[] | null = null;
   private followTokenLargeInsiderState: FollowTokenLargeInsiderState | null =
     null;
   private followTokenEarlyBundlerExitState: FollowTokenEarlyBundlerExitState | null =
@@ -1794,6 +1800,25 @@ export class InsiderBot extends EventEmitter {
   private async stopFollowTokenLargeInsiderFlow(reason: string): Promise<void> {
     const state = this.followTokenLargeInsiderState;
     if (!state?.active) return;
+
+    // Safety guard: while a position is held and its exit sell has not yet been
+    // triggered, tearing this flow down would unsubscribe the very ≥25% scrape
+    // watches the exit depends on. Only a completed sell (positionSellTriggered)
+    // or a genuine token-flow end may close it. Callers that must close early
+    // (e.g. pre-buy skip) never reach here with an active position.
+    if (this.activePosition && !this.positionSellTriggered) {
+      this.followTokenLargeInsiderLog(
+        "close skipped — position held and exit sell not yet triggered",
+        {
+          mint: state.mint,
+          reason,
+          activePositionMint: this.activePosition.mint,
+          phase: this.phase,
+          positionSellTriggered: this.positionSellTriggered,
+        },
+      );
+      return;
+    }
 
     this.clearFollowTokenLargeInsiderWindowTimer();
     if (state.validWalletReconcileTimer) {
@@ -3429,7 +3454,9 @@ export class InsiderBot extends EventEmitter {
     buyTxCount: number;
     scannedTxCount: number;
   } | null> {
-    const earlyBuys = this.followTokenEarlyInsiderBuys;
+    const earlyBuys =
+      this.followTokenEarlyInsiderBuys ??
+      this.followTokenEarlyInsiderBuySnapshot;
     if (!earlyBuys?.length) return null;
 
     const largest = earlyBuys.reduce(
@@ -3660,7 +3687,9 @@ export class InsiderBot extends EventEmitter {
       this.log.info("Buy-time largest early insider sell-tx count", {
         mint: state.mint,
         triggerSource: options.triggerSource ?? "valid_wallet_4",
-        earlyInsiderCount: this.followTokenEarlyInsiderBuys?.length ?? 0,
+        earlyInsiderCount:
+          (this.followTokenEarlyInsiderBuys ??
+            this.followTokenEarlyInsiderBuySnapshot)?.length ?? 0,
         largestEarlyInsiderWallet: largestEarlyInsiderSells?.wallet ?? null,
         largestEarlyInsiderTokenAmount:
           largestEarlyInsiderSells?.tokenAmount ?? null,
@@ -4222,6 +4251,9 @@ export class InsiderBot extends EventEmitter {
         earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT),
       );
       this.followTokenEarlyInsiderBuys = earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT);
+      this.followTokenEarlyInsiderBuySnapshot = [
+        ...earlyBuys.slice(0, BUNDLER_FUNDER_REQUIRED_COUNT),
+      ];
       void this.startFollowTokenEarlyBundlerExitMonitoring(event.mint);
       this.log.info("Follow-insider token observation started", {
         mint: event.mint,
@@ -5051,6 +5083,7 @@ export class InsiderBot extends EventEmitter {
 
     this.bundlerFunderWatch = this.buildFollowTokenStubBundlerWatch(mint, firstFour);
     this.followTokenEarlyInsiderBuys = firstFour;
+    this.followTokenEarlyInsiderBuySnapshot = [...firstFour];
     if (this.devWallet) {
       this.subscribeDevWalletFullExitWatch();
     }
@@ -5739,6 +5772,19 @@ export class InsiderBot extends EventEmitter {
           }
         }
         if (!matchingPair) {
+          if (this.buySubmitted || this.activePosition) {
+            this.log.warn(
+              "Follow-insider observer fee pair missing but buy already submitted — keeping flow alive",
+              {
+                mint,
+                candidateCount: state.preLiFirstBuyObserverCandidateOrder.length,
+                validWalletCount:
+                  this.followTokenLargeInsiderState?.validWallets.length ?? 0,
+              },
+            );
+            state.preLiFirstBuyObserverFeePairResolved = true;
+            return;
+          }
           void this.sendTelegramSafe(
             `<b>⛔ ${this.label} Follow-Insider Observer Skipped</b>\nToken: <code>${mint}</code>\nThe first three $110–$300 observer buys did not contain two transaction fees within the $${PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD.toFixed(3)} tolerance. Token reset.`,
             "follow-insider observer fee pair missing",
@@ -15727,6 +15773,7 @@ export class InsiderBot extends EventEmitter {
       reason: "reset",
     });
     this.followTokenEarlyInsiderBuys = null;
+    this.followTokenEarlyInsiderBuySnapshot = null;
     this.followTokenEarlyBundlerExitState = null;
     this.followTokenLargeInsiderState = null;
     this.followTokenMigrationTimestamp = 0;
