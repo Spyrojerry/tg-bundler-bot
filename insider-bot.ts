@@ -1680,15 +1680,12 @@ export class InsiderBot extends EventEmitter {
     triggerReason: string,
     options?: { skipTelegram?: boolean },
   ): Promise<void> {
+    // Gate removed: the LI start failure no longer resets the flow. Log only so
+    // callers can decide whether any other path (observer) can still buy.
     this.followTokenTopBuyerWatchBackend(
-      "Large Insider failed to start — resetting follow-token flow",
-      { mint, triggerReason },
+      "Large Insider failed to start — continuing without LI flow",
+      { mint, triggerReason, skipTelegram: options?.skipTelegram ?? false },
     );
-    await this.stopFollowTokenTopBuyerWatch("large insider flow failed to start");
-    await this.resetForNewToken(false, {
-      reason: "large_insider_feePayer_lock_failed",
-      skipTelegram: options?.skipTelegram,
-    });
   }
 
   private clearFollowTokenLargeInsiderWindowTimer(): void {
@@ -1809,12 +1806,7 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "follow-token large insider qualified sol buy gate failed",
     );
-    await this.stopFollowTokenLargeInsiderFlow(
-      "large insider qualified SOL buy gate failed",
-    );
-    await this.resetForNewToken(false, {
-      reason: "large_insider_qualified_sol_buy_gate_failed",
-    });
+    // Gate removed: no reset. The flow stays alive and other triggers may still buy.
   }
 
   private passesFollowTokenPostLiBundlerQualifiedSolBuyGate(): boolean {
@@ -8968,8 +8960,7 @@ export class InsiderBot extends EventEmitter {
       "follow-token large insider bundler max single sell skip",
     );
 
-    await this.stopFollowTokenLargeInsiderFlow("bundler max_single_sell gate skip");
-    await this.resetForNewToken(false, { reason });
+    // Gate removed: no reset. Flow stays alive for other buy triggers.
   }
 
   private async skipFollowTokenLargeInsiderFromBundlerHighUsdPreLi(
@@ -9019,8 +9010,7 @@ export class InsiderBot extends EventEmitter {
       "follow-token large insider high usd pre-li skip",
     );
 
-    await this.stopFollowTokenLargeInsiderFlow("high USD pre-LI skip");
-    await this.resetForNewToken(false, { reason });
+    // Gate removed: no reset. Flow stays alive for other buy triggers.
   }
 
   private async skipFollowTokenLargeInsiderFromPostLiBundlerQualifiedSolGate(
@@ -9073,10 +9063,7 @@ export class InsiderBot extends EventEmitter {
       "follow-token post-li bundler qualified sol buy gate failed",
     );
 
-    await this.stopFollowTokenLargeInsiderFlow(
-      "post-LI bundler qualified SOL gate skip",
-    );
-    await this.resetForNewToken(false, { reason });
+    // Gate removed: no reset. Flow stays alive for other buy triggers.
   }
 
   private async fetchTokenAthMarketCapUsdFor16mFallbackGate(
@@ -9149,10 +9136,7 @@ export class InsiderBot extends EventEmitter {
       "follow-token 16m fallback ath mc skip",
     );
 
-    if (funderState && this.followTokenLargeInsiderState?.active) {
-      await this.stopFollowTokenLargeInsiderFlow("16M fallback ATH MC gate skip");
-    }
-    await this.resetForNewToken(false, { reason });
+    // Gate removed: no reset. Flow stays alive for other buy triggers.
   }
 
   private async maybeTriggerFollowTokenLargeInsiderPreBuyFromBundlerPath(
@@ -9191,26 +9175,15 @@ export class InsiderBot extends EventEmitter {
       } as HeliusTransaction);
 
     const waitingGate = await this.getBundlerSoldAllMaxSingleSellGateSnapshot();
-    const activeWatchOver60M = waitingGate.maxSingleSellTokenAmount > 60_000_000;
-    if (activeWatchOver60M) {
-      this.log.warn("Pre-LI sold-all handling stopped — active watch exceeds 60M cap", {
+    if (waitingGate.maxSingleSellTokenAmount > 60_000_000) {
+      // Gate removed: the 60M cap no longer resets the flow. Log only and
+      // continue so other buy triggers (normal-route observer) still run.
+      this.log.warn("Pre-LI sold-all — active watch exceeds 60M cap; continuing", {
         mint: funderState.mint,
         maxSingleSellTokenAmount: waitingGate.maxSingleSellTokenAmount,
         maxSingleSellWallet: waitingGate.maxSingleSellWallet,
         cap: 60_000_000,
       });
-      void this.sendTelegramSafe(
-        [
-          `<b>⛔ ${this.label} Pre-LI Sold-All Stopped — 60M Cap</b>`,
-          `Token: <code>${funderState.mint}</code>`,
-          `Highest max-single-sell: <b>${waitingGate.maxSingleSellTokenAmount.toLocaleString()}</b> tokens`,
-          "No Bundler Sold-All observer or $110–$300 wallet observer will run for this token.",
-          "Token is being skipped because an active watch exceeded the 60M maximum.",
-        ].join("\n"),
-        "follow-token pre-li 60m cap stop",
-      );
-      await this.resetForNewToken(false, { reason: "active_watch_max_single_sell_over_60m" });
-      return;
     }
     if (waitingGate.tier === "fail") {
       await this.skipFollowTokenLargeInsiderFromPreLiMaxSingleSellGate(
@@ -9331,8 +9304,7 @@ export class InsiderBot extends EventEmitter {
       "follow-token pre-li max single sell skip",
     );
 
-    await this.stopFollowTokenLargeInsiderFlow("pre-LI max single sell gate skip");
-    await this.resetForNewToken(false, { reason });
+    // Gate removed: no reset. Flow stays alive for other buy triggers.
   }
 
   private async maybeEvaluateFollowTokenEarlyBundlerExit(
