@@ -148,10 +148,10 @@ export function loadConfig(): ServiceConfig {
   );
   const insiderFollowTokenMaxMigrationAgeSec = optionalInt(
     'INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC',
-    2,
+    5,
   );
-  if (insiderFollowTokenMaxMigrationAgeSec > 2) {
-    throw new Error('INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC must be at most 2 seconds');
+  if (insiderFollowTokenMaxMigrationAgeSec > 5) {
+    throw new Error('INSIDER_FOLLOW_TOKEN_MAX_MIGRATION_AGE_SEC must be at most 5 seconds');
   }
   const rawLogLevel      = optional('LOG_LEVEL', 'info');
   const telegramBotToken = optionalNullable('TELEGRAM_BOT_TOKEN');

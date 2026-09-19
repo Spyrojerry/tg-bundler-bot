@@ -30,11 +30,15 @@ import {
 const log = createLogger('FOLLOW-TOKEN');
 
 const PUMP_MINT_SUFFIX = 'pump';
-const DEFAULT_MAX_MIGRATION_AGE_SEC = 2;
+const DEFAULT_MAX_MIGRATION_AGE_SEC = 5;
 const FOLLOW_INSIDER_MIN_MIGRATION_AGE_SEC = 400;
 const FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC = 800;
+const FOLLOW_INSIDER_ROUTE_ENABLED = false;
 const FOLLOW_INSIDER_MIN_EARLY_BUY_SOL = 4;
 const FOLLOW_INSIDER_MAX_EARLY_BUY_SOL = 12;
+/** Normal follow-token route: first four unique SWAP buys must fall in this SOL range. */
+const FOLLOW_TOKEN_NORMAL_MIN_EARLY_BUY_SOL = 10;
+const FOLLOW_TOKEN_NORMAL_MAX_EARLY_BUY_SOL = 25;
 const REQUIRED_BUNDLER_COUNT = 4;
 const NEW_TOKEN_MC_CHECK_DELAY_MS = 1_000;
 const LOG_NEW_TOKEN_MC_FILTER = false;
@@ -88,12 +92,13 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
       projectId: config.insiderHeliusProjectId || undefined,
     });
     this.metadataClient = new TokenMetaplexMetadataClient(heliusKey);
-    this.maxMigrationAgeSec = Math.max(
+    const configuredMaxMigrationAgeSec =
       config.insiderFollowTokenMaxMigrationAgeSec > 0
         ? config.insiderFollowTokenMaxMigrationAgeSec
-        : DEFAULT_MAX_MIGRATION_AGE_SEC,
-      FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC,
-    );
+        : DEFAULT_MAX_MIGRATION_AGE_SEC;
+    this.maxMigrationAgeSec = FOLLOW_INSIDER_ROUTE_ENABLED
+      ? Math.max(configuredMaxMigrationAgeSec, FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC)
+      : configuredMaxMigrationAgeSec;
 
     insiderBots.forEach((bot) => {
       bot.on('tokenFlowEnded', (event: InsiderTokenFlowEndedEvent) => {
@@ -370,6 +375,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
 
       const { devWallet, migrationAgeSec, funding, devCreateCount } = coreResult;
       const followInsiderMode =
+        FOLLOW_INSIDER_ROUTE_ENABLED &&
         migrationAgeSec >= FOLLOW_INSIDER_MIN_MIGRATION_AGE_SEC &&
         migrationAgeSec <= FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC;
       if (!followInsiderMode && !this.config.insiderFollowTokenNormalEnabled) {
@@ -472,6 +478,40 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
             `Already tracking <b>${followInsiderWalletCount}/${MAX_FOLLOW_WALLETS}</b> follow-insider wallets.`,
             'This migration will not start another follow-insider flow.',
             'Existing tracked follow-insider token flows remain unaffected.',
+          ]);
+          return;
+        }
+      } else {
+        const earlyBuys = await this.fetchFirstFourEarlyBuys(mint);
+        const invalidEarlyBuys = earlyBuys.filter(
+          (buy) =>
+            buy.buySol === null ||
+            buy.buySol < FOLLOW_TOKEN_NORMAL_MIN_EARLY_BUY_SOL ||
+            buy.buySol > FOLLOW_TOKEN_NORMAL_MAX_EARLY_BUY_SOL,
+        );
+        if (earlyBuys.length < 4 || invalidEarlyBuys.length > 0) {
+          this.seenMigrationMints.add(mint);
+          log.info('Follow-token migration skipped — first-four buy SOL outside 10-25 SOL range', {
+            mint,
+            signature,
+            requiredRangeSol: [
+              FOLLOW_TOKEN_NORMAL_MIN_EARLY_BUY_SOL,
+              FOLLOW_TOKEN_NORMAL_MAX_EARLY_BUY_SOL,
+            ],
+            earlyBuys: earlyBuys.map((buy) => ({
+              wallet: buy.wallet,
+              buySol: buy.buySol,
+              signature: buy.signature,
+            })),
+          });
+          void this.sendMigrationTelegram([
+            '<b>⏭️ Follow-Token Migration Skipped — Buy SOL Range</b>',
+            `Token: <code>${this.html(mint)}</code>`,
+            'All 4 early bundler first buys must be between <b>10 SOL and 25 SOL</b>.',
+            ...earlyBuys.map(
+              (buy, index) =>
+                `${index + 1}. <code>${this.html(buy.wallet)}</code> · ${buy.buySol === null ? 'unknown' : `${buy.buySol} SOL`}`,
+            ),
           ]);
           return;
         }

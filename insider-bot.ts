@@ -138,6 +138,17 @@ const PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 const NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS = 3;
 /** Smallest-root chain remaining at/above this amount triggers an immediate buy instead of waiting for observer wallets. */
 const FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING = 40_000_000;
+/** Normal follow-token route: wallet first-buy SOL band for the observer buy trigger. */
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_SOL = 0.11;
+const NORMAL_ROUTE_OBSERVER_MAX_BUY_SOL = 0.3;
+/** Normal follow-token route: collect up to this many qualifying observer wallets. */
+const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
+/** Normal follow-token route: buy once this many qualifying observer wallets are found. */
+const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 3;
+/** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
+const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
+/** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
+const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 5 * 60 * 1_000;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -846,6 +857,42 @@ export class InsiderBot extends EventEmitter {
    * the buy-time largest-early-insider sell-tx scan can always report.
    */
   private followTokenEarlyInsiderBuySnapshot: EarlyInsiderBuy[] | null = null;
+  /**
+   * Normal follow-token route observer: watches wallets whose first buy is
+   * 0.11–0.3 SOL and whose fee matches any insider wallet's sell fee within
+   * $0.005. A qualifying first buy is held for a 5-minute confirmation window:
+   * if any further buy or sell occurs after the first buy, the wallet is
+   * dropped immediately; if the window passes with neither, the wallet joins
+   * the qualified pool. Three qualified wallets trigger the buy; this is the
+   * sole buy trigger on the normal route.
+   */
+  private normalRouteObserverActive = false;
+  private normalRouteObserverMint: string | null = null;
+  private normalRouteObserverWatchId: number | null = null;
+  private normalRouteObserverReferenceFeeLamports: number | null = null;
+  private normalRouteObserverSeenWallets = new Set<string>();
+  /** Pending wallets held through the 5-minute confirmation window. */
+  private normalRouteObserverPending = new Map<
+    string,
+    {
+      buySol: number;
+      feeLamports: number;
+      signature: string;
+      timestamp: number;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  private normalRouteObserverQualified = new Map<
+    string,
+    {
+      buySol: number;
+      buyUsd: number;
+      feeLamports: number;
+      signature: string;
+      timestamp: number;
+    }
+  >();
+  private normalRouteObserverRejected = new Set<string>();
   private followTokenLargeInsiderState: FollowTokenLargeInsiderState | null =
     null;
   private followTokenEarlyBundlerExitState: FollowTokenEarlyBundlerExitState | null =
@@ -3427,6 +3474,12 @@ export class InsiderBot extends EventEmitter {
 
     if (this.buySubmitted) return;
 
+    // Normal follow-token route: the observer is the sole buy trigger, so the
+    // valid-wallet-#4 branch must not buy here.
+    if (!this.followInsiderObservationMode && !this.fromNewTokenStreamActive()) {
+      return;
+    }
+
     if (validIndex === FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT) {
       if (this.canTriggerFollowTokenLargeInsiderBuyOnValidWalletFourth()) {
         await this.emitFollowTokenLargeInsiderBuy(
@@ -5136,6 +5189,11 @@ export class InsiderBot extends EventEmitter {
       devCreateTimestamp: this.devCreateTimestamp,
       initialBundlers: [...this.bundlerFunderWatch.bundlerWallets],
     });
+    // Normal route: the observer is the sole buy trigger. Start it now; it will
+    // defer until an insider wallet sell fee exists to anchor the tolerance.
+    if (!followInsiderMode && !fromNewTokenStream) {
+      this.startNormalRouteObserver(mint);
+    }
     void this.sendTelegramSafe(
       [
         `<b>✅ ${this.label} Follow-Token Large Insider Watch Started</b>`,
@@ -5378,6 +5436,314 @@ export class InsiderBot extends EventEmitter {
       referenceFeeLamports: state.smallestBundlerSellFeeLamports,
       closeToleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
     });
+  }
+
+  /**
+   * Normal follow-token route observer: watches wallets whose first buy is
+   * 0.11–0.3 SOL, matching an insider wallet's sell fee within $0.005, with the
+   * next-tx-not-a-buy and no-sell-within-5min filters. Three qualifying wallets
+   * trigger the buy; this is the sole buy trigger on the normal route.
+   */
+  private startNormalRouteObserver(mint: string): void {
+    if (
+      this.normalRouteObserverActive ||
+      !this.enhancedWs ||
+      this.followInsiderObservationMode ||
+      this.fromNewTokenStreamActive()
+    ) {
+      return;
+    }
+    const referenceFeeLamports = this.resolveNormalRouteObserverReferenceFee();
+    if (referenceFeeLamports === null) {
+      this.log.info(
+        "Normal-route observer not started — no insider wallet sell fee yet",
+        { mint },
+      );
+      return;
+    }
+    this.normalRouteObserverActive = true;
+    this.normalRouteObserverMint = mint;
+    this.normalRouteObserverReferenceFeeLamports = referenceFeeLamports;
+    this.normalRouteObserverSeenWallets.clear();
+    this.normalRouteObserverPending.clear();
+    this.normalRouteObserverQualified.clear();
+    this.normalRouteObserverRejected.clear();
+    this.normalRouteObserverWatchId = this.enhancedWs.watch(mint, (tx) => {
+      void this.observeNormalRouteFirstBuy(mint, tx);
+    });
+    this.log.info("Started normal-route observer", {
+      mint,
+      minBuySol: NORMAL_ROUTE_OBSERVER_MIN_BUY_SOL,
+      maxBuySol: NORMAL_ROUTE_OBSERVER_MAX_BUY_SOL,
+      maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
+      buyTriggerWallets: NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS,
+      referenceFeeLamports,
+      closeToleranceUsd: NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>👀 ${this.label} Normal-Route Observer Started</b>`,
+        `Token: <code>${mint}</code>`,
+        `Watching for wallets with first buy <b>${NORMAL_ROUTE_OBSERVER_MIN_BUY_SOL}–${NORMAL_ROUTE_OBSERVER_MAX_BUY_SOL} SOL</b>.`,
+        `Buy when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> qualifying wallets found (up to ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}).`,
+      ].join("\n"),
+      "normal-route observer started",
+    );
+  }
+
+  /** Base fee for the normal-route observer: any insider wallet's sell fee. */
+  private resolveNormalRouteObserverReferenceFee(): number | null {
+    const state = this.followTokenEarlyBundlerExitState;
+    if (state?.active) {
+      const fees = [...state.watches.values()]
+        .map((watch) => watch.lastSellFeeLamports)
+        .filter((fee): fee is number => fee !== null);
+      if (fees.length > 0) return Math.min(...fees);
+    }
+    return null;
+  }
+
+  private fromNewTokenStreamActive(): boolean {
+    return this.followTokenEarlyBundlerExitState?.fromNewTokenStream ?? false;
+  }
+
+  private async observeNormalRouteFirstBuy(
+    mint: string,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    if (
+      !this.normalRouteObserverActive ||
+      this.normalRouteObserverMint !== mint ||
+      this.normalRouteObserverQualified.size >= NORMAL_ROUTE_OBSERVER_MAX_WALLETS ||
+      this.buySubmitted
+    ) {
+      return;
+    }
+    const referenceFeeLamports = this.normalRouteObserverReferenceFeeLamports;
+    if (referenceFeeLamports === null) return;
+    const feeLamports = tx.fee;
+    if (feeLamports === undefined) return;
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    if (solPriceUsd === null) return;
+    const feeDifferenceUsd =
+      (Math.abs(feeLamports - referenceFeeLamports) * solPriceUsd) / 1_000_000_000;
+    if (feeDifferenceUsd > NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD) return;
+
+    const recipients = new Set(
+      (tx.tokenTransfers ?? [])
+        .filter((transfer) => transfer.mint === mint && transfer.tokenAmount > 0)
+        .map((transfer) => transfer.toUserAccount)
+        .filter(Boolean),
+    );
+    // Pending-wallet guard first: any buy/sell touching a wallet held through
+    // its 5-minute confirmation window disqualifies it immediately. A sell has
+    // the wallet as the sender, so scan both directions.
+    if (this.normalRouteObserverPending.size > 0) {
+      const touchedWallets = new Set<string>();
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint !== mint) continue;
+        if (transfer.toUserAccount) touchedWallets.add(transfer.toUserAccount);
+        if (transfer.fromUserAccount) touchedWallets.add(transfer.fromUserAccount);
+      }
+      for (const wallet of touchedWallets) {
+        if (!this.normalRouteObserverPending.has(wallet)) continue;
+        const pendingKind = this.classifyTx(tx, wallet, mint);
+        if (pendingKind === "buy" || pendingKind === "sell") {
+          this.rejectNormalRouteObserverWallet(
+            wallet,
+            `buy/sell after first buy during confirmation window (${pendingKind})`,
+          );
+        }
+      }
+    }
+    if (this.normalRouteObserverQualified.size >= NORMAL_ROUTE_OBSERVER_MAX_WALLETS) {
+      return;
+    }
+    for (const wallet of recipients) {
+      if (
+        wallet === "__pool__" ||
+        this.normalRouteObserverSeenWallets.has(wallet) ||
+        this.normalRouteObserverPending.has(wallet) ||
+        this.normalRouteObserverQualified.has(wallet) ||
+        this.normalRouteObserverRejected.has(wallet)
+      ) {
+        continue;
+      }
+      if (this.classifyTx(tx, wallet, mint) !== "buy") continue;
+      this.normalRouteObserverSeenWallets.add(wallet);
+      const buySol = this.estimateEarlyBuySol(tx, wallet);
+      if (buySol === null) continue;
+      if (
+        buySol < NORMAL_ROUTE_OBSERVER_MIN_BUY_SOL ||
+        buySol > NORMAL_ROUTE_OBSERVER_MAX_BUY_SOL
+      ) {
+        continue;
+      }
+      this.holdNormalRouteObserverWallet(mint, wallet, tx, buySol, feeLamports);
+    }
+  }
+
+  /**
+   * Holds a qualifying first buy through a 5-minute confirmation window. If the
+   * window passes with no further buy or sell on the wallet, it is promoted to
+   * the qualified pool; any intermediate buy/sell rejects it sooner.
+   */
+  private holdNormalRouteObserverWallet(
+    mint: string,
+    wallet: string,
+    tx: HeliusTransaction,
+    buySol: number,
+    feeLamports: number,
+  ): void {
+    const timer = setTimeout(() => {
+      this.promoteNormalRouteObserverWallet(wallet);
+    }, NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS);
+    this.normalRouteObserverPending.set(wallet, {
+      buySol,
+      feeLamports,
+      signature: tx.signature,
+      timestamp: tx.timestamp,
+      timer,
+    });
+    this.log.info("Normal-route observer wallet held for 5-minute confirmation", {
+      mint,
+      wallet,
+      buySol,
+      feeLamports,
+      windowMs: NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS,
+      pendingCount: this.normalRouteObserverPending.size,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>⏳ ${this.label} Normal-Route Observer — Wallet Held</b>`,
+        `Token: <code>${mint}</code>`,
+        `Wallet: <code>${wallet}</code>`,
+        `First buy: <b>${buySol.toFixed(4)} SOL</b>`,
+        `Buy tx: <code>${tx.signature}</code>`,
+        "Held for <b>5 minutes</b>; any buy or sell after this buy drops the wallet.",
+      ].join("\n"),
+      "normal-route observer wallet held",
+    );
+  }
+
+  private promoteNormalRouteObserverWallet(wallet: string): void {
+    const pending = this.normalRouteObserverPending.get(wallet);
+    if (!pending) return;
+    if (
+      !this.normalRouteObserverActive ||
+      this.normalRouteObserverRejected.has(wallet) ||
+      this.normalRouteObserverQualified.size >= NORMAL_ROUTE_OBSERVER_MAX_WALLETS
+    ) {
+      this.normalRouteObserverPending.delete(wallet);
+      return;
+    }
+    const mint = this.normalRouteObserverMint;
+    this.normalRouteObserverPending.delete(wallet);
+    this.normalRouteObserverQualified.set(wallet, {
+      buySol: pending.buySol,
+      buyUsd: 0,
+      feeLamports: pending.feeLamports,
+      signature: pending.signature,
+      timestamp: pending.timestamp,
+    });
+    const count = this.normalRouteObserverQualified.size;
+    this.log.info("Normal-route observer qualifying wallet", {
+      mint,
+      wallet,
+      buySol: pending.buySol,
+      feeLamports: pending.feeLamports,
+      walletCount: count,
+      maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>👀 ${this.label} Normal-Route Observer Wallet #${count}</b>`,
+        `Token: <code>${mint}</code>`,
+        `Wallet: <code>${wallet}</code>`,
+        `First buy: <b>${pending.buySol.toFixed(4)} SOL</b>`,
+        `Buy tx: <code>${pending.signature}</code>`,
+        "Passed the 5-minute confirmation window with no further buy or sell.",
+        `Qualifying wallets: <b>${count}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> needed (max ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS})`,
+      ].join("\n"),
+      "normal-route observer wallet",
+    );
+    void this.maybeTriggerNormalRouteObserverBuy();
+  }
+
+  private async maybeTriggerNormalRouteObserverBuy(): Promise<void> {
+    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
+    if (this.normalRouteObserverQualified.size < NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS) {
+      return;
+    }
+    const funderState = this.bundlerFunderWatch;
+    if (!funderState) return;
+    const entry = [...this.normalRouteObserverQualified.entries()].at(-1);
+    if (!entry) return;
+    const [wallet, info] = entry;
+    const triggerTx = {
+      signature: info.signature,
+      timestamp: info.timestamp,
+      type: "SWAP",
+    } as HeliusTransaction;
+    await this.emitFollowTokenLargeInsiderBuy(
+      funderState,
+      wallet,
+      info.signature,
+      triggerTx,
+      {
+        triggerSource: "smallest_bundler_sell_gate",
+        buySolOverride: this.getBuySolForFundingMode(false),
+      },
+    );
+  }
+
+  private rejectNormalRouteObserverWallet(wallet: string, reason: string): void {
+    const pending = this.normalRouteObserverPending.get(wallet);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.normalRouteObserverPending.delete(wallet);
+    }
+    this.normalRouteObserverRejected.add(wallet);
+    this.log.info("Normal-route observer wallet rejected", {
+      mint: this.normalRouteObserverMint,
+      wallet,
+      reason,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>🚫 ${this.label} Normal-Route Observer — Wallet Dropped</b>`,
+        `Token: <code>${this.normalRouteObserverMint ?? "unknown"}</code>`,
+        `Wallet: <code>${wallet}</code>`,
+        `Reason: ${reason}`,
+        `Qualifying wallets so far: <b>${this.normalRouteObserverQualified.size}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b>`,
+      ].join("\n"),
+      "normal-route observer wallet dropped",
+    );
+  }
+
+  private async stopNormalRouteObserver(reason: string): Promise<void> {
+    if (this.normalRouteObserverWatchId !== null) {
+      const watchId = this.normalRouteObserverWatchId;
+      this.normalRouteObserverWatchId = null;
+      await this.enhancedWs?.unwatch(watchId).catch(() => undefined);
+    }
+    for (const pending of this.normalRouteObserverPending.values()) {
+      clearTimeout(pending.timer);
+    }
+    if (this.normalRouteObserverActive) {
+      this.log.info("Stopped normal-route observer", {
+        mint: this.normalRouteObserverMint,
+        qualifiedWallets: this.normalRouteObserverQualified.size,
+        reason,
+      });
+    }
+    this.normalRouteObserverActive = false;
+    this.normalRouteObserverMint = null;
+    this.normalRouteObserverReferenceFeeLamports = null;
+    this.normalRouteObserverSeenWallets.clear();
+    this.normalRouteObserverPending.clear();
+    this.normalRouteObserverQualified.clear();
+    this.normalRouteObserverRejected.clear();
   }
 
   private startNewTokenBuyClusterLogger(mint: string): void {
@@ -8210,6 +8576,16 @@ export class InsiderBot extends EventEmitter {
     const state = this.followTokenEarlyBundlerExitState;
     if (!state?.active) return;
 
+    // Normal follow-token route: the observer is the sole buy trigger, so the
+    // bundler sold-all branch must not buy. Exits still run.
+    if (!this.followInsiderObservationMode && !this.fromNewTokenStreamActive()) {
+      this.log.info(
+        "Normal-route sold-all branch did not buy — observer is the sole buy trigger",
+        { mint: funderState.mint, triggerWallet, signature },
+      );
+      return;
+    }
+
     if (
       options.preLiPhase &&
       this.resolveFollowTokenEarlyBundlerPreBuyExitBranch() ===
@@ -9247,6 +9623,16 @@ export class InsiderBot extends EventEmitter {
       watch.soldAmount += amount;
       watch.lastSellFeeLamports = tx.fee ?? null;
       watch.lastSellTimestamp = tx.timestamp;
+      // Normal route: an insider wallet sell fee anchors the observer's fee
+      // tolerance. Start the observer now that a reference fee exists.
+      if (
+        !this.normalRouteObserverActive &&
+        !this.followInsiderObservationMode &&
+        !this.fromNewTokenStreamActive() &&
+        watch.lastSellFeeLamports !== null
+      ) {
+        this.startNormalRouteObserver(mint);
+      }
       if (amount > watch.maxSingleSellTokenAmount) {
         watch.maxSingleSellTokenAmount = amount;
       }
@@ -15667,6 +16053,7 @@ export class InsiderBot extends EventEmitter {
       return;
     }
     await this.stopNewTokenBuyClusterLogger("token flow reset");
+    await this.stopNormalRouteObserver("token flow reset");
     const endedMint = this.watchingMint ?? this.activePosition?.mint ?? null;
     const endedFeePayer =
       this.funderFirstFeePayer ?? this.bundlerFunderWatch?.funderWallet ?? null;

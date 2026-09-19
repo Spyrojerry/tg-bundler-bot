@@ -186,7 +186,7 @@ export interface ServiceConfig {
   insiderFollowTokenEnabled: boolean;
   /** Enable the normal fast follow-token route; disabled by default so only follow-insider runs. */
   insiderFollowTokenNormalEnabled: boolean;
-  /** Normal follow-token route accepts CREATE -> migrate ages up to 2 seconds. */
+  /** Normal follow-token route accepts CREATE -> migrate ages up to 5 seconds. */
   insiderFollowTokenMaxMigrationAgeSec: number;
   /** Follow-token post-LI bundler sold-all: buy SOL when 8M gate fails but 16M fallback passes. */
   insiderFollowToken16mPostLiBuySol: number;
