@@ -143,6 +143,8 @@ const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 110;
 const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 300;
 /** Normal follow-token route: collect up to this many qualifying observer wallets. */
 const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
+/** Normal follow-token route: max wallets held (pending) at once while finding the valid ones. */
+const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 20;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
 const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 3;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
@@ -5470,6 +5472,7 @@ export class InsiderBot extends EventEmitter {
       minBuyUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_USD,
       maxBuyUsd: NORMAL_ROUTE_OBSERVER_MAX_BUY_USD,
       maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
+      maxHeldWallets: NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS,
       buyTriggerWallets: NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS,
       referenceFeeLamports,
       closeToleranceUsd: NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD,
@@ -5479,7 +5482,7 @@ export class InsiderBot extends EventEmitter {
         `<b>👀 ${this.label} Normal-Route Observer Started</b>`,
         `Token: <code>${mint}</code>`,
         `Watching for wallets with first buy <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD}</b>.`,
-        `Buy when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> qualifying wallets found (up to ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}).`,
+        `Buy when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> qualifying wallets found (up to ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}, max ${NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS} held at once).`,
       ].join("\n"),
       "normal-route observer started",
     );
@@ -5562,6 +5565,20 @@ export class InsiderBot extends EventEmitter {
         this.normalRouteObserverRejected.has(wallet)
       ) {
         continue;
+      }
+      if (
+        this.normalRouteObserverPending.size >=
+        NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS
+      ) {
+        this.log.info(
+          "Normal-route observer held-wallet cap reached — not holding more until confirms drain",
+          {
+            mint,
+            heldCount: this.normalRouteObserverPending.size,
+            maxHeldWallets: NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS,
+          },
+        );
+        break;
       }
       if (this.classifyTx(tx, wallet, mint) !== "buy") continue;
       this.normalRouteObserverSeenWallets.add(wallet);
