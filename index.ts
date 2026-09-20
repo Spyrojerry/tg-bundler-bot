@@ -2138,16 +2138,39 @@ async function main(): Promise<void> {
           );
           return;
         }
+        // Hard floor regardless of target: if P&L is below -30%, force-sell even
+        // when MC has not reached the exit target.
+        const hardFloorPnlPct =
+          bot.getEntryMc() > 0
+            ? ((currentMc - bot.getEntryMc()) / bot.getEntryMc()) * 100
+            : 0;
+        if (hardFloorPnlPct < -30) {
+          log.warn(
+            `[INSIDER ${botNumber} EXIT] PnL ${hardFloorPnlPct.toFixed(2)}% below -30% hard floor (MC $${currentMc.toLocaleString()} below target $${exitMc.toLocaleString()}) — selling.`,
+          );
+          bot.emit("sellTrigger", {
+            followedWallet: bot.getFollowedWallet()!,
+            positionMint: activePos.mint,
+            signature: "MC_HARD_FLOOR",
+            reason: `PnL ${hardFloorPnlPct.toFixed(2)}% below -30% hard floor (MC $${currentMc.toLocaleString()})`,
+          });
+          return;
+        }
         if (currentMc >= exitMc) {
           const pnlPct =
             bot.getEntryMc() > 0
               ? ((currentMc - bot.getEntryMc()) / bot.getEntryMc()) * 100
               : 0;
-          if (pnlPct > -30 && !positiveExitConfirmation) {
+          // P&L bands at the exit-MC trigger:
+          //  - P&L >= 0  → 1-second MC confirmation, then sell if MC holds.
+          //  - -30% <= P&L < 0 → hold; never sell here, wait for P&L positive.
+          //  - P&L < -30% → sell normally (no confirmation gate).
+          const HOLD_PNL_FLOOR_PCT = -30;
+          if (pnlPct >= 0 && !positiveExitConfirmation) {
             if (positiveMcExitConfirmations.has(index)) return;
             positiveMcExitConfirmations.add(index);
             log.info(
-              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% (above -30% floor) target reached; waiting 1 second for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% ≥ 0 target reached; waiting 1 second for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
             );
             setTimeout(() => {
               positiveMcExitConfirmations.delete(index);
@@ -2158,6 +2181,25 @@ async function main(): Promise<void> {
                 exitMc,
               });
             }, 1_000);
+            return;
+          }
+          if (pnlPct >= HOLD_PNL_FLOOR_PCT && pnlPct < 0) {
+            log.info(
+              `[INSIDER ${botNumber} MC EXIT HOLD] PnL ${pnlPct.toFixed(2)}% is between ${HOLD_PNL_FLOOR_PCT}% and 0% — holding until P&L turns positive. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+            );
+            return;
+          }
+          // P&L < -30%: sell normally, bypassing the dev-swap defer gate.
+          if (pnlPct < HOLD_PNL_FLOOR_PCT) {
+            log.warn(
+              `[INSIDER ${botNumber} EXIT] PnL ${pnlPct.toFixed(2)}% below ${HOLD_PNL_FLOOR_PCT}% — selling normally (no dev-swap defer). Current MC $${currentMc.toLocaleString()} reached Exit MC $${exitMc.toLocaleString()}.`,
+            );
+            bot.emit("sellTrigger", {
+              followedWallet: bot.getFollowedWallet()!,
+              positionMint: activePos.mint,
+              signature: "MC_TRIGGER",
+              reason: `Current MC $${currentMc.toLocaleString()} reached target $${exitMc.toLocaleString()} (PnL ${pnlPct.toFixed(2)}% below ${HOLD_PNL_FLOOR_PCT}%)`,
+            });
             return;
           }
           if (

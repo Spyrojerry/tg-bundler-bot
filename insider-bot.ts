@@ -147,6 +147,8 @@ const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
 const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 20;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
 const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 2;
+/** Normal follow-token route: do not buy when MC is below this floor; skip + reset instead. */
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 30_000;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
 const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 /** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
@@ -5596,6 +5598,38 @@ export class InsiderBot extends EventEmitter {
     const entry = [...this.normalRouteObserverQualified.entries()].at(-1);
     if (!entry) return;
     const [wallet, info] = entry;
+
+    // Buy-time MC floor: if the token's MC is below the floor when the observer
+    // buy trigger fires, skip the token and reset instead of buying.
+    const currentMc = await this.gmgnClient
+      .fetchTokenMarketCapUsd(funderState.mint)
+      .catch(() => null);
+    if (currentMc !== null && currentMc < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD) {
+      this.log.warn(
+        "Normal-route observer buy skipped — MC below floor; resetting token",
+        {
+          mint: funderState.mint,
+          currentMc,
+          minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
+          qualifiedWallets: this.normalRouteObserverQualified.size,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏭️ ${this.label} Normal-Route Buy Skipped — MC Below Floor</b>`,
+          `Token: <code>${funderState.mint}</code>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          `Required floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
+          "Observer buy trigger fired but MC is below the floor — token skipped and flow reset.",
+        ].join("\n"),
+        "normal-route observer buy skipped below mc floor",
+      );
+      await this.resetForNewToken(true, {
+        reason: "normal_route_observer_mc_below_floor",
+      });
+      return;
+    }
+
     await this.emitFollowTokenLargeInsiderBuy(
       funderState,
       wallet,
