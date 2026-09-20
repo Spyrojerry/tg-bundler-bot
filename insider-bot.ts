@@ -901,6 +901,8 @@ export class InsiderBot extends EventEmitter {
     }
   >();
   private normalRouteObserverRejected = new Set<string>();
+  /** Cumulative count of wallets ever held (past + currently held) this flow. */
+  private normalRouteObserverTotalHeldCount = 0;
   private followTokenLargeInsiderState: FollowTokenLargeInsiderState | null =
     null;
   private followTokenEarlyBundlerExitState: FollowTokenEarlyBundlerExitState | null =
@@ -3636,10 +3638,11 @@ export class InsiderBot extends EventEmitter {
         ? `Largest early insider (<code>${largestEarlyInsiderSells.wallet}</code>, ${largestEarlyInsiderSells.tokenAmount.toLocaleString()} tokens): <b>${largestEarlyInsiderSells.sellTxCount}</b> sell tx(s) at buy time`
         : "";
       const normalRouteHeldCount = this.normalRouteObserverPending.size;
+      const normalRouteTotalHeldCount = this.normalRouteObserverTotalHeldCount;
       const normalRouteQualifiedCount = this.normalRouteObserverQualified.size;
       const normalRouteObserverLine =
-        normalRouteQualifiedCount > 0 || normalRouteHeldCount > 0
-          ? `Normal-route observer at buy: <b>${normalRouteQualifiedCount}</b> qualified of ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS} · <b>${normalRouteHeldCount}</b> still held (5-min window)`
+        normalRouteQualifiedCount > 0 || normalRouteTotalHeldCount > 0
+          ? `Normal-route observer at buy: <b>${normalRouteQualifiedCount}</b> qualified of ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS} · <b>${normalRouteTotalHeldCount}</b> held total (${normalRouteHeldCount} still in 5-min window)`
           : "";
       this.log.info("Buy-time largest early insider sell-tx count", {
         mint: state.mint,
@@ -3658,6 +3661,7 @@ export class InsiderBot extends EventEmitter {
           largestEarlyInsiderSells?.scannedTxCount ?? null,
         normalRouteQualifiedCount,
         normalRouteHeldCount,
+        normalRouteTotalHeldCount,
       });
       void this.sendTelegramSafe(
         [
@@ -5356,6 +5360,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverActive = true;
     this.normalRouteObserverMint = mint;
     this.normalRouteObserverReferenceFeeLamports = referenceFeeLamports;
+    this.normalRouteObserverTotalHeldCount = 0;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
@@ -5510,6 +5515,7 @@ export class InsiderBot extends EventEmitter {
     const timer = setTimeout(() => {
       this.promoteNormalRouteObserverWallet(wallet);
     }, NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS);
+    this.normalRouteObserverTotalHeldCount += 1;
     this.normalRouteObserverPending.set(wallet, {
       buySol,
       buyUsd,
@@ -5527,6 +5533,7 @@ export class InsiderBot extends EventEmitter {
       feeLamports,
       windowMs: NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS,
       pendingCount: this.normalRouteObserverPending.size,
+      totalHeldCount: this.normalRouteObserverTotalHeldCount,
     });
     void this.sendTelegramSafe(
       [
@@ -5699,6 +5706,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverActive = false;
     this.normalRouteObserverMint = null;
     this.normalRouteObserverReferenceFeeLamports = null;
+    this.normalRouteObserverTotalHeldCount = 0;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
