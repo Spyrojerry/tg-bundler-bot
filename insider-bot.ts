@@ -8977,126 +8977,17 @@ export class InsiderBot extends EventEmitter {
   ): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
     const funderState = this.bundlerFunderWatch;
-    const li = this.followTokenLargeInsiderState;
+    // Pre-LI bundler sold-all buy path removed. The normal-route observer
+    // (qualified wallets #1–10) is the sole buy trigger; early bundler/recipient
+    // watches no longer trigger a buy and their wallets are not valid wallets.
     if (!state?.active || !funderState || state.mint !== funderState.mint) {
       return;
     }
-    if (
-      this.buySubmitted ||
-      this.buyDisabled ||
-      this.isBuyExecuting ||
-      this.isBuyGateEvaluating ||
-      state.preBuyBundlerPathTriggered
-    ) {
-      return;
-    }
-
-    const triggerWallet = this.resolveFollowTokenEarlyBundlerPreBuyTriggerWallet(
-      triggerTx,
-    );
-    if (!triggerWallet) return;
-
-    const earlyBuy = this.followTokenEarlyInsiderBuys?.[0];
-    const signature =
-      triggerTx?.signature ?? earlyBuy?.signature ?? "BUNDLER_SOLD_ALL";
-    const tx =
-      triggerTx ??
-      ({
-        signature,
-        timestamp: earlyBuy?.timestamp ?? 0,
-        type: "SWAP",
-      } as HeliusTransaction);
-
-    const waitingGate = await this.getBundlerSoldAllMaxSingleSellGateSnapshot();
-    if (waitingGate.maxSingleSellTokenAmount > 60_000_000) {
-      // Gate removed: the 60M cap no longer resets the flow. Log only and
-      // continue so other buy triggers (normal-route observer) still run.
-      this.log.warn("Pre-LI sold-all — active watch exceeds 60M cap; continuing", {
-        mint: funderState.mint,
-        maxSingleSellTokenAmount: waitingGate.maxSingleSellTokenAmount,
-        maxSingleSellWallet: waitingGate.maxSingleSellWallet,
-        cap: 60_000_000,
-      });
-    }
-    if (waitingGate.tier === "fail") {
-      await this.skipFollowTokenLargeInsiderFromPreLiMaxSingleSellGate(
-        tx,
-        waitingGate,
-      );
-      return;
-    }
-
-    if (!this.hasFollowTokenLargeInsiderValidWalletDiscovered()) {
-      if (
-        !state.preLiWaitingForValidLiNotified &&
-        (waitingGate.tier === "standard_8m" ||
-          waitingGate.tier === "fallback_16m")
-      ) {
-        state.preLiWaitingForValidLiNotified = true;
-        this.startPreLiFirstBuyObserver(funderState.mint);
-        const gateLabel =
-          waitingGate.tier === "fallback_16m" ? "16M fallback" : "8M standard";
-        const profitExitPercent =
-          waitingGate.tier === "fallback_16m"
-            ? FOLLOW_TOKEN_EARLY_BUNDLER_FALLBACK_PROFIT_EXIT_PERCENT
-            : FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT;
-        const windowRemainingSec = Math.max(
-          0,
-          (li?.feePayerWindowEndsAt ?? 0) - Math.floor(Date.now() / 1000),
-        );
-        void this.sendTelegramSafe(
-          [
-            `<b>⏳ ${this.label} Pre-LI Bundler Sold-All — Waiting for LI</b>`,
-            `Token: <code>${funderState.mint}</code>`,
-            `Path: <b>${gateLabel}</b> (+${profitExitPercent}% MC TP)`,
-            "All early bundlers/transfer recipients sold all before the first valid LI wallet.",
-            "No buy yet — waiting for at least 1 valid LI wallet.",
-            `Remaining LI window: <b>${Math.ceil(windowRemainingSec / 60)}m</b>`,
-            "Rug detection remains active; window close with no valid LI resets the flow.",
-          ].join("\n"),
-          "follow-token pre-li sold-all waiting for valid LI",
-        );
-      }
-      this.log.info("Pre-LI bundler sold-all — waiting for first valid LI wallet", {
-        mint: funderState.mint,
-        signature,
-      });
-      return;
-    }
-
-    // Bundler/recipient sold-all is only an armed pre-LI +80% path. Do not
-    // buy on the early exit before LI discovery; the first valid LI wallet
-    // within the feePayer window releases this path.
-    if (!li?.active || li.mint !== funderState.mint) return;
-
-    const firstLiGate = await this.getBundlerSoldAllMaxSingleSellGateSnapshot();
-    if (firstLiGate.tier === "fail") {
-      this.notifyBundlerSoldAllMaxSingleSellBuyBlocked("pre_li", firstLiGate);
-      return;
-    }
-
-    const gate = await this.getBundlerSoldAllMaxSingleSellGateSnapshot();
-    const maxSellTxCount = this.getFollowTokenEarlyBundlerExitMaxSellTxCount();
-    const maxCumulativeSellUsd =
-      this.getFollowTokenEarlyBundlerExitMaxCumulativeSellUsd();
-
-    this.log.warn("Pre-LI bundler sold-all — max-single-sell gate eval after first LI", {
-      mint: funderState.mint,
-      maxSellTxCount,
-      maxCumulativeSellUsd,
-      ...gate,
-      signature,
-    });
-
-    await this.triggerFollowTokenBundlerSoldAllBuy(
-      funderState,
-      triggerWallet,
-      signature,
-      tx,
-      gate,
+    this.log.info(
+      "Pre-LI bundler sold-all — buy path removed; observer is the sole buy trigger",
       {
-        preLiPhase: true,
-        bundlerExitBranch: "normal_mc_tp",
+        mint: funderState.mint,
+        signature: triggerTx?.signature ?? null,
       },
     );
   }
