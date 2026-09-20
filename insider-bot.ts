@@ -3635,6 +3635,12 @@ export class InsiderBot extends EventEmitter {
       const largestEarlyInsiderLine = largestEarlyInsiderSells
         ? `Largest early insider (<code>${largestEarlyInsiderSells.wallet}</code>, ${largestEarlyInsiderSells.tokenAmount.toLocaleString()} tokens): <b>${largestEarlyInsiderSells.sellTxCount}</b> sell tx(s) at buy time`
         : "";
+      const normalRouteHeldCount = this.normalRouteObserverPending.size;
+      const normalRouteQualifiedCount = this.normalRouteObserverQualified.size;
+      const normalRouteObserverLine =
+        normalRouteQualifiedCount > 0 || normalRouteHeldCount > 0
+          ? `Normal-route observer at buy: <b>${normalRouteQualifiedCount}</b> qualified of ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS} · <b>${normalRouteHeldCount}</b> still held (5-min window)`
+          : "";
       this.log.info("Buy-time largest early insider sell-tx count", {
         mint: state.mint,
         triggerSource: options.triggerSource ?? "valid_wallet_4",
@@ -3650,6 +3656,8 @@ export class InsiderBot extends EventEmitter {
           largestEarlyInsiderSells?.buyTxCount ?? null,
         largestEarlyInsiderScannedTxCount:
           largestEarlyInsiderSells?.scannedTxCount ?? null,
+        normalRouteQualifiedCount,
+        normalRouteHeldCount,
       });
       void this.sendTelegramSafe(
         [
@@ -3667,6 +3675,7 @@ export class InsiderBot extends EventEmitter {
             ? `Post-LI Qualified SOL gate: <b>${postLiQualifiedSolPass ? "PASSED" : "FAILED"}</b> · at least 1 present valid wallet must be &lt;${FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} SOL${postLiQualifiedSol.length ? ` · ${postLiQualifiedSol.map(({ wallet, qualifiedSol }) => `${wallet.slice(0, 6)}…=${qualifiedSol === null ? "?" : qualifiedSol.toFixed(2)} SOL`).join(", ")}` : ""}`
             : "",
           largestEarlyInsiderLine,
+          normalRouteObserverLine,
           `Buy: <b>${buySol} SOL</b>`,
           triggerSource === "valid_wallet_4"
             ? `Still watching for valid wallet #5.`
@@ -5354,6 +5363,9 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverWatchId = this.enhancedWs.watch(mint, (tx) => {
       void this.observeNormalRouteFirstBuy(mint, tx);
     });
+    // Keep qualified observer wallets' scrape watches healthy and re-scan their
+    // sells so the ≥25% exit is reliably tracked on this route too.
+    this.startValidWalletReconciliation();
     this.log.info("Started normal-route observer", {
       mint,
       minBuyUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_USD,
@@ -5563,6 +5575,8 @@ export class InsiderBot extends EventEmitter {
         signature: pending.signature,
         timestamp: pending.timestamp,
       });
+      // Ensure reconciliation is running so this wallet's sells are tracked.
+      this.startValidWalletReconciliation();
     }
     const count = this.normalRouteObserverQualified.size;
     this.log.info("Normal-route observer qualifying wallet", {
