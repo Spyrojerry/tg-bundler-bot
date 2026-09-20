@@ -148,7 +148,7 @@ const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 20;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
 const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 2;
 /** Normal follow-token route: do not buy when MC is below this floor; skip + reset instead. */
-const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 30_000;
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 40_000;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
 const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 /** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
