@@ -146,13 +146,15 @@ const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
 /** Normal follow-token route: max wallets held (pending) at once while finding the valid ones. */
 const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 20;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
-const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 2;
+const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 5;
 /** Normal follow-token route: do not buy when MC is below this floor; skip + reset instead. */
 const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 40_000;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
 const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 /** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
-const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 5 * 60 * 1_000;
+const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
+/** Normal follow-token route: a dropped held wallet with P&L above this % triggers a sell when the drop came from a sell tx. */
+const NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT = 25;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -865,10 +867,10 @@ export class InsiderBot extends EventEmitter {
   /**
    * Normal follow-token route observer: watches wallets whose first buy is
    * 0.11–0.3 SOL and whose fee matches any insider wallet's sell fee within
-   * $0.005. A qualifying first buy is held for a 5-minute confirmation window:
+   * $0.005. A qualifying first buy is held for a 4-minute confirmation window:
    * if any further buy or sell occurs after the first buy, the wallet is
    * dropped immediately; if the window passes with neither, the wallet joins
-   * the qualified pool. Three qualified wallets trigger the buy; this is the
+   * the qualified pool. Five qualified wallets trigger the buy; this is the
    * sole buy trigger on the normal route.
    */
   private normalRouteObserverActive = false;
@@ -876,7 +878,7 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverWatchId: number | null = null;
   private normalRouteObserverReferenceFeeLamports: number | null = null;
   private normalRouteObserverSeenWallets = new Set<string>();
-  /** Pending wallets held through the 5-minute confirmation window. */
+  /** Pending wallets held through the 4-minute confirmation window. */
   private normalRouteObserverPending = new Map<
     string,
     {
@@ -3642,7 +3644,7 @@ export class InsiderBot extends EventEmitter {
       const normalRouteQualifiedCount = this.normalRouteObserverQualified.size;
       const normalRouteObserverLine =
         normalRouteQualifiedCount > 0 || normalRouteTotalHeldCount > 0
-          ? `Normal-route observer at buy: <b>${normalRouteQualifiedCount}</b> qualified of ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS} · <b>${normalRouteTotalHeldCount}</b> held total (${normalRouteHeldCount} still in 5-min window)`
+          ? `Normal-route observer at buy: <b>${normalRouteQualifiedCount}</b> qualified of ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS} · <b>${normalRouteTotalHeldCount}</b> held total (${normalRouteHeldCount} still in 4-min window)`
           : "";
       this.log.info("Buy-time largest early insider sell-tx count", {
         mint: state.mint,
@@ -5437,7 +5439,7 @@ export class InsiderBot extends EventEmitter {
         .filter(Boolean),
     );
     // Pending-wallet guard first: any buy/sell touching a wallet held through
-    // its 5-minute confirmation window disqualifies it immediately. A sell has
+    // its 4-minute confirmation window disqualifies it immediately. A sell has
     // the wallet as the sender, so scan both directions.
     if (this.normalRouteObserverPending.size > 0) {
       const touchedWallets = new Set<string>();
@@ -5453,6 +5455,7 @@ export class InsiderBot extends EventEmitter {
           this.rejectNormalRouteObserverWallet(
             wallet,
             `buy/sell after first buy during confirmation window (${pendingKind})`,
+            pendingKind,
           );
         }
       }
@@ -5500,7 +5503,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * Holds a qualifying first buy through a 5-minute confirmation window. If the
+   * Holds a qualifying first buy through a 4-minute confirmation window. If the
    * window passes with no further buy or sell on the wallet, it is promoted to
    * the qualified pool; any intermediate buy/sell rejects it sooner.
    */
@@ -5525,7 +5528,7 @@ export class InsiderBot extends EventEmitter {
       tx,
       timer,
     });
-    this.log.info("Normal-route observer wallet held for 5-minute confirmation", {
+    this.log.info("Normal-route observer wallet held for 4-minute confirmation", {
       mint,
       wallet,
       buySol,
@@ -5542,7 +5545,7 @@ export class InsiderBot extends EventEmitter {
         `Wallet: <code>${wallet}</code>`,
         `First buy: <b>$${buyUsd.toFixed(2)}</b> · <b>${buySol.toFixed(4)} SOL</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
-        "Held for <b>5 minutes</b>; any buy or sell after this buy drops the wallet.",
+        "Held for <b>4 minutes</b>; any buy or sell after this buy drops the wallet.",
       ].join("\n"),
       "normal-route observer wallet held",
     );
@@ -5601,7 +5604,7 @@ export class InsiderBot extends EventEmitter {
         `Wallet: <code>${wallet}</code>`,
         `First buy: <b>$${pending.buyUsd.toFixed(2)}</b> · <b>${pending.buySol.toFixed(4)} SOL</b>`,
         `Buy tx: <code>${pending.signature}</code>`,
-        "Passed the 5-minute confirmation window with no further buy or sell.",
+        "Passed the 4-minute confirmation window with no further buy or sell.",
         `Qualifying wallets: <b>${count}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> needed (max ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS})`,
       ].join("\n"),
       "normal-route observer wallet",
@@ -5663,7 +5666,11 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
-  private rejectNormalRouteObserverWallet(wallet: string, reason: string): void {
+  private rejectNormalRouteObserverWallet(
+    wallet: string,
+    reason: string,
+    droppedByKind?: "buy" | "sell",
+  ): void {
     const pending = this.normalRouteObserverPending.get(wallet);
     if (pending) {
       clearTimeout(pending.timer);
@@ -5674,6 +5681,7 @@ export class InsiderBot extends EventEmitter {
       mint: this.normalRouteObserverMint,
       wallet,
       reason,
+      droppedByKind: droppedByKind ?? null,
     });
     void this.sendTelegramSafe(
       [
@@ -5684,6 +5692,66 @@ export class InsiderBot extends EventEmitter {
         `Qualifying wallets so far: <b>${this.normalRouteObserverQualified.size}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b>`,
       ].join("\n"),
       "normal-route observer wallet dropped",
+    );
+    // Sell trigger: only a drop caused by a sell tx (never a buy) can exit the
+    // position, and only when the position is up more than +25%.
+    if (droppedByKind === "sell") {
+      void this.maybeSellOnDroppedNormalRouteObserverWallet(wallet, reason);
+    }
+  }
+
+  /**
+   * Sell trigger: a held Normal-route observer wallet dropped by a sell tx while
+   * our MC-derived P&L is above +25% → exit the position.
+   */
+  private async maybeSellOnDroppedNormalRouteObserverWallet(
+    wallet: string,
+    reason: string,
+  ): Promise<void> {
+    if (
+      !this.activePosition ||
+      this.positionSellTriggered ||
+      this.phase !== "holding"
+    ) {
+      return;
+    }
+    const mint = this.activePosition.mint;
+    const entryMc = this.getEntryMc();
+    if (!(entryMc > 0)) return;
+    const currentMc = await this.gmgnClient
+      .fetchTokenMarketCapUsd(mint)
+      .catch(() => null);
+    if (currentMc === null) return;
+    const pnlPct = ((currentMc - entryMc) / entryMc) * 100;
+    if (pnlPct <= NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT) {
+      this.log.info(
+        "Normal-route observer dropped wallet — P&L not above +25%; no sell",
+        {
+          mint,
+          wallet,
+          pnlPct,
+          thresholdPct: NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT,
+          entryMc,
+          currentMc,
+        },
+      );
+      return;
+    }
+    const signature =
+      this.followTokenLargeInsiderState?.scrapeWatches.get(wallet)
+        ?.tokenActions?.at(-1)?.signature ?? "NORMAL_ROUTE_DROPPED_WALLET_SELL";
+    await this.triggerPositionSell(
+      mint,
+      `normal-route observer wallet dropped by sell tx (P&L +${pnlPct.toFixed(2)}%)`,
+      [
+        `<b>🚨 ${this.label} Normal-Route Observer Drop — Selling</b>`,
+        `Token: <code>${mint}</code>`,
+        `Dropped wallet: <code>${wallet}</code>`,
+        `Drop reason: ${reason}`,
+        `P&L: <b>+${pnlPct.toFixed(2)}%</b> (entry $${entryMc.toLocaleString()}, now $${currentMc.toLocaleString()})`,
+        "A held observer wallet sold while the position was above +25% — exiting.",
+      ],
+      signature,
     );
   }
 
