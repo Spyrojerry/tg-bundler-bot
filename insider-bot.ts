@@ -867,11 +867,12 @@ export class InsiderBot extends EventEmitter {
   /**
    * Normal follow-token route observer: watches wallets whose first buy is
    * 0.11–0.3 SOL and whose fee matches any insider wallet's sell fee within
-   * $0.005. A qualifying first buy is held for a 4-minute confirmation window:
-   * if any further buy or sell occurs after the first buy, the wallet is
-   * dropped immediately; if the window passes with neither, the wallet joins
-   * the qualified pool. Five qualified wallets trigger the buy; this is the
-   * sole buy trigger on the normal route.
+   * $0.005. A qualifying first buy is held for its own 4-minute confirmation
+   * window: any further buy or sell on the wallet during that window drops it;
+   * survivors are promoted to the qualified pool. Five held wallets trigger the
+   * buy — evaluated on the held count, not on the window; this is the sole buy
+   * trigger on the normal route. After the buy, only qualified (promoted)
+   * wallets feed the sell triggers.
    */
   private normalRouteObserverActive = false;
   private normalRouteObserverMint: string | null = null;
@@ -905,6 +906,24 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverRejected = new Set<string>();
   /** Cumulative count of wallets ever held (past + currently held) this flow. */
   private normalRouteObserverTotalHeldCount = 0;
+  /** Session-wide cumulative held wallets across all tokens (never reset). */
+  private normalRouteObserverSessionHeldWallets = 0;
+  /** Session-wide cumulative held wallets that reached qualified across all tokens. */
+  private normalRouteObserverSessionQualifiedWallets = 0;
+  /** Session-wide cumulative tokens that ran a normal-route observer. */
+  private normalRouteObserverSessionTokenCount = 0;
+  /** Session-wide cumulative observer window time (ms) accumulated across tokens. */
+  private normalRouteObserverSessionActiveMs = 0;
+  /** Wall-clock ms when the current normal-route observer started, for rate math. */
+  private normalRouteObserverStartedAtMs: number | null = null;
+  /** Per-token snapshot captured when the observer stops, for the reset message. */
+  private normalRouteObserverLastRunSummary: {
+    mint: string | null;
+    heldWallets: number;
+    qualifiedWallets: number;
+    activeMs: number;
+    heldPerMinute: number | null;
+  } | null = null;
   private followTokenLargeInsiderState: FollowTokenLargeInsiderState | null =
     null;
   private followTokenEarlyBundlerExitState: FollowTokenEarlyBundlerExitState | null =
@@ -3642,10 +3661,8 @@ export class InsiderBot extends EventEmitter {
       const normalRouteHeldCount = this.normalRouteObserverPending.size;
       const normalRouteTotalHeldCount = this.normalRouteObserverTotalHeldCount;
       const normalRouteQualifiedCount = this.normalRouteObserverQualified.size;
-      const normalRouteObserverLine =
-        normalRouteQualifiedCount > 0 || normalRouteTotalHeldCount > 0
-          ? `Normal-route observer at buy: <b>${normalRouteQualifiedCount}</b> qualified of ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS} · <b>${normalRouteTotalHeldCount}</b> held total (${normalRouteHeldCount} still in 4-min window)`
-          : "";
+      // Cumulative held totals are reported in the per-token reset message, not
+      // the buy message.
       this.log.info("Buy-time largest early insider sell-tx count", {
         mint: state.mint,
         triggerSource: options.triggerSource ?? "valid_wallet_4",
@@ -3681,7 +3698,6 @@ export class InsiderBot extends EventEmitter {
             ? `Post-LI Qualified SOL gate: <b>${postLiQualifiedSolPass ? "PASSED" : "FAILED"}</b> · at least 1 present valid wallet must be &lt;${FOLLOW_TOKEN_POST_LI_BUNDLER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW} SOL${postLiQualifiedSol.length ? ` · ${postLiQualifiedSol.map(({ wallet, qualifiedSol }) => `${wallet.slice(0, 6)}…=${qualifiedSol === null ? "?" : qualifiedSol.toFixed(2)} SOL`).join(", ")}` : ""}`
             : "",
           largestEarlyInsiderLine,
-          normalRouteObserverLine,
           `Buy: <b>${buySol} SOL</b>`,
           triggerSource === "valid_wallet_4"
             ? `Still watching for valid wallet #5.`
@@ -5363,6 +5379,8 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverMint = mint;
     this.normalRouteObserverReferenceFeeLamports = referenceFeeLamports;
     this.normalRouteObserverTotalHeldCount = 0;
+    this.normalRouteObserverStartedAtMs = Date.now();
+    this.normalRouteObserverSessionTokenCount += 1;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
@@ -5388,7 +5406,8 @@ export class InsiderBot extends EventEmitter {
         `<b>👀 ${this.label} Normal-Route Observer Started</b>`,
         `Token: <code>${mint}</code>`,
         `Watching for wallets with first buy <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD}</b>.`,
-        `Buy when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> qualifying wallets found (up to ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}, max ${NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS} held at once).`,
+        `Buy when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> wallets are held (up to ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}, max ${NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS} held at once).`,
+        `Each wallet is confirmed over its own <b>${NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS / 60_000}-minute</b> window.`,
       ].join("\n"),
       "normal-route observer started",
     );
@@ -5503,9 +5522,10 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * Holds a qualifying first buy through a 4-minute confirmation window. If the
-   * window passes with no further buy or sell on the wallet, it is promoted to
-   * the qualified pool; any intermediate buy/sell rejects it sooner.
+   * Holds a qualifying first buy through its own 4-minute confirmation window.
+   * The buy trigger is evaluated on the held count immediately; if any further
+   * buy or sell occurs on the wallet before its window elapses, it is dropped.
+   * Survivors promote to the qualified pool, which is what the sell triggers use.
    */
   private holdNormalRouteObserverWallet(
     mint: string,
@@ -5536,6 +5556,7 @@ export class InsiderBot extends EventEmitter {
       feeLamports,
       windowMs: NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS,
       pendingCount: this.normalRouteObserverPending.size,
+      heldCount: this.normalRouteObserverHeldCount(),
       totalHeldCount: this.normalRouteObserverTotalHeldCount,
     });
     void this.sendTelegramSafe(
@@ -5545,10 +5566,16 @@ export class InsiderBot extends EventEmitter {
         `Wallet: <code>${wallet}</code>`,
         `First buy: <b>$${buyUsd.toFixed(2)}</b> · <b>${buySol.toFixed(4)} SOL</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
-        "Held for <b>4 minutes</b>; any buy or sell after this buy drops the wallet.",
+        `Held <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> needed to buy; any buy or sell drops the wallet.`,
       ].join("\n"),
       "normal-route observer wallet held",
     );
+    void this.maybeTriggerNormalRouteObserverBuy();
+  }
+
+  /** Held wallets that count toward the buy trigger: pending + already qualified. */
+  private normalRouteObserverHeldCount(): number {
+    return this.normalRouteObserverPending.size + this.normalRouteObserverQualified.size;
   }
 
   private promoteNormalRouteObserverWallet(wallet: string): void {
@@ -5595,6 +5622,7 @@ export class InsiderBot extends EventEmitter {
       buySol: pending.buySol,
       feeLamports: pending.feeLamports,
       walletCount: count,
+      heldCount: this.normalRouteObserverHeldCount(),
       maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
     });
     void this.sendTelegramSafe(
@@ -5604,8 +5632,8 @@ export class InsiderBot extends EventEmitter {
         `Wallet: <code>${wallet}</code>`,
         `First buy: <b>$${pending.buyUsd.toFixed(2)}</b> · <b>${pending.buySol.toFixed(4)} SOL</b>`,
         `Buy tx: <code>${pending.signature}</code>`,
-        "Passed the 4-minute confirmation window with no further buy or sell.",
-        `Qualifying wallets: <b>${count}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> needed (max ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS})`,
+        "Survived the 4-minute confirmation window with no further buy or sell.",
+        `Held wallets: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> needed (max ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS})`,
       ].join("\n"),
       "normal-route observer wallet",
     );
@@ -5614,12 +5642,16 @@ export class InsiderBot extends EventEmitter {
 
   private async maybeTriggerNormalRouteObserverBuy(): Promise<void> {
     if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
-    if (this.normalRouteObserverQualified.size < NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS) {
+    // Buy trigger is evaluated on held wallets (pending + qualified), not on the
+    // 4-minute confirmation window — five held wallets is the trigger.
+    if (this.normalRouteObserverHeldCount() < NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS) {
       return;
     }
     const funderState = this.bundlerFunderWatch;
     if (!funderState) return;
-    const entry = [...this.normalRouteObserverQualified.entries()].at(-1);
+    const entry =
+      [...this.normalRouteObserverQualified.entries()].at(-1) ??
+      [...this.normalRouteObserverPending.entries()].at(-1);
     if (!entry) return;
     const [wallet, info] = entry;
 
@@ -5635,7 +5667,7 @@ export class InsiderBot extends EventEmitter {
           mint: funderState.mint,
           currentMc,
           minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
-          qualifiedWallets: this.normalRouteObserverQualified.size,
+          heldCount: this.normalRouteObserverHeldCount(),
         },
       );
       void this.sendTelegramSafe(
@@ -5671,17 +5703,19 @@ export class InsiderBot extends EventEmitter {
     reason: string,
     droppedByKind?: "buy" | "sell",
   ): void {
-    const pending = this.normalRouteObserverPending.get(wallet);
-    if (pending) {
-      clearTimeout(pending.timer);
-      this.normalRouteObserverPending.delete(wallet);
-    }
+    const wasQualified = this.normalRouteObserverQualified.has(wallet);
+    this.normalRouteObserverPending.delete(wallet);
+    // A held wallet that was already promoted must also leave the qualified pool
+    // so it stops counting toward the buy trigger.
+    this.normalRouteObserverQualified.delete(wallet);
     this.normalRouteObserverRejected.add(wallet);
     this.log.info("Normal-route observer wallet rejected", {
       mint: this.normalRouteObserverMint,
       wallet,
       reason,
       droppedByKind: droppedByKind ?? null,
+      wasQualified,
+      heldCount: this.normalRouteObserverHeldCount(),
     });
     void this.sendTelegramSafe(
       [
@@ -5689,20 +5723,22 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${this.normalRouteObserverMint ?? "unknown"}</code>`,
         `Wallet: <code>${wallet}</code>`,
         `Reason: ${reason}`,
-        `Qualifying wallets so far: <b>${this.normalRouteObserverQualified.size}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b>`,
+        `Qualified: <b>${wasQualified ? "yes" : "no (still in confirmation window)"}</b>`,
+        `Held wallets so far: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b>`,
       ].join("\n"),
       "normal-route observer wallet dropped",
     );
-    // Sell trigger: only a drop caused by a sell tx (never a buy) can exit the
-    // position, and only when the position is up more than +25%.
+    // Sell trigger: any held wallet (pending or qualified) dropped by a sell tx
+    // — never a buy — when the position is up more than +25%. Qualification is
+    // NOT required here; only the ≥25% sold exit requires qualified wallets.
     if (droppedByKind === "sell") {
       void this.maybeSellOnDroppedNormalRouteObserverWallet(wallet, reason);
     }
   }
 
   /**
-   * Sell trigger: a held Normal-route observer wallet dropped by a sell tx while
-   * our MC-derived P&L is above +25% → exit the position.
+   * Sell trigger: any held Normal-route observer wallet (pending or qualified)
+   * dropped by a sell tx while our MC-derived P&L is above +25% → exit.
    */
   private async maybeSellOnDroppedNormalRouteObserverWallet(
     wallet: string,
@@ -5755,6 +5791,46 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  /**
+   * Cumulative normal-route observer totals across every token this session.
+   * Sent around each token reset. Includes the per-minute held rate for this
+   * token's run and the session-wide rate.
+   */
+  private async sendNormalRouteObserverCumulativeTelegram(
+    endedMint: string | null,
+  ): Promise<void> {
+    const run = this.normalRouteObserverLastRunSummary;
+    const sessionHeld = this.normalRouteObserverSessionHeldWallets;
+    const sessionQualified = this.normalRouteObserverSessionQualifiedWallets;
+    const sessionTokens = this.normalRouteObserverSessionTokenCount;
+    const sessionActiveMs = this.normalRouteObserverSessionActiveMs;
+    const sessionPerMinute =
+      sessionActiveMs > 0 ? sessionHeld / (sessionActiveMs / 60_000) : null;
+    const thisRunPerMinute = run?.heldPerMinute ?? null;
+    if (sessionTokens === 0 && !run) return;
+    await this.sendTelegramSafe(
+      [
+        `<b>📊 ${this.label} Normal-Route Held — Cumulative</b>`,
+        endedMint ? `Token just ended: <code>${endedMint}</code>` : "",
+        "",
+        `This token — held: <b>${run?.heldWallets ?? 0}</b> · qualified: <b>${run?.qualifiedWallets ?? 0}</b>`,
+        thisRunPerMinute !== null
+          ? `This token — held per minute: <b>${thisRunPerMinute.toFixed(2)}</b> (${((run?.activeMs ?? 0) / 1_000).toFixed(0)}s window)`
+          : "",
+        "",
+        `Cumulative tokens observed: <b>${sessionTokens}</b>`,
+        `Cumulative held wallets: <b>${sessionHeld}</b>`,
+        `Cumulative qualified wallets: <b>${sessionQualified}</b>`,
+        sessionPerMinute !== null
+          ? `Cumulative held per minute: <b>${sessionPerMinute.toFixed(2)}</b> (${(sessionActiveMs / 60_000).toFixed(2)} min total)`
+          : "",
+      ]
+        .filter((line) => line !== "")
+        .join("\n"),
+      "normal-route cumulative held notification",
+    );
+  }
+
   private async stopNormalRouteObserver(reason: string): Promise<void> {
     if (this.normalRouteObserverWatchId !== null) {
       const watchId = this.normalRouteObserverWatchId;
@@ -5765,9 +5841,31 @@ export class InsiderBot extends EventEmitter {
       clearTimeout(pending.timer);
     }
     if (this.normalRouteObserverActive) {
+      const heldWallets = this.normalRouteObserverTotalHeldCount;
+      const qualifiedWallets = this.normalRouteObserverQualified.size;
+      const activeMs =
+        this.normalRouteObserverStartedAtMs !== null
+          ? Math.max(0, Date.now() - this.normalRouteObserverStartedAtMs)
+          : 0;
+      this.normalRouteObserverLastRunSummary = {
+        mint: this.normalRouteObserverMint,
+        heldWallets,
+        qualifiedWallets,
+        activeMs,
+        heldPerMinute:
+          activeMs > 0 ? heldWallets / (activeMs / 60_000) : null,
+      };
+      this.normalRouteObserverSessionHeldWallets += heldWallets;
+      this.normalRouteObserverSessionQualifiedWallets += qualifiedWallets;
+      this.normalRouteObserverSessionActiveMs += activeMs;
       this.log.info("Stopped normal-route observer", {
         mint: this.normalRouteObserverMint,
-        qualifiedWallets: this.normalRouteObserverQualified.size,
+        qualifiedWallets,
+        heldWallets,
+        activeMs,
+        heldPerMinute:
+          activeMs > 0 ? +(heldWallets / (activeMs / 60_000)).toFixed(2) : null,
+        sessionHeldWallets: this.normalRouteObserverSessionHeldWallets,
         reason,
       });
     }
@@ -5775,6 +5873,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverMint = null;
     this.normalRouteObserverReferenceFeeLamports = null;
     this.normalRouteObserverTotalHeldCount = 0;
+    this.normalRouteObserverStartedAtMs = null;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
@@ -15873,6 +15972,12 @@ export class InsiderBot extends EventEmitter {
         endedMint,
         liNearMisses,
       );
+    }
+
+    // Cumulative normal-route observer held totals across all tokens, reported
+    // here (around each token reset) rather than in the buy message.
+    if (!options?.skipTelegram) {
+      await this.sendNormalRouteObserverCumulativeTelegram(endedMint);
     }
 
     if (
