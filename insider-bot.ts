@@ -914,8 +914,12 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverSessionTokenCount = 0;
   /** Session-wide cumulative observer window time (ms) accumulated across tokens. */
   private normalRouteObserverSessionActiveMs = 0;
+  /** Session-wide exact held counts bucketed by minute (index 0 = minute 1). */
+  private normalRouteObserverSessionHeldPerMinute: number[] = [];
   /** Wall-clock ms when the current normal-route observer started, for rate math. */
   private normalRouteObserverStartedAtMs: number | null = null;
+  /** Exact held count bucketed by elapsed clock minute (index 0 = first minute). */
+  private normalRouteObserverHeldPerMinute: number[] = [];
   /** Per-token snapshot captured when the observer stops, for the reset message. */
   private normalRouteObserverLastRunSummary: {
     mint: string | null;
@@ -923,6 +927,7 @@ export class InsiderBot extends EventEmitter {
     qualifiedWallets: number;
     activeMs: number;
     heldPerMinute: number | null;
+    heldPerMinuteBuckets: number[];
   } | null = null;
   private followTokenLargeInsiderState: FollowTokenLargeInsiderState | null =
     null;
@@ -5380,6 +5385,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverReferenceFeeLamports = referenceFeeLamports;
     this.normalRouteObserverTotalHeldCount = 0;
     this.normalRouteObserverStartedAtMs = Date.now();
+    this.normalRouteObserverHeldPerMinute = [];
     this.normalRouteObserverSessionTokenCount += 1;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
@@ -5536,6 +5542,16 @@ export class InsiderBot extends EventEmitter {
       this.promoteNormalRouteObserverWallet(wallet);
     }, NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS);
     this.normalRouteObserverTotalHeldCount += 1;
+    // Bucket this hold into its elapsed clock minute (index 0 = minute 1).
+    if (this.normalRouteObserverStartedAtMs !== null) {
+      const minuteIndex = Math.floor(
+        (Date.now() - this.normalRouteObserverStartedAtMs) / 60_000,
+      );
+      while (this.normalRouteObserverHeldPerMinute.length <= minuteIndex) {
+        this.normalRouteObserverHeldPerMinute.push(0);
+      }
+      this.normalRouteObserverHeldPerMinute[minuteIndex] += 1;
+    }
     this.normalRouteObserverPending.set(wallet, {
       buySol,
       buyUsd,
@@ -5722,6 +5738,7 @@ export class InsiderBot extends EventEmitter {
       wasQualified,
       heldCount: this.normalRouteObserverHeldCount(),
     });
+    const droppedBySell = droppedByKind === "sell";
     void this.sendTelegramSafe(
       [
         `<b>🚫 ${this.label} Normal-Route Observer — Wallet Dropped</b>`,
@@ -5729,6 +5746,7 @@ export class InsiderBot extends EventEmitter {
         `Wallet: <code>${wallet}</code>`,
         `Reason: ${reason}`,
         `Qualified: <b>${wasQualified ? "yes" : "no (still in confirmation window)"}</b>`,
+        `Drop tx: <b>${droppedByKind ?? "unknown"}</b>${droppedBySell ? " — checking P&L for sell trigger" : " — no sell trigger (buy drop)"}`,
         `Held wallets so far: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b>`,
       ].join("\n"),
       "normal-route observer wallet dropped",
@@ -5736,7 +5754,7 @@ export class InsiderBot extends EventEmitter {
     // Sell trigger: any held wallet (pending or qualified) dropped by a sell tx
     // — never a buy — when the position is up more than +25%. Qualification is
     // NOT required here; only the ≥25% sold exit requires qualified wallets.
-    if (droppedByKind === "sell") {
+    if (droppedBySell) {
       void this.maybeSellOnDroppedNormalRouteObserverWallet(wallet, reason);
     }
   }
@@ -5813,21 +5831,27 @@ export class InsiderBot extends EventEmitter {
       sessionActiveMs > 0 ? sessionHeld / (sessionActiveMs / 60_000) : null;
     const thisRunPerMinute = run?.heldPerMinute ?? null;
     if (sessionTokens === 0 && !run) return;
+    const formatMinuteBuckets = (buckets: number[]): string =>
+      buckets.length > 0
+        ? buckets.map((count, i) => `min ${i + 1}: <b>${count}</b>`).join(" · ")
+        : "none";
     await this.sendTelegramSafe(
       [
         `<b>📊 ${this.label} Normal-Route Held — Cumulative</b>`,
         endedMint ? `Token just ended: <code>${endedMint}</code>` : "",
         "",
         `This token — held: <b>${run?.heldWallets ?? 0}</b> · qualified: <b>${run?.qualifiedWallets ?? 0}</b>`,
+        `This token — held each minute: ${formatMinuteBuckets(run?.heldPerMinuteBuckets ?? [])}`,
         thisRunPerMinute !== null
-          ? `This token — held per minute: <b>${thisRunPerMinute.toFixed(2)}</b> (${((run?.activeMs ?? 0) / 1_000).toFixed(0)}s window)`
+          ? `This token — average held per minute: <b>${thisRunPerMinute.toFixed(2)}</b> (${((run?.activeMs ?? 0) / 1_000).toFixed(0)}s window)`
           : "",
         "",
         `Cumulative tokens observed: <b>${sessionTokens}</b>`,
         `Cumulative held wallets: <b>${sessionHeld}</b>`,
         `Cumulative qualified wallets: <b>${sessionQualified}</b>`,
+        `Cumulative held each minute: ${formatMinuteBuckets(this.normalRouteObserverSessionHeldPerMinute)}`,
         sessionPerMinute !== null
-          ? `Cumulative held per minute: <b>${sessionPerMinute.toFixed(2)}</b> (${(sessionActiveMs / 60_000).toFixed(2)} min total)`
+          ? `Cumulative average held per minute: <b>${sessionPerMinute.toFixed(2)}</b> (${(sessionActiveMs / 60_000).toFixed(2)} min total)`
           : "",
       ]
         .filter((line) => line !== "")
@@ -5859,10 +5883,18 @@ export class InsiderBot extends EventEmitter {
         activeMs,
         heldPerMinute:
           activeMs > 0 ? heldWallets / (activeMs / 60_000) : null,
+        heldPerMinuteBuckets: [...this.normalRouteObserverHeldPerMinute],
       };
       this.normalRouteObserverSessionHeldWallets += heldWallets;
       this.normalRouteObserverSessionQualifiedWallets += qualifiedWallets;
       this.normalRouteObserverSessionActiveMs += activeMs;
+      for (let i = 0; i < this.normalRouteObserverHeldPerMinute.length; i += 1) {
+        while (this.normalRouteObserverSessionHeldPerMinute.length <= i) {
+          this.normalRouteObserverSessionHeldPerMinute.push(0);
+        }
+        this.normalRouteObserverSessionHeldPerMinute[i] +=
+          this.normalRouteObserverHeldPerMinute[i];
+      }
       this.log.info("Stopped normal-route observer", {
         mint: this.normalRouteObserverMint,
         qualifiedWallets,
