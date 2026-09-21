@@ -2120,7 +2120,6 @@ async function main(): Promise<void> {
       log.info(
         `[INSIDER ${botNumber} MC CHECK] Token: ${mint} MC: $${currentMc.toLocaleString()} (Source: ${fetched?.source ?? "Unknown"})`,
       );
-
       // Rug reset: dev CLOSE_ACCOUNT / zero SOL (InsiderBot WSS) plus MC below $3k here.
 
       if (await bot.tryTriggerRugMarketCapReset(currentMc)) {
@@ -2138,21 +2137,21 @@ async function main(): Promise<void> {
           );
           return;
         }
-        // Hard floor regardless of target: if P&L is below -50%, force-sell even
+        // Hard floor regardless of target: if P&L is below -60%, force-sell even
         // when MC has not reached the exit target.
         const hardFloorPnlPct =
           bot.getEntryMc() > 0
             ? ((currentMc - bot.getEntryMc()) / bot.getEntryMc()) * 100
             : 0;
-        if (hardFloorPnlPct < -50) {
+        if (hardFloorPnlPct < -60) {
           log.warn(
-            `[INSIDER ${botNumber} EXIT] PnL ${hardFloorPnlPct.toFixed(2)}% below -50% hard floor (MC $${currentMc.toLocaleString()} below target $${exitMc.toLocaleString()}) — selling.`,
+            `[INSIDER ${botNumber} EXIT] PnL ${hardFloorPnlPct.toFixed(2)}% below -60% hard floor (MC $${currentMc.toLocaleString()} below target $${exitMc.toLocaleString()}) — selling.`,
           );
           bot.emit("sellTrigger", {
             followedWallet: bot.getFollowedWallet()!,
             positionMint: activePos.mint,
             signature: "MC_HARD_FLOOR",
-            reason: `PnL ${hardFloorPnlPct.toFixed(2)}% below -50% hard floor (MC $${currentMc.toLocaleString()})`,
+            reason: `PnL ${hardFloorPnlPct.toFixed(2)}% below -60% hard floor (MC $${currentMc.toLocaleString()})`,
           });
           return;
         }

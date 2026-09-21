@@ -5433,11 +5433,11 @@ export class InsiderBot extends EventEmitter {
     mint: string,
     tx: HeliusTransaction,
   ): Promise<void> {
+    // No buySubmitted short-circuit: the observer must keep processing after the
+    // buy so held-wallet drops (and the dropped-wallet sell trigger) stay live.
     if (
       !this.normalRouteObserverActive ||
-      this.normalRouteObserverMint !== mint ||
-      this.normalRouteObserverQualified.size >= NORMAL_ROUTE_OBSERVER_MAX_WALLETS ||
-      this.buySubmitted
+      this.normalRouteObserverMint !== mint
     ) {
       return;
     }
@@ -5478,9 +5478,6 @@ export class InsiderBot extends EventEmitter {
           );
         }
       }
-    }
-    if (this.normalRouteObserverQualified.size >= NORMAL_ROUTE_OBSERVER_MAX_WALLETS) {
-      return;
     }
     for (const wallet of recipients) {
       if (
@@ -5581,12 +5578,20 @@ export class InsiderBot extends EventEmitter {
   private promoteNormalRouteObserverWallet(wallet: string): void {
     const pending = this.normalRouteObserverPending.get(wallet);
     if (!pending) return;
-    if (
-      !this.normalRouteObserverActive ||
-      this.normalRouteObserverRejected.has(wallet) ||
-      this.normalRouteObserverQualified.size >= NORMAL_ROUTE_OBSERVER_MAX_WALLETS
-    ) {
+    if (!this.normalRouteObserverActive || this.normalRouteObserverRejected.has(wallet)) {
       this.normalRouteObserverPending.delete(wallet);
+      return;
+    }
+    // Cap applies only to promoted (qualified) wallets. Holds and drops keep
+    // being tracked past this point; we just stop promoting beyond the max.
+    if (this.normalRouteObserverQualified.size >= NORMAL_ROUTE_OBSERVER_MAX_WALLETS) {
+      this.normalRouteObserverPending.delete(wallet);
+      this.log.info("Normal-route observer promotion cap reached — wallet not promoted", {
+        mint: this.normalRouteObserverMint,
+        wallet,
+        qualifiedCount: this.normalRouteObserverQualified.size,
+        maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
+      });
       return;
     }
     const mint = this.normalRouteObserverMint;
