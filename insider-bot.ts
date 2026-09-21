@@ -151,7 +151,7 @@ const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 5;
  * Normal follow-token route: buy normally when MC is at/above this floor. Below
  * it, wait a grace minute for MC to reach the floor before skipping/resetting.
  */
-const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 75_000;
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 70_000;
 /** How long to wait for MC to reach the floor before skipping and resetting. */
 const NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS = 60 * 1_000;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
@@ -922,6 +922,12 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverHeldPerMinute: number[] = [];
   /** True while the buy is waiting out the below-floor MC grace minute. */
   private normalRouteObserverMcGraceInFlight = false;
+  /**
+   * One-shot latch for the grace evaluation. Set when a grace minute starts and
+   * only cleared when the observer stops for that token, so the async reset
+   * teardown cannot let a second grace/skip fire for the same token.
+   */
+  private normalRouteObserverMcGraceConsumed = false;
   /** Deadline timer for the below-floor MC grace wait. */
   private normalRouteObserverMcGraceTimer: ReturnType<typeof setTimeout> | null =
     null;
@@ -1148,9 +1154,8 @@ export class InsiderBot extends EventEmitter {
       currentMc,
       minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
     });
-    void this.maybeTriggerNormalRouteObserverBuy();
+    void this.emitNormalRouteObserverBuy();
   }
-
   getMonitoredWallet() {
     return this.monitoredWallet;
   }
@@ -5412,6 +5417,8 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverTotalHeldCount = 0;
     this.normalRouteObserverStartedAtMs = Date.now();
     this.normalRouteObserverHeldPerMinute = [];
+    this.normalRouteObserverMcGraceInFlight = false;
+    this.normalRouteObserverMcGraceConsumed = false;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
@@ -5694,6 +5701,7 @@ export class InsiderBot extends EventEmitter {
       return;
     }
     if (this.normalRouteObserverMcGraceInFlight) return;
+    if (this.normalRouteObserverMcGraceConsumed) return;
     const funderState = this.bundlerFunderWatch;
     if (!funderState) return;
     const entry =
@@ -5703,8 +5711,8 @@ export class InsiderBot extends EventEmitter {
     const [wallet, info] = entry;
 
     // MC gate: at/above the floor → buy normally. Below it → wait a grace
-    // minute, polling MC; if it reaches the floor we buy as normal, otherwise
-    // the token is skipped and the flow resets.
+    // minute, watching MC on the normal monitoring loop; if it reaches the
+    // floor we buy as normal, otherwise the token is skipped and the flow resets.
     const currentMc = await this.gmgnClient
       .fetchTokenMarketCapUsd(funderState.mint)
       .catch(() => null);
@@ -5713,6 +5721,7 @@ export class InsiderBot extends EventEmitter {
       currentMc < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD
     ) {
       this.normalRouteObserverMcGraceInFlight = true;
+      this.normalRouteObserverMcGraceConsumed = true;
       this.log.warn(
         "Normal-route observer buy held — MC below floor; waiting grace minute",
         {
@@ -5737,6 +5746,19 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
+    await this.emitNormalRouteObserverBuy();
+  }
+
+  /** Emit the normal-route observer buy using the latest held wallet. */
+  private async emitNormalRouteObserverBuy(): Promise<void> {
+    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
+    const funderState = this.bundlerFunderWatch;
+    if (!funderState) return;
+    const entry =
+      [...this.normalRouteObserverQualified.entries()].at(-1) ??
+      [...this.normalRouteObserverPending.entries()].at(-1);
+    if (!entry) return;
+    const [wallet, info] = entry;
     await this.emitFollowTokenLargeInsiderBuy(
       funderState,
       wallet,
@@ -5782,7 +5804,7 @@ export class InsiderBot extends EventEmitter {
         "Normal-route observer MC reached floor at grace deadline — buying",
         { mint, finalMc, minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD },
       );
-      await this.maybeTriggerNormalRouteObserverBuy();
+      await this.emitNormalRouteObserverBuy();
       return;
     }
     this.log.warn(
@@ -5976,6 +5998,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverStartedAtMs = null;
     this.normalRouteObserverHeldPerMinute = [];
     this.normalRouteObserverMcGraceInFlight = false;
+    this.normalRouteObserverMcGraceConsumed = false;
     if (this.normalRouteObserverMcGraceTimer !== null) {
       clearTimeout(this.normalRouteObserverMcGraceTimer);
       this.normalRouteObserverMcGraceTimer = null;
