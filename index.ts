@@ -2260,6 +2260,9 @@ async function main(): Promise<void> {
               (async () => {
                 const currentMc = await fetchInsiderMarketCapUsd(i, preBuyMint);
                 if (currentMc !== null) {
+                  // Feed the normal-route observer's below-floor grace wait so
+                  // it sees MC on the same 500ms cycle as normal monitoring.
+                  bot.notifyPreBuyMarketCap(currentMc.marketCap, preBuyMint);
                   await checkInsiderMcapFlow(
                     i,
                     currentMc.marketCap,

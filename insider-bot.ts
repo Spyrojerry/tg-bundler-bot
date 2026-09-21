@@ -147,8 +147,13 @@ const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
 const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 20;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
 const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 5;
-/** Normal follow-token route: do not buy when MC is below this floor; skip + reset instead. */
-const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 40_000;
+/**
+ * Normal follow-token route: buy normally when MC is at/above this floor. Below
+ * it, wait a grace minute for MC to reach the floor before skipping/resetting.
+ */
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 75_000;
+/** How long to wait for MC to reach the floor before skipping and resetting. */
+const NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS = 60 * 1_000;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
 const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 /** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
@@ -553,6 +558,11 @@ export interface InsiderBot {
   getStopLossMcPercent(): number;
   tryTriggerStopLossSell(currentMc: number): Promise<boolean>;
   tryTriggerRugMarketCapReset(currentMc: number): Promise<boolean>;
+  /**
+   * Pre-buy MC tick from the normal market-cap monitoring loop (500ms). Used by
+   * the normal-route observer's grace wait to detect MC reaching the floor.
+   */
+  notifyPreBuyMarketCap(currentMc: number, mint: string): void;
   isProfitExitDisabled(): boolean;
   shouldDeferFollowTokenEarlyBundlerMcTp(): boolean;
   notifyFollowTokenEarlyBundlerMcTpReached(currentMc: number): void;
@@ -906,20 +916,17 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverRejected = new Set<string>();
   /** Cumulative count of wallets ever held (past + currently held) this flow. */
   private normalRouteObserverTotalHeldCount = 0;
-  /** Session-wide cumulative held wallets across all tokens (never reset). */
-  private normalRouteObserverSessionHeldWallets = 0;
-  /** Session-wide cumulative held wallets that reached qualified across all tokens. */
-  private normalRouteObserverSessionQualifiedWallets = 0;
-  /** Session-wide cumulative tokens that ran a normal-route observer. */
-  private normalRouteObserverSessionTokenCount = 0;
-  /** Session-wide cumulative observer window time (ms) accumulated across tokens. */
-  private normalRouteObserverSessionActiveMs = 0;
-  /** Session-wide exact held counts bucketed by minute (index 0 = minute 1). */
-  private normalRouteObserverSessionHeldPerMinute: number[] = [];
   /** Wall-clock ms when the current normal-route observer started, for rate math. */
   private normalRouteObserverStartedAtMs: number | null = null;
   /** Exact held count bucketed by elapsed clock minute (index 0 = first minute). */
   private normalRouteObserverHeldPerMinute: number[] = [];
+  /** True while the buy is waiting out the below-floor MC grace minute. */
+  private normalRouteObserverMcGraceInFlight = false;
+  /** Deadline timer for the below-floor MC grace wait. */
+  private normalRouteObserverMcGraceTimer: ReturnType<typeof setTimeout> | null =
+    null;
+  /** Most recent pre-buy MC seen during the grace wait, for diagnostics. */
+  private normalRouteObserverLastGraceMc: number | null = null;
   /** Per-token snapshot captured when the observer stops, for the reset message. */
   private normalRouteObserverLastRunSummary: {
     mint: string | null;
@@ -1123,6 +1130,25 @@ export class InsiderBot extends EventEmitter {
 
   getPreBuyMint() {
     return this.watchingMint;
+  }
+
+  /**
+   * Called from the normal MC monitoring loop for the pre-buy mint. When the
+   * grace wait is active, a tick at/above the floor buys immediately.
+   */
+  notifyPreBuyMarketCap(currentMc: number, mint: string): void {
+    if (!this.normalRouteObserverMcGraceInFlight) return;
+    if (this.normalRouteObserverMint !== mint) return;
+    if (!Number.isFinite(currentMc)) return;
+    this.normalRouteObserverLastGraceMc = currentMc;
+    if (currentMc < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD) return;
+    this.normalRouteObserverMcGraceInFlight = false;
+    this.log.info("Normal-route observer MC reached floor (normal MC loop) — buying", {
+      mint,
+      currentMc,
+      minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
+    });
+    void this.maybeTriggerNormalRouteObserverBuy();
   }
 
   getMonitoredWallet() {
@@ -5386,7 +5412,6 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverTotalHeldCount = 0;
     this.normalRouteObserverStartedAtMs = Date.now();
     this.normalRouteObserverHeldPerMinute = [];
-    this.normalRouteObserverSessionTokenCount += 1;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
@@ -5668,6 +5693,7 @@ export class InsiderBot extends EventEmitter {
     if (this.normalRouteObserverHeldCount() < NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS) {
       return;
     }
+    if (this.normalRouteObserverMcGraceInFlight) return;
     const funderState = this.bundlerFunderWatch;
     if (!funderState) return;
     const entry =
@@ -5676,34 +5702,38 @@ export class InsiderBot extends EventEmitter {
     if (!entry) return;
     const [wallet, info] = entry;
 
-    // Buy-time MC floor: if the token's MC is below the floor when the observer
-    // buy trigger fires, skip the token and reset instead of buying.
+    // MC gate: at/above the floor → buy normally. Below it → wait a grace
+    // minute, polling MC; if it reaches the floor we buy as normal, otherwise
+    // the token is skipped and the flow resets.
     const currentMc = await this.gmgnClient
       .fetchTokenMarketCapUsd(funderState.mint)
       .catch(() => null);
-    if (currentMc !== null && currentMc < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD) {
+    if (
+      currentMc !== null &&
+      currentMc < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD
+    ) {
+      this.normalRouteObserverMcGraceInFlight = true;
       this.log.warn(
-        "Normal-route observer buy skipped — MC below floor; resetting token",
+        "Normal-route observer buy held — MC below floor; waiting grace minute",
         {
           mint: funderState.mint,
           currentMc,
           minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
+          graceMs: NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS,
           heldCount: this.normalRouteObserverHeldCount(),
         },
       );
       void this.sendTelegramSafe(
         [
-          `<b>⏭️ ${this.label} Normal-Route Buy Skipped — MC Below Floor</b>`,
+          `<b>⏳ ${this.label} Normal-Route Buy Held — MC Below Floor</b>`,
           `Token: <code>${funderState.mint}</code>`,
           `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-          `Required floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
-          "Observer buy trigger fired but MC is below the floor — token skipped and flow reset.",
+          `Target floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
+          `Waiting up to <b>1 minute</b> for MC to reach the floor — buy on reach, skip + reset otherwise.`,
         ].join("\n"),
-        "normal-route observer buy skipped below mc floor",
+        "normal-route observer mc grace wait started",
       );
-      await this.resetForNewToken(true, {
-        reason: "normal_route_observer_mc_below_floor",
-      });
+      void this.awaitNormalRouteObserverMcGrace(funderState.mint);
       return;
     }
 
@@ -5717,6 +5747,66 @@ export class InsiderBot extends EventEmitter {
         buySolOverride: this.getBuySolForFundingMode(false),
       },
     );
+  }
+
+  /**
+   * Below-floor grace: watch MC for up to a minute using the normal MC
+   * monitoring loop (via notifyPreBuyMarketCap) rather than polling. If MC
+   * reaches the floor the tick buys as normal; if not, the token is skipped and
+   * the flow resets.
+   */
+  private async awaitNormalRouteObserverMcGrace(mint: string): Promise<void> {
+    this.normalRouteObserverLastGraceMc = null;
+    await new Promise<void>((resolve) => {
+      this.normalRouteObserverMcGraceTimer = setTimeout(() => {
+        this.normalRouteObserverMcGraceTimer = null;
+        resolve();
+      }, NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS);
+    });
+    if (this.normalRouteObserverMcGraceInFlight) {
+      // Deadline reached with MC still below the floor (a floor tick would have
+      // cleared the flag and started the buy).
+      this.normalRouteObserverMcGraceInFlight = false;
+    }
+    if (!this.normalRouteObserverActive || this.normalRouteObserverMint !== mint) {
+      return;
+    }
+    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
+    // One final direct check so a tick that landed just before the deadline
+    // isn't lost.
+    const finalMc = await this.gmgnClient
+      .fetchTokenMarketCapUsd(mint)
+      .catch(() => null);
+    if (finalMc !== null && finalMc >= NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD) {
+      this.log.info(
+        "Normal-route observer MC reached floor at grace deadline — buying",
+        { mint, finalMc, minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD },
+      );
+      await this.maybeTriggerNormalRouteObserverBuy();
+      return;
+    }
+    this.log.warn(
+      "Normal-route observer grace expired — MC never reached floor; resetting",
+      {
+        mint,
+        finalMc,
+        lastTickMc: this.normalRouteObserverLastGraceMc,
+        minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
+      },
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏭️ ${this.label} Normal-Route Buy Skipped — MC Never Reached Floor</b>`,
+        `Token: <code>${mint}</code>`,
+        `MC after 1 minute: <b>${finalMc !== null ? `$${finalMc.toLocaleString()}` : "unknown"}</b>`,
+        `Target floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
+        "Grace minute elapsed without reaching the floor — token skipped and flow reset.",
+      ].join("\n"),
+      "normal-route observer mc grace expired",
+    );
+    await this.resetForNewToken(true, {
+      reason: "normal_route_observer_mc_grace_expired_below_floor",
+    });
   }
 
   private rejectNormalRouteObserverWallet(
@@ -5815,48 +5905,32 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * Cumulative normal-route observer totals across every token this session.
-   * Sent around each token reset. Includes the per-minute held rate for this
-   * token's run and the session-wide rate.
+   * Per-token summary of the normal-route observer's held counts, sent around
+   * each token reset. Current token only — no session-wide cumulative totals.
    */
   private async sendNormalRouteObserverCumulativeTelegram(
     endedMint: string | null,
   ): Promise<void> {
     const run = this.normalRouteObserverLastRunSummary;
-    const sessionHeld = this.normalRouteObserverSessionHeldWallets;
-    const sessionQualified = this.normalRouteObserverSessionQualifiedWallets;
-    const sessionTokens = this.normalRouteObserverSessionTokenCount;
-    const sessionActiveMs = this.normalRouteObserverSessionActiveMs;
-    const sessionPerMinute =
-      sessionActiveMs > 0 ? sessionHeld / (sessionActiveMs / 60_000) : null;
-    const thisRunPerMinute = run?.heldPerMinute ?? null;
-    if (sessionTokens === 0 && !run) return;
+    if (!run) return;
     const formatMinuteBuckets = (buckets: number[]): string =>
       buckets.length > 0
         ? buckets.map((count, i) => `min ${i + 1}: <b>${count}</b>`).join(" · ")
         : "none";
     await this.sendTelegramSafe(
       [
-        `<b>📊 ${this.label} Normal-Route Held — Cumulative</b>`,
-        endedMint ? `Token just ended: <code>${endedMint}</code>` : "",
+        `<b>📊 ${this.label} Normal-Route Held</b>`,
+        endedMint ? `Token: <code>${endedMint}</code>` : "",
         "",
-        `This token — held: <b>${run?.heldWallets ?? 0}</b> · qualified: <b>${run?.qualifiedWallets ?? 0}</b>`,
-        `This token — held each minute: ${formatMinuteBuckets(run?.heldPerMinuteBuckets ?? [])}`,
-        thisRunPerMinute !== null
-          ? `This token — average held per minute: <b>${thisRunPerMinute.toFixed(2)}</b> (${((run?.activeMs ?? 0) / 1_000).toFixed(0)}s window)`
-          : "",
-        "",
-        `Cumulative tokens observed: <b>${sessionTokens}</b>`,
-        `Cumulative held wallets: <b>${sessionHeld}</b>`,
-        `Cumulative qualified wallets: <b>${sessionQualified}</b>`,
-        `Cumulative held each minute: ${formatMinuteBuckets(this.normalRouteObserverSessionHeldPerMinute)}`,
-        sessionPerMinute !== null
-          ? `Cumulative average held per minute: <b>${sessionPerMinute.toFixed(2)}</b> (${(sessionActiveMs / 60_000).toFixed(2)} min total)`
+        `Held: <b>${run.heldWallets}</b> · qualified: <b>${run.qualifiedWallets}</b>`,
+        `Held each minute: ${formatMinuteBuckets(run.heldPerMinuteBuckets)}`,
+        run.heldPerMinute !== null
+          ? `Average held per minute: <b>${run.heldPerMinute.toFixed(2)}</b> (${(run.activeMs / 1_000).toFixed(0)}s window)`
           : "",
       ]
         .filter((line) => line !== "")
         .join("\n"),
-      "normal-route cumulative held notification",
+      "normal-route held notification",
     );
   }
 
@@ -5885,16 +5959,6 @@ export class InsiderBot extends EventEmitter {
           activeMs > 0 ? heldWallets / (activeMs / 60_000) : null,
         heldPerMinuteBuckets: [...this.normalRouteObserverHeldPerMinute],
       };
-      this.normalRouteObserverSessionHeldWallets += heldWallets;
-      this.normalRouteObserverSessionQualifiedWallets += qualifiedWallets;
-      this.normalRouteObserverSessionActiveMs += activeMs;
-      for (let i = 0; i < this.normalRouteObserverHeldPerMinute.length; i += 1) {
-        while (this.normalRouteObserverSessionHeldPerMinute.length <= i) {
-          this.normalRouteObserverSessionHeldPerMinute.push(0);
-        }
-        this.normalRouteObserverSessionHeldPerMinute[i] +=
-          this.normalRouteObserverHeldPerMinute[i];
-      }
       this.log.info("Stopped normal-route observer", {
         mint: this.normalRouteObserverMint,
         qualifiedWallets,
@@ -5902,7 +5966,6 @@ export class InsiderBot extends EventEmitter {
         activeMs,
         heldPerMinute:
           activeMs > 0 ? +(heldWallets / (activeMs / 60_000)).toFixed(2) : null,
-        sessionHeldWallets: this.normalRouteObserverSessionHeldWallets,
         reason,
       });
     }
@@ -5911,6 +5974,13 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverReferenceFeeLamports = null;
     this.normalRouteObserverTotalHeldCount = 0;
     this.normalRouteObserverStartedAtMs = null;
+    this.normalRouteObserverHeldPerMinute = [];
+    this.normalRouteObserverMcGraceInFlight = false;
+    if (this.normalRouteObserverMcGraceTimer !== null) {
+      clearTimeout(this.normalRouteObserverMcGraceTimer);
+      this.normalRouteObserverMcGraceTimer = null;
+    }
+    this.normalRouteObserverLastGraceMc = null;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
