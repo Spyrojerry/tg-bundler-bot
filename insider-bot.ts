@@ -908,8 +908,8 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverSeenWallets = new Set<string>();
   /**
    * Normal-route early fee-buy mode: wallets from the token's first-2s buys
-   * whose tx fee exceeded $1. The sell trigger fires once every one of these
-   * wallets has sold all.
+   * whose tx fee exceeded $1. The sell trigger fires as soon as any one of
+   * these wallets has sold all.
    */
   private normalRouteEarlyFeeBuyWallets = new Set<string>();
   private normalRouteEarlyFeeBuyMode = false;
@@ -2963,7 +2963,7 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * Normal-route early fee-buy sell trigger: the position exits once every
+   * Normal-route early fee-buy sell trigger: the position exits as soon as any
    * qualifying first-2s fee-$1+ wallet has sold all of its holdings.
    */
   private async handleNormalRouteEarlyFeeBuyWalletSoldAll(
@@ -3012,13 +3012,12 @@ export class InsiderBot extends EventEmitter {
         `Wallet: <code>${wallet}</code>`,
         `Sold all: <b>${soldAllCount}/${totalCount}</b> qualifying wallets`,
         totalCount > 1
-          ? "Waiting for the remaining qualifying wallets to sell all before exiting."
-          : "All qualifying wallets sold all — exiting.",
+          ? "Any qualifying wallet sold all — exiting."
+          : "Qualifying wallet sold all — exiting.",
       ].join("\n"),
       "normal-route early fee-buy wallet sold all",
     );
 
-    if (soldAllCount < totalCount) return;
     if (this.phase !== "holding") return;
 
     li.exitTriggerSignature = tx.signature;
@@ -3028,12 +3027,12 @@ export class InsiderBot extends EventEmitter {
     }
     await this.triggerPositionSell(
       funderState.mint,
-      "normal-route early fee-buy all qualifying wallets sold all",
+      "normal-route early fee-buy any qualifying wallet sold all",
       [
         `<b>🚨 ${this.label} Normal-Route Exit</b>`,
         `Token: <code>${funderState.mint}</code>`,
-        `All <b>${totalCount}</b> qualifying wallet(s) (first-2s buys, fee &gt; $1) sold all.`,
-        `Last wallet: <code>${wallet}</code>`,
+        `Qualifying wallet <code>${wallet}</code> (first-2s buys, fee &gt; $1) sold all.`,
+        `Sold all so far: <b>${soldAllCount}/${totalCount}</b>.`,
         `Tx: <code>${tx.signature}</code>`,
         "",
         "Selling the <b>100%</b> position.",
@@ -5634,9 +5633,9 @@ export class InsiderBot extends EventEmitter {
 
     const [first] = qualifying;
 
-    // Enter early fee-buy mode: track every qualifying wallet and sell once all
-    // of them have sold all. Register each with a scrape watch like the ≥25%
-    // exit pool so their sells are observed.
+    // Enter early fee-buy mode: track every qualifying wallet and sell as soon
+    // as any one of them has sold all. Register each with a scrape watch like
+    // the ≥25% exit pool so their sells are observed.
     this.normalRouteEarlyFeeBuyMode = true;
     this.normalRouteEarlyFeeBuyWallets = new Set(qualifying.map((q) => q.wallet));
     this.normalRouteEarlyFeeBuySoldAllWallets.clear();
@@ -5666,7 +5665,7 @@ export class InsiderBot extends EventEmitter {
             `${index + 1}. <code>${wallet}</code> · fee <b>$${feeUsd.toFixed(4)}</b>`,
         ),
         "",
-        `Exit: sell once <b>all ${qualifying.length}</b> qualifying wallet(s) sell all · <b>+80%</b> MC TP also active.`,
+        `Exit: sell once <b>any</b> of the ${qualifying.length} qualifying wallet(s) sell all · <b>+80%</b> MC TP also active.`,
         "Buying immediately.",
       ].join("\n"),
       "normal-route early fee-buy trigger",
