@@ -98,7 +98,8 @@ const FOLLOW_TOKEN_LARGE_INSIDER_MAX_VALID_WALLETS = 5;
 const FOLLOW_TOKEN_LARGE_INSIDER_BUY_AT_VALID_WALLET_COUNT = 4;
 /** At buy time (wallet #4), at least one of the first four valid wallets must have Qualified SOL below this. */
 const FOLLOW_TOKEN_LARGE_INSIDER_BUY_REQUIRES_ONE_QUALIFIED_SOL_BELOW = 20;
-const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION = 0.25;
+/** Valid-wallet early exit: trigger only when the wallet has sold 100% of its holdings. */
+const FOLLOW_TOKEN_LARGE_INSIDER_EXIT_SOLD_FRACTION = 1;
 const FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT = 80;
 const NEW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT = 40;
 const FOLLOW_TOKEN_LARGE_INSIDER_MAX_CHILDREN_PER_WALLET = 2;
@@ -1747,7 +1748,7 @@ export class InsiderBot extends EventEmitter {
         `Trigger: <b>${actionLabel}</b> tx`,
         `Tx: <code>${tx.signature}</code>`,
         "",
-        `Selling full position (${context}).`,
+        `Selling <b>100%</b> (${context}).`,
       ],
       tx.signature,
     );
@@ -3035,7 +3036,7 @@ export class InsiderBot extends EventEmitter {
         `Last wallet: <code>${wallet}</code>`,
         `Tx: <code>${tx.signature}</code>`,
         "",
-        "Selling the full position.",
+        "Selling the <b>100%</b> position.",
       ],
       tx.signature,
     );
@@ -3246,7 +3247,7 @@ export class InsiderBot extends EventEmitter {
         ? ((watch.soldAmount / watch.boughtAmount) * 100).toFixed(1)
         : null;
 
-    this.followTokenLargeInsiderLog("valid wallet ≥25% sold — exiting", {
+    this.followTokenLargeInsiderLog("valid wallet sold all (100%) — exiting", {
       mint: li.mint,
       wallet,
       validIndex,
@@ -3267,21 +3268,21 @@ export class InsiderBot extends EventEmitter {
         ? " (16M max-single-sell fallback buy — +40% MC TP tier)"
         : "";
     const exitDetail = ebState?.highSellUsdMode
-      ? `Valid wallet ≥25% exit (bundler cumulative sell >$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} — +${activeMcTpPercent.toFixed(0)}% MC TP disabled).`
+      ? `Valid wallet full-sell exit (bundler cumulative sell >$${FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_HIGH_SELL_USD_MC_TP_DISABLE.toLocaleString()} — +${activeMcTpPercent.toFixed(0)}% MC TP disabled). Selling <b>100%</b>.`
       : ebState?.allSoldAllComplete
-        ? `All early bundlers sold all; valid wallet ≥25% — selling full position${gateTierNote}.`
-        : `Valid wallet holdings below 75% — selling full position (+${activeMcTpPercent.toFixed(0)}% MC TP bypassed).`;
+        ? `All early bundlers sold all; valid wallet sold all — selling <b>100%</b>${gateTierNote}.`
+        : `Valid wallet sold all its holdings — selling <b>100%</b> (+${activeMcTpPercent.toFixed(0)}% MC TP bypassed).`;
 
     await this.triggerPositionSell(
       funderState.mint,
-      "follow-token large insider valid wallet 25% sold",
+      "follow-token large insider valid wallet sold all",
       [
         `<b>🚨 ${this.label} Follow-Token Large Insider Exit</b>`,
         `Token: <code>${funderState.mint}</code>`,
         validIndex > 0
           ? `Valid wallet #${validIndex}: <code>${wallet}</code>`
           : `Valid wallet: <code>${wallet}</code>`,
-        `Sold: <b>≥25%</b> (${soldPercent}% tracked)`,
+        `Sold: <b>100%</b> (${soldPercent}% tracked)`,
         tx ? `Tx: <code>${tx.signature}</code>` : "",
         "",
         exitDetail,
@@ -3364,7 +3365,7 @@ export class InsiderBot extends EventEmitter {
         `Valid wallet: <code>${wallet}</code>`,
         `Tx: <code>${tx.signature}</code>`,
         "",
-        "Tag-plan override: valid wallet sold all — selling full position.",
+        "Tag-plan override: valid wallet sold all — selling <b>100%</b>.",
       ],
       tx.signature,
     );
@@ -8643,7 +8644,7 @@ export class InsiderBot extends EventEmitter {
           : "valid wallet #4";
 
     this.followTokenLargeInsiderLog(
-      "buy skipped — valid LI wallet already sold ≥25% before buy",
+      "buy skipped — valid LI wallet already sold 100% before buy",
       {
         mint,
         triggerSource,
@@ -8658,7 +8659,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `Trigger: ${triggerLabel}`,
         "",
-        `≥1 valid Large Insider wallet already sold <b>≥25%</b> of holdings before buy — would buy then exit immediately.`,
+        `≥1 valid Large Insider wallet already sold <b>100%</b> of holdings before buy — would buy then exit immediately.`,
         "",
         ...wallets.map(
           ({ index, wallet, soldPercent }) =>
