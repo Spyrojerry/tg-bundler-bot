@@ -146,7 +146,7 @@ const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
 /** Normal follow-token route: max wallets held (pending) at once while finding the valid ones. */
 const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 25;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
-const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 20;
+const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 5;
 /**
  * Normal follow-token route: buy normally when MC is at/above this floor. Below
  * it, wait a grace minute for MC to reach the floor before skipping/resetting.
