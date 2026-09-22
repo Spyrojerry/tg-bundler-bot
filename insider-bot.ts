@@ -166,6 +166,16 @@ const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
 /** Normal follow-token route: a dropped held wallet triggers a sell when the drop came from a sell tx and P&L is above this % (any value from here upward). */
 const NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT = -20;
+/**
+ * Normal follow-token route (paused observer replacement): buy trigger scans all
+ * buys in the token's first 2 seconds and keeps those whose tx fee exceeds $1.
+ * A non-empty wallet list triggers the buy.
+ */
+const NORMAL_ROUTE_EARLY_FEE_BUY_WINDOW_MS = 2 * 1_000;
+/** Minimum tx fee in USD for an early buy to qualify as a trigger wallet. */
+const NORMAL_ROUTE_EARLY_FEE_BUY_MIN_USD = 1;
+/** How many of the token's earliest SWAPs to scan for the trigger. */
+const NORMAL_ROUTE_EARLY_FEE_BUY_SCAN_LIMIT = 40;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -895,6 +905,15 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverWatchId: number | null = null;
   private normalRouteObserverReferenceFeeLamports: number | null = null;
   private normalRouteObserverSeenWallets = new Set<string>();
+  /**
+   * Normal-route early fee-buy mode: wallets from the token's first-2s buys
+   * whose tx fee exceeded $1. The sell trigger fires once every one of these
+   * wallets has sold all.
+   */
+  private normalRouteEarlyFeeBuyWallets = new Set<string>();
+  private normalRouteEarlyFeeBuyMode = false;
+  /** Qualifying wallets observed to have sold all, by wallet address. */
+  private normalRouteEarlyFeeBuySoldAllWallets = new Set<string>();
   /** Pending wallets held through the 4-minute confirmation window. */
   private normalRouteObserverPending = new Map<
     string,
@@ -2925,7 +2944,9 @@ export class InsiderBot extends EventEmitter {
     );
     watch.tokenActions.push({ kind: "sell", signature: tx.signature, amount: sellAmount });
     watch.soldAmount += sellAmount;
-    if (this.isFollowTokenLargeInsiderBuyExitMode()) {
+    if (this.normalRouteEarlyFeeBuyMode) {
+      await this.handleNormalRouteEarlyFeeBuyWalletSoldAll(wallet, tx, watch);
+    } else if (this.isFollowTokenLargeInsiderBuyExitMode()) {
       await this.handleFollowTokenLargeInsiderValidWalletTwentyFivePercentSoldExit(
         wallet,
         tx,
@@ -2938,6 +2959,86 @@ export class InsiderBot extends EventEmitter {
         watch,
       );
     }
+  }
+
+  /**
+   * Normal-route early fee-buy sell trigger: the position exits once every
+   * qualifying first-2s fee-$1+ wallet has sold all of its holdings.
+   */
+  private async handleNormalRouteEarlyFeeBuyWalletSoldAll(
+    wallet: string,
+    tx: HeliusTransaction,
+    watch: FollowTokenLargeInsiderScrapeWatch,
+  ): Promise<void> {
+    const li = this.followTokenLargeInsiderState;
+    const funderState = this.bundlerFunderWatch;
+    if (
+      !li?.active ||
+      !funderState ||
+      !this.normalRouteEarlyFeeBuyWallets.has(wallet)
+    ) {
+      return;
+    }
+    if (li.exitTriggerSignature || this.positionSellTriggered) return;
+
+    const remainingAmount = await this.getRecipientTokenBalanceAtTx(
+      funderState,
+      this.buildFollowTokenLargeInsiderRecipientWatchStub(watch),
+      tx,
+    );
+    const soldAll =
+      (remainingAmount !== null && remainingAmount <= 0) ||
+      (watch.boughtAmount > 0 && watch.soldAmount >= watch.boughtAmount);
+    if (!soldAll) return;
+
+    this.normalRouteEarlyFeeBuySoldAllWallets.add(wallet);
+    const soldAllCount = this.normalRouteEarlyFeeBuySoldAllWallets.size;
+    const totalCount = this.normalRouteEarlyFeeBuyWallets.size;
+    this.log.info("Normal-route early fee-buy wallet sold all", {
+      mint: li.mint,
+      wallet,
+      soldAllCount,
+      totalCount,
+      signature: tx.signature,
+      boughtAmount: watch.boughtAmount,
+      soldAmount: watch.soldAmount,
+      remainingAmount,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>🔻 ${this.label} Normal-Route Wallet Sold All</b>`,
+        `Token: <code>${li.mint}</code>`,
+        `Wallet: <code>${wallet}</code>`,
+        `Sold all: <b>${soldAllCount}/${totalCount}</b> qualifying wallets`,
+        totalCount > 1
+          ? "Waiting for the remaining qualifying wallets to sell all before exiting."
+          : "All qualifying wallets sold all — exiting.",
+      ].join("\n"),
+      "normal-route early fee-buy wallet sold all",
+    );
+
+    if (soldAllCount < totalCount) return;
+    if (this.phase !== "holding") return;
+
+    li.exitTriggerSignature = tx.signature;
+    const ebState = this.followTokenEarlyBundlerExitState;
+    if (ebState?.active) {
+      ebState.exitTriggerSignature = tx.signature;
+    }
+    await this.triggerPositionSell(
+      funderState.mint,
+      "normal-route early fee-buy all qualifying wallets sold all",
+      [
+        `<b>🚨 ${this.label} Normal-Route Exit</b>`,
+        `Token: <code>${funderState.mint}</code>`,
+        `All <b>${totalCount}</b> qualifying wallet(s) (first-2s buys, fee &gt; $1) sold all.`,
+        `Last wallet: <code>${wallet}</code>`,
+        `Tx: <code>${tx.signature}</code>`,
+        "",
+        "Selling the full position.",
+      ],
+      tx.signature,
+    );
   }
 
   private isFollowTokenLargeInsiderBuyExitMode(): boolean {
@@ -5154,10 +5255,10 @@ export class InsiderBot extends EventEmitter {
       devCreateTimestamp: this.devCreateTimestamp,
       initialBundlers: [...this.bundlerFunderWatch.bundlerWallets],
     });
-    // Normal route: the observer is the sole buy trigger. Start it now; it will
-    // defer until an insider wallet sell fee exists to anchor the tolerance.
+    // Normal route: the 5/20-wallet observer is paused. The buy trigger is now
+    // the early fee-buy scan over the token's first 2 seconds.
     if (!followInsiderMode && !fromNewTokenStream) {
-      this.startNormalRouteObserver(mint);
+      void this.runNormalRouteEarlyFeeBuyTrigger(mint);
     }
     // Backend-log only: watch-start banner is informational.
     this.log.info("Follow-token Large Insider watch started", {
@@ -5395,6 +5496,189 @@ export class InsiderBot extends EventEmitter {
       referenceFeeLamports: state.smallestBundlerSellFeeLamports,
       closeToleranceUsd: PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD,
     });
+  }
+
+  /**
+   * Normal follow-token route buy trigger (replaces the paused observer): scan
+   * every buy in the token's first 2 seconds, keep the ones whose tx fee is
+   * above $1, and buy when that wallet list is non-empty.
+   */
+  private async runNormalRouteEarlyFeeBuyTrigger(mint: string): Promise<void> {
+    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
+    const funderState = this.bundlerFunderWatch;
+    if (!funderState) return;
+    const createdTs = this.devCreateTimestamp;
+    if (createdTs === null) {
+      this.log.warn(
+        "Normal-route early fee-buy trigger skipped — dev CREATE timestamp unavailable",
+        { mint },
+      );
+      return;
+    }
+    const solPriceUsd = await this.getCachedSolPriceUsd();
+    if (solPriceUsd === null) {
+      this.log.warn("Normal-route early fee-buy trigger skipped — no SOL price", {
+        mint,
+      });
+      return;
+    }
+
+    let swaps: HeliusTransaction[];
+    try {
+      swaps = await this.heliusClient.getEarlyInsiderSwaps(
+        mint,
+        NORMAL_ROUTE_EARLY_FEE_BUY_SCAN_LIMIT,
+      );
+    } catch (err) {
+      this.log.warn("Normal-route early fee-buy trigger — swap fetch failed; resetting", {
+        mint,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      void this.sendTelegramSafe(
+        [
+          `<b>⏭️ ${this.label} Normal-Route Buy Skipped</b>`,
+          `Token: <code>${mint}</code>`,
+          `Reason: could not read early swaps — ${err instanceof Error ? err.message : String(err)}`,
+          "Token skipped and flow reset.",
+        ].join("\n"),
+        "normal-route early fee-buy fetch failed",
+      );
+      await this.resetForNewToken(true, {
+        reason: "normal_route_early_fee_buy_swap_fetch_failed",
+      });
+      return;
+    }
+
+    const windowEnd = createdTs + NORMAL_ROUTE_EARLY_FEE_BUY_WINDOW_MS / 1_000;
+    // The four initial insider/bundler wallets are excluded from both the buy
+    // trigger list and the all-sold-all sell trigger.
+    const insiderWallets = new Set(
+      (
+        this.followTokenEarlyInsiderBuys ??
+        this.followTokenEarlyInsiderBuySnapshot ??
+        []
+      ).map((buy) => buy.wallet),
+    );
+    const seenWallets = new Set<string>();
+    const qualifying: Array<{
+      wallet: string;
+      feeUsd: number;
+      feeLamports: number;
+      signature: string;
+      timestamp: number;
+      tx: HeliusTransaction;
+    }> = [];
+    for (const tx of swaps) {
+      if (tx.type !== "SWAP") continue;
+      if (tx.timestamp === undefined || tx.timestamp > windowEnd) continue;
+      const feeLamports = tx.fee;
+      if (feeLamports === undefined) continue;
+      const feeUsd = (feeLamports * solPriceUsd) / 1_000_000_000;
+      if (feeUsd <= NORMAL_ROUTE_EARLY_FEE_BUY_MIN_USD) continue;
+      for (const transfer of tx.tokenTransfers ?? []) {
+        if (transfer.mint !== mint) continue;
+        if (!(transfer.tokenAmount > 0)) continue;
+        const wallet = transfer.toUserAccount;
+        if (!wallet || wallet === "__pool__") continue;
+        if (insiderWallets.has(wallet)) continue;
+        if (seenWallets.has(wallet)) continue;
+        seenWallets.add(wallet);
+        qualifying.push({
+          wallet,
+          feeUsd,
+          feeLamports,
+          signature: tx.signature,
+          timestamp: tx.timestamp,
+          tx,
+        });
+      }
+    }
+
+    this.log.info("Normal-route early fee-buy trigger evaluated", {
+      mint,
+      createdTs,
+      excludedInsiderWallets: [...insiderWallets],
+      windowEnd,
+      scannedSwaps: swaps.length,
+      qualifyingWallets: qualifying.length,
+      qualifying: qualifying.map((q) => ({
+        wallet: q.wallet,
+        feeUsd: +q.feeUsd.toFixed(4),
+      })),
+    });
+
+    if (qualifying.length === 0) {
+      this.log.warn(
+        "Normal-route early fee-buy trigger — no qualifying wallets; skipping + resetting",
+        { mint, windowEnd, scannedSwaps: swaps.length },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏭️ ${this.label} Normal-Route Buy Skipped</b>`,
+          `Token: <code>${mint}</code>`,
+          `Window: first <b>2 seconds</b> after create`,
+          `Scanned SWAPs: <b>${swaps.length}</b>`,
+          `Excluded the <b>${insiderWallets.size}</b> initial insider wallet(s) from the list.`,
+          `No remaining buy in the first 2s had tx fee above <b>$${NORMAL_ROUTE_EARLY_FEE_BUY_MIN_USD}</b> — token skipped and flow reset.`,
+        ].join("\n"),
+        "normal-route early fee-buy skipped",
+      );
+      await this.resetForNewToken(true, {
+        reason: "normal_route_early_fee_buy_no_qualifying_wallets",
+      });
+      return;
+    }
+
+    const [first] = qualifying;
+
+    // Enter early fee-buy mode: track every qualifying wallet and sell once all
+    // of them have sold all. Register each with a scrape watch like the ≥25%
+    // exit pool so their sells are observed.
+    this.normalRouteEarlyFeeBuyMode = true;
+    this.normalRouteEarlyFeeBuyWallets = new Set(qualifying.map((q) => q.wallet));
+    this.normalRouteEarlyFeeBuySoldAllWallets.clear();
+    const li = this.followTokenLargeInsiderState;
+    if (li?.active) {
+      for (const { wallet, tx, signature, timestamp } of qualifying) {
+        if (!li.validWallets.includes(wallet)) {
+          li.validWallets.push(wallet);
+        }
+        this.registerFollowTokenLargeInsiderValidWalletForExitMonitoring(wallet, {
+          tx,
+          signature,
+          timestamp,
+        });
+      }
+      this.startValidWalletReconciliation();
+    }
+
+    void this.sendTelegramSafe(
+      [
+        `<b>🎯 ${this.label} Normal-Route Early Fee-Buy Trigger</b>`,
+        `Token: <code>${mint}</code>`,
+        `Window: first <b>2 seconds</b> after create`,
+        `Qualifying wallets: <b>${qualifying.length}</b> (tx fee &gt; $${NORMAL_ROUTE_EARLY_FEE_BUY_MIN_USD}, ${insiderWallets.size} initial insider wallet(s) excluded)`,
+        ...qualifying.map(
+          ({ wallet, feeUsd }, index) =>
+            `${index + 1}. <code>${wallet}</code> · fee <b>$${feeUsd.toFixed(4)}</b>`,
+        ),
+        "",
+        `Exit: sell once <b>all ${qualifying.length}</b> qualifying wallet(s) sell all · <b>+80%</b> MC TP also active.`,
+        "Buying immediately.",
+      ].join("\n"),
+      "normal-route early fee-buy trigger",
+    );
+
+    await this.emitFollowTokenLargeInsiderBuy(
+      funderState,
+      first.wallet,
+      first.signature,
+      first.tx,
+      {
+        triggerSource: "smallest_bundler_sell_gate",
+        buySolOverride: this.getBuySolForFundingMode(false),
+      },
+    );
   }
 
   /**
@@ -9772,16 +10056,8 @@ export class InsiderBot extends EventEmitter {
       watch.soldAmount += amount;
       watch.lastSellFeeLamports = tx.fee ?? null;
       watch.lastSellTimestamp = tx.timestamp;
-      // Normal route: an insider wallet sell fee anchors the observer's fee
-      // tolerance. Start the observer now that a reference fee exists.
-      if (
-        !this.normalRouteObserverActive &&
-        !this.followInsiderObservationMode &&
-        !this.fromNewTokenStreamActive() &&
-        watch.lastSellFeeLamports !== null
-      ) {
-        this.startNormalRouteObserver(mint);
-      }
+      // Normal-route observer is paused — the early fee-buy scan is the buy
+      // trigger on the normal route, so no reference-fee observer is started.
       if (amount > watch.maxSingleSellTokenAmount) {
         watch.maxSingleSellTokenAmount = amount;
       }
@@ -16271,6 +16547,9 @@ export class InsiderBot extends EventEmitter {
     this.isBuyGateEvaluating = false;
     this.smallestRootImmediateBuy = false;
     this.newTokenBuyClusterWallets.clear();
+    this.normalRouteEarlyFeeBuyMode = false;
+    this.normalRouteEarlyFeeBuyWallets.clear();
+    this.normalRouteEarlyFeeBuySoldAllWallets.clear();
     this.profitExitDisabled = false;
     this.disableProfitExitAfterBuy = false;
     this.heliusPoolMetricsMint = null;
