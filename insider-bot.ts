@@ -144,7 +144,7 @@ const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 300;
 /** Normal follow-token route: collect up to this many qualifying observer wallets. */
 const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
 /** Normal follow-token route: max wallets held (pending) at once while finding the valid ones. */
-const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 25;
+const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 20;
 /** Normal follow-token route: buy once this many qualifying observer wallets are found. */
 const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 5;
 /**
@@ -160,6 +160,13 @@ const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 75_000;
 const NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS = 20;
 /** How long to wait for MC to reach the floor before skipping and resetting. */
 const NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS = 60 * 1_000;
+/**
+ * Extended MC grace: if the 1-minute grace ends with the required wallets held
+ * but MC still below the floor, keep watching for the floor until a held wallet
+ * is promoted (passes its own 4-minute confirmation window). Promotion ends the
+ * wait: buy if MC reached the floor, otherwise skip + reset.
+ */
+const NORMAL_ROUTE_OBSERVER_MC_GRACE_EXTENDED_MAX_MS = 4 * 60 * 1_000;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
 const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 /** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
@@ -936,6 +943,17 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverMcGraceConsumed = false;
   /** Deadline timer for the below-floor MC grace wait. */
   private normalRouteObserverMcGraceTimer: ReturnType<typeof setTimeout> | null =
+    null;
+  /**
+   * True once the 1-minute grace has been extended into the wallet-promotion
+   * wait (20 held but MC still below floor). Ended by the first promotion, or by
+   * the extended deadline.
+   */
+  private normalRouteObserverMcGraceExtended = false;
+  /** Resolver for the extended grace wait, released when promotion/deadline hits. */
+  private normalRouteObserverMcGraceExtendedResolve: (() => void) | null = null;
+  /** Safety deadline timer for the extended grace wait. */
+  private normalRouteObserverMcGraceExtendedTimer: ReturnType<typeof setTimeout> | null =
     null;
   /** Most recent pre-buy MC seen during the grace wait, for diagnostics. */
   private normalRouteObserverLastGraceMc: number | null = null;
@@ -3535,6 +3553,15 @@ export class InsiderBot extends EventEmitter {
       this.isBuyGateEvaluating ||
       this.isBuyBlockedByDevTokenOut(state.mint)
     ) {
+      this.log.info("Follow-token large insider buy skipped — emit precondition", {
+        mint: state.mint,
+        triggerSource: options.triggerSource ?? "valid_wallet_4",
+        buySubmitted: this.buySubmitted,
+        buyDisabled: this.buyDisabled,
+        isBuyExecuting: this.isBuyExecuting,
+        isBuyGateEvaluating: this.isBuyGateEvaluating,
+        devTokenOut: this.isBuyBlockedByDevTokenOut(state.mint),
+      });
       return;
     }
 
@@ -5419,6 +5446,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverHeldPerMinute = [];
     this.normalRouteObserverMcGraceInFlight = false;
     this.normalRouteObserverMcGraceConsumed = false;
+    this.normalRouteObserverMcGraceExtended = false;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
@@ -5644,6 +5672,9 @@ export class InsiderBot extends EventEmitter {
         qualifiedCount: this.normalRouteObserverQualified.size,
         maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
       });
+      // The wallet still completed its own 4-minute window, so the extended MC
+      // grace wait ends here just as a real promotion would.
+      this.releaseNormalRouteObserverExtendedGrace();
       return;
     }
     const mint = this.normalRouteObserverMint;
@@ -5656,6 +5687,9 @@ export class InsiderBot extends EventEmitter {
       timestamp: pending.timestamp,
       tx: pending.tx,
     });
+    // A promotion ends the extended MC grace wait (buy if MC reached the floor,
+    // else the grace skip + reset path runs).
+    this.releaseNormalRouteObserverExtendedGrace();
     // Join the Large Insider ≥25% exit pool with a scrape watch so this
     // wallet's post-buy sells can trigger the exit — same as the NewToken
     // observer wallets.
@@ -5698,9 +5732,24 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async maybeTriggerNormalRouteObserverBuy(): Promise<void> {
-    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
-    // Direct path: five held wallets and MC already at/above the floor → buy.
-    if (this.normalRouteObserverHeldCount() < NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS) {
+    const heldCount = this.normalRouteObserverHeldCount();
+    const required = this.normalRouteObserverMcGraceInFlight
+      ? NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS
+      : NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS;
+    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) {
+      if (heldCount >= required) {
+        this.log.info("Normal-route buy trigger skipped — buy precondition", {
+          mint: this.normalRouteObserverMint,
+          heldCount,
+          required,
+          buySubmitted: this.buySubmitted,
+          buyDisabled: this.buyDisabled,
+          isBuyExecuting: this.isBuyExecuting,
+        });
+      }
+      return;
+    }
+    if (heldCount < required) {
       return;
     }
     if (this.normalRouteObserverMcGraceInFlight) {
@@ -5709,13 +5758,34 @@ export class InsiderBot extends EventEmitter {
       this.evaluateNormalRouteObserverGrace(this.normalRouteObserverLastGraceMc);
       return;
     }
-    if (this.normalRouteObserverMcGraceConsumed) return;
+    if (this.normalRouteObserverMcGraceConsumed) {
+      this.log.info("Normal-route buy trigger skipped — grace already consumed", {
+        mint: this.normalRouteObserverMint,
+        heldCount,
+        required,
+      });
+      return;
+    }
     const funderState = this.bundlerFunderWatch;
-    if (!funderState) return;
+    if (!funderState) {
+      this.log.info("Normal-route buy trigger skipped — no funder state", {
+        mint: this.normalRouteObserverMint,
+        heldCount,
+        required,
+      });
+      return;
+    }
     const entry =
       [...this.normalRouteObserverQualified.entries()].at(-1) ??
       [...this.normalRouteObserverPending.entries()].at(-1);
-    if (!entry) return;
+    if (!entry) {
+      this.log.info("Normal-route buy trigger skipped — no held entry", {
+        mint: this.normalRouteObserverMint,
+        heldCount,
+        required,
+      });
+      return;
+    }
 
     // MC gate: at/above the floor → buy normally. Below it → start the grace
     // minute; the buy then requires the grace wallet count AND MC at the floor.
@@ -5812,8 +5882,11 @@ export class InsiderBot extends EventEmitter {
   /**
    * Below-floor grace: watch MC for up to a minute using the normal MC
    * monitoring loop (via notifyPreBuyMarketCap) rather than polling. If MC
-   * reaches the floor the tick buys as normal; if not, the token is skipped and
-   * the flow resets.
+   * reaches the floor with the required wallets held, the tick buys as normal.
+   * If the minute ends with the required wallets held but MC still below the
+   * floor, the wait is extended until a held wallet promotes: promotion ends the
+   * wait (buy if MC reached the floor, else skip + reset). A minute ending with
+   * too few wallets skips + resets immediately.
    */
   private async awaitNormalRouteObserverMcGrace(mint: string): Promise<void> {
     this.normalRouteObserverLastGraceMc = null;
@@ -5823,50 +5896,135 @@ export class InsiderBot extends EventEmitter {
         resolve();
       }, NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS);
     });
-    if (this.normalRouteObserverMcGraceInFlight) {
-      // Deadline reached with MC still below the floor (a floor tick would have
-      // cleared the flag and started the buy).
-      this.normalRouteObserverMcGraceInFlight = false;
-    }
     if (!this.normalRouteObserverActive || this.normalRouteObserverMint !== mint) {
       return;
     }
     if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
-    // One final direct check so a tick that landed just before the deadline
-    // isn't lost. Both conditions must hold: MC at/above floor AND the grace
-    // wallet count held.
-    const finalMc = await this.gmgnClient
+
+    // A floor tick during the minute clears the in-flight flag and buys.
+    if (!this.normalRouteObserverMcGraceInFlight) return;
+
+    const heldCount = this.normalRouteObserverHeldCount();
+    const mcAtMinuteEnd = await this.gmgnClient
       .fetchTokenMarketCapUsd(mint)
       .catch(() => null);
-    const heldCount = this.normalRouteObserverHeldCount();
+
+    // Minute ended with MC at the floor and enough wallets — buy.
     if (
-      finalMc !== null &&
-      finalMc >= NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD &&
+      mcAtMinuteEnd !== null &&
+      mcAtMinuteEnd >= NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD &&
       heldCount >= NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS
     ) {
-      this.log.info(
-        "Normal-route observer grace satisfied at deadline — buying",
-        {
-          mint,
-          finalMc,
-          heldCount,
-          minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
-          graceRequiredWallets: NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS,
-        },
-      );
+      this.normalRouteObserverMcGraceInFlight = false;
+      this.log.info("Normal-route observer grace satisfied at 1-minute mark — buying", {
+        mint,
+        mcAtMinuteEnd,
+        heldCount,
+        minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
+      });
       await this.emitNormalRouteObserverBuy();
       return;
     }
-    const mcShort = finalMc === null || finalMc < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD;
-    const walletsShort = heldCount < NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS;
+
+    // Minute ended, 20 wallets held but MC still below the floor — extend the
+    // wait until a wallet promotes.
+    if (heldCount >= NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS) {
+      this.normalRouteObserverMcGraceExtended = true;
+      this.log.info(
+        "Normal-route observer MC grace extended — required wallets held, MC below floor; waiting for promotion",
+        {
+          mint,
+          mcAtMinuteEnd,
+          heldCount,
+          minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
+          extendedMaxMs: NORMAL_ROUTE_OBSERVER_MC_GRACE_EXTENDED_MAX_MS,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏳ ${this.label} Normal-Route MC Grace Extended</b>`,
+          `Token: <code>${mint}</code>`,
+          `MC at 1 minute: <b>${mcAtMinuteEnd !== null ? `$${mcAtMinuteEnd.toLocaleString()}` : "unknown"}</b>`,
+          `Target floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
+          `Held: <b>${heldCount}/${NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS}</b> — still watching for the floor.`,
+          "Wait ends at the first wallet promotion: buy if MC reached the floor, skip + reset otherwise.",
+        ].join("\n"),
+        "normal-route observer mc grace extended",
+      );
+      await new Promise<void>((resolve) => {
+        this.normalRouteObserverMcGraceExtendedResolve = resolve;
+        this.normalRouteObserverMcGraceExtendedTimer = setTimeout(() => {
+          this.normalRouteObserverMcGraceExtendedTimer = null;
+          resolve();
+        }, NORMAL_ROUTE_OBSERVER_MC_GRACE_EXTENDED_MAX_MS);
+      });
+      this.normalRouteObserverMcGraceExtendedResolve = null;
+      this.normalRouteObserverMcGraceExtended = false;
+      if (this.normalRouteObserverMcGraceExtendedTimer !== null) {
+        clearTimeout(this.normalRouteObserverMcGraceExtendedTimer);
+        this.normalRouteObserverMcGraceExtendedTimer = null;
+      }
+      if (!this.normalRouteObserverActive || this.normalRouteObserverMint !== mint) {
+        return;
+      }
+      // A floor tick during the extension clears the flag and buys.
+      if (!this.normalRouteObserverMcGraceInFlight) return;
+      if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
+      // Promotion (or the extended deadline) released the wait. Final check.
+      const finalMc = await this.gmgnClient
+        .fetchTokenMarketCapUsd(mint)
+        .catch(() => null);
+      const finalHeld = this.normalRouteObserverHeldCount();
+      if (
+        finalMc !== null &&
+        finalMc >= NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD &&
+        finalHeld >= NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS
+      ) {
+        this.normalRouteObserverMcGraceInFlight = false;
+        this.log.info(
+          "Normal-route observer MC reached floor before promotion — buying",
+          { mint, finalMc, finalHeld, minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD },
+        );
+        await this.emitNormalRouteObserverBuy();
+        return;
+      }
+      this.normalRouteObserverMcGraceInFlight = false;
+      this.log.warn(
+        "Normal-route observer extended grace ended before MC reached floor — resetting",
+        {
+          mint,
+          finalMc,
+          finalHeld,
+          lastTickMc: this.normalRouteObserverLastGraceMc,
+          minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏭️ ${this.label} Normal-Route Buy Skipped — MC Never Reached Floor</b>`,
+          `Token: <code>${mint}</code>`,
+          `MC at wait end: <b>${finalMc !== null ? `$${finalMc.toLocaleString()}` : "unknown"}</b>`,
+          `Target floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
+          "Wallet promotion reached before MC hit the floor — token skipped and flow reset.",
+        ].join("\n"),
+        "normal-route observer mc grace extended expired",
+      );
+      await this.resetForNewToken(true, {
+        reason: "normal_route_observer_mc_grace_extended_below_floor",
+      });
+      return;
+    }
+
+    // Minute ended without enough held wallets — skip + reset as before.
+    this.normalRouteObserverMcGraceInFlight = false;
+    const mcShort = mcAtMinuteEnd === null || mcAtMinuteEnd < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD;
     this.log.warn(
-      "Normal-route observer grace expired — conditions unmet; resetting",
+      "Normal-route observer grace expired — insufficient wallets; resetting",
       {
         mint,
-        finalMc,
+        mcAtMinuteEnd,
         heldCount,
         mcShort,
-        walletsShort,
         lastTickMc: this.normalRouteObserverLastGraceMc,
         minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
         graceRequiredWallets: NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS,
@@ -5876,20 +6034,31 @@ export class InsiderBot extends EventEmitter {
       [
         `<b>⏭️ ${this.label} Normal-Route Buy Skipped — Grace Conditions Unmet</b>`,
         `Token: <code>${mint}</code>`,
-        `MC after 1 minute: <b>${finalMc !== null ? `$${finalMc.toLocaleString()}` : "unknown"}</b>`,
+        `MC after 1 minute: <b>${mcAtMinuteEnd !== null ? `$${mcAtMinuteEnd.toLocaleString()}` : "unknown"}</b>`,
         `Target floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
         `Held at end: <b>${heldCount}/${NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS}</b> needed.`,
-        mcShort && walletsShort
-          ? "MC stayed below the floor and the required wallets were not held — token skipped and flow reset."
-          : mcShort
-            ? "MC stayed below the floor — token skipped and flow reset."
-            : "Required wallet count was not held — token skipped and flow reset.",
+        "Required wallet count was not held — token skipped and flow reset.",
       ].join("\n"),
       "normal-route observer mc grace expired",
     );
     await this.resetForNewToken(true, {
       reason: "normal_route_observer_mc_grace_expired_below_floor",
     });
+  }
+
+  /**
+   * Called when a held wallet promotes during the extended MC grace: releases
+   * the wait so the promotion decides (buy if MC reached the floor, else reset).
+   */
+  private releaseNormalRouteObserverExtendedGrace(): void {
+    if (!this.normalRouteObserverMcGraceExtended) return;
+    if (this.normalRouteObserverMcGraceExtendedTimer !== null) {
+      clearTimeout(this.normalRouteObserverMcGraceExtendedTimer);
+      this.normalRouteObserverMcGraceExtendedTimer = null;
+    }
+    const resolve = this.normalRouteObserverMcGraceExtendedResolve;
+    this.normalRouteObserverMcGraceExtendedResolve = null;
+    resolve?.();
   }
 
   private rejectNormalRouteObserverWallet(
@@ -6060,6 +6229,16 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverHeldPerMinute = [];
     this.normalRouteObserverMcGraceInFlight = false;
     this.normalRouteObserverMcGraceConsumed = false;
+    this.normalRouteObserverMcGraceExtended = false;
+    if (this.normalRouteObserverMcGraceExtendedTimer !== null) {
+      clearTimeout(this.normalRouteObserverMcGraceExtendedTimer);
+      this.normalRouteObserverMcGraceExtendedTimer = null;
+    }
+    if (this.normalRouteObserverMcGraceExtendedResolve !== null) {
+      const resolve = this.normalRouteObserverMcGraceExtendedResolve;
+      this.normalRouteObserverMcGraceExtendedResolve = null;
+      resolve();
+    }
     if (this.normalRouteObserverMcGraceTimer !== null) {
       clearTimeout(this.normalRouteObserverMcGraceTimer);
       this.normalRouteObserverMcGraceTimer = null;
