@@ -164,8 +164,8 @@ const NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS = 60 * 1_000;
 const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 /** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
 const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
-/** Normal follow-token route: a dropped held wallet with P&L above this % triggers a sell when the drop came from a sell tx. */
-const NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT = 25;
+/** Normal follow-token route: a dropped held wallet triggers a sell when the drop came from a sell tx and P&L is above this % (any value from here upward). */
+const NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT = -20;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -5957,7 +5957,7 @@ export class InsiderBot extends EventEmitter {
     const pnlPct = ((currentMc - entryMc) / entryMc) * 100;
     if (pnlPct <= NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT) {
       this.log.info(
-        "Normal-route observer dropped wallet — P&L not above +25%; no sell",
+        "Normal-route observer dropped wallet — P&L at/below the sell threshold; no sell",
         {
           mint,
           wallet,
@@ -5974,14 +5974,14 @@ export class InsiderBot extends EventEmitter {
         ?.tokenActions?.at(-1)?.signature ?? "NORMAL_ROUTE_DROPPED_WALLET_SELL";
     await this.triggerPositionSell(
       mint,
-      `normal-route observer wallet dropped by sell tx (P&L +${pnlPct.toFixed(2)}%)`,
+      `normal-route observer wallet dropped by sell tx (P&L ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)`,
       [
         `<b>🚨 ${this.label} Normal-Route Observer Drop — Selling</b>`,
         `Token: <code>${mint}</code>`,
         `Dropped wallet: <code>${wallet}</code>`,
         `Drop reason: ${reason}`,
-        `P&L: <b>+${pnlPct.toFixed(2)}%</b> (entry $${entryMc.toLocaleString()}, now $${currentMc.toLocaleString()})`,
-        "A held observer wallet sold while the position was above +25% — exiting.",
+        `P&L: <b>${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</b> (entry $${entryMc.toLocaleString()}, now $${currentMc.toLocaleString()})`,
+        `A held observer wallet sold while the position was above the ${NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT}% sell threshold — exiting.`,
       ],
       signature,
     );
