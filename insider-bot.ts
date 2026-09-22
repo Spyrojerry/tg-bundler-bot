@@ -5235,6 +5235,13 @@ export class InsiderBot extends EventEmitter {
 
     void this.startFollowTokenEarlyBundlerExitMonitoring(mint, fromNewTokenStream);
 
+    // Normal route: the early fee-buy scan is the buy trigger and does not depend
+    // on the Large Insider flow starting (it only needs the bundler watch + dev
+    // create timestamp), so run it before any LI-start failure return.
+    if (!followInsiderMode && !fromNewTokenStream) {
+      void this.runNormalRouteEarlyFeeBuyTrigger(mint);
+    }
+
     const stubSecondGroup =
       this.buildFollowTokenStubSecondGroupFromInitialBundlers(watchState);
     const largeInsiderStarted = await this.startFollowTokenLargeInsiderFlow(
@@ -5256,11 +5263,6 @@ export class InsiderBot extends EventEmitter {
       devCreateTimestamp: this.devCreateTimestamp,
       initialBundlers: [...this.bundlerFunderWatch.bundlerWallets],
     });
-    // Normal route: the 5/20-wallet observer is paused. The buy trigger is now
-    // the early fee-buy scan over the token's first 2 seconds.
-    if (!followInsiderMode && !fromNewTokenStream) {
-      void this.runNormalRouteEarlyFeeBuyTrigger(mint);
-    }
     // Backend-log only: watch-start banner is informational.
     this.log.info("Follow-token Large Insider watch started", {
       mint,
