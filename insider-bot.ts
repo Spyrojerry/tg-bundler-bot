@@ -31,6 +31,12 @@ const REQUIRED_BUNDLER_MATCHES = 2;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 /** Follow-token route: minimum MC required to buy; below this the token is skipped and the flow resets. */
 const FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD = 40_000;
+/** Follow-token route: GMGN 24h net-buy entry threshold (USD). */
+export const FOLLOW_TOKEN_NET_BUY_ENTRY_USD = 15_000;
+/** Follow-token route: GMGN 24h net-buy take-profit threshold (USD). */
+export const FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD = 20_000;
+/** Follow-token route: GMGN 24h net-buy stop-loss threshold (USD). */
+export const FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD = 11_000;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
 const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
@@ -582,6 +588,12 @@ export interface InsiderBot {
    * the normal-route observer's grace wait to detect MC reaching the floor.
    */
   notifyPreBuyMarketCap(currentMc: number, mint: string): void;
+  /**
+   * GMGN net-buy driven buy gate for the normal follow-token route. Buys when
+   * the 24h net buy reaches the entry threshold and MC is at/above the minimum
+   * buy floor; skips and resets the token when MC is below the floor.
+   */
+  tryTriggerFollowTokenNetBuyEntry(mint: string): Promise<boolean>;
   isProfitExitDisabled(): boolean;
   shouldDeferFollowTokenEarlyBundlerMcTp(): boolean;
   notifyFollowTokenEarlyBundlerMcTpReached(currentMc: number): void;
@@ -1178,6 +1190,127 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverLastGraceMc = currentMc;
     this.evaluateNormalRouteObserverGrace(currentMc);
   }
+  /**
+   * GMGN net-buy driven buy gate for the normal follow-token route. Buys when
+   * the 24h net buy reaches the entry threshold and MC is at/above the minimum
+   * buy floor; skips + resets the token when MC is below the floor.
+   */
+  async tryTriggerFollowTokenNetBuyEntry(mint: string): Promise<boolean> {
+    if (this.flowSource !== "follow-token") return false;
+    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return false;
+    if (this.isBuyGateEvaluating) return false;
+    if (this.watchingMint !== mint) return false;
+    if (this.isBuyBlockedByDevTokenOut(mint)) return false;
+
+    const state = this.bundlerFunderWatch;
+    if (!state?.funderWallet) return false;
+
+    this.isBuyGateEvaluating = true;
+    try {
+      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
+      if (currentMc === null) {
+        this.log.warn(
+          "Follow-token net-buy entry — market cap unavailable; holding",
+          { mint },
+        );
+        return false;
+      }
+      if (currentMc < FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD) {
+        this.log.warn(
+          "Follow-token net-buy entry skipped — MC below minimum buy floor; resetting",
+          {
+            mint,
+            currentMc,
+            minBuyMarketCapUsd: FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD,
+          },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
+            `Token: <code>${mint}</code>`,
+            `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+            `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
+            "MC below the minimum buy floor — token skipped and flow reset.",
+          ].join("\n"),
+          "follow-token below minimum buy MC skip",
+        );
+        this.isBuyGateEvaluating = false;
+        await this.resetForNewToken(true, {
+          reason: `below_min_buy_market_cap_${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD}`,
+        });
+        return true;
+      }
+      const netBuy24h = await this.gmgnClient.fetchTokenNetBuy24hUsd(mint);
+      if (netBuy24h === null) {
+        this.log.warn("Follow-token net-buy entry — net buy unavailable; holding", {
+          mint,
+          currentMc,
+        });
+        return false;
+      }
+      if (netBuy24h < FOLLOW_TOKEN_NET_BUY_ENTRY_USD) {
+        this.log.info("Follow-token net-buy entry gate not reached", {
+          mint,
+          netBuy24h,
+          entryThresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
+          currentMc,
+        });
+        return false;
+      }
+
+      const profitExitPercent = FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT;
+      const buySol = this.getBuySolForFundingMode(state.lowFundingMode);
+      this.log.warn("Follow-token net-buy entry gate passed — buying", {
+        mint,
+        netBuy24h,
+        entryThresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
+        currentMc,
+        buySol,
+      });
+      if (this.isBuyBlockedByDevTokenOut(mint)) return false;
+      this.setEntryMc(currentMc);
+      this.setExitMc(20_000);
+      this.setBuyExecuting(true);
+      this.buySubmitted = true;
+      this.preBuyStopped = true;
+      this.disableProfitExitAfterBuy = true;
+      this.profitExitDisabled = false;
+      this.armDevTokenOutPostBuyWatch(mint);
+
+      void this.sendTelegramSafe(
+        [
+          `<b>🟢 ${this.label} Follow-Token Buy (GMGN Net Buy)</b>`,
+          `Token: <code>${mint}</code>`,
+          `24h net buy: <b>$${netBuy24h.toLocaleString()}</b> (entry ≥ $${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()})`,
+          `Entry MC: <b>$${currentMc.toLocaleString()}</b>`,
+          `Buy: <b>${buySol} SOL</b>`,
+          `Exit: take profit $${FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD.toLocaleString()} · stop loss $${FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD.toLocaleString()} (24h net buy)`,
+        ].join("\n"),
+        "follow-token net-buy entry",
+      );
+
+      this.emit("buyTrigger", {
+        followedWallet: this.getBuyTriggerFollowedWallet(state),
+        mint,
+        signature: "GMGN_NET_BUY_24H_ENTRY",
+        buySol,
+        entryMc: currentMc,
+        profitExitPercent,
+        monitoredWallet: this.monitoredWallet ?? undefined,
+        tradersListStr: [
+          `<b>GMGN Follow-Token Buy Gate Passed</b>`,
+          `24h net buy: <b>$${netBuy24h.toLocaleString()}</b>`,
+          `Entry threshold: <b>$${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()}</b>`,
+          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+          `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
+        ].join("\n"),
+      });
+      return true;
+    } finally {
+      this.isBuyGateEvaluating = false;
+    }
+  }
+
   getMonitoredWallet() {
     return this.monitoredWallet;
   }
@@ -3664,39 +3797,29 @@ export class InsiderBot extends EventEmitter {
 
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) return;
-      if (this.flowSource === "follow-token") {
-        if (currentMc < FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD) {
-          this.log.warn(
-            "Follow-token buy skipped — MC below minimum buy floor; resetting",
-            {
-              mint: state.mint,
-              currentMc,
-              minBuyMarketCapUsd: FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD,
-            },
-          );
-          void this.sendTelegramSafe(
-            [
-              `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
-              `Token: <code>${state.mint}</code>`,
-              `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-              `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
-              "MC below the minimum buy floor — token skipped and flow reset.",
-            ].join("\n"),
-            "follow-token below minimum buy MC skip",
-          );
-          await this.resetForNewToken(true, {
-            reason: `below_min_buy_market_cap_${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD}`,
-          });
-          return;
-        }
-        const netBuy24h = await this.gmgnClient.fetchTokenNetBuy24hUsd(state.mint);
-        if (netBuy24h === null || netBuy24h < 15_000) {
-          this.log.info("Follow-token buy deferred — GMGN 24h net buy below $15,000", {
+      if (this.flowSource === "follow-token" && currentMc < FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD) {
+        this.log.warn(
+          "Follow-token buy skipped — MC below minimum buy floor; resetting",
+          {
             mint: state.mint,
-            netBuy24h,
-          });
-          return;
-        }
+            currentMc,
+            minBuyMarketCapUsd: FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD,
+          },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
+            `Token: <code>${state.mint}</code>`,
+            `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+            `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
+            "MC below the minimum buy floor — token skipped and flow reset.",
+          ].join("\n"),
+          "follow-token below minimum buy MC skip",
+        );
+        await this.resetForNewToken(true, {
+          reason: `below_min_buy_market_cap_${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD}`,
+        });
+        return;
       }
       this.recordObservedMarketCapUsd(currentMc);
       if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
@@ -5148,6 +5271,29 @@ export class InsiderBot extends EventEmitter {
         followInsiderMode,
         fromNewTokenStream,
       });
+      if (!followInsiderMode) {
+        this.log.info("Follow-token GMGN net-buy flow started", {
+          mint,
+          entryThresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
+          takeProfitThresholdUsd: FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD,
+          stopLossThresholdUsd: FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD,
+          minBuyMarketCapUsd: FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD,
+          pollIntervalMs: 5_000,
+        });
+        void this.sendTelegramSafe(
+          [
+            `<b>👀 ${this.label} Follow-Token GMGN Flow Started</b>`,
+            `Token: <code>${mint}</code>`,
+            `Migrate tx: <code>${migrationSignature}</code>`,
+            `Early bundlers: <b>${earlyBundlerWallets.length}</b>`,
+            `Buy trigger: 24h net buy ≥ <b>$${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()}</b>`,
+            `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
+            `Exit: take profit <b>$${FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD.toLocaleString()}</b> · stop loss <b>$${FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD.toLocaleString()}</b>`,
+            "Polling GMGN 24h net buy every <b>5s</b>…",
+          ].join("\n"),
+          "follow-token GMGN flow started",
+        );
+      }
     }
     return this.isFollowTokenFlowActive(mint);
   }
