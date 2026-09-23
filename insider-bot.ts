@@ -36,7 +36,7 @@ export const FOLLOW_TOKEN_NET_BUY_ENTRY_USD = 15_000;
 /** Follow-token route: GMGN 24h net-buy take-profit threshold (USD). */
 export const FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD = 18_000;
 /** Follow-token route: GMGN 24h net-buy stop-loss threshold (USD). */
-export const FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD = 13_500;
+export const FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD = 11_000;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
 const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
