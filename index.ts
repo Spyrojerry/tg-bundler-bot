@@ -46,6 +46,10 @@ const followWalletLog = createLogger("FOLLOW-WALLET");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const MCAP_CHECK_INTERVAL_MS = 500;
+const FOLLOW_TOKEN_NET_BUY_POLL_INTERVAL_MS = 5_000;
+const FOLLOW_TOKEN_NET_BUY_ENTRY_USD = 15_000;
+const FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD = 20_000;
+const FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD = 10_000;
 const MCAP_FETCH_GRACE_MS = 400;
 const INSIDER_DAS_NO_PRICE_COOLDOWN_MS = 10_000;
 const isHeliusUsageExhaustionError = (err: unknown): boolean => {
@@ -241,6 +245,7 @@ async function main(): Promise<void> {
     string,
     { balance: bigint; quote: SellQuote | null; timestamp: number }
   >();
+  const followTokenNetBuyPollAt = new Map<number, number>();
   const activePositionRefreshes = new Set<string>();
   const positiveMcExitConfirmations = new Set<number>();
   const INSIDER_SELL_RETRY_DELAY_MS = 5_000;
@@ -2101,6 +2106,63 @@ async function main(): Promise<void> {
     const mint = preBuyMint || activePos!.mint;
 
     try {
+      if (bot.getFlowSource() === "follow-token") {
+        const lastNetBuyPoll = followTokenNetBuyPollAt.get(index) ?? 0;
+        if (Date.now() - lastNetBuyPoll < FOLLOW_TOKEN_NET_BUY_POLL_INTERVAL_MS) return;
+        followTokenNetBuyPollAt.set(index, Date.now());
+        const netBuy = await gmgnClients[index].fetchTokenNetBuy24hUsd(mint);
+        log.info(`[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] Poll result`, {
+          mint,
+          netBuy24hUsd: netBuy,
+          hasPosition: Boolean(activePos),
+          entryThresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
+          takeProfitThresholdUsd: FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD,
+          stopLossThresholdUsd: FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD,
+        });
+        if (netBuy === null) {
+          log.warn(`[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] No value returned; holding current state`, { mint });
+          return;
+        }
+        if (!activePos) {
+          if (netBuy < FOLLOW_TOKEN_NET_BUY_ENTRY_USD) {
+            log.info(`[INSIDER ${botNumber} FOLLOW-TOKEN ENTRY] Buy gate not reached`, {
+              mint,
+              netBuy24hUsd: netBuy,
+              thresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
+            });
+            return;
+          }
+          log.info(
+            `[INSIDER ${botNumber} FOLLOW-TOKEN ENTRY] 24h net buy $${netBuy.toLocaleString()} reached $${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()}.`,
+          );
+        } else if (
+          netBuy >= FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD ||
+          netBuy <= FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD
+        ) {
+          const reason = netBuy >= FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD
+            ? "24h net buy take profit"
+            : "24h net buy stop loss";
+          log.warn(
+            `[INSIDER ${botNumber} FOLLOW-TOKEN EXIT] ${reason}: $${netBuy.toLocaleString()}.`,
+          );
+          bot.emit("sellTrigger", {
+            followedWallet: bot.getFollowedWallet()!,
+            positionMint: activePos.mint,
+            signature: "GMGN_NET_BUY_24H",
+            reason: `${reason} at $${netBuy.toLocaleString()}`,
+          });
+          return;
+        }
+        if (activePos && netBuy > FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD && netBuy < FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD) {
+          log.info(`[INSIDER ${botNumber} FOLLOW-TOKEN EXIT] Thresholds not reached; holding`, {
+            mint,
+            netBuy24hUsd: netBuy,
+            stopLossThresholdUsd: FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD,
+            takeProfitThresholdUsd: FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD,
+          });
+          return;
+        }
+      }
       const fetched =
         preFetchedMc !== undefined
           ? {

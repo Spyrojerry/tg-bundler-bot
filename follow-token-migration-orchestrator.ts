@@ -287,8 +287,7 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
     } finally {
       this.inFlightMints.delete(mint);
     }
-  }
-
+      }
 
   suspendMigrationFeedForActiveFlow(mint: string): void {
     this.unsubscribeMigrationFeedForActiveFlow(mint);
@@ -362,6 +361,24 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         metadataPda: earlyResult.metadata.metadataPda,
       });
 
+      // Run the inexpensive, decisive 10-25 SOL gate before the remaining
+      // core checks so rejected tokens do not consume those Helius requests.
+      if (this.config.insiderFollowTokenNormalEnabled) {
+        const earlyBuys = await this.fetchFirstFourEarlyBuys(mint);
+        const invalidEarlyBuys = earlyBuys.filter(
+          (buy) => buy.buySol === null ||
+            buy.buySol < FOLLOW_TOKEN_NORMAL_MIN_EARLY_BUY_SOL ||
+            buy.buySol > FOLLOW_TOKEN_NORMAL_MAX_EARLY_BUY_SOL,
+        );
+        if (earlyBuys.length < REQUIRED_BUNDLER_COUNT || invalidEarlyBuys.length > 0) {
+          this.seenMigrationMints.add(mint);
+          log.info('Follow-token migration skipped — first-four buy SOL outside 10-25 SOL range', {
+            mint, signature, earlyBuys,
+          });
+          return;
+        }
+      }
+
       const coreResult = await this.evaluateCoreMigrationFilters(
         mint,
         migrationTimestamp,
@@ -382,6 +399,8 @@ export class FollowTokenMigrationOrchestrator extends EventEmitter {
         FOLLOW_INSIDER_ROUTE_ENABLED &&
         migrationAgeSec >= FOLLOW_INSIDER_MIN_MIGRATION_AGE_SEC &&
         migrationAgeSec <= FOLLOW_INSIDER_MAX_MIGRATION_AGE_SEC;
+
+
       if (!followInsiderMode && !this.config.insiderFollowTokenNormalEnabled) {
         this.seenMigrationMints.add(mint);
         log.info('Follow-token migration skipped — normal route disabled', {

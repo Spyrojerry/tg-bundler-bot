@@ -3662,6 +3662,22 @@ export class InsiderBot extends EventEmitter {
 
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) return;
+      if (this.flowSource === "follow-token") {
+        const netBuy24h = await this.gmgnClient.fetchTokenNetBuy24hUsd(state.mint);
+        this.log.info("Follow-token GMGN buy gate evaluated", {
+          mint: state.mint,
+          netBuy24h,
+          requiredNetBuy24h: 15_000,
+          passed: netBuy24h !== null && netBuy24h >= 15_000,
+        });
+        if (netBuy24h === null || netBuy24h < 15_000) {
+          this.log.info("Follow-token buy deferred — GMGN 24h net buy below $15,000", {
+            mint: state.mint,
+            netBuy24h,
+          });
+          return;
+        }
+      }
       this.recordObservedMarketCapUsd(currentMc);
       if (currentMc < INSIDER_RUG_MARKET_CAP_USD) {
         await this.resetForNewToken(true, {
@@ -3728,7 +3744,7 @@ export class InsiderBot extends EventEmitter {
         return;
       }
       this.setEntryMc(currentMc);
-      this.setExitMc(currentMc * (1 + profitExitPercent / 100));
+      this.setExitMc(this.flowSource === "follow-token" ? 20_000 : currentMc * (1 + profitExitPercent / 100));
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
@@ -5233,13 +5249,6 @@ export class InsiderBot extends EventEmitter {
     }
 
     void this.startFollowTokenEarlyBundlerExitMonitoring(mint, fromNewTokenStream);
-
-    // Normal route: the early fee-buy scan is the buy trigger and does not depend
-    // on the Large Insider flow starting (it only needs the bundler watch + dev
-    // create timestamp), so run it before any LI-start failure return.
-    if (!followInsiderMode && !fromNewTokenStream) {
-      void this.runNormalRouteEarlyFeeBuyTrigger(mint);
-    }
 
     const stubSecondGroup =
       this.buildFollowTokenStubSecondGroupFromInitialBundlers(watchState);

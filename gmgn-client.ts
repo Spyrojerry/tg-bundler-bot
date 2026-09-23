@@ -230,6 +230,52 @@ export class GmgnClient {
     return null;
   }
 
+  /** Fetch GMGN's current 24-hour net-buy value in USD. */
+  async fetchTokenNetBuy24hUsd(mint: string): Promise<number | null> {
+    this.validateSolAddress(mint, "mint");
+    log.info(`GMGN 24h net-buy poll started for ${mint}`);
+    try {
+      let data: Record<string, unknown> | null = null;
+      if (this.fetchMode !== "direct") data = await this.fetchCliData("token", mint);
+      if (!data) {
+        data = await this.limiter.schedule(() =>
+          this.fetchRawTokenData("v1/token/info", mint),
+        );
+      }
+      if (!data) return null;
+
+      const candidates = [
+        data.net_buy_24h,
+        data.net_buy_24h_usd,
+        data.net_buy_usd_24h,
+        data.net_buy_24h_value,
+        data.net_buy_24h_amount,
+        data.net_inflow_24h,
+        data.net_buy,
+        this.asRecord(data.stat).net_buy_24h,
+        this.asRecord(data.stat).net_buy_24h_usd,
+        this.asRecord(data.stat).net_inflow_24h,
+        this.asRecord(data.token).net_buy_24h,
+        this.asRecord(data.token).net_buy_24h_usd,
+      ];
+      for (const candidate of candidates) {
+        const parsed = this.parseNullableNumber(candidate);
+        if (parsed !== null) {
+          log.info(`GMGN 24h net-buy poll completed for ${mint}`, {
+            netBuy24hUsd: parsed,
+          });
+          return parsed;
+        }
+      }
+      log.warn(`GMGN 24h net-buy value missing for ${mint}`, {
+        responseKeys: Object.keys(data),
+      });
+    } catch (err) {
+      log.warn(`GMGN 24h net-buy poll failed for ${mint}`, { error: String(err) });
+    }
+    return null;
+  }
+
   async fetchTokenAthMarketCapUsd(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, "mint");
 
