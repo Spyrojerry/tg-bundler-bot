@@ -51,7 +51,7 @@ const followWalletLog = createLogger("FOLLOW-WALLET");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const MCAP_CHECK_INTERVAL_MS = 500;
-const FOLLOW_TOKEN_NET_BUY_POLL_INTERVAL_MS = 5_000;
+const FOLLOW_TOKEN_NET_BUY_POLL_INTERVAL_MS = 2_500;
 const FOLLOW_TOKEN_NET_BUY_LOG_BAND_USD = 2_500;
 const MCAP_FETCH_GRACE_MS = 400;
 const INSIDER_DAS_NO_PRICE_COOLDOWN_MS = 10_000;
