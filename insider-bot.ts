@@ -32,7 +32,7 @@ const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 /** Follow-token route: minimum MC required to buy; below this the token is skipped and the flow resets. */
 const FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD = 40_000;
 /** Follow-token route: GMGN 24h net-buy entry threshold (USD). */
-export const FOLLOW_TOKEN_NET_BUY_ENTRY_USD = 15_000;
+export const FOLLOW_TOKEN_NET_BUY_ENTRY_USD = 16_000;
 /** Follow-token route: GMGN 24h net-buy take-profit threshold (USD). */
 export const FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD = 18_000;
 /** Follow-token route: GMGN 24h net-buy stop-loss threshold (USD). */
