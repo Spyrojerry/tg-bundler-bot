@@ -253,6 +253,7 @@ async function main(): Promise<void> {
   const activePositionRefreshes = new Set<string>();
   const positiveMcExitConfirmations = new Set<number>();
   const INSIDER_SELL_RETRY_DELAY_MS = 5_000;
+  const INSIDER_SELL_RETRY_MAX_ATTEMPTS = 3;
   const insiderDasNoPriceUntil = new Map<string, number>();
   const handledHeliusUsageStops = new Set<number>();
   let heliusUsageProcessStopRequested = false;
@@ -3231,8 +3232,27 @@ async function main(): Promise<void> {
 
         log.info(
           `[SELL RETRY] Scheduling retry for ${mint} in ${INSIDER_SELL_RETRY_DELAY_MS}ms`,
-          { attempt },
+          { attempt, maxAttempts: INSIDER_SELL_RETRY_MAX_ATTEMPTS },
         );
+        if (attempt >= INSIDER_SELL_RETRY_MAX_ATTEMPTS) {
+          log.warn(
+            `[SELL RETRY] Giving up after ${attempt} attempts for ${mint}; PumpPortal sell not confirmed`,
+            { attempt, maxAttempts: INSIDER_SELL_RETRY_MAX_ATTEMPTS },
+          );
+          if (!failureNotified && chatId && telegramBot) {
+            failureNotified = true;
+            await telegramBot.sendChat(
+              chatId,
+              [
+                `<b>⚠️ Sell Not Confirmed After ${attempt} Attempts</b>`,
+                `Token: <code>${html(mint)}</code>`,
+                `Attempts: <b>${attempt}/${INSIDER_SELL_RETRY_MAX_ATTEMPTS}</b>`,
+                "Stopping automatic sell retries. Position state retained for manual handling.",
+              ].join("\n"),
+            );
+          }
+          return;
+        }
         await new Promise((resolve) =>
           setTimeout(resolve, INSIDER_SELL_RETRY_DELAY_MS),
         );
