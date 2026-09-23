@@ -233,7 +233,6 @@ export class GmgnClient {
   /** Fetch GMGN's current 24-hour net-buy value in USD. */
   async fetchTokenNetBuy24hUsd(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, "mint");
-    log.info(`GMGN 24h net-buy poll started for ${mint}`);
     try {
       let data: Record<string, unknown> | null = null;
       if (this.fetchMode !== "direct") data = await this.fetchCliData("token", mint);
@@ -254,7 +253,7 @@ export class GmgnClient {
         const sellVolume = this.parseNullableNumber(price[`sell_volume_${window}`]);
         if (buyVolume === null && sellVolume === null) continue;
         const netBuy = (buyVolume ?? 0) - (sellVolume ?? 0);
-        log.info(`GMGN ${window} net-buy poll completed for ${mint}`, {
+        log.debug(`GMGN ${window} net-buy poll completed for ${mint}`, {
           window,
           buyVolumeUsd: buyVolume,
           sellVolumeUsd: sellVolume,
@@ -263,7 +262,7 @@ export class GmgnClient {
         });
         return netBuy;
       }
-      log.warn(`GMGN net-buy value missing for ${mint}`, {
+      log.debug(`GMGN net-buy value missing for ${mint}`, {
         responseKeys: Object.keys(data),
         priceKeys: Object.keys(price),
       });

@@ -2111,27 +2111,12 @@ async function main(): Promise<void> {
         if (Date.now() - lastNetBuyPoll < FOLLOW_TOKEN_NET_BUY_POLL_INTERVAL_MS) return;
         followTokenNetBuyPollAt.set(index, Date.now());
         const netBuy = await gmgnClients[index].fetchTokenNetBuy24hUsd(mint);
-        log.info(`[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] Poll result`, {
-          mint,
-          netBuy24hUsd: netBuy,
-          hasPosition: Boolean(activePos),
-          entryThresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
-          takeProfitThresholdUsd: FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD,
-          stopLossThresholdUsd: FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD,
-        });
         if (netBuy === null) {
           log.warn(`[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] No value returned; holding current state`, { mint });
           return;
         }
         if (!activePos) {
-          if (netBuy < FOLLOW_TOKEN_NET_BUY_ENTRY_USD) {
-            log.info(`[INSIDER ${botNumber} FOLLOW-TOKEN ENTRY] Buy gate not reached`, {
-              mint,
-              netBuy24hUsd: netBuy,
-              thresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
-            });
-            return;
-          }
+          if (netBuy < FOLLOW_TOKEN_NET_BUY_ENTRY_USD) return;
           log.info(
             `[INSIDER ${botNumber} FOLLOW-TOKEN ENTRY] 24h net buy $${netBuy.toLocaleString()} reached $${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()}.`,
           );
@@ -2152,14 +2137,7 @@ async function main(): Promise<void> {
             reason: `${reason} at $${netBuy.toLocaleString()}`,
           });
           return;
-        }
-        if (activePos && netBuy > FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD && netBuy < FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD) {
-          log.info(`[INSIDER ${botNumber} FOLLOW-TOKEN EXIT] Thresholds not reached; holding`, {
-            mint,
-            netBuy24hUsd: netBuy,
-            stopLossThresholdUsd: FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD,
-            takeProfitThresholdUsd: FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD,
-          });
+        } else {
           return;
         }
       }

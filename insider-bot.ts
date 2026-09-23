@@ -29,6 +29,8 @@ const LOW_FUNDING_DEV_BUY_SYNC_LIMIT = 10;
 const DEV_BUY_COUNT_AFTER_CREATE_MAX_EXCLUSIVE = 20;
 const REQUIRED_BUNDLER_MATCHES = 2;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
+/** Follow-token route: minimum MC required to buy; below this the token is skipped and the flow resets. */
+const FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD = 40_000;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
 const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
@@ -3663,13 +3665,31 @@ export class InsiderBot extends EventEmitter {
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) return;
       if (this.flowSource === "follow-token") {
+        if (currentMc < FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD) {
+          this.log.warn(
+            "Follow-token buy skipped — MC below minimum buy floor; resetting",
+            {
+              mint: state.mint,
+              currentMc,
+              minBuyMarketCapUsd: FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD,
+            },
+          );
+          void this.sendTelegramSafe(
+            [
+              `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
+              `Token: <code>${state.mint}</code>`,
+              `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+              `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
+              "MC below the minimum buy floor — token skipped and flow reset.",
+            ].join("\n"),
+            "follow-token below minimum buy MC skip",
+          );
+          await this.resetForNewToken(true, {
+            reason: `below_min_buy_market_cap_${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD}`,
+          });
+          return;
+        }
         const netBuy24h = await this.gmgnClient.fetchTokenNetBuy24hUsd(state.mint);
-        this.log.info("Follow-token GMGN buy gate evaluated", {
-          mint: state.mint,
-          netBuy24h,
-          requiredNetBuy24h: 15_000,
-          passed: netBuy24h !== null && netBuy24h >= 15_000,
-        });
         if (netBuy24h === null || netBuy24h < 15_000) {
           this.log.info("Follow-token buy deferred — GMGN 24h net buy below $15,000", {
             mint: state.mint,
