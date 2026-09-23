@@ -244,31 +244,28 @@ export class GmgnClient {
       }
       if (!data) return null;
 
-      const candidates = [
-        data.net_buy_24h,
-        data.net_buy_24h_usd,
-        data.net_buy_usd_24h,
-        data.net_buy_24h_value,
-        data.net_buy_24h_amount,
-        data.net_inflow_24h,
-        data.net_buy,
-        this.asRecord(data.stat).net_buy_24h,
-        this.asRecord(data.stat).net_buy_24h_usd,
-        this.asRecord(data.stat).net_inflow_24h,
-        this.asRecord(data.token).net_buy_24h,
-        this.asRecord(data.token).net_buy_24h_usd,
-      ];
-      for (const candidate of candidates) {
-        const parsed = this.parseNullableNumber(candidate);
-        if (parsed !== null) {
-          log.info(`GMGN 24h net-buy poll completed for ${mint}`, {
-            netBuy24hUsd: parsed,
-          });
-          return parsed;
-        }
+      // GMGN token info exposes net buy as buy_volume_<window> minus
+      // sell_volume_<window> inside the `price` block. Prefer the 24h window,
+      // then fall back to the longest available window.
+      const price = this.asRecord(data.price);
+      const windows = ["24h", "6h", "1h", "5m", "1m"] as const;
+      for (const window of windows) {
+        const buyVolume = this.parseNullableNumber(price[`buy_volume_${window}`]);
+        const sellVolume = this.parseNullableNumber(price[`sell_volume_${window}`]);
+        if (buyVolume === null && sellVolume === null) continue;
+        const netBuy = (buyVolume ?? 0) - (sellVolume ?? 0);
+        log.info(`GMGN ${window} net-buy poll completed for ${mint}`, {
+          window,
+          buyVolumeUsd: buyVolume,
+          sellVolumeUsd: sellVolume,
+          netBuyUsd: netBuy,
+          source: data.source,
+        });
+        return netBuy;
       }
-      log.warn(`GMGN 24h net-buy value missing for ${mint}`, {
+      log.warn(`GMGN net-buy value missing for ${mint}`, {
         responseKeys: Object.keys(data),
+        priceKeys: Object.keys(price),
       });
     } catch (err) {
       log.warn(`GMGN 24h net-buy poll failed for ${mint}`, { error: String(err) });
