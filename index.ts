@@ -52,7 +52,7 @@ const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const MCAP_CHECK_INTERVAL_MS = 500;
 const FOLLOW_TOKEN_NET_BUY_POLL_INTERVAL_MS = 5_000;
-const FOLLOW_TOKEN_NET_BUY_LOG_INTERVAL_MS = 60_000;
+const FOLLOW_TOKEN_NET_BUY_LOG_BAND_USD = 2_500;
 const MCAP_FETCH_GRACE_MS = 400;
 const INSIDER_DAS_NO_PRICE_COOLDOWN_MS = 10_000;
 const isHeliusUsageExhaustionError = (err: unknown): boolean => {
@@ -249,7 +249,7 @@ async function main(): Promise<void> {
     { balance: bigint; quote: SellQuote | null; timestamp: number }
   >();
   const followTokenNetBuyPollAt = new Map<number, number>();
-  const followTokenNetBuyLogAt = new Map<number, number>();
+  const followTokenNetBuyBand = new Map<number, number>();
   const activePositionRefreshes = new Set<string>();
   const positiveMcExitConfirmations = new Set<number>();
   const INSIDER_SELL_RETRY_DELAY_MS = 5_000;
@@ -2119,15 +2119,22 @@ async function main(): Promise<void> {
           log.warn(`[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] No value returned; holding current state`, { mint });
           return;
         }
+        const netBuyBand = Math.floor(netBuy / FOLLOW_TOKEN_NET_BUY_LOG_BAND_USD);
+        const previousBand = followTokenNetBuyBand.get(index);
+        if (previousBand !== netBuyBand) {
+          followTokenNetBuyBand.set(index, netBuyBand);
+          log.info(
+            `[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] 24h net buy $${netBuy.toLocaleString()} (entry $${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()})`,
+            { mint, netBuy24hUsd: netBuy, hasPosition: Boolean(activePos) },
+          );
+        } else {
+          log.debug(
+            `[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] 24h net buy $${netBuy.toLocaleString()}`,
+            { mint, netBuy24hUsd: netBuy },
+          );
+        }
         if (!activePos) {
           if (netBuy < FOLLOW_TOKEN_NET_BUY_ENTRY_USD) {
-            if (Date.now() - (followTokenNetBuyLogAt.get(index) ?? 0) >= FOLLOW_TOKEN_NET_BUY_LOG_INTERVAL_MS) {
-              followTokenNetBuyLogAt.set(index, Date.now());
-              log.info(
-                `[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] 24h net buy $${netBuy.toLocaleString()} below entry $${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()} — holding`,
-                { mint, netBuy24hUsd: netBuy },
-              );
-            }
             return;
           }
           log.info(
