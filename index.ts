@@ -32,11 +32,6 @@ import {
 import { FunderFirstOrchestrator } from "./funder-first-orchestrator";
 import { FollowTokenMigrationOrchestrator } from "./follow-token-migration-orchestrator";
 import { InsiderBot, MAX_FOLLOW_WALLETS } from "./insider-bot";
-import {
-  FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
-  FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD,
-  FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD,
-} from "./insider-bot";
 import type { InsiderBuyTrigger, InsiderMintClaimFn } from "./insider-bot";
 import { HeliusDasMarketCapClient } from "./helius-das-market-cap";
 import { PumpReserveMarketCapClient } from "./pump-reserve-market-cap";
@@ -51,8 +46,6 @@ const followWalletLog = createLogger("FOLLOW-WALLET");
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const MCAP_CHECK_INTERVAL_MS = 500;
-const FOLLOW_TOKEN_NET_BUY_POLL_INTERVAL_MS = 2_500;
-const FOLLOW_TOKEN_NET_BUY_LOG_BAND_USD = 2_500;
 const MCAP_FETCH_GRACE_MS = 400;
 const INSIDER_DAS_NO_PRICE_COOLDOWN_MS = 10_000;
 const isHeliusUsageExhaustionError = (err: unknown): boolean => {
@@ -248,8 +241,6 @@ async function main(): Promise<void> {
     string,
     { balance: bigint; quote: SellQuote | null; timestamp: number }
   >();
-  const followTokenNetBuyPollAt = new Map<number, number>();
-  const followTokenNetBuyBand = new Map<number, number>();
   const activePositionRefreshes = new Set<string>();
   const positiveMcExitConfirmations = new Set<number>();
   const INSIDER_SELL_RETRY_DELAY_MS = 5_000;
@@ -2111,79 +2102,10 @@ async function main(): Promise<void> {
     const mint = preBuyMint || activePos!.mint;
 
     try {
-      if (bot.getFlowSource() === "follow-token") {
-        const lastNetBuyPoll = followTokenNetBuyPollAt.get(index) ?? 0;
-        if (Date.now() - lastNetBuyPoll < FOLLOW_TOKEN_NET_BUY_POLL_INTERVAL_MS) return;
-        followTokenNetBuyPollAt.set(index, Date.now());
-        const netBuy = await gmgnClients[index].fetchTokenNetBuy24hUsd(mint);
-        if (netBuy === null) {
-          log.warn(`[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] No value returned; holding current state`, { mint });
-          return;
-        }
-        const netBuyBand = Math.floor(netBuy / FOLLOW_TOKEN_NET_BUY_LOG_BAND_USD);
-        const previousBand = followTokenNetBuyBand.get(index);
-        if (previousBand !== netBuyBand) {
-          followTokenNetBuyBand.set(index, netBuyBand);
-          log.info(
-            `[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] 24h net buy $${netBuy.toLocaleString()} (entry $${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()})`,
-            { mint, netBuy24hUsd: netBuy, hasPosition: Boolean(activePos) },
-          );
-        } else {
-          log.debug(
-            `[INSIDER ${botNumber} FOLLOW-TOKEN NET-BUY] 24h net buy $${netBuy.toLocaleString()}`,
-            { mint, netBuy24hUsd: netBuy },
-          );
-        }
-        if (!activePos) {
-          if (netBuy < FOLLOW_TOKEN_NET_BUY_ENTRY_USD) {
-            return;
-          }
-          log.info(
-            `[INSIDER ${botNumber} FOLLOW-TOKEN ENTRY] 24h net buy $${netBuy.toLocaleString()} reached $${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()} — triggering buy`,
-            { mint, netBuy24hUsd: netBuy },
-          );
-          await bot.tryTriggerFollowTokenNetBuyEntry(mint);
-          return;
-        } else if (
-          netBuy >= FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD ||
-          netBuy <= FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD
-        ) {
-          const reason = netBuy >= FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD
-            ? "24h net buy take profit"
-            : "24h net buy stop loss";
-          log.warn(
-            `[INSIDER ${botNumber} FOLLOW-TOKEN EXIT] ${reason}: $${netBuy.toLocaleString()}.`,
-            { mint, netBuy24hUsd: netBuy },
-          );
-          void telegramBot
-            ?.sendDefault(
-              [
-                `<b>🔴 Insider ${botNumber} Follow-Token Exit</b>`,
-                `Token: <code>${html(mint)}</code>`,
-                `Trigger: <b>${html(reason)}</b>`,
-                `24h net buy: <b>$${netBuy.toLocaleString()}</b>`,
-                `Take profit: $${FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD.toLocaleString()} · Stop loss: $${FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD.toLocaleString()}`,
-                "",
-                "Submitting sell...",
-              ].join("\n"),
-            )
-            .catch((err) =>
-              log.warn(
-                `[INSIDER ${botNumber}] Follow-token exit Telegram notification failed`,
-                { error: err instanceof Error ? err.message : String(err) },
-              ),
-            );
-          bot.emit("sellTrigger", {
-            followedWallet: bot.getFollowedWallet()!,
-            positionMint: activePos.mint,
-            signature: "GMGN_NET_BUY_24H",
-            reason: `${reason} at $${netBuy.toLocaleString()}`,
-          });
-          return;
-        } else {
-          return;
-        }
-      }
+      // The GMGN 24h net-buy flow (entry threshold, take-profit, stop-loss) has
+      // been removed. The normal-route observer is the only buy path, and the
+      // exit is the observer's 5,000-lamport sell fee or the +80% MC take-profit
+      // evaluated below.
       const fetched =
         preFetchedMc !== undefined
           ? {

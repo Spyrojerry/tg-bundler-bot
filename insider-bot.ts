@@ -31,12 +31,6 @@ const REQUIRED_BUNDLER_MATCHES = 2;
 const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 /** Follow-token route: minimum MC required to buy; below this the token is skipped and the flow resets. */
 const FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD = 40_000;
-/** Follow-token route: GMGN 24h net-buy entry threshold (USD). */
-export const FOLLOW_TOKEN_NET_BUY_ENTRY_USD = 16_000;
-/** Follow-token route: GMGN 24h net-buy take-profit threshold (USD). */
-export const FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD = 900;
-/** Follow-token route: GMGN 24h net-buy stop-loss threshold (USD). */
-export const FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD = 300;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
 const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
@@ -148,8 +142,8 @@ const NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS = 3;
 /** Smallest-root chain remaining at/above this amount triggers an immediate buy instead of waiting for observer wallets. */
 const FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING = 40_000_000;
 /** Normal follow-token route: wallet first-buy USD band for the observer buy trigger. */
-const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 110;
-const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 300;
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 1;
+const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 900;
 /** Normal follow-token route: collect up to this many qualifying observer wallets. */
 const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
 /** Normal follow-token route: max wallets held (pending) at once while finding the valid ones. */
@@ -171,10 +165,16 @@ const NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS = 20;
 const NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS = 60 * 1_000;
 /** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
 const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
+/**
+ * The only fee that qualifies a wallet on the normal route: an exact tx fee of
+ * 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
+ * the lamport count must match exactly.
+ */
+const NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS = 5_000;
+/** Normal follow-token route: fallback take-profit (%) when no 5,000-lamport sell fee is seen. */
+const NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT = 80;
 /** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
 const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
-/** Normal follow-token route: a dropped held wallet triggers a sell when the drop came from a sell tx and P&L is above this % (any value from here upward). */
-const NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT = -20;
 /**
  * Normal follow-token route (paused observer replacement): buy trigger scans all
  * buys in the token's first 2 seconds and keeps those whose tx fee exceeds $1.
@@ -1232,125 +1232,12 @@ export class InsiderBot extends EventEmitter {
    * buy floor; skips + resets the token when MC is below the floor.
    */
   async tryTriggerFollowTokenNetBuyEntry(mint: string): Promise<boolean> {
-    if (NORMAL_ROUTE_OBSERVER_ONLY_BUY_PATH) {
-      this.log.info("Follow-token net-buy entry rejected — normal-route observer is the only buy path", {
-        mint,
-      });
-      return false;
-    }
-    if (this.flowSource !== "follow-token") return false;
-    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return false;
-    if (this.isBuyGateEvaluating) return false;
-    if (this.watchingMint !== mint) return false;
-    if (this.isBuyBlockedByDevTokenOut(mint)) return false;
-
-    const state = this.bundlerFunderWatch;
-    if (!state?.funderWallet) return false;
-
-    this.isBuyGateEvaluating = true;
-    try {
-      const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(mint);
-      if (currentMc === null) {
-        this.log.warn(
-          "Follow-token net-buy entry — market cap unavailable; holding",
-          { mint },
-        );
-        return false;
-      }
-      if (currentMc < FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD) {
-        this.log.warn(
-          "Follow-token net-buy entry skipped — MC below minimum buy floor; resetting",
-          {
-            mint,
-            currentMc,
-            minBuyMarketCapUsd: FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD,
-          },
-        );
-        void this.sendTelegramSafe(
-          [
-            `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
-            `Token: <code>${mint}</code>`,
-            `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-            `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
-            "MC below the minimum buy floor — token skipped and flow reset.",
-          ].join("\n"),
-          "follow-token below minimum buy MC skip",
-        );
-        this.isBuyGateEvaluating = false;
-        await this.resetForNewToken(true, {
-          reason: `below_min_buy_market_cap_${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD}`,
-        });
-        return true;
-      }
-      const netBuy24h = await this.gmgnClient.fetchTokenNetBuy24hUsd(mint);
-      if (netBuy24h === null) {
-        this.log.warn("Follow-token net-buy entry — net buy unavailable; holding", {
-          mint,
-          currentMc,
-        });
-        return false;
-      }
-      if (netBuy24h < FOLLOW_TOKEN_NET_BUY_ENTRY_USD) {
-        this.log.info("Follow-token net-buy entry gate not reached", {
-          mint,
-          netBuy24h,
-          entryThresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
-          currentMc,
-        });
-        return false;
-      }
-
-      const profitExitPercent = FOLLOW_TOKEN_LARGE_INSIDER_PROFIT_EXIT_PERCENT;
-      const buySol = this.getBuySolForFundingMode(state.lowFundingMode);
-      this.log.warn("Follow-token net-buy entry gate passed — buying", {
-        mint,
-        netBuy24h,
-        entryThresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
-        currentMc,
-        buySol,
-      });
-      if (this.isBuyBlockedByDevTokenOut(mint)) return false;
-      this.setEntryMc(currentMc);
-      this.setExitMc(20_000);
-      this.setBuyExecuting(true);
-      this.buySubmitted = true;
-      this.preBuyStopped = true;
-      this.disableProfitExitAfterBuy = true;
-      this.profitExitDisabled = false;
-      this.armDevTokenOutPostBuyWatch(mint);
-
-      void this.sendTelegramSafe(
-        [
-          `<b>🟢 ${this.label} Follow-Token Buy (GMGN Net Buy)</b>`,
-          `Token: <code>${mint}</code>`,
-          `24h net buy: <b>$${netBuy24h.toLocaleString()}</b> (entry ≥ $${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()})`,
-          `Entry MC: <b>$${currentMc.toLocaleString()}</b>`,
-          `Buy: <b>${buySol} SOL</b>`,
-          `Exit: take profit $${FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD.toLocaleString()} · stop loss $${FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD.toLocaleString()} (24h net buy)`,
-        ].join("\n"),
-        "follow-token net-buy entry",
-      );
-
-      this.emit("buyTrigger", {
-        followedWallet: this.getBuyTriggerFollowedWallet(state),
-        mint,
-        signature: "GMGN_NET_BUY_24H_ENTRY",
-        buySol,
-        entryMc: currentMc,
-        profitExitPercent,
-        monitoredWallet: this.monitoredWallet ?? undefined,
-        tradersListStr: [
-          `<b>GMGN Follow-Token Buy Gate Passed</b>`,
-          `24h net buy: <b>$${netBuy24h.toLocaleString()}</b>`,
-          `Entry threshold: <b>$${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()}</b>`,
-          `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-          `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
-        ].join("\n"),
-      });
-      return true;
-    } finally {
-      this.isBuyGateEvaluating = false;
-    }
+    // The GMGN 24h net-buy flow has been removed. The normal-route observer is
+    // the only buy path, so this gate never buys.
+    this.log.info("Follow-token net-buy entry rejected — normal-route observer is the only buy path", {
+      mint,
+    });
+    return false;
   }
 
   getMonitoredWallet() {
@@ -3974,7 +3861,13 @@ export class InsiderBot extends EventEmitter {
         return;
       }
       this.setEntryMc(currentMc);
-      this.setExitMc(this.flowSource === "follow-token" ? 20_000 : currentMc * (1 + profitExitPercent / 100));
+      // Only exit on the normal route: +80% MC take-profit (unless a held
+      // wallet's 5,000-lamport sell fee fires first, handled in the observer).
+      this.setExitMc(
+        this.flowSource === "follow-token"
+          ? currentMc * (1 + NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT / 100)
+          : currentMc * (1 + profitExitPercent / 100),
+      );
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
@@ -6001,14 +5894,9 @@ export class InsiderBot extends EventEmitter {
 
   /** Base fee for the normal-route observer: any insider wallet's sell fee. */
   private resolveNormalRouteObserverReferenceFee(): number | null {
-    const state = this.followTokenEarlyBundlerExitState;
-    if (state?.active) {
-      const fees = [...state.watches.values()]
-        .map((watch) => watch.lastSellFeeLamports)
-        .filter((fee): fee is number => fee !== null);
-      if (fees.length > 0) return Math.min(...fees);
-    }
-    return null;
+    // The qualifying fee is a fixed 5,000 lamports (the "$0 fee" wallet
+    // signature). No insider sell-fee reference is needed any more.
+    return NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS;
   }
 
   private fromNewTokenStreamActive(): boolean {
@@ -6031,11 +5919,11 @@ export class InsiderBot extends EventEmitter {
     if (referenceFeeLamports === null) return;
     const feeLamports = tx.fee;
     if (feeLamports === undefined) return;
+    // Exact fee match only: the tx fee must be exactly 5,000 lamports. No
+    // tolerance — a single lamport off is not a qualifying wallet.
+    if (feeLamports !== NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS) return;
     const solPriceUsd = await this.getCachedSolPriceUsd();
     if (solPriceUsd === null) return;
-    const feeDifferenceUsd =
-      (Math.abs(feeLamports - referenceFeeLamports) * solPriceUsd) / 1_000_000_000;
-    if (feeDifferenceUsd > NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD) return;
 
     const recipients = new Set(
       (tx.tokenTransfers ?? [])
@@ -6061,6 +5949,7 @@ export class InsiderBot extends EventEmitter {
             wallet,
             `buy/sell after first buy during confirmation window (${pendingKind})`,
             pendingKind,
+            tx,
           );
         }
       }
@@ -6522,6 +6411,7 @@ export class InsiderBot extends EventEmitter {
     wallet: string,
     reason: string,
     droppedByKind?: "buy" | "sell",
+    tx?: HeliusTransaction,
   ): void {
     const wasQualified = this.normalRouteObserverQualified.has(wallet);
     this.normalRouteObserverPending.delete(wallet);
@@ -6554,17 +6444,20 @@ export class InsiderBot extends EventEmitter {
     // — never a buy — when the position is up more than +25%. Qualification is
     // NOT required here; only the ≥25% sold exit requires qualified wallets.
     if (droppedBySell) {
-      void this.maybeSellOnDroppedNormalRouteObserverWallet(wallet, reason);
+      void this.maybeSellOnDroppedNormalRouteObserverWallet(wallet, reason, tx);
     }
   }
 
   /**
-   * Sell trigger: any held Normal-route observer wallet (pending or qualified)
-   * dropped by a sell tx while our MC-derived P&L is above +25% → exit.
+   * Sell trigger: a held Normal-route observer wallet sold with a tx fee of
+   * exactly 5,000 lamports (the insider $0-fee signature) → exit immediately.
+   * Any other sell fee does not trigger a sell; the +80% MC take-profit armed at
+   * buy is the fallback exit in that case.
    */
   private async maybeSellOnDroppedNormalRouteObserverWallet(
     wallet: string,
     reason: string,
+    tx?: HeliusTransaction,
   ): Promise<void> {
     if (
       !this.activePosition ||
@@ -6573,42 +6466,47 @@ export class InsiderBot extends EventEmitter {
     ) {
       return;
     }
-    const mint = this.activePosition.mint;
-    const entryMc = this.getEntryMc();
-    if (!(entryMc > 0)) return;
-    const currentMc = await this.gmgnClient
-      .fetchTokenMarketCapUsd(mint)
-      .catch(() => null);
-    if (currentMc === null) return;
-    const pnlPct = ((currentMc - entryMc) / entryMc) * 100;
-    if (pnlPct <= NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT) {
+    const sellFeeLamports = tx?.fee;
+    if (sellFeeLamports !== NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS) {
       this.log.info(
-        "Normal-route observer dropped wallet — P&L at/below the sell threshold; no sell",
+        "Normal-route observer dropped wallet — sell fee not 5,000 lamports; no fee-based sell (+80% MC TP remains armed)",
         {
-          mint,
+          mint: this.activePosition.mint,
           wallet,
-          pnlPct,
-          thresholdPct: NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT,
-          entryMc,
-          currentMc,
+          sellFeeLamports: sellFeeLamports ?? null,
+          requiredFeeLamports: NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS,
+          exitMc: this.exitMc,
         },
       );
       return;
     }
+    const mint = this.activePosition.mint;
+    const entryMc = this.getEntryMc();
+    const currentMc = await this.gmgnClient
+      .fetchTokenMarketCapUsd(mint)
+      .catch(() => null);
+    const pnlPct =
+      entryMc > 0 && currentMc !== null
+        ? ((currentMc - entryMc) / entryMc) * 100
+        : null;
     const signature =
+      tx?.signature ??
       this.followTokenLargeInsiderState?.scrapeWatches.get(wallet)
-        ?.tokenActions?.at(-1)?.signature ?? "NORMAL_ROUTE_DROPPED_WALLET_SELL";
+        ?.tokenActions?.at(-1)?.signature ??
+      "NORMAL_ROUTE_DROPPED_WALLET_SELL";
     await this.triggerPositionSell(
       mint,
-      `normal-route observer wallet dropped by sell tx (P&L ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)`,
+      `normal-route observer wallet sold with 5,000-lamport fee (${reason})`,
       [
-        `<b>🚨 ${this.label} Normal-Route Observer Drop — Selling</b>`,
+        `<b>🚨 ${this.label} Normal-Route Sell Fee — Selling</b>`,
         `Token: <code>${mint}</code>`,
-        `Dropped wallet: <code>${wallet}</code>`,
-        `Drop reason: ${reason}`,
-        `P&L: <b>${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</b> (entry $${entryMc.toLocaleString()}, now $${currentMc.toLocaleString()})`,
-        `A held observer wallet sold while the position was above the ${NORMAL_ROUTE_OBSERVER_DROPPED_WALLET_SELL_PNL_PCT}% sell threshold — exiting.`,
-      ],
+        `Wallet: <code>${wallet}</code>`,
+        `Sell fee: <b>${NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS.toLocaleString()} lamports</b> (exact match)`,
+        pnlPct !== null
+          ? `P&L: <b>${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</b> (entry $${entryMc.toLocaleString()}, now $${currentMc!.toLocaleString()})`
+          : "",
+        "A watched wallet sold with the insider 5,000-lamport fee — exiting.",
+      ].filter(Boolean),
       signature,
     );
   }
@@ -6986,8 +6884,8 @@ export class InsiderBot extends EventEmitter {
         `Remaining: <b>${remainingAmount.toLocaleString()}</b> tokens (under 60M)`,
         "The smallest-root chain has met the sell requirement. Its watches were unsubscribed.",
         immediateBuyTriggered
-          ? `Remaining ≥ <b>${FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING.toLocaleString()}</b> tokens — buying immediately instead of waiting for observer wallets. The $110–$300 observer still runs and can trigger the ≥25% exit.`
-          : "Starting the logs-only $110–$300 first-buy observer; buy remains disabled until two qualifying wallets are observed.",
+          ? `Remaining ≥ <b>${FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING.toLocaleString()}</b> tokens — buying immediately instead of waiting for observer wallets. The $${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD} observer still runs and can trigger the ≥25% exit.`
+          : `Starting the logs-only $${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD} first-buy observer; buy remains disabled until two qualifying wallets are observed.`,
       ].join("\n"),
       "follow-insider smallest bundler sell gate passed",
     );
@@ -7103,7 +7001,7 @@ export class InsiderBot extends EventEmitter {
             return;
           }
           void this.sendTelegramSafe(
-            `<b>⛔ ${this.label} Follow-Insider Observer Skipped</b>\nToken: <code>${mint}</code>\nThe first three $110–$300 observer buys did not contain two transaction fees within the $${PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD.toFixed(3)} tolerance. Token reset.`,
+            `<b>⛔ ${this.label} Follow-Insider Observer Skipped</b>\nToken: <code>${mint}</code>\nThe first three $${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD} observer buys did not contain two transaction fees within the $${PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD.toFixed(3)} tolerance. Token reset.`,
             "follow-insider observer fee pair missing",
           );
           await this.resetForNewToken(true, { reason: "follow_insider_observer_fee_pair_missing" });
