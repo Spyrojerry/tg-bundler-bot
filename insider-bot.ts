@@ -186,6 +186,30 @@ const NORMAL_ROUTE_EARLY_FEE_BUY_MIN_USD = 1;
 /** How many of the token's earliest SWAPs to scan for the trigger. */
 const NORMAL_ROUTE_EARLY_FEE_BUY_SCAN_LIMIT = 40;
 
+/**
+ * Kill switch: when true, every non-normal-route buy gate is disabled so the
+ * normal-route observer is the sole buy path. The normal-route observer sets
+ * allowOnlyNormalRoute on its emit; all other gates are rejected.
+ */
+const NORMAL_ROUTE_OBSERVER_ONLY_BUY_PATH = true;
+/**
+ * Kill switch: when true, every sell exit except the feePayer cumulative
+ * incoming-sol sell is disabled.
+ */
+const FEEPAYER_INCOMING_SELL_ONLY = true;
+/**
+ * FeePayer sell trigger: while watching the shared feePayer address, only
+ * incoming native SOL transfers above this many SOL are counted. Smaller
+ * transfer-ins are ignored entirely.
+ */
+const FEEPAYER_SELL_INCOMING_MIN_SOL = 10;
+/**
+ * FeePayer sell trigger: sell the whole position once the cumulative total of
+ * qualifying incoming transfer-ins (> FEEPAYER_SELL_INCOMING_MIN_SOL each)
+ * reaches this many SOL. Counted from the moment the feePayer watch locks.
+ */
+const FEEPAYER_SELL_CUMULATIVE_SOL = 50;
+
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
 /** Defer sold-all exit eval when ATA hits zero before the sell tx is processed. */
@@ -764,6 +788,12 @@ interface BundlerFunderWatchState {
   parallelFeePayerFunderWallet: string | null;
   parallelFeePayerFunderCursorSignature: string | null;
   parallelFeePayerFunderFundedAtSec: number | null;
+  /** FeePayer sell trigger: cumulative SOL of incoming transfer-ins > FEEPAYER_SELL_INCOMING_MIN_SOL since the watch locked. */
+  feePayerIncomingSolCumulative: number;
+  /** FeePayer sell trigger: transfer-in signatures already counted, so a re-delivered tx is not double-counted. */
+  feePayerIncomingSolSignatures: Set<string>;
+  /** FeePayer sell trigger: true once the cumulative threshold fired the sell (one-shot). */
+  feePayerIncomingSellTriggered: boolean;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -1196,6 +1226,12 @@ export class InsiderBot extends EventEmitter {
    * buy floor; skips + resets the token when MC is below the floor.
    */
   async tryTriggerFollowTokenNetBuyEntry(mint: string): Promise<boolean> {
+    if (NORMAL_ROUTE_OBSERVER_ONLY_BUY_PATH) {
+      this.log.info("Follow-token net-buy entry rejected — normal-route observer is the only buy path", {
+        mint,
+      });
+      return false;
+    }
     if (this.flowSource !== "follow-token") return false;
     if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return false;
     if (this.isBuyGateEvaluating) return false;
@@ -3762,8 +3798,21 @@ export class InsiderBot extends EventEmitter {
       profitExitPercent?: number;
       buySolOverride?: number;
       maxSingleSellGateTier?: "standard_8m" | "fallback_16m";
+      /**
+       * Only the normal-route observer sets this. All other buy gates are
+       * disabled: without it, the emit is rejected so the normal-route observer
+       * is the sole buy path.
+       */
+      allowOnlyNormalRoute?: boolean;
     } = {},
   ): Promise<void> {
+    if (!options.allowOnlyNormalRoute) {
+      this.log.info("Follow-token buy rejected — normal-route observer is the only buy path", {
+        mint: state.mint,
+        triggerSource: options.triggerSource ?? "valid_wallet_4",
+      });
+      return;
+    }
     if (
       this.buySubmitted ||
       this.buyDisabled ||
@@ -3797,13 +3846,16 @@ export class InsiderBot extends EventEmitter {
 
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) return;
-      if (this.flowSource === "follow-token" && currentMc < FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD) {
+      const minBuyMcFloorUsd = options.allowOnlyNormalRoute
+        ? Math.min(FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD, NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD)
+        : FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD;
+      if (currentMc < minBuyMcFloorUsd) {
         this.log.warn(
           "Follow-token buy skipped — MC below minimum buy floor; resetting",
           {
             mint: state.mint,
             currentMc,
-            minBuyMarketCapUsd: FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD,
+            minBuyMarketCapUsd: minBuyMcFloorUsd,
           },
         );
         void this.sendTelegramSafe(
@@ -3811,13 +3863,14 @@ export class InsiderBot extends EventEmitter {
             `<b>⏭️ ${this.label} Follow-Token Skipped</b>`,
             `Token: <code>${state.mint}</code>`,
             `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
-            `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
+            `Minimum buy MC: <b>$${minBuyMcFloorUsd.toLocaleString()}</b>`,
             "MC below the minimum buy floor — token skipped and flow reset.",
           ].join("\n"),
           "follow-token below minimum buy MC skip",
         );
+        this.normalRouteObserverMcGraceInFlight = false;
         await this.resetForNewToken(true, {
-          reason: `below_min_buy_market_cap_${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD}`,
+          reason: `below_min_buy_market_cap_${minBuyMcFloorUsd}`,
         });
         return;
       }
@@ -5347,6 +5400,9 @@ export class InsiderBot extends EventEmitter {
       parallelFeePayerFunderWallet: null,
       parallelFeePayerFunderCursorSignature: null,
       parallelFeePayerFunderFundedAtSec: null,
+      feePayerIncomingSolCumulative: 0,
+      feePayerIncomingSolSignatures: new Set<string>(),
+      feePayerIncomingSellTriggered: false,
     };
   }
 
@@ -5865,12 +5921,7 @@ export class InsiderBot extends EventEmitter {
    * trigger the buy; this is the sole buy trigger on the normal route.
    */
   private startNormalRouteObserver(mint: string): void {
-    if (
-      this.normalRouteObserverActive ||
-      !this.enhancedWs ||
-      this.followInsiderObservationMode ||
-      this.fromNewTokenStreamActive()
-    ) {
+    if (this.normalRouteObserverActive || !this.enhancedWs) {
       return;
     }
     const referenceFeeLamports = this.resolveNormalRouteObserverReferenceFee();
@@ -5919,6 +5970,22 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "normal-route observer started",
     );
+
+    // The reference fee is now snapshotted into
+    // normalRouteObserverReferenceFeeLamports, which is what the observer
+    // actually compares against — the early-bundler exit watch is no longer
+    // needed to supply it, so stop that watch. Deferred to the next tick so we
+    // don't tear down the early-bundler exit state while the caller that
+    // started this observer is still mid-evaluation.
+    setImmediate(() => {
+      if (this.normalRouteObserverActive && this.normalRouteObserverMint === mint) {
+        this.log.info(
+          "Reference fee snapshotted — stopping early-bundler exit watch (normal-route observer is now the only path)",
+          { mint, referenceFeeLamports },
+        );
+        void this.stopFollowTokenEarlyBundlerExitMonitoring();
+      }
+    });
   }
 
   /** Base fee for the normal-route observer: any insider wallet's sell fee. */
@@ -6285,11 +6352,61 @@ export class InsiderBot extends EventEmitter {
     void this.emitNormalRouteObserverBuy();
   }
 
+  /**
+   * A feePayer is "locked" only when a real funder has been resolved from
+   * bundler funding records (discovery active) — not for the pre-buy stub that
+   * carries a placeholder funder and stops discovery immediately.
+   */
+  private isBundlerFunderLocked(
+    state: BundlerFunderWatchState | null | undefined,
+  ): boolean {
+    if (!state) return false;
+    if (state.discoveryStopped) return false;
+    return state.originalFunderWallet.length > 0 && state.originalFunderWallet !== state.mint;
+  }
+
   /** Emit the normal-route observer buy using the latest held wallet. */
   private async emitNormalRouteObserverBuy(): Promise<void> {
     if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
     const funderState = this.bundlerFunderWatch;
     if (!funderState) return;
+
+    // Pre-buy gate: a real feePayer must be locked before we buy.
+    if (!this.isBundlerFunderLocked(funderState)) {
+      this.log.warn(
+        "Normal-route observer buy blocked — no locked feePayer",
+        { mint: funderState.mint, funderWallet: funderState.funderWallet },
+      );
+      return;
+    }
+
+    // Pre-buy gate: if the 50 SOL cumulative incoming hit after the feePayer
+    // locked but before this buy, skip + reset for the next token.
+    if (funderState.feePayerIncomingSolCumulative >= FEEPAYER_SELL_CUMULATIVE_SOL) {
+      this.log.warn(
+        "Normal-route observer buy skipped — feePayer 50 SOL cumulative reached pre-buy; resetting",
+        {
+          mint: funderState.mint,
+          cumulativeSol: funderState.feePayerIncomingSolCumulative,
+          thresholdSol: FEEPAYER_SELL_CUMULATIVE_SOL,
+        },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏭️ ${this.label} Normal-Route Buy Skipped</b>`,
+          `Token: <code>${funderState.mint}</code>`,
+          `FeePayer cumulative incoming: <b>${funderState.feePayerIncomingSolCumulative.toFixed(4)} SOL</b> (>= ${FEEPAYER_SELL_CUMULATIVE_SOL} SOL)`,
+          "Cumulative reached after the feePayer locked but before buy — token skipped and flow reset.",
+        ].join("\n"),
+        "normal-route observer pre-buy cumulative skip",
+      );
+      this.normalRouteObserverMcGraceInFlight = false;
+      await this.resetForNewToken(true, {
+        reason: "norm_route_pre_buy_fee_payer_cumulative_reached",
+      });
+      return;
+    }
+
     const entry =
       [...this.normalRouteObserverQualified.entries()].at(-1) ??
       [...this.normalRouteObserverPending.entries()].at(-1);
@@ -6303,6 +6420,7 @@ export class InsiderBot extends EventEmitter {
       {
         triggerSource: "smallest_bundler_sell_gate",
         buySolOverride: this.getBuySolForFundingMode(false),
+        allowOnlyNormalRoute: true,
       },
     );
   }
@@ -6862,7 +6980,7 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "follow-insider smallest bundler sell gate passed",
     );
-    this.startPreLiFirstBuyObserver(state.mint);
+    this.startNormalRouteObserver(state.mint);
     this.startValidWalletReconciliation();
     if (immediateBuyTriggered && !this.buySubmitted) {
       const funderState = this.bundlerFunderWatch;
@@ -7667,6 +7785,9 @@ export class InsiderBot extends EventEmitter {
       parallelFeePayerFunderWallet: null,
       parallelFeePayerFunderCursorSignature: null,
       parallelFeePayerFunderFundedAtSec: null,
+      feePayerIncomingSolCumulative: 0,
+      feePayerIncomingSolSignatures: new Set<string>(),
+      feePayerIncomingSellTriggered: false,
     };
 
     this.subscribeBundlerFunder(funderWallet);
@@ -7834,6 +7955,9 @@ export class InsiderBot extends EventEmitter {
       parallelFeePayerFunderWallet: null,
       parallelFeePayerFunderCursorSignature: null,
       parallelFeePayerFunderFundedAtSec: null,
+      feePayerIncomingSolCumulative: 0,
+      feePayerIncomingSolSignatures: new Set<string>(),
+      feePayerIncomingSellTriggered: false,
     };
 
     this.subscribeBundlerFunder(feePayer);
@@ -12455,6 +12579,7 @@ export class InsiderBot extends EventEmitter {
           : signal.kind === "mc_floor"
             ? "mc-rug-reset"
             : "dev-zero-balance",
+        { allowWhenFeePayerOnly: true },
       );
     } else {
       if (signal.kind === "zero_balance") {
@@ -12977,6 +13102,81 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
+  /**
+   * FeePayer sell trigger: sums incoming native SOL transfer-ins to the shared
+   * feePayer that exceed FEEPAYER_SELL_INCOMING_MIN_SOL, and sells the whole
+   * position once the cumulative total reaches FEEPAYER_SELL_CUMULATIVE_SOL.
+   * Counts from the moment the feePayer watch locks. One-shot per position.
+   */
+  private async trackFeePayerIncomingSolForSell(
+    state: BundlerFunderWatchState,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    if (state.feePayerIncomingSellTriggered) return;
+    if (state.feePayerIncomingSolSignatures.has(tx.signature)) return;
+
+    const incomingSol = this.extractSolIncomingAmountToWallet(tx, state.funderWallet);
+    if (incomingSol <= FEEPAYER_SELL_INCOMING_MIN_SOL) return;
+
+    state.feePayerIncomingSolSignatures.add(tx.signature);
+    state.feePayerIncomingSolCumulative += incomingSol;
+
+    this.log.info("FeePayer qualifying incoming transfer counted toward sell trigger", {
+      mint: state.mint,
+      funderWallet: state.funderWallet,
+      signature: tx.signature,
+      incomingSol,
+      cumulativeSol: state.feePayerIncomingSolCumulative,
+      thresholdSol: FEEPAYER_SELL_CUMULATIVE_SOL,
+    });
+
+    if (state.feePayerIncomingSolCumulative < FEEPAYER_SELL_CUMULATIVE_SOL) return;
+
+    state.feePayerIncomingSellTriggered = true;
+    await this.triggerFeePayerCumulativeIncomingSell(state, tx);
+  }
+
+  private async triggerFeePayerCumulativeIncomingSell(
+    state: BundlerFunderWatchState,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    if (
+      !this.activePosition ||
+      this.activePosition.mint !== state.mint ||
+      this.phase !== "holding" ||
+      this.positionSellTriggered
+    ) {
+      this.log.info(
+        "FeePayer cumulative incoming sell threshold reached but no open position to sell",
+        {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          cumulativeSol: state.feePayerIncomingSolCumulative,
+          hasPosition: !!this.activePosition,
+          phase: this.phase,
+          positionSellTriggered: this.positionSellTriggered,
+        },
+      );
+      return;
+    }
+
+    await this.triggerPositionSell(
+      state.mint,
+      `FeePayer ${state.funderWallet} received >${FEEPAYER_SELL_INCOMING_MIN_SOL} SOL transfer-ins totalling ${state.feePayerIncomingSolCumulative.toFixed(4)} SOL (>= ${FEEPAYER_SELL_CUMULATIVE_SOL} SOL) on ${state.mint}`,
+      [
+        `<b>🚨 ${this.label} FeePayer Cumulative Incoming Sell</b>`,
+        `Token: <code>${state.mint}</code>`,
+        `FeePayer: <code>${state.funderWallet}</code>`,
+        `Cumulative incoming: <b>${state.feePayerIncomingSolCumulative.toFixed(4)} SOL</b> (>= ${FEEPAYER_SELL_CUMULATIVE_SOL} SOL)`,
+        `Trigger tx: <code>${tx.signature}</code>`,
+        "",
+        "Selling <b>100%</b> — feePayer cumulative incoming threshold reached.",
+      ],
+      tx.signature,
+      { allowWhenFeePayerOnly: true },
+    );
+  }
+
   private async inspectBundlerFunderTransaction(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
@@ -12987,6 +13187,7 @@ export class InsiderBot extends EventEmitter {
     const isPrimaryWatch = watchedWallet === state.funderWallet;
     if (isPrimaryWatch) {
       this.recordLowFundingFunderTx(state, tx);
+      await this.trackFeePayerIncomingSolForSell(state, tx);
     }
     const transferOut = this.extractSolTransferOutFromWallet(
       tx,
@@ -14713,7 +14914,14 @@ export class InsiderBot extends EventEmitter {
       sharedFeePayerBalanceAfterInitialTransfers?: number;
     },
   ): Promise<void> {
+    // Disabled: the normal-route observer is the only buy path.
+    this.log.info("Low-funding shared feePayer buy rejected — normal-route observer is the only buy path", {
+      mint: state.mint,
+      sharedFeePayer: state.funderWallet,
+      signature,
+    });
     if (
+      NORMAL_ROUTE_OBSERVER_ONLY_BUY_PATH ||
       this.buySubmitted ||
       this.buyDisabled ||
       this.isBuyExecuting ||
@@ -14804,7 +15012,14 @@ export class InsiderBot extends EventEmitter {
     triggerTx?: HeliusTransaction,
     exitOptions: { fixedExitMc?: number; exitPercent?: number; disableProfitExit?: boolean } = {},
   ): Promise<void> {
+    // Disabled: the normal-route observer is the only buy path.
+    this.log.info("Low-funding recipient buy rejected — normal-route observer is the only buy path", {
+      mint: state.mint,
+      recipient: watch.wallet,
+      signature,
+    });
     if (
+      NORMAL_ROUTE_OBSERVER_ONLY_BUY_PATH ||
       this.buySubmitted ||
       this.buyDisabled ||
       this.isBuyExecuting ||
@@ -14912,7 +15127,14 @@ export class InsiderBot extends EventEmitter {
     triggerTx?: HeliusTransaction,
     exitPercentOverride?: number,
   ): Promise<void> {
+    // Disabled: the normal-route observer is the only buy path.
+    this.log.info("Bundler-funder recipient buy rejected — normal-route observer is the only buy path", {
+      mint: state.mint,
+      recipient: watch.wallet,
+      signature,
+    });
     if (
+      NORMAL_ROUTE_OBSERVER_ONLY_BUY_PATH ||
       this.buySubmitted ||
       this.buyDisabled ||
       this.isBuyExecuting ||
@@ -16482,7 +16704,19 @@ export class InsiderBot extends EventEmitter {
     reason: string,
     telegramLines: string[],
     signature: string,
+    options: { allowWhenFeePayerOnly?: boolean } = {},
   ): Promise<void> {
+    // While the feePayer-incoming-only sell mode is on, only the feePayer
+    // cumulative incoming-sol sell and the emergency rug/dev-exit path may
+    // exit. Every other exit is disabled.
+    if (FEEPAYER_INCOMING_SELL_ONLY && !options.allowWhenFeePayerOnly) {
+      this.log.info("Sell rejected — only the feePayer cumulative incoming sell is active", {
+        mint,
+        reason,
+        signature,
+      });
+      return;
+    }
     if (!this.activePosition || this.positionSellTriggered) return;
     this.positionSellTriggered = true;
 
