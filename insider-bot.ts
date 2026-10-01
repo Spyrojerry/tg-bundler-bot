@@ -5375,6 +5375,10 @@ export class InsiderBot extends EventEmitter {
     }
 
     void this.startFollowTokenEarlyBundlerExitMonitoring(mint, fromNewTokenStream);
+    // The normal-route observer is the only buy path and must run regardless of
+    // whether the Large Insider feePayer locks. Start it here, before the LI
+    // attempt, so a failed lock no longer suppresses the 5,000-lamport buy scan.
+    this.startNormalRouteObserver(mint);
 
     const stubSecondGroup =
       this.buildFollowTokenStubSecondGroupFromInitialBundlers(watchState);
@@ -9976,6 +9980,17 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async maybeEvaluateFollowTokenEarlyBundlerExit(
+    triggerTx?: HeliusTransaction,
+  ): Promise<void> {
+    // The early-bundler sold-all / bundler-exit flow has been removed. The only
+    // purpose of the early bundler exit watches now is to observe watched
+    // wallets' sell transactions (and their fees) for the normal-route 5,000-
+    // lamport sell trigger. No sold-all evaluation, buy, or reset runs here.
+    void triggerTx;
+    return;
+  }
+
+  private async maybeEvaluateFollowTokenEarlyBundlerExitDisabled(
     triggerTx?: HeliusTransaction,
   ): Promise<void> {
     const state = this.followTokenEarlyBundlerExitState;
