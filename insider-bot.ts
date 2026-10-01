@@ -34,9 +34,9 @@ const FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD = 40_000;
 /** Follow-token route: GMGN 24h net-buy entry threshold (USD). */
 export const FOLLOW_TOKEN_NET_BUY_ENTRY_USD = 16_000;
 /** Follow-token route: GMGN 24h net-buy take-profit threshold (USD). */
-export const FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD = 18_000;
+export const FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD = 900;
 /** Follow-token route: GMGN 24h net-buy stop-loss threshold (USD). */
-export const FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD = 11_000;
+export const FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD = 300;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
 const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
@@ -2316,6 +2316,9 @@ export class InsiderBot extends EventEmitter {
       existing.funderWallet !== mint &&
       !existing.bundlerWallets.has(existing.funderWallet)
     ) {
+      // A previously-resolved real feePayer is already locked. Clear the stub's
+      // discoveryStopped so the pre-buy lock gate (isBundlerFunderLocked) sees it.
+      existing.discoveryStopped = false;
       return true;
     }
     if (!earlyBuys || earlyBuys.length < BUNDLER_FUNDER_REQUIRED_COUNT) {
@@ -13281,8 +13284,22 @@ export class InsiderBot extends EventEmitter {
         return false;
       }
       if (transferOutUsd >= BUNDLER_FUNDER_NORMAL_TINY_TRANSFER_OUT_MAX_USD) return false;
+      const lowFundingMigrated = await this.maybeMoveBundlerFunderWatchAfterZeroDrain(
+        state,
+        tx,
+        transferOut,
+      );
+      if (lowFundingMigrated) return true;
       await this.handleLowFundingTinyTransferOut(state, tx, transferOut, transferOutUsd);
       return false;
+    }
+    if (isPrimaryWatch) {
+      const migrated = await this.maybeMoveBundlerFunderWatchAfterZeroDrain(
+        state,
+        tx,
+        transferOut,
+      );
+      if (migrated) return true;
     }
     return this.handleNormalModeTinyTransferOut(state, tx, transferOut, watchedWallet);
   }
@@ -13760,6 +13777,70 @@ export class InsiderBot extends EventEmitter {
       },
     );
     return false;
+  }
+
+  /**
+   * Any transfer-out (of any size) that drains the watched feePayer to zero
+   * hands the watch off to the recipient, so monitoring continues from the new
+   * feePayer. Unlike maybeMoveBundlerFunderWatchAfterLargeDrain this is not
+   * amount-gated: a wallet emptied by several small transfers still migrates.
+   */
+  private async maybeMoveBundlerFunderWatchAfterZeroDrain(
+    state: BundlerFunderWatchState,
+    tx: HeliusTransaction,
+    transferOut: { to: string; amountSol: number },
+  ): Promise<boolean> {
+    if (!Number.isFinite(tx.timestamp) || tx.timestamp <= 0) return false;
+    if (!transferOut.to || transferOut.to === state.funderWallet) return false;
+    if (this.isFollowTokenLargeInsiderSharedFeePayer(transferOut.to)) {
+      this.log.info(
+        "Zero-drain feePayer handoff skipped — drain returned to original shared feePayer",
+        {
+          mint: state.mint,
+          watchedWallet: state.funderWallet,
+          originalFunderWallet: state.originalFunderWallet,
+          signature: tx.signature,
+          amountSol: transferOut.amountSol,
+          recipient: transferOut.to,
+        },
+      );
+      return false;
+    }
+    try {
+      const drained = await this.isFunderWalletDrainedAfterTx(state.funderWallet, tx);
+      if (!drained) return false;
+      const recipientBalanceSol = await this.getBundlerFunderLiveBalanceSol(transferOut.to);
+      if (
+        recipientBalanceSol === null ||
+        recipientBalanceSol <= ZERO_BALANCE_EPSILON_SOL
+      ) {
+        this.log.info("Zero-drain feePayer handoff skipped — recipient is also at zero", {
+          mint: state.mint,
+          funderWallet: state.funderWallet,
+          recipient: transferOut.to,
+          signature: tx.signature,
+          amountSol: transferOut.amountSol,
+        });
+        return false;
+      }
+      await this.switchBundlerFunderWatchAddress(
+        state,
+        transferOut.to,
+        tx.signature,
+        `Transfer-out drained watched feePayer to zero; continuing this token's feePayer monitor from receiver.`,
+      );
+      return true;
+    } catch (err) {
+      void this.heliusClient.handlePossibleRateLimitError(err);
+      this.log.warn("Failed to check shared feePayer zero-drain handoff", {
+        mint: state.mint,
+        watchedWallet: state.funderWallet,
+        recipient: transferOut.to,
+        signature: tx.signature,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
   }
 
   private async maybeMoveBundlerFunderWatchAfterLargeDrain(
