@@ -208,7 +208,7 @@ const FEEPAYER_SELL_INCOMING_MIN_SOL = 10;
  * qualifying incoming transfer-ins (> FEEPAYER_SELL_INCOMING_MIN_SOL each)
  * reaches this many SOL. Counted from the moment the feePayer watch locks.
  */
-const FEEPAYER_SELL_CUMULATIVE_SOL = 50;
+const FEEPAYER_SELL_CUMULATIVE_SOL = 20;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -416,6 +416,12 @@ const BUNDLER_FUNDER_MAX_NORMAL_TRANSFER_OUT_SOL = 100;
 const BUNDLER_FUNDER_STARTUP_HANDOFF_HISTORY_LIMIT = 50;
 const BUNDLER_FUNDER_STARTUP_HANDOFF_MAX_CHAIN = 5;
 const ZERO_BALANCE_EPSILON_SOL = 1e-6;
+/**
+ * A feePayer holding less than this is treated as drained for handoff: it can
+ * no longer fund bundler buys, so the watch migrates to its last recipient even
+ * if the final outgoing transfer left a dust remainder rather than exact zero.
+ */
+const BUNDLER_FUNDER_DRAINED_BALANCE_SOL = 0.5;
 
 function bundlerFundingIncomingQualifies(
   amountSol: number,
@@ -2178,6 +2184,22 @@ export class InsiderBot extends EventEmitter {
         feePayerWindowEndsAt: options.feePayerWindowEndsAt ?? null,
         initialBundlers: options.secondGroupWalletCount ?? null,
       });
+      void this.sendTelegramSafe(
+        [
+          `<b>🔒 ${this.label} FeePayer Locked</b>`,
+          `Token: <code>${mint}</code>`,
+          `Shared feePayer: <code>${options.feePayer ?? "unknown"}</code>`,
+          `Trigger: ${triggerReason}`,
+          options.secondGroupWalletCount !== null &&
+          options.secondGroupWalletCount !== undefined
+            ? `Bundlers: <b>${options.secondGroupWalletCount}</b>`
+            : "",
+          "Watching this feePayer's transfer-outs to continue the token's flow.",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        "follow-token feePayer locked",
+      );
       return;
     }
 
@@ -2185,6 +2207,15 @@ export class InsiderBot extends EventEmitter {
       mint,
       triggerReason,
     });
+    void this.sendTelegramSafe(
+      [
+        `<b>⚠️ ${this.label} FeePayer Lock Failed</b>`,
+        `Token: <code>${mint}</code>`,
+        `Trigger: ${triggerReason}`,
+        "No shared feePayer could be locked (e.g. split bundler funding) — token skipped.",
+      ].join("\n"),
+      "follow-token feePayer lock failed",
+    );
   }
 
   private buildFollowTokenStubSecondGroupFromInitialBundlers(
@@ -5327,29 +5358,6 @@ export class InsiderBot extends EventEmitter {
         followInsiderMode,
         fromNewTokenStream,
       });
-      if (!followInsiderMode) {
-        this.log.info("Follow-token GMGN net-buy flow started", {
-          mint,
-          entryThresholdUsd: FOLLOW_TOKEN_NET_BUY_ENTRY_USD,
-          takeProfitThresholdUsd: FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD,
-          stopLossThresholdUsd: FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD,
-          minBuyMarketCapUsd: FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD,
-          pollIntervalMs: 5_000,
-        });
-        void this.sendTelegramSafe(
-          [
-            `<b>👀 ${this.label} Follow-Token GMGN Flow Started</b>`,
-            `Token: <code>${mint}</code>`,
-            `Migrate tx: <code>${migrationSignature}</code>`,
-            `Early bundlers: <b>${earlyBundlerWallets.length}</b>`,
-            `Buy trigger: 24h net buy ≥ <b>$${FOLLOW_TOKEN_NET_BUY_ENTRY_USD.toLocaleString()}</b>`,
-            `Minimum buy MC: <b>$${FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD.toLocaleString()}</b>`,
-            `Exit: take profit <b>$${FOLLOW_TOKEN_NET_BUY_TAKE_PROFIT_USD.toLocaleString()}</b> · stop loss <b>$${FOLLOW_TOKEN_NET_BUY_STOP_LOSS_USD.toLocaleString()}</b>`,
-            "Polling GMGN 24h net buy every <b>5s</b>…",
-          ].join("\n"),
-          "follow-token GMGN flow started",
-        );
-      }
     }
     return this.isFollowTokenFlowActive(mint);
   }
@@ -13780,10 +13788,14 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * Any transfer-out (of any size) that drains the watched feePayer to zero
-   * hands the watch off to the recipient, so monitoring continues from the new
-   * feePayer. Unlike maybeMoveBundlerFunderWatchAfterLargeDrain this is not
-   * amount-gated: a wallet emptied by several small transfers still migrates.
+   * Any transfer-out (of any size) that drains the watched feePayer below the
+   * working-balance threshold hands the watch off to the recipient, so
+   * monitoring continues from the new feePayer. Unlike
+   * maybeMoveBundlerFunderWatchAfterLargeDrain this is not amount-gated: a
+   * wallet emptied by several small transfers still migrates. The recipient may
+   * itself be thin right now — that is fine, it is the live address the rest of
+   * the token's feePayer activity will flow through, so we still follow it
+   * rather than stalling on a dead wallet.
    */
   private async maybeMoveBundlerFunderWatchAfterZeroDrain(
     state: BundlerFunderWatchState,
@@ -13807,27 +13819,24 @@ export class InsiderBot extends EventEmitter {
       return false;
     }
     try {
-      const drained = await this.isFunderWalletDrainedAfterTx(state.funderWallet, tx);
-      if (!drained) return false;
+      const liveBalanceSol = await this.getBundlerFunderLiveBalanceSol(state.funderWallet);
+      if (liveBalanceSol === null) return false;
+      if (liveBalanceSol > BUNDLER_FUNDER_DRAINED_BALANCE_SOL) return false;
       const recipientBalanceSol = await this.getBundlerFunderLiveBalanceSol(transferOut.to);
-      if (
-        recipientBalanceSol === null ||
-        recipientBalanceSol <= ZERO_BALANCE_EPSILON_SOL
-      ) {
-        this.log.info("Zero-drain feePayer handoff skipped — recipient is also at zero", {
-          mint: state.mint,
-          funderWallet: state.funderWallet,
-          recipient: transferOut.to,
-          signature: tx.signature,
-          amountSol: transferOut.amountSol,
-        });
-        return false;
-      }
+      this.log.info("FeePayer drained below working balance — handing off to receiver", {
+        mint: state.mint,
+        funderWallet: state.funderWallet,
+        recipient: transferOut.to,
+        liveBalanceSol,
+        recipientBalanceSol,
+        amountSol: transferOut.amountSol,
+        signature: tx.signature,
+      });
       await this.switchBundlerFunderWatchAddress(
         state,
         transferOut.to,
         tx.signature,
-        `Transfer-out drained watched feePayer to zero; continuing this token's feePayer monitor from receiver.`,
+        `Transfer-out drained watched feePayer below ${BUNDLER_FUNDER_DRAINED_BALANCE_SOL} SOL; continuing this token's feePayer monitor from receiver.`,
       );
       return true;
     } catch (err) {
