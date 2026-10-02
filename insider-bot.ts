@@ -167,6 +167,8 @@ const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 10;
  * fee (in USD) below this threshold.
  */
 const NORMAL_ROUTE_OBSERVER_MIN_FEE_USD = 0.009;
+/** FeeSnip: if the market cap at buy time is below this, skip the token and reset. */
+const FEE_SNIP_MIN_BUY_MC_USD = 60_000;
 /**
  * The only fee that qualifies a wallet exit on the normal route: an exact tx fee
  * of 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
@@ -3809,8 +3811,9 @@ export class InsiderBot extends EventEmitter {
 
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) return;
+      // FeeSnip: skip + reset when the buy-time MC is below the floor.
       const minBuyMcFloorUsd = options.allowOnlyNormalRoute
-        ? 0
+        ? FEE_SNIP_MIN_BUY_MC_USD
         : FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD;
       if (currentMc < minBuyMcFloorUsd) {
         this.log.warn(
@@ -5929,7 +5932,7 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `Waiting <b>${(remainingDelayMs / 1_000).toFixed(1)}s</b> after token start before scanning.`,
         `Watching for wallets with first buy <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD}</b> (first ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}).`,
-        `Buy on first tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b>, or when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> wallets are collected.`,
+        `Collect all <b>${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}</b> wallets first, then buy if one has a tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b> (else skip + reset).`,
       ].join("\n"),
       "feesnip observer armed",
     );
@@ -5984,7 +5987,7 @@ export class InsiderBot extends EventEmitter {
         `<b>🔎 ${this.label} FeeSnip Scanning</b>`,
         `Token: <code>${mint}</code>`,
         `Now tracking $${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD} buys (first ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}).`,
-        `Buy on first tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b>.`,
+        `Buy only after all ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS} are collected and one has a tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b>.`,
       ].join("\n"),
       "feesnip watch live",
     );
@@ -6018,10 +6021,9 @@ export class InsiderBot extends EventEmitter {
     if (feeLamports === undefined) return;
     const solPriceUsd = await this.getCachedSolPriceUsd();
     if (solPriceUsd === null) return;
-    // FeeSnip: the qualifying fee is the buy trigger — any buy whose tx fee (in
-    // USD) is below $0.009 buys the moment it is seen.
+    // FeeSnip: the qualifying fee is what the cap-time decision matches against;
+    // no wallet buys mid-collection any more.
     const feeUsd = (feeLamports / 1_000_000_000) * solPriceUsd;
-    const feeBelowThreshold = feeUsd < NORMAL_ROUTE_OBSERVER_MIN_FEE_USD;
 
     const recipients = new Set(
       (tx.tokenTransfers ?? [])
@@ -6068,7 +6070,8 @@ export class InsiderBot extends EventEmitter {
         continue;
       }
       // FeeSnip: hard cap — stop searching the moment 10 qualifying wallets
-      // have been collected. No further wallets are held or watched.
+      // have been collected. No wallet buys mid-collection; the buy is decided
+      // only once all 10 are in.
       if (
         this.normalRouteObserverCollectedCount() >=
         NORMAL_ROUTE_OBSERVER_MAX_WALLETS
@@ -6078,9 +6081,8 @@ export class InsiderBot extends EventEmitter {
           collected: this.normalRouteObserverCollectedCount(),
           maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
         });
-        // 10 wallets collected with no sub-$0.009 fee and no buy → skip + reset.
         if (!this.buySubmitted && !this.isBuyExecuting) {
-          void this.skipNormalRouteObserverAtCapNoFee(mint);
+          void this.evaluateNormalRouteObserverAtCap(mint);
         }
         return;
       }
@@ -6095,8 +6097,8 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
-      // FeeSnip: buy immediately when this qualifying buy's fee is below the
-      // threshold — no confirmation window, no wallet count needed.
+      // FeeSnip: collect this qualifying wallet. No buy here — the decision is
+      // made once all 10 wallets have been collected.
       this.holdNormalRouteObserverWallet(
         mint,
         wallet,
@@ -6106,26 +6108,13 @@ export class InsiderBot extends EventEmitter {
         feeLamports,
         feeUsd,
       );
-      if (feeBelowThreshold && !this.buySubmitted && !this.isBuyExecuting) {
-        this.log.warn("FeeSnip sub-threshold fee seen — buying now", {
-          mint,
-          wallet,
-          feeUsd,
-          minFeeUsd: NORMAL_ROUTE_OBSERVER_MIN_FEE_USD,
-          feeLamports,
-          buyUsd,
-        });
-        void this.maybeTriggerNormalRouteObserverBuy(wallet, feeUsd);
-        return;
-      }
     }
   }
 
   /**
-   * Holds a qualifying first buy through its own confirmation window. The buy
-   * trigger is evaluated on the held count immediately; if any further buy or
-   * sell occurs on the wallet before its window elapses, it is dropped.
-   * Survivors promote to the qualified pool, which is what the sell triggers use.
+   * Holds a qualifying first buy through its confirmation window. A later buy
+   * from the wallet is ignored; only a sell drops it (and, after the buy, also
+   * triggers our exit). Survivors promote to the qualified pool.
    */
   private holdNormalRouteObserverWallet(
     mint: string,
@@ -6186,13 +6175,12 @@ export class InsiderBot extends EventEmitter {
         `First buy: <b>$${buyUsd.toFixed(2)}</b> · <b>${buySol.toFixed(4)} SOL</b>`,
         `Tx fee: <b>$${feeUsd.toFixed(6)}</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
-        `Collected <b>${collectedCount}/${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}</b> wallets; buy fires on first fee below $${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD} or at ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}.`,
+        `Collected <b>${collectedCount}/${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}</b> wallets; buy decided once all ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS} are collected (need a fee below $${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}).`,
       ].join("\n"),
       "feesnip wallet held",
     );
-    void this.maybeTriggerNormalRouteObserverBuy();
-    // FeeSnip: if this wallet was the 10th collected and no sub-$0.009 fee has
-    // bought, skip + reset (deferred so a same-batch fee trigger can still win).
+    // FeeSnip: once all 10 are collected, decide the buy (match → buy, else
+    // skip + reset). Deferred so a same-batch wallet can still be collected.
     if (
       this.normalRouteObserverCollectedCount() >=
         NORMAL_ROUTE_OBSERVER_MAX_WALLETS &&
@@ -6206,17 +6194,17 @@ export class InsiderBot extends EventEmitter {
           !this.buySubmitted &&
           !this.isBuyExecuting
         ) {
-          void this.skipNormalRouteObserverAtCapNoFee(mint);
+          void this.evaluateNormalRouteObserverAtCap(mint);
         }
       });
     }
   }
 
   /**
-   * FeeSnip: 10 wallets were collected but none had a tx fee below $0.009, so no
-   * buy fired. Skip the token and reset the flow for the next one.
+   * FeeSnip: once all 10 wallets are collected, decide the buy. If any collected
+   * wallet has a tx fee below $0.009, buy that wallet. Otherwise skip + reset.
    */
-  private async skipNormalRouteObserverAtCapNoFee(mint: string): Promise<void> {
+  private async evaluateNormalRouteObserverAtCap(mint: string): Promise<void> {
     if (this.normalRouteObserverCapSkipFired) return;
     if (
       !this.normalRouteObserverActive ||
@@ -6226,7 +6214,28 @@ export class InsiderBot extends EventEmitter {
     ) {
       return;
     }
+    if (
+      this.normalRouteObserverCollectedCount() <
+      NORMAL_ROUTE_OBSERVER_MAX_WALLETS
+    ) {
+      return;
+    }
     this.normalRouteObserverCapSkipFired = true;
+
+    // Find the first collected wallet whose tx fee is below the threshold.
+    const match = this.findNormalRouteObserverFeeMatch();
+    if (match) {
+      this.log.warn("FeeSnip 10 wallets collected — fee match found; buying", {
+        mint,
+        wallet: match.wallet,
+        feeUsd: match.feeUsd,
+        minFeeUsd: NORMAL_ROUTE_OBSERVER_MIN_FEE_USD,
+        collected: this.normalRouteObserverCollectedCount(),
+      });
+      await this.maybeTriggerNormalRouteObserverBuy(match.wallet, match.feeUsd);
+      return;
+    }
+
     this.log.warn(
       "FeeSnip skip — 10 wallets collected with no fee below $0.009; resetting",
       {
@@ -6247,6 +6256,27 @@ export class InsiderBot extends EventEmitter {
     await this.resetForNewToken(true, {
       reason: "feesnip_no_sub_threshold_fee_at_cap",
     });
+  }
+
+  /**
+   * FeeSnip: the first collected wallet (pending or qualified) whose tx fee is
+   * below the sub-$0.009 threshold, or null when none matches.
+   */
+  private findNormalRouteObserverFeeMatch(): {
+    wallet: string;
+    feeUsd: number;
+  } | null {
+    for (const [wallet, info] of this.normalRouteObserverPending) {
+      if (info.feeUsd < NORMAL_ROUTE_OBSERVER_MIN_FEE_USD) {
+        return { wallet, feeUsd: info.feeUsd };
+      }
+    }
+    for (const [wallet, info] of this.normalRouteObserverQualified) {
+      if (info.feeUsd < NORMAL_ROUTE_OBSERVER_MIN_FEE_USD) {
+        return { wallet, feeUsd: info.feeUsd };
+      }
+    }
+    return null;
   }
 
   /** Held wallets that count toward the buy trigger: pending + already qualified. */
@@ -6415,10 +6445,8 @@ export class InsiderBot extends EventEmitter {
         `<b>🟢 ${this.label} FeeSnip Buy Triggered</b>`,
         `Token: <code>${funderState.mint}</code>`,
         `Wallet: <code>${entryWallet ?? "unknown"}</code>`,
-        feeTriggered
-          ? `Reason: first tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b> ($${feeUsd!.toFixed(6)})`
-          : `Reason: <b>${required}</b> qualifying wallets collected`,
-        `Collected: <b>${heldCount}</b>`,
+        `Reason: 10 wallets collected and tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b> ($${feeUsd!.toFixed(6)})`,
+        `Collected: <b>${collectedCount}</b>`,
       ].join("\n"),
       "feesnip buy triggered",
     );
