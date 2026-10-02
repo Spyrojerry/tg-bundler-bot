@@ -168,7 +168,7 @@ const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 10;
  */
 const NORMAL_ROUTE_OBSERVER_MIN_FEE_USD = 0.009;
 /** FeeSnip: if the market cap at buy time is below this, skip the token and reset. */
-const FEE_SNIP_MIN_BUY_MC_USD = 60_000;
+const FEE_SNIP_MIN_BUY_MC_USD = 58_000;
 /**
  * The only fee that qualifies a wallet exit on the normal route: an exact tx fee
  * of 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
@@ -1015,6 +1015,12 @@ export class InsiderBot extends EventEmitter {
   private normalRouteObserverDelayElapsed = false;
   /** One-shot guard so the no-fee-at-cap skip/reset only fires once per token. */
   private normalRouteObserverCapSkipFired = false;
+  /**
+   * True while the active position was entered by the FeeSnip flow. FeeSnip
+   * always keeps the +80% MC take-profit armed — the shared bundler/LI exit
+   * machinery must not disable it.
+   */
+  private feesnipPosition = false;
   /** Cumulative count of wallets ever held (past + currently held) this flow. */
   private normalRouteObserverTotalHeldCount = 0;
   /** Wall-clock ms when the current normal-route observer started, for rate math. */
@@ -3556,7 +3562,7 @@ export class InsiderBot extends EventEmitter {
         };
       }
       if (state) state.highSellUsdMode = true;
-      this.profitExitDisabled = true;
+      if (!this.feesnipPosition) this.profitExitDisabled = true;
       return {
         mode: "li_only",
         meetsSellTxGate,
@@ -3916,6 +3922,13 @@ export class InsiderBot extends EventEmitter {
       this.setBuyExecuting(true);
       this.buySubmitted = true;
       this.preBuyStopped = true;
+      if (options.allowOnlyNormalRoute) {
+        // FeeSnip is the only normal-route buy path: always keep +80% MC TP armed
+        // and don't let the shared bundler/LI exit machinery disable it.
+        this.feesnipPosition = true;
+        this.profitExitDisabled = false;
+        this.disableProfitExitAfterBuy = false;
+      }
       this.armDevTokenOutPostBuyWatch(state.mint);
       if (
         ebState?.active &&
@@ -10233,7 +10246,7 @@ export class InsiderBot extends EventEmitter {
       this.anyFollowTokenEarlyBundlerExitWatchExceedsHighSellUsdMcTpDisable();
     if (highSellUsd) {
       state.highSellUsdMode = true;
-      this.profitExitDisabled = true;
+      if (!this.feesnipPosition) this.profitExitDisabled = true;
     }
 
     this.log.warn("Follow-token early bundler all sold all — evaluating LI exit", {
@@ -15948,7 +15961,8 @@ export class InsiderBot extends EventEmitter {
         if (
           !state.lowFundingMode &&
           !watch.normalTinyTransferMode &&
-          !this.profitExitDisabled
+          !this.profitExitDisabled &&
+          !this.feesnipPosition
         ) {
           this.profitExitDisabled = true;
           this.log.warn(
@@ -17084,6 +17098,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteEarlyFeeBuyMode = false;
     this.normalRouteEarlyFeeBuyWallets.clear();
     this.normalRouteEarlyFeeBuySoldAllWallets.clear();
+    this.feesnipPosition = false;
     this.profitExitDisabled = false;
     this.disableProfitExitAfterBuy = false;
     this.heliusPoolMetricsMint = null;
