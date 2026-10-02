@@ -141,39 +141,41 @@ const PRE_LI_FIRST_BUY_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
 const NEW_TOKEN_BUY_CLUSTER_MAX_CLUSTERS = 3;
 /** Smallest-root chain remaining at/above this amount triggers an immediate buy instead of waiting for observer wallets. */
 const FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING = 40_000_000;
-/** Normal follow-token route: wallet first-buy USD band for the observer buy trigger. */
-const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 1;
-const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 900;
-/** Normal follow-token route: collect up to this many qualifying observer wallets. */
+/**
+ * FeeSnip flow (the only buy path): after a token starts, wait 10 seconds, then
+ * watch the normal-route buys in the $300–$500 band, collect up to the first 10
+ * of them, and buy the moment any observed buy has a transaction fee below
+ * $0.009. If more than one wallet matches, buy the first and watch the rest for
+ * sells. This replaces the old MC-floor / market-cap-grace buy trigger.
+ */
+/** FeeSnip: wait this long after the token starts before the observer begins. */
+const FEE_SNIP_START_DELAY_MS = 10 * 1_000;
+/** FeeSnip: wallet first-buy USD band for the observer buy trigger. */
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 300;
+const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 500;
+/** FeeSnip: collect up to this many qualifying observer wallets (the first 10). */
 const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 10;
-/** Normal follow-token route: max wallets held (pending) at once while finding the valid ones. */
+/** FeeSnip: max wallets held (pending) at once while finding the valid ones. */
 const NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS = 20;
-/** Normal follow-token route: buy once this many qualifying observer wallets are found. */
-const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 5;
 /**
- * Normal follow-token route: buy normally when MC is at/above this floor. Below
- * it, wait a grace minute for MC to reach the floor before skipping/resetting.
+ * FeeSnip: buy once this many qualifying observer wallets are found, even if no
+ * sub-$0.009 fee has been seen by then.
  */
-const NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD = 75_000;
+const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 10;
 /**
- * Normal follow-token route: when the buy is deferred into the MC grace minute
- * (MC below the floor at the 5-wallet trigger), it only proceeds once this many
- * wallets are held, and only if MC is at/above the floor by then.
+ * FeeSnip: buy immediately when any observed qualifying buy has a transaction
+ * fee (in USD) below this threshold.
  */
-const NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS = 20;
-/** How long to wait for MC to reach the floor before skipping and resetting. */
-const NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS = 60 * 1_000;
-/** Normal follow-token route: fee tolerance (USD) against the insider-wallet sell-fee reference. */
-const NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD = 0.005;
+const NORMAL_ROUTE_OBSERVER_MIN_FEE_USD = 0.009;
 /**
- * The only fee that qualifies a wallet on the normal route: an exact tx fee of
- * 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
+ * The only fee that qualifies a wallet exit on the normal route: an exact tx fee
+ * of 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
  * the lamport count must match exactly.
  */
 const NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS = 5_000;
-/** Normal follow-token route: fallback take-profit (%) when no 5,000-lamport sell fee is seen. */
+/** FeeSnip: fallback take-profit (%) when no 5,000-lamport sell fee is seen. */
 const NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT = 80;
-/** Normal follow-token route: a sell within this window after a wallet's first buy disqualifies it. */
+/** FeeSnip: a sell within this window after a wallet's first buy disqualifies it. */
 const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
 /**
  * Normal follow-token route (paused observer replacement): buy trigger scans all
@@ -965,13 +967,14 @@ export class InsiderBot extends EventEmitter {
   private normalRouteEarlyFeeBuyMode = false;
   /** Qualifying wallets observed to have sold all, by wallet address. */
   private normalRouteEarlyFeeBuySoldAllWallets = new Set<string>();
-  /** Pending wallets held through the 4-minute confirmation window. */
+  /** Pending wallets held through the confirmation window. */
   private normalRouteObserverPending = new Map<
     string,
     {
       buySol: number;
       buyUsd: number;
       feeLamports: number;
+      feeUsd: number;
       signature: string;
       timestamp: number;
       tx: HeliusTransaction;
@@ -984,12 +987,25 @@ export class InsiderBot extends EventEmitter {
       buySol: number;
       buyUsd: number;
       feeLamports: number;
+      feeUsd: number;
       signature: string;
       timestamp: number;
       tx: HeliusTransaction;
     }
   >();
   private normalRouteObserverRejected = new Set<string>();
+  /**
+   * FeeSnip: extra qualifying wallets (beyond the first-match buy wallet)
+   * watched only for sells after the buy — used when >1 wallet matches.
+   */
+  private normalRouteObserverExtraSellWallets = new Set<string>();
+  /** FeeSnip: token-start timestamp (unix seconds) used for the 10s start delay. */
+  private normalRouteObserverTokenStartedAtSec: number | null = null;
+  /** FeeSnip: pending timer for the 10s post-start observer delay. */
+  private normalRouteObserverStartDelayTimer: ReturnType<typeof setTimeout> | null =
+    null;
+  /** True once the 10s post-start delay has elapsed and the watch is live. */
+  private normalRouteObserverDelayElapsed = false;
   /** Cumulative count of wallets ever held (past + currently held) this flow. */
   private normalRouteObserverTotalHeldCount = 0;
   /** Wall-clock ms when the current normal-route observer started, for rate math. */
@@ -1215,16 +1231,11 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * Called from the normal MC monitoring loop for the pre-buy mint. When the
-   * grace wait is active, MC must be at/above the floor AND the grace-required
-   * wallet count must be held before the buy fires.
+   * Called from the normal MC monitoring loop for the pre-buy mint. The FeeSnip
+   * flow has no market-cap gate, so this is now a no-op.
    */
-  notifyPreBuyMarketCap(currentMc: number, mint: string): void {
-    if (!this.normalRouteObserverMcGraceInFlight) return;
-    if (this.normalRouteObserverMint !== mint) return;
-    if (!Number.isFinite(currentMc)) return;
-    this.normalRouteObserverLastGraceMc = currentMc;
-    this.evaluateNormalRouteObserverGrace(currentMc);
+  notifyPreBuyMarketCap(_currentMc: number, _mint: string): void {
+    return;
   }
   /**
    * GMGN net-buy driven buy gate for the normal follow-token route. Buys when
@@ -3768,7 +3779,7 @@ export class InsiderBot extends EventEmitter {
       const currentMc = await this.gmgnClient.fetchTokenMarketCapUsd(state.mint);
       if (currentMc === null) return;
       const minBuyMcFloorUsd = options.allowOnlyNormalRoute
-        ? Math.min(FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD, NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD)
+        ? 0
         : FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD;
       if (currentMc < minBuyMcFloorUsd) {
         this.log.warn(
@@ -5823,10 +5834,11 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * Normal follow-token route observer: watches wallets whose first buy is
-   * 0.11–0.3 SOL, matching an insider wallet's sell fee within $0.005, with the
-   * next-tx-not-a-buy and no-sell-within-5min filters. Three qualifying wallets
-   * trigger the buy; this is the sole buy trigger on the normal route.
+   * FeeSnip observer (the only buy path): after the token starts, wait 10
+   * seconds, then watch wallets whose first buy is $300–$500. Collect up to the
+   * first 10 such buys; buy the moment any observed buy has a transaction fee
+   * below $0.009, or when 10 qualifying wallets are collected. Extra matches
+   * are watched for sells. Exits are a watched-wallet sell or the +80% TP.
    */
   private startNormalRouteObserver(mint: string): void {
     if (this.normalRouteObserverActive || !this.enhancedWs) {
@@ -5835,7 +5847,7 @@ export class InsiderBot extends EventEmitter {
     const referenceFeeLamports = this.resolveNormalRouteObserverReferenceFee();
     if (referenceFeeLamports === null) {
       this.log.info(
-        "Normal-route observer not started — no insider wallet sell fee yet",
+        "FeeSnip observer not started — no insider wallet sell fee yet",
         { mint },
       );
       return;
@@ -5852,48 +5864,98 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
     this.normalRouteObserverRejected.clear();
-    this.normalRouteObserverWatchId = this.enhancedWs.watch(mint, (tx) => {
-      void this.observeNormalRouteFirstBuy(mint, tx);
-    });
-    // Keep qualified observer wallets' scrape watches healthy and re-scan their
-    // sells so the ≥25% exit is reliably tracked on this route too.
-    this.startValidWalletReconciliation();
-    this.log.info("Started normal-route observer", {
+    this.normalRouteObserverExtraSellWallets.clear();
+    this.normalRouteObserverDelayElapsed = false;
+    this.normalRouteObserverWatchId = null;
+
+    // FeeSnip: no buy scanning for the token's first 10 seconds. Compute the
+    // remaining delay from the token-start (migration) timestamp so a token that
+    // is already past 10s starts watching immediately.
+    const startSec =
+      this.followTokenMigrationTimestamp > 0
+        ? this.followTokenMigrationTimestamp
+        : Math.floor(Date.now() / 1_000);
+    this.normalRouteObserverTokenStartedAtSec = startSec;
+    const elapsedMs = Date.now() - startSec * 1_000;
+    const remainingDelayMs = Math.max(0, FEE_SNIP_START_DELAY_MS - elapsedMs);
+
+    this.log.info("FeeSnip observer armed — waiting out token-start delay", {
       mint,
       minBuyUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_USD,
       maxBuyUsd: NORMAL_ROUTE_OBSERVER_MAX_BUY_USD,
       maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
       maxHeldWallets: NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS,
       buyTriggerWallets: NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS,
+      minFeeUsd: NORMAL_ROUTE_OBSERVER_MIN_FEE_USD,
+      startDelayMs: FEE_SNIP_START_DELAY_MS,
+      remainingDelayMs,
       referenceFeeLamports,
-      closeToleranceUsd: NORMAL_ROUTE_OBSERVER_CLOSE_TOLERANCE_USD,
     });
     void this.sendTelegramSafe(
       [
-        `<b>👀 ${this.label} Normal-Route Observer Started</b>`,
+        `<b>👀 ${this.label} FeeSnip Flow Armed</b>`,
         `Token: <code>${mint}</code>`,
-        `Watching for wallets with first buy <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD}</b>.`,
-        `Buy when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> wallets are held (up to ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}, max ${NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS} held at once).`,
-        `Each wallet is confirmed over its own <b>${NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS / 60_000}-minute</b> window.`,
+        `Waiting <b>${(remainingDelayMs / 1_000).toFixed(1)}s</b> after token start before scanning.`,
+        `Watching for wallets with first buy <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD}</b> (first ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}).`,
+        `Buy on first tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b>, or when <b>${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> wallets are collected.`,
       ].join("\n"),
-      "normal-route observer started",
+      "feesnip observer armed",
     );
 
-    // The reference fee is now snapshotted into
-    // normalRouteObserverReferenceFeeLamports, which is what the observer
-    // actually compares against — the early-bundler exit watch is no longer
-    // needed to supply it, so stop that watch. Deferred to the next tick so we
-    // don't tear down the early-bundler exit state while the caller that
-    // started this observer is still mid-evaluation.
+    if (remainingDelayMs <= 0) {
+      this.beginNormalRouteObserverWatch(mint);
+      return;
+    }
+    this.normalRouteObserverStartDelayTimer = setTimeout(() => {
+      this.normalRouteObserverStartDelayTimer = null;
+      this.beginNormalRouteObserverWatch(mint);
+    }, remainingDelayMs);
+
+    // The reference fee is snapshotted into
+    // normalRouteObserverReferenceFeeLamports, so the early-bundler exit watch is
+    // no longer needed to supply it. Deferred to the next tick so we don't tear
+    // down the early-bundler exit state mid-evaluation.
     setImmediate(() => {
       if (this.normalRouteObserverActive && this.normalRouteObserverMint === mint) {
         this.log.info(
-          "Reference fee snapshotted — stopping early-bundler exit watch (normal-route observer is now the only path)",
+          "Reference fee snapshotted — stopping early-bundler exit watch (FeeSnip is the only path)",
           { mint, referenceFeeLamports },
         );
         void this.stopFollowTokenEarlyBundlerExitMonitoring();
       }
     });
+  }
+
+  /** FeeSnip: install the enhanced-WS watch once the 10s token-start delay ends. */
+  private beginNormalRouteObserverWatch(mint: string): void {
+    if (
+      !this.normalRouteObserverActive ||
+      this.normalRouteObserverMint !== mint ||
+      !this.enhancedWs ||
+      this.normalRouteObserverWatchId !== null
+    ) {
+      return;
+    }
+    this.normalRouteObserverDelayElapsed = true;
+    this.normalRouteObserverWatchId = this.enhancedWs.watch(mint, (tx) => {
+      void this.observeNormalRouteFirstBuy(mint, tx);
+    });
+    // Keep qualified observer wallets' scrape watches healthy and re-scan their
+    // sells so the ≥25% exit is reliably tracked on this route too.
+    this.startValidWalletReconciliation();
+    this.log.info("FeeSnip observer watch live — token-start delay elapsed", {
+      mint,
+      startDelayMs: FEE_SNIP_START_DELAY_MS,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>🔎 ${this.label} FeeSnip Scanning</b>`,
+        `Token: <code>${mint}</code>`,
+        `Now tracking $${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD} buys (first ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}).`,
+        `Buy on first tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b>.`,
+      ].join("\n"),
+      "feesnip watch live",
+    );
   }
 
   /** Base fee for the normal-route observer: any insider wallet's sell fee. */
@@ -5915,19 +5977,19 @@ export class InsiderBot extends EventEmitter {
     // buy so held-wallet drops (and the dropped-wallet sell trigger) stay live.
     if (
       !this.normalRouteObserverActive ||
-      this.normalRouteObserverMint !== mint
+      this.normalRouteObserverMint !== mint ||
+      !this.normalRouteObserverDelayElapsed
     ) {
       return;
     }
-    const referenceFeeLamports = this.normalRouteObserverReferenceFeeLamports;
-    if (referenceFeeLamports === null) return;
     const feeLamports = tx.fee;
     if (feeLamports === undefined) return;
-    // Exact fee match only: the tx fee must be exactly 5,000 lamports. No
-    // tolerance — a single lamport off is not a qualifying wallet.
-    if (feeLamports !== NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS) return;
     const solPriceUsd = await this.getCachedSolPriceUsd();
     if (solPriceUsd === null) return;
+    // FeeSnip: the qualifying fee is the buy trigger — any buy whose tx fee (in
+    // USD) is below $0.009 buys the moment it is seen.
+    const feeUsd = (feeLamports / 1_000_000_000) * solPriceUsd;
+    const feeBelowThreshold = feeUsd < NORMAL_ROUTE_OBSERVER_MIN_FEE_USD;
 
     const recipients = new Set(
       (tx.tokenTransfers ?? [])
@@ -5936,8 +5998,8 @@ export class InsiderBot extends EventEmitter {
         .filter(Boolean),
     );
     // Pending-wallet guard first: any buy/sell touching a wallet held through
-    // its 4-minute confirmation window disqualifies it immediately. A sell has
-    // the wallet as the sender, so scan both directions.
+    // its confirmation window disqualifies it immediately. A sell has the wallet
+    // as the sender, so scan both directions.
     if (this.normalRouteObserverPending.size > 0) {
       const touchedWallets = new Set<string>();
       for (const transfer of tx.tokenTransfers ?? []) {
@@ -5973,7 +6035,7 @@ export class InsiderBot extends EventEmitter {
         NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS
       ) {
         this.log.info(
-          "Normal-route observer held-wallet cap reached — not holding more until confirms drain",
+          "FeeSnip held-wallet cap reached — not holding more until confirms drain",
           {
             mint,
             heldCount: this.normalRouteObserverPending.size,
@@ -5993,14 +6055,36 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
-      this.holdNormalRouteObserverWallet(mint, wallet, tx, buySol, buyUsd, feeLamports);
+      // FeeSnip: buy immediately when this qualifying buy's fee is below the
+      // threshold — no confirmation window, no wallet count needed.
+      this.holdNormalRouteObserverWallet(
+        mint,
+        wallet,
+        tx,
+        buySol,
+        buyUsd,
+        feeLamports,
+        feeUsd,
+      );
+      if (feeBelowThreshold && !this.buySubmitted && !this.isBuyExecuting) {
+        this.log.warn("FeeSnip sub-threshold fee seen — buying now", {
+          mint,
+          wallet,
+          feeUsd,
+          minFeeUsd: NORMAL_ROUTE_OBSERVER_MIN_FEE_USD,
+          feeLamports,
+          buyUsd,
+        });
+        void this.maybeTriggerNormalRouteObserverBuy(wallet, feeUsd);
+        return;
+      }
     }
   }
 
   /**
-   * Holds a qualifying first buy through its own 4-minute confirmation window.
-   * The buy trigger is evaluated on the held count immediately; if any further
-   * buy or sell occurs on the wallet before its window elapses, it is dropped.
+   * Holds a qualifying first buy through its own confirmation window. The buy
+   * trigger is evaluated on the held count immediately; if any further buy or
+   * sell occurs on the wallet before its window elapses, it is dropped.
    * Survivors promote to the qualified pool, which is what the sell triggers use.
    */
   private holdNormalRouteObserverWallet(
@@ -6010,6 +6094,7 @@ export class InsiderBot extends EventEmitter {
     buySol: number,
     buyUsd: number,
     feeLamports: number,
+    feeUsd: number,
   ): void {
     const timer = setTimeout(() => {
       this.promoteNormalRouteObserverWallet(wallet);
@@ -6029,36 +6114,41 @@ export class InsiderBot extends EventEmitter {
       buySol,
       buyUsd,
       feeLamports,
+      feeUsd,
       signature: tx.signature,
       timestamp: tx.timestamp,
       tx,
       timer,
     });
-    this.log.info("Normal-route observer wallet held for 4-minute confirmation", {
+    this.log.info("FeeSnip qualifying wallet held for confirmation", {
       mint,
       wallet,
       buySol,
       buyUsd,
       feeLamports,
+      feeUsd,
       windowMs: NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS,
       pendingCount: this.normalRouteObserverPending.size,
       heldCount: this.normalRouteObserverHeldCount(),
       totalHeldCount: this.normalRouteObserverTotalHeldCount,
     });
     const heldCount = this.normalRouteObserverHeldCount();
-    const heldRequirement = this.normalRouteObserverMcGraceInFlight
-      ? NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS
-      : NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS;
+    // FeeSnip: multiple matches in the first 10 — after a buy, every matching
+    // wallet beyond the buy wallet is watched for sells only.
+    if (this.buySubmitted && this.normalRouteObserverActive) {
+      this.normalRouteObserverExtraSellWallets.add(wallet);
+    }
     void this.sendTelegramSafe(
       [
-        `<b>⏳ ${this.label} Normal-Route Observer — Wallet Held</b>`,
+        `<b>⏳ ${this.label} FeeSnip — Wallet Held</b>`,
         `Token: <code>${mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
         `First buy: <b>$${buyUsd.toFixed(2)}</b> · <b>${buySol.toFixed(4)} SOL</b>`,
+        `Tx fee: <b>$${feeUsd.toFixed(6)}</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
-        `Held <b>${heldCount}/${heldRequirement}</b> needed to buy${this.normalRouteObserverMcGraceInFlight ? " (grace path — also needs MC at/above floor)" : ""}; any buy or sell drops the wallet.`,
+        `Collected <b>${heldCount}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> wallets; buy fires on first fee below $${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD} or at ${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}.`,
       ].join("\n"),
-      "normal-route observer wallet held",
+      "feesnip wallet held",
     );
     void this.maybeTriggerNormalRouteObserverBuy();
   }
@@ -6079,7 +6169,7 @@ export class InsiderBot extends EventEmitter {
     // being tracked past this point; we just stop promoting beyond the max.
     if (this.normalRouteObserverQualified.size >= NORMAL_ROUTE_OBSERVER_MAX_WALLETS) {
       this.normalRouteObserverPending.delete(wallet);
-      this.log.info("Normal-route observer promotion cap reached — wallet not promoted", {
+      this.log.info("FeeSnip promotion cap reached — wallet not promoted", {
         mint: this.normalRouteObserverMint,
         wallet,
         qualifiedCount: this.normalRouteObserverQualified.size,
@@ -6093,6 +6183,7 @@ export class InsiderBot extends EventEmitter {
       buySol: pending.buySol,
       buyUsd: pending.buyUsd,
       feeLamports: pending.feeLamports,
+      feeUsd: pending.feeUsd,
       signature: pending.signature,
       timestamp: pending.timestamp,
       tx: pending.tx,
@@ -6114,38 +6205,40 @@ export class InsiderBot extends EventEmitter {
       this.startValidWalletReconciliation();
     }
     const count = this.normalRouteObserverQualified.size;
-    this.log.info("Normal-route observer qualifying wallet", {
+    this.log.info("FeeSnip qualifying wallet", {
       mint,
       wallet,
       buySol: pending.buySol,
       feeLamports: pending.feeLamports,
+      feeUsd: pending.feeUsd,
       walletCount: count,
       heldCount: this.normalRouteObserverHeldCount(),
       maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
     });
     void this.sendTelegramSafe(
       [
-        `<b>👀 ${this.label} Normal-Route Observer Wallet #${count}</b>`,
+        `<b>👀 ${this.label} FeeSnip Wallet #${count}</b>`,
         `Token: <code>${mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
         `First buy: <b>$${pending.buyUsd.toFixed(2)}</b> · <b>${pending.buySol.toFixed(4)} SOL</b>`,
+        `Tx fee: <b>$${pending.feeUsd.toFixed(6)}</b>`,
         `Buy tx: <code>${pending.signature}</code>`,
-        "Survived the 4-minute confirmation window with no further buy or sell.",
-        `Held wallets: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> needed (max ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS})`,
+        `Collected: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> (max ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS})`,
       ].join("\n"),
-      "normal-route observer wallet",
+      "feesnip wallet",
     );
     void this.maybeTriggerNormalRouteObserverBuy();
   }
 
-  private async maybeTriggerNormalRouteObserverBuy(): Promise<void> {
+  private async maybeTriggerNormalRouteObserverBuy(
+    feeTriggerWallet?: string,
+    feeUsd?: number,
+  ): Promise<void> {
     const heldCount = this.normalRouteObserverHeldCount();
-    const required = this.normalRouteObserverMcGraceInFlight
-      ? NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS
-      : NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS;
+    const required = NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS;
     if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) {
       if (heldCount >= required) {
-        this.log.info("Normal-route buy trigger skipped — buy precondition", {
+        this.log.info("FeeSnip buy trigger skipped — buy precondition", {
           mint: this.normalRouteObserverMint,
           heldCount,
           required,
@@ -6156,17 +6249,15 @@ export class InsiderBot extends EventEmitter {
       }
       return;
     }
-    if (heldCount < required) {
-      return;
-    }
-    if (this.normalRouteObserverMcGraceInFlight) {
-      // Grace is running: re-check eligibility now that wallet counts may have
-      // changed. MC checks happen on the normal monitoring loop.
-      this.evaluateNormalRouteObserverGrace(this.normalRouteObserverLastGraceMc);
+    // FeeSnip: a sub-$0.009 fee buys immediately regardless of the collected
+    // count; otherwise buy once the required wallet count is collected.
+    const feeTriggered =
+      feeTriggerWallet !== undefined && feeUsd !== undefined;
+    if (!feeTriggered && heldCount < required) {
       return;
     }
     if (this.normalRouteObserverMcGraceConsumed) {
-      this.log.info("Normal-route buy trigger skipped — grace already consumed", {
+      this.log.info("FeeSnip buy trigger skipped — already consumed", {
         mint: this.normalRouteObserverMint,
         heldCount,
         required,
@@ -6175,85 +6266,56 @@ export class InsiderBot extends EventEmitter {
     }
     const funderState = this.bundlerFunderWatch;
     if (!funderState) {
-      this.log.info("Normal-route buy trigger skipped — no funder state", {
+      this.log.info("FeeSnip buy trigger skipped — no funder state", {
         mint: this.normalRouteObserverMint,
         heldCount,
         required,
       });
       return;
     }
-    const entry =
-      [...this.normalRouteObserverQualified.entries()].at(-1) ??
-      [...this.normalRouteObserverPending.entries()].at(-1);
+    // FeeSnip: buy the first matching wallet (the fee-trigger wallet when one
+    // fired, else the earliest collected). Extra matches are watched for sells.
+    const entry = feeTriggerWallet
+      ? (this.normalRouteObserverQualified.get(feeTriggerWallet) ??
+         this.normalRouteObserverPending.get(feeTriggerWallet))
+      : ([...this.normalRouteObserverQualified.entries()].at(-1) ??
+         [...this.normalRouteObserverPending.entries()].at(-1)?.[1]);
     if (!entry) {
-      this.log.info("Normal-route buy trigger skipped — no held entry", {
+      this.log.info("FeeSnip buy trigger skipped — no held entry", {
         mint: this.normalRouteObserverMint,
         heldCount,
         required,
       });
       return;
     }
-
-    // 5 held wallets no longer buys directly: start the 1-minute grace. The buy
-    // then requires the grace wallet count (20) AND MC at/above the floor.
-    const currentMc = await this.gmgnClient
-      .fetchTokenMarketCapUsd(funderState.mint)
-      .catch(() => null);
-    this.normalRouteObserverMcGraceInFlight = true;
     this.normalRouteObserverMcGraceConsumed = true;
-    this.normalRouteObserverLastGraceMc = currentMc;
-    this.log.warn(
-      "Normal-route observer 5-wallet trigger — starting grace minute",
-      {
-        mint: funderState.mint,
-        currentMc,
-        minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
-        graceMs: NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS,
-        heldCount: this.normalRouteObserverHeldCount(),
-        graceRequiredWallets: NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS,
-      },
-    );
+    const entryWallet =
+      feeTriggerWallet ??
+      ([...this.normalRouteObserverQualified.keys()].at(-1) ??
+       [...this.normalRouteObserverPending.keys()].at(-1) ??
+       null);
+    this.log.warn("FeeSnip buy trigger — buying", {
+      mint: funderState.mint,
+      wallet: entryWallet,
+      feeTriggered,
+      feeUsd: feeUsd ?? null,
+      heldCount,
+      required,
+      minFeeUsd: NORMAL_ROUTE_OBSERVER_MIN_FEE_USD,
+    });
     void this.sendTelegramSafe(
       [
-        `<b>⏳ ${this.label} Normal-Route Grace Started</b>`,
+        `<b>🟢 ${this.label} FeeSnip Buy Triggered</b>`,
         `Token: <code>${funderState.mint}</code>`,
-        `MC at grace start: <b>${currentMc !== null ? `$${currentMc.toLocaleString()}` : "unknown"}</b>`,
-        `Target floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
-        `Held now: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS}</b>.`,
-        `Waiting up to <b>1 minute</b>: buy only when <b>${NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS}</b> wallets are held and MC is at/above the floor — skip + reset otherwise.`,
+        `Wallet: <code>${entryWallet ?? "unknown"}</code>`,
+        feeTriggered
+          ? `Reason: first tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b> ($${feeUsd!.toFixed(6)})`
+          : `Reason: <b>${required}</b> qualifying wallets collected`,
+        `Collected: <b>${heldCount}</b>`,
       ].join("\n"),
-      "normal-route observer grace started",
+      "feesnip buy triggered",
     );
-    void this.awaitNormalRouteObserverMcGrace(funderState.mint);
-  }
-
-  /**
-   * Grace eligibility: buy when MC is at/above the floor AND the grace wallet
-   * count is held. Called from the normal MC loop and whenever a wallet is held
-   * during the grace.
-   */
-  private evaluateNormalRouteObserverGrace(currentMc: number | null): void {
-    if (!this.normalRouteObserverMcGraceInFlight) return;
-    if (currentMc === null || !Number.isFinite(currentMc)) return;
-    if (currentMc < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD) return;
-    if (
-      this.normalRouteObserverHeldCount() <
-      NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS
-    ) {
-      return;
-    }
-    this.normalRouteObserverMcGraceInFlight = false;
-    this.log.info(
-      "Normal-route observer grace satisfied — MC at floor with required wallets; buying",
-      {
-        mint: this.normalRouteObserverMint,
-        currentMc,
-        heldCount: this.normalRouteObserverHeldCount(),
-        minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
-        graceRequiredWallets: NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS,
-      },
-    );
-    void this.emitNormalRouteObserverBuy();
+    await this.emitNormalRouteObserverBuy(entryWallet ?? undefined);
   }
 
   /**
@@ -6269,8 +6331,8 @@ export class InsiderBot extends EventEmitter {
     return state.originalFunderWallet.length > 0 && state.originalFunderWallet !== state.mint;
   }
 
-  /** Emit the normal-route observer buy using the latest held wallet. */
-  private async emitNormalRouteObserverBuy(): Promise<void> {
+  /** Emit the FeeSnip buy for the given wallet (or the latest held wallet). */
+  private async emitNormalRouteObserverBuy(walletOverride?: string): Promise<void> {
     if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
     const funderState = this.bundlerFunderWatch;
     if (!funderState) return;
@@ -6278,7 +6340,7 @@ export class InsiderBot extends EventEmitter {
     // Pre-buy gate: a real feePayer must be locked before we buy.
     if (!this.isBundlerFunderLocked(funderState)) {
       this.log.warn(
-        "Normal-route observer buy blocked — no locked feePayer",
+        "FeeSnip buy blocked — no locked feePayer",
         { mint: funderState.mint, funderWallet: funderState.funderWallet },
       );
       return;
@@ -6288,7 +6350,7 @@ export class InsiderBot extends EventEmitter {
     // locked but before this buy, skip + reset for the next token.
     if (funderState.feePayerIncomingSolCumulative >= FEEPAYER_SELL_CUMULATIVE_SOL) {
       this.log.warn(
-        "Normal-route observer buy skipped — feePayer 50 SOL cumulative reached pre-buy; resetting",
+        "FeeSnip buy skipped — feePayer 50 SOL cumulative reached pre-buy; resetting",
         {
           mint: funderState.mint,
           cumulativeSol: funderState.feePayerIncomingSolCumulative,
@@ -6297,118 +6359,41 @@ export class InsiderBot extends EventEmitter {
       );
       void this.sendTelegramSafe(
         [
-          `<b>⏭️ ${this.label} Normal-Route Buy Skipped</b>`,
+          `<b>⏭️ ${this.label} FeeSnip Buy Skipped</b>`,
           `Token: <code>${funderState.mint}</code>`,
           `FeePayer cumulative incoming: <b>${funderState.feePayerIncomingSolCumulative.toFixed(4)} SOL</b> (>= ${FEEPAYER_SELL_CUMULATIVE_SOL} SOL)`,
           "Cumulative reached after the feePayer locked but before buy — token skipped and flow reset.",
         ].join("\n"),
-        "normal-route observer pre-buy cumulative skip",
+        "feesnip pre-buy cumulative skip",
       );
-      this.normalRouteObserverMcGraceInFlight = false;
       await this.resetForNewToken(true, {
-        reason: "norm_route_pre_buy_fee_payer_cumulative_reached",
+        reason: "feesnip_pre_buy_fee_payer_cumulative_reached",
       });
       return;
     }
 
-    const entry =
-      [...this.normalRouteObserverQualified.entries()].at(-1) ??
-      [...this.normalRouteObserverPending.entries()].at(-1);
+    const entry = walletOverride
+      ? (this.normalRouteObserverQualified.get(walletOverride) ??
+         this.normalRouteObserverPending.get(walletOverride))
+      : ([...this.normalRouteObserverQualified.values()].at(-1) ??
+         [...this.normalRouteObserverPending.values()].at(-1));
     if (!entry) return;
-    const [wallet, info] = entry;
+    const wallet =
+      walletOverride ??
+      ([...this.normalRouteObserverQualified.keys()].at(-1) ??
+       [...this.normalRouteObserverPending.keys()].at(-1) ??
+       "unknown");
     await this.emitFollowTokenLargeInsiderBuy(
       funderState,
       wallet,
-      info.signature,
-      info.tx,
+      entry.signature,
+      entry.tx,
       {
         triggerSource: "smallest_bundler_sell_gate",
         buySolOverride: this.getBuySolForFundingMode(false),
         allowOnlyNormalRoute: true,
       },
     );
-  }
-
-  /**
-   * Grace minute started by the 5-wallet trigger. MC is watched on the normal
-   * monitoring loop (via notifyPreBuyMarketCap); the buy fires when MC is
-   * at/above the floor AND the grace wallet count is held. At the 1-minute mark
-   * without a buy, the token is always skipped and the flow resets.
-   */
-  private async awaitNormalRouteObserverMcGrace(mint: string): Promise<void> {
-    this.normalRouteObserverLastGraceMc = null;
-    await new Promise<void>((resolve) => {
-      this.normalRouteObserverMcGraceTimer = setTimeout(() => {
-        this.normalRouteObserverMcGraceTimer = null;
-        resolve();
-      }, NORMAL_ROUTE_OBSERVER_MC_GRACE_WAIT_MS);
-    });
-    if (!this.normalRouteObserverActive || this.normalRouteObserverMint !== mint) {
-      return;
-    }
-    if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) return;
-
-    // A floor tick with enough wallets during the minute clears the flag + buys.
-    if (!this.normalRouteObserverMcGraceInFlight) return;
-
-    const heldCount = this.normalRouteObserverHeldCount();
-    const mcAtMinuteEnd = await this.gmgnClient
-      .fetchTokenMarketCapUsd(mint)
-      .catch(() => null);
-
-    // Minute ended with MC at the floor and enough wallets — final buy.
-    if (
-      mcAtMinuteEnd !== null &&
-      mcAtMinuteEnd >= NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD &&
-      heldCount >= NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS
-    ) {
-      this.normalRouteObserverMcGraceInFlight = false;
-      this.log.info("Normal-route observer grace satisfied at 1-minute mark — buying", {
-        mint,
-        mcAtMinuteEnd,
-        heldCount,
-        minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
-      });
-      await this.emitNormalRouteObserverBuy();
-      return;
-    }
-
-    // Minute ended without a buy — always skip + reset.
-    this.normalRouteObserverMcGraceInFlight = false;
-    const mcShort =
-      mcAtMinuteEnd === null || mcAtMinuteEnd < NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD;
-    const walletsShort = heldCount < NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS;
-    this.log.warn(
-      "Normal-route observer grace expired — no buy; resetting",
-      {
-        mint,
-        mcAtMinuteEnd,
-        heldCount,
-        mcShort,
-        walletsShort,
-        lastTickMc: this.normalRouteObserverLastGraceMc,
-        minBuyMcUsd: NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD,
-        graceRequiredWallets: NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS,
-      },
-    );
-    void this.sendTelegramSafe(
-      [
-        `<b>⏭️ ${this.label} Normal-Route Buy Skipped — Grace Conditions Unmet</b>`,
-        `Token: <code>${mint}</code>`,
-        `MC after 1 minute: <b>${mcAtMinuteEnd !== null ? `$${mcAtMinuteEnd.toLocaleString()}` : "unknown"}</b>`,
-        `Target floor: <b>$${NORMAL_ROUTE_OBSERVER_MIN_BUY_MC_USD.toLocaleString()}</b>`,
-        `Held at end: <b>${heldCount}/${NORMAL_ROUTE_OBSERVER_GRACE_REQUIRED_WALLETS}</b> needed.`,
-        mcShort && walletsShort
-          ? "MC stayed below the floor and the required wallets were not held — token skipped and flow reset."
-          : mcShort
-            ? "MC stayed below the floor — token skipped and flow reset."
-            : "Required wallet count was not held — token skipped and flow reset.",
-      ].join("\n"),
-      "normal-route observer mc grace expired",
-    );
-    await this.resetForNewToken(true, {
-      reason: "normal_route_observer_mc_grace_expired_below_floor",
-    });
   }
 
   private rejectNormalRouteObserverWallet(
@@ -6418,45 +6403,45 @@ export class InsiderBot extends EventEmitter {
     tx?: HeliusTransaction,
   ): void {
     const wasQualified = this.normalRouteObserverQualified.has(wallet);
+    const wasExtraSellWallet = this.normalRouteObserverExtraSellWallets.has(wallet);
     this.normalRouteObserverPending.delete(wallet);
     // A held wallet that was already promoted must also leave the qualified pool
     // so it stops counting toward the buy trigger.
     this.normalRouteObserverQualified.delete(wallet);
+    this.normalRouteObserverExtraSellWallets.delete(wallet);
     this.normalRouteObserverRejected.add(wallet);
-    this.log.info("Normal-route observer wallet rejected", {
+    this.log.info("FeeSnip wallet rejected", {
       mint: this.normalRouteObserverMint,
       wallet,
       reason,
       droppedByKind: droppedByKind ?? null,
       wasQualified,
+      wasExtraSellWallet,
       heldCount: this.normalRouteObserverHeldCount(),
     });
     const droppedBySell = droppedByKind === "sell";
     void this.sendTelegramSafe(
       [
-        `<b>🚫 ${this.label} Normal-Route Observer — Wallet Dropped</b>`,
+        `<b>🚫 ${this.label} FeeSnip — Wallet Dropped</b>`,
         `Token: <code>${this.normalRouteObserverMint ?? "unknown"}</code>`,
         `Wallet: <code>${wallet}</code>`,
         `Reason: ${reason}`,
         `Qualified: <b>${wasQualified ? "yes" : "no (still in confirmation window)"}</b>`,
         `Drop tx: <b>${droppedByKind ?? "unknown"}</b>${droppedBySell ? " — checking P&L for sell trigger" : " — no sell trigger (buy drop)"}`,
-        `Held wallets so far: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b>`,
+        `Wallets collected: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b>`,
       ].join("\n"),
-      "normal-route observer wallet dropped",
+      "feesnip wallet dropped",
     );
-    // Sell trigger: any held wallet (pending or qualified) dropped by a sell tx
-    // — never a buy — when the position is up more than +25%. Qualification is
-    // NOT required here; only the ≥25% sold exit requires qualified wallets.
-    if (droppedBySell) {
+    // Sell trigger: the buy wallet or any extra matched wallet selling exits the
+    // position; a buy drop never does.
+    if (droppedBySell && (wasQualified || wasExtraSellWallet || this.buySubmitted)) {
       void this.maybeSellOnDroppedNormalRouteObserverWallet(wallet, reason, tx);
-    }
-  }
+    }  }
 
   /**
-   * Sell trigger: a held Normal-route observer wallet sold with a tx fee of
-   * exactly 5,000 lamports (the insider $0-fee signature) → exit immediately.
-   * Any other sell fee does not trigger a sell; the +80% MC take-profit armed at
-   * buy is the fallback exit in that case.
+   * FeeSnip sell trigger: a watched wallet (the buy wallet or an extra match)
+   * sold → exit immediately. The +80% MC take-profit armed at buy is the
+   * fallback exit when no watched wallet sells.
    */
   private async maybeSellOnDroppedNormalRouteObserverWallet(
     wallet: string,
@@ -6470,20 +6455,6 @@ export class InsiderBot extends EventEmitter {
     ) {
       return;
     }
-    const sellFeeLamports = tx?.fee;
-    if (sellFeeLamports !== NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS) {
-      this.log.info(
-        "Normal-route observer dropped wallet — sell fee not 5,000 lamports; no fee-based sell (+80% MC TP remains armed)",
-        {
-          mint: this.activePosition.mint,
-          wallet,
-          sellFeeLamports: sellFeeLamports ?? null,
-          requiredFeeLamports: NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS,
-          exitMc: this.exitMc,
-        },
-      );
-      return;
-    }
     const mint = this.activePosition.mint;
     const entryMc = this.getEntryMc();
     const currentMc = await this.gmgnClient
@@ -6493,6 +6464,7 @@ export class InsiderBot extends EventEmitter {
       entryMc > 0 && currentMc !== null
         ? ((currentMc - entryMc) / entryMc) * 100
         : null;
+    const sellFeeLamports = tx?.fee ?? null;
     const signature =
       tx?.signature ??
       this.followTokenLargeInsiderState?.scrapeWatches.get(wallet)
@@ -6500,16 +6472,18 @@ export class InsiderBot extends EventEmitter {
       "NORMAL_ROUTE_DROPPED_WALLET_SELL";
     await this.triggerPositionSell(
       mint,
-      `normal-route observer wallet sold with 5,000-lamport fee (${reason})`,
+      `feesnip watched wallet sold (${reason})`,
       [
-        `<b>🚨 ${this.label} Normal-Route Sell Fee — Selling</b>`,
+        `<b>🚨 ${this.label} FeeSnip Wallet Sold — Selling</b>`,
         `Token: <code>${mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
-        `Sell fee: <b>${NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS.toLocaleString()} lamports</b> (exact match)`,
+        sellFeeLamports !== null
+          ? `Sell fee: <b>${sellFeeLamports.toLocaleString()} lamports</b>`
+          : "",
         pnlPct !== null
           ? `P&L: <b>${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</b> (entry $${entryMc.toLocaleString()}, now $${currentMc!.toLocaleString()})`
           : "",
-        "A watched wallet sold with the insider 5,000-lamport fee — exiting.",
+        "A watched FeeSnip wallet sold — exiting.",
       ].filter(Boolean),
       signature,
     );
@@ -6546,6 +6520,10 @@ export class InsiderBot extends EventEmitter {
   }
 
   private async stopNormalRouteObserver(reason: string): Promise<void> {
+    if (this.normalRouteObserverStartDelayTimer !== null) {
+      clearTimeout(this.normalRouteObserverStartDelayTimer);
+      this.normalRouteObserverStartDelayTimer = null;
+    }
     if (this.normalRouteObserverWatchId !== null) {
       const watchId = this.normalRouteObserverWatchId;
       this.normalRouteObserverWatchId = null;
@@ -6597,6 +6575,9 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
     this.normalRouteObserverRejected.clear();
+    this.normalRouteObserverExtraSellWallets.clear();
+    this.normalRouteObserverTokenStartedAtSec = null;
+    this.normalRouteObserverDelayElapsed = false;
   }
 
   private startNewTokenBuyClusterLogger(mint: string): void {
