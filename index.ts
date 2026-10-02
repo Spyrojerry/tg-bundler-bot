@@ -3173,6 +3173,13 @@ async function main(): Promise<void> {
               ].join("\n"),
             );
           }
+          // After the failure notice, skip the token and reset the flow so the
+          // bot can move on to the next one.
+          if (pending.event.insiderBotIndex !== undefined) {
+            insiderBots[
+              pending.event.insiderBotIndex
+            ]?.skipAndResetAfterSellFailure(mint);
+          }
           return;
         }
         await new Promise((resolve) =>

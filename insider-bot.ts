@@ -608,6 +608,11 @@ export interface InsiderBot {
   clearActivePosition(): void;
   clearActivePositionAfterSuccessfulSell(): void;
   rearmPositionMonitoringAfterSellFailure(mint: string): void;
+  /**
+   * Sell retries were exhausted without confirmation: skip the token and reset
+   * the flow for the next one (position state is dropped).
+   */
+  skipAndResetAfterSellFailure(mint: string): void;
   armPositionSellTrigger(mint: string): void;
   clearPreBuyMint(): void;
   getEntryMc(): number;
@@ -1006,6 +1011,8 @@ export class InsiderBot extends EventEmitter {
     null;
   /** True once the 10s post-start delay has elapsed and the watch is live. */
   private normalRouteObserverDelayElapsed = false;
+  /** One-shot guard so the no-fee-at-cap skip/reset only fires once per token. */
+  private normalRouteObserverCapSkipFired = false;
   /** Cumulative count of wallets ever held (past + currently held) this flow. */
   private normalRouteObserverTotalHeldCount = 0;
   /** Wall-clock ms when the current normal-route observer started, for rate math. */
@@ -1293,6 +1300,30 @@ export class InsiderBot extends EventEmitter {
 
   clearPreBuyMint(): void {
     void this.resetForNewToken(true);
+  }
+
+  skipAndResetAfterSellFailure(mint: string): void {
+    this.log.warn(
+      "Sell retries exhausted — skipping token and resetting flow",
+      {
+        mint,
+        activePosition: this.activePosition?.mint ?? null,
+        positionSellTriggered: this.positionSellTriggered,
+      },
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏭️ ${this.label} Sell Retries Exhausted — Skipping Token</b>`,
+        `Token: <code>${mint}</code>`,
+        "Automatic sell retries stopped and the flow is being reset for the next token.",
+      ].join("\n"),
+      "sell retries exhausted reset",
+    );
+    // positionSellTriggered stays latched so resetForNewToken's sell-first guard
+    // is skipped — we are done trying to sell and just drop the position + reset.
+    void this.resetForNewToken(true, {
+      reason: "sell_retries_exhausted",
+    });
   }
 
   private assertBuySol(value: number, label = "Insider buy SOL"): void {
@@ -5866,6 +5897,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverRejected.clear();
     this.normalRouteObserverExtraSellWallets.clear();
     this.normalRouteObserverDelayElapsed = false;
+    this.normalRouteObserverCapSkipFired = false;
     this.normalRouteObserverWatchId = null;
 
     // FeeSnip: no buy scanning for the token's first 10 seconds. Compute the
@@ -5997,10 +6029,13 @@ export class InsiderBot extends EventEmitter {
         .map((transfer) => transfer.toUserAccount)
         .filter(Boolean),
     );
-    // Pending-wallet guard first: any buy/sell touching a wallet held through
-    // its confirmation window disqualifies it immediately. A sell has the wallet
-    // as the sender, so scan both directions.
-    if (this.normalRouteObserverPending.size > 0) {
+    // Watched-wallet guard: a collected wallet is dropped (and, if we hold a
+    // position, triggers our sell) only if it SELLS. A later buy is ignored.
+    if (
+      this.normalRouteObserverPending.size > 0 ||
+      this.normalRouteObserverQualified.size > 0 ||
+      this.normalRouteObserverExtraSellWallets.size > 0
+    ) {
       const touchedWallets = new Set<string>();
       for (const transfer of tx.tokenTransfers ?? []) {
         if (transfer.mint !== mint) continue;
@@ -6008,16 +6043,18 @@ export class InsiderBot extends EventEmitter {
         if (transfer.fromUserAccount) touchedWallets.add(transfer.fromUserAccount);
       }
       for (const wallet of touchedWallets) {
-        if (!this.normalRouteObserverPending.has(wallet)) continue;
-        const pendingKind = this.classifyTx(tx, wallet, mint);
-        if (pendingKind === "buy" || pendingKind === "sell") {
-          this.rejectNormalRouteObserverWallet(
-            wallet,
-            `buy/sell after first buy during confirmation window (${pendingKind})`,
-            pendingKind,
-            tx,
-          );
-        }
+        const isWatched =
+          this.normalRouteObserverPending.has(wallet) ||
+          this.normalRouteObserverQualified.has(wallet) ||
+          this.normalRouteObserverExtraSellWallets.has(wallet);
+        if (!isWatched) continue;
+        if (this.classifyTx(tx, wallet, mint) !== "sell") continue;
+        this.rejectNormalRouteObserverWallet(
+          wallet,
+          "watched wallet sold",
+          "sell",
+          tx,
+        );
       }
     }
     for (const wallet of recipients) {
@@ -6030,19 +6067,22 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
+      // FeeSnip: hard cap — stop searching the moment 10 qualifying wallets
+      // have been collected. No further wallets are held or watched.
       if (
-        this.normalRouteObserverPending.size >=
-        NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS
+        this.normalRouteObserverCollectedCount() >=
+        NORMAL_ROUTE_OBSERVER_MAX_WALLETS
       ) {
-        this.log.info(
-          "FeeSnip held-wallet cap reached — not holding more until confirms drain",
-          {
-            mint,
-            heldCount: this.normalRouteObserverPending.size,
-            maxHeldWallets: NORMAL_ROUTE_OBSERVER_MAX_HELD_WALLETS,
-          },
-        );
-        break;
+        this.log.info("FeeSnip collect cap reached — stopping search at 10", {
+          mint,
+          collected: this.normalRouteObserverCollectedCount(),
+          maxWallets: NORMAL_ROUTE_OBSERVER_MAX_WALLETS,
+        });
+        // 10 wallets collected with no sub-$0.009 fee and no buy → skip + reset.
+        if (!this.buySubmitted && !this.isBuyExecuting) {
+          void this.skipNormalRouteObserverAtCapNoFee(mint);
+        }
+        return;
       }
       if (this.classifyTx(tx, wallet, mint) !== "buy") continue;
       this.normalRouteObserverSeenWallets.add(wallet);
@@ -6132,7 +6172,7 @@ export class InsiderBot extends EventEmitter {
       heldCount: this.normalRouteObserverHeldCount(),
       totalHeldCount: this.normalRouteObserverTotalHeldCount,
     });
-    const heldCount = this.normalRouteObserverHeldCount();
+    const collectedCount = this.normalRouteObserverCollectedCount();
     // FeeSnip: multiple matches in the first 10 — after a buy, every matching
     // wallet beyond the buy wallet is watched for sells only.
     if (this.buySubmitted && this.normalRouteObserverActive) {
@@ -6146,16 +6186,81 @@ export class InsiderBot extends EventEmitter {
         `First buy: <b>$${buyUsd.toFixed(2)}</b> · <b>${buySol.toFixed(4)} SOL</b>`,
         `Tx fee: <b>$${feeUsd.toFixed(6)}</b>`,
         `Buy tx: <code>${tx.signature}</code>`,
-        `Collected <b>${heldCount}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b> wallets; buy fires on first fee below $${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD} or at ${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}.`,
+        `Collected <b>${collectedCount}/${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}</b> wallets; buy fires on first fee below $${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD} or at ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}.`,
       ].join("\n"),
       "feesnip wallet held",
     );
     void this.maybeTriggerNormalRouteObserverBuy();
+    // FeeSnip: if this wallet was the 10th collected and no sub-$0.009 fee has
+    // bought, skip + reset (deferred so a same-batch fee trigger can still win).
+    if (
+      this.normalRouteObserverCollectedCount() >=
+        NORMAL_ROUTE_OBSERVER_MAX_WALLETS &&
+      !this.buySubmitted &&
+      !this.isBuyExecuting
+    ) {
+      setImmediate(() => {
+        if (
+          this.normalRouteObserverActive &&
+          this.normalRouteObserverMint === mint &&
+          !this.buySubmitted &&
+          !this.isBuyExecuting
+        ) {
+          void this.skipNormalRouteObserverAtCapNoFee(mint);
+        }
+      });
+    }
+  }
+
+  /**
+   * FeeSnip: 10 wallets were collected but none had a tx fee below $0.009, so no
+   * buy fired. Skip the token and reset the flow for the next one.
+   */
+  private async skipNormalRouteObserverAtCapNoFee(mint: string): Promise<void> {
+    if (this.normalRouteObserverCapSkipFired) return;
+    if (
+      !this.normalRouteObserverActive ||
+      this.normalRouteObserverMint !== mint ||
+      this.buySubmitted ||
+      this.isBuyExecuting
+    ) {
+      return;
+    }
+    this.normalRouteObserverCapSkipFired = true;
+    this.log.warn(
+      "FeeSnip skip — 10 wallets collected with no fee below $0.009; resetting",
+      {
+        mint,
+        collected: this.normalRouteObserverCollectedCount(),
+        minFeeUsd: NORMAL_ROUTE_OBSERVER_MIN_FEE_USD,
+      },
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏭️ ${this.label} FeeSnip Skipped — No Sub-$0.009 Fee</b>`,
+        `Token: <code>${mint}</code>`,
+        `Collected <b>${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}</b> wallets, none with a tx fee below <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b>.`,
+        "No buy triggered — token skipped and flow reset.",
+      ].join("\n"),
+      "feesnip skip no fee at cap",
+    );
+    await this.resetForNewToken(true, {
+      reason: "feesnip_no_sub_threshold_fee_at_cap",
+    });
   }
 
   /** Held wallets that count toward the buy trigger: pending + already qualified. */
   private normalRouteObserverHeldCount(): number {
     return this.normalRouteObserverPending.size + this.normalRouteObserverQualified.size;
+  }
+
+  /**
+   * FeeSnip: total qualifying wallets collected this flow (held, promoted, or
+   * dropped). This is what the hard cap of 10 is enforced against, so the search
+   * stops at 10 regardless of how many have since dropped.
+   */
+  private normalRouteObserverCollectedCount(): number {
+    return this.normalRouteObserverTotalHeldCount;
   }
 
   private promoteNormalRouteObserverWallet(wallet: string): void {
@@ -6235,12 +6340,14 @@ export class InsiderBot extends EventEmitter {
     feeUsd?: number,
   ): Promise<void> {
     const heldCount = this.normalRouteObserverHeldCount();
+    const collectedCount = this.normalRouteObserverCollectedCount();
     const required = NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS;
     if (this.buySubmitted || this.buyDisabled || this.isBuyExecuting) {
-      if (heldCount >= required) {
+      if (collectedCount >= required) {
         this.log.info("FeeSnip buy trigger skipped — buy precondition", {
           mint: this.normalRouteObserverMint,
           heldCount,
+          collectedCount,
           required,
           buySubmitted: this.buySubmitted,
           buyDisabled: this.buyDisabled,
@@ -6249,11 +6356,11 @@ export class InsiderBot extends EventEmitter {
       }
       return;
     }
-    // FeeSnip: a sub-$0.009 fee buys immediately regardless of the collected
-    // count; otherwise buy once the required wallet count is collected.
+    // FeeSnip: the ONLY buy trigger is a tx fee below $0.009. Reaching 10
+    // collected wallets without one skips + resets instead of buying.
     const feeTriggered =
       feeTriggerWallet !== undefined && feeUsd !== undefined;
-    if (!feeTriggered && heldCount < required) {
+    if (!feeTriggered) {
       return;
     }
     if (this.normalRouteObserverMcGraceConsumed) {
@@ -6428,15 +6535,16 @@ export class InsiderBot extends EventEmitter {
         `Reason: ${reason}`,
         `Qualified: <b>${wasQualified ? "yes" : "no (still in confirmation window)"}</b>`,
         `Drop tx: <b>${droppedByKind ?? "unknown"}</b>${droppedBySell ? " — checking P&L for sell trigger" : " — no sell trigger (buy drop)"}`,
-        `Wallets collected: <b>${this.normalRouteObserverHeldCount()}/${NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS}</b>`,
+        `Wallets collected: <b>${this.normalRouteObserverCollectedCount()}/${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}</b>`,
       ].join("\n"),
       "feesnip wallet dropped",
     );
-    // Sell trigger: the buy wallet or any extra matched wallet selling exits the
+    // Sell trigger: the buy wallet or any collected wallet selling exits the
     // position; a buy drop never does.
     if (droppedBySell && (wasQualified || wasExtraSellWallet || this.buySubmitted)) {
       void this.maybeSellOnDroppedNormalRouteObserverWallet(wallet, reason, tx);
-    }  }
+    }
+  }
 
   /**
    * FeeSnip sell trigger: a watched wallet (the buy wallet or an extra match)
@@ -6486,6 +6594,7 @@ export class InsiderBot extends EventEmitter {
         "A watched FeeSnip wallet sold — exiting.",
       ].filter(Boolean),
       signature,
+      { allowWhenFeePayerOnly: true },
     );
   }
 
@@ -6578,6 +6687,7 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverExtraSellWallets.clear();
     this.normalRouteObserverTokenStartedAtSec = null;
     this.normalRouteObserverDelayElapsed = false;
+    this.normalRouteObserverCapSkipFired = false;
   }
 
   private startNewTokenBuyClusterLogger(mint: string): void {
@@ -16835,6 +16945,7 @@ export class InsiderBot extends EventEmitter {
           "A reset/exit trigger fired while a position was held — dumping the position first.",
         ],
         options?.reason ?? "reset_while_holding",
+        { allowWhenFeePayerOnly: true },
       );
       return;
     }
