@@ -203,22 +203,10 @@ const NORMAL_ROUTE_EARLY_FEE_BUY_SCAN_LIMIT = 40;
  */
 const NORMAL_ROUTE_OBSERVER_ONLY_BUY_PATH = true;
 /**
- * Kill switch: when true, every sell exit except the feePayer cumulative
- * incoming-sol sell is disabled.
+ * Kill switch retained from the removed feePayer sell flow. FeeSnip's exits pass
+ * allowWhenFeePayerOnly so they are unaffected; there is no feePayer sell path.
  */
 const FEEPAYER_INCOMING_SELL_ONLY = true;
-/**
- * FeePayer sell trigger: while watching the shared feePayer address, only
- * incoming native SOL transfers above this many SOL are counted. Smaller
- * transfer-ins are ignored entirely.
- */
-const FEEPAYER_SELL_INCOMING_MIN_SOL = 10;
-/**
- * FeePayer sell trigger: sell the whole position once the cumulative total of
- * qualifying incoming transfer-ins (> FEEPAYER_SELL_INCOMING_MIN_SOL each)
- * reaches this many SOL. Counted from the moment the feePayer watch locks.
- */
-const FEEPAYER_SELL_CUMULATIVE_SOL = 20;
 
 type FollowTokenMaxSingleSellGateTier = "standard_8m" | "fallback_16m" | "fail";
 const FOLLOW_TOKEN_EARLY_BUNDLER_EXIT_SOLD_FRACTION = 0.25;
@@ -809,12 +797,10 @@ interface BundlerFunderWatchState {
   parallelFeePayerFunderWallet: string | null;
   parallelFeePayerFunderCursorSignature: string | null;
   parallelFeePayerFunderFundedAtSec: number | null;
-  /** FeePayer sell trigger: cumulative SOL of incoming transfer-ins > FEEPAYER_SELL_INCOMING_MIN_SOL since the watch locked. */
+  /** FeePayer incoming-sol transfer tracking (retained; sell flow removed). */
   feePayerIncomingSolCumulative: number;
-  /** FeePayer sell trigger: transfer-in signatures already counted, so a re-delivered tx is not double-counted. */
+  /** FeePayer incoming-sol transfer signatures already counted. */
   feePayerIncomingSolSignatures: Set<string>;
-  /** FeePayer sell trigger: true once the cumulative threshold fired the sell (one-shot). */
-  feePayerIncomingSellTriggered: boolean;
 }
 
 export class InsiderBot extends EventEmitter {
@@ -5371,7 +5357,6 @@ export class InsiderBot extends EventEmitter {
       parallelFeePayerFunderFundedAtSec: null,
       feePayerIncomingSolCumulative: 0,
       feePayerIncomingSolSignatures: new Set<string>(),
-      feePayerIncomingSellTriggered: false,
     };
   }
 
@@ -7821,7 +7806,6 @@ export class InsiderBot extends EventEmitter {
       parallelFeePayerFunderFundedAtSec: null,
       feePayerIncomingSolCumulative: 0,
       feePayerIncomingSolSignatures: new Set<string>(),
-      feePayerIncomingSellTriggered: false,
     };
 
     this.subscribeBundlerFunder(funderWallet);
@@ -7991,7 +7975,6 @@ export class InsiderBot extends EventEmitter {
       parallelFeePayerFunderFundedAtSec: null,
       feePayerIncomingSolCumulative: 0,
       feePayerIncomingSolSignatures: new Set<string>(),
-      feePayerIncomingSellTriggered: false,
     };
 
     this.subscribeBundlerFunder(feePayer);
@@ -13147,81 +13130,6 @@ export class InsiderBot extends EventEmitter {
     });
   }
 
-  /**
-   * FeePayer sell trigger: sums incoming native SOL transfer-ins to the shared
-   * feePayer that exceed FEEPAYER_SELL_INCOMING_MIN_SOL, and sells the whole
-   * position once the cumulative total reaches FEEPAYER_SELL_CUMULATIVE_SOL.
-   * Counts from the moment the feePayer watch locks. One-shot per position.
-   */
-  private async trackFeePayerIncomingSolForSell(
-    state: BundlerFunderWatchState,
-    tx: HeliusTransaction,
-  ): Promise<void> {
-    if (state.feePayerIncomingSellTriggered) return;
-    if (state.feePayerIncomingSolSignatures.has(tx.signature)) return;
-
-    const incomingSol = this.extractSolIncomingAmountToWallet(tx, state.funderWallet);
-    if (incomingSol <= FEEPAYER_SELL_INCOMING_MIN_SOL) return;
-
-    state.feePayerIncomingSolSignatures.add(tx.signature);
-    state.feePayerIncomingSolCumulative += incomingSol;
-
-    this.log.info("FeePayer qualifying incoming transfer counted toward sell trigger", {
-      mint: state.mint,
-      funderWallet: state.funderWallet,
-      signature: tx.signature,
-      incomingSol,
-      cumulativeSol: state.feePayerIncomingSolCumulative,
-      thresholdSol: FEEPAYER_SELL_CUMULATIVE_SOL,
-    });
-
-    if (state.feePayerIncomingSolCumulative < FEEPAYER_SELL_CUMULATIVE_SOL) return;
-
-    state.feePayerIncomingSellTriggered = true;
-    await this.triggerFeePayerCumulativeIncomingSell(state, tx);
-  }
-
-  private async triggerFeePayerCumulativeIncomingSell(
-    state: BundlerFunderWatchState,
-    tx: HeliusTransaction,
-  ): Promise<void> {
-    if (
-      !this.activePosition ||
-      this.activePosition.mint !== state.mint ||
-      this.phase !== "holding" ||
-      this.positionSellTriggered
-    ) {
-      this.log.info(
-        "FeePayer cumulative incoming sell threshold reached but no open position to sell",
-        {
-          mint: state.mint,
-          funderWallet: state.funderWallet,
-          cumulativeSol: state.feePayerIncomingSolCumulative,
-          hasPosition: !!this.activePosition,
-          phase: this.phase,
-          positionSellTriggered: this.positionSellTriggered,
-        },
-      );
-      return;
-    }
-
-    await this.triggerPositionSell(
-      state.mint,
-      `FeePayer ${state.funderWallet} received >${FEEPAYER_SELL_INCOMING_MIN_SOL} SOL transfer-ins totalling ${state.feePayerIncomingSolCumulative.toFixed(4)} SOL (>= ${FEEPAYER_SELL_CUMULATIVE_SOL} SOL) on ${state.mint}`,
-      [
-        `<b>🚨 ${this.label} FeePayer Cumulative Incoming Sell</b>`,
-        `Token: <code>${state.mint}</code>`,
-        `FeePayer: <code>${state.funderWallet}</code>`,
-        `Cumulative incoming: <b>${state.feePayerIncomingSolCumulative.toFixed(4)} SOL</b> (>= ${FEEPAYER_SELL_CUMULATIVE_SOL} SOL)`,
-        `Trigger tx: <code>${tx.signature}</code>`,
-        "",
-        "Selling <b>100%</b> — feePayer cumulative incoming threshold reached.",
-      ],
-      tx.signature,
-      { allowWhenFeePayerOnly: true },
-    );
-  }
-
   private async inspectBundlerFunderTransaction(
     state: BundlerFunderWatchState,
     tx: HeliusTransaction,
@@ -13232,7 +13140,6 @@ export class InsiderBot extends EventEmitter {
     const isPrimaryWatch = watchedWallet === state.funderWallet;
     if (isPrimaryWatch) {
       this.recordLowFundingFunderTx(state, tx);
-      await this.trackFeePayerIncomingSolForSell(state, tx);
     }
     const transferOut = this.extractSolTransferOutFromWallet(
       tx,
