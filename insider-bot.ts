@@ -171,7 +171,7 @@ const NORMAL_ROUTE_OBSERVER_BUY_TRIGGER_WALLETS = 5;
  * FeeSnip: a wallet qualifies only when its buy tx fee (in SOL) is within this
  * band — 0.001–0.001005 SOL.
  */
-const NORMAL_ROUTE_OBSERVER_MIN_FEE_SOL = 0.001;
+const NORMAL_ROUTE_OBSERVER_MIN_FEE_SOL = 0.00095;
 const NORMAL_ROUTE_OBSERVER_MAX_FEE_SOL = 0.001005;
 /** FeeSnip: if the market cap at buy time is below this, skip the token and reset. */
 const FEE_SNIP_MIN_BUY_MC_USD = 40_000;
