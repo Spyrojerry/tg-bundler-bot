@@ -151,7 +151,7 @@ const FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING = 40_000_000;
 /** FeeSnip: wait this long after the token starts before the observer begins. */
 const FEE_SNIP_START_DELAY_MS = 10 * 1_000;
 /** FeeSnip: wallet first-buy USD band for the observer buy trigger. */
-const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 0.4;
+const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 0;
 const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 2;
 /** FeeSnip: collect up to this many qualifying wallets (the first 5). */
 const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 5;
