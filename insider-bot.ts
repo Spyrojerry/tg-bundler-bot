@@ -6449,8 +6449,8 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * FeeSnip: a watched wallet sold. Drop it (and, when holding, trigger our
-   * exit) only on a full exit; a partial sell keeps it watched.
+   * FeeSnip: a watched wallet sold. Any sell (partial or full) drops it and,
+   * when holding, triggers our exit.
    */
   private async handleWatchedNormalRouteObserverSell(
     wallet: string,
@@ -6463,18 +6463,9 @@ export class InsiderBot extends EventEmitter {
     ) {
       return;
     }
-    const soldAll = await this.walletSoldAllOfMint(wallet, mint);
-    if (!soldAll) {
-      this.log.info("FeeSnip watched wallet partial sell — keeping it watched", {
-        mint,
-        wallet,
-        signature: tx.signature,
-      });
-      return;
-    }
     this.rejectNormalRouteObserverWallet(
       wallet,
-      "watched wallet sold all",
+      "watched wallet sold",
       "sell",
       tx,
     );
@@ -6512,14 +6503,14 @@ export class InsiderBot extends EventEmitter {
         `Reason: ${reason}`,
         `Qualified: <b>${wasQualified ? "yes" : "no (still in confirmation window)"}</b>`,
         droppedBySell
-          ? "Drop tx: <b>sell</b> — sold all; checking P&L for sell trigger"
+          ? "Drop tx: <b>sell</b> — checking P&L for sell trigger"
           : "Drop tx: <b>buy</b> — no sell trigger (buy drop)",
         `Wallets collected: <b>${this.normalRouteObserverCollectedCount()}/${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}</b>`,
       ].join("\n"),
       "feesnip wallet dropped",
     );
     // Sell trigger: a watched wallet (the buy wallet or any collected wallet)
-    // that sold all exits the position; a buy drop never does.
+    // selling exits the position; a buy drop never does.
     if (droppedBySell) {
       void this.maybeSellOnDroppedNormalRouteObserverWallet(wallet, reason, tx);
     }
@@ -6527,8 +6518,8 @@ export class InsiderBot extends EventEmitter {
 
   /**
    * FeeSnip sell trigger: a watched wallet (the buy wallet or an extra match)
-   * SOLD ALL of its holding → exit immediately. The +80% MC take-profit armed at
-   * buy is the fallback exit when no watched wallet sells all.
+   * SOLD → exit immediately. The +80% MC take-profit armed at buy is the fallback
+   * exit when no watched wallet sells.
    */
   private async maybeSellOnDroppedNormalRouteObserverWallet(
     wallet: string,
@@ -6559,9 +6550,9 @@ export class InsiderBot extends EventEmitter {
       "NORMAL_ROUTE_DROPPED_WALLET_SELL";
     await this.triggerPositionSell(
       mint,
-      `feesnip watched wallet sold all (${reason})`,
+      `feesnip watched wallet sold (${reason})`,
       [
-        `<b>🚨 ${this.label} FeeSnip Wallet Sold All — Selling</b>`,
+        `<b>🚨 ${this.label} FeeSnip Wallet Sold — Selling</b>`,
         `Token: <code>${mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
         sellFeeLamports !== null
@@ -6570,44 +6561,11 @@ export class InsiderBot extends EventEmitter {
         pnlPct !== null
           ? `P&L: <b>${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</b> (entry $${entryMc.toLocaleString()}, now $${currentMc!.toLocaleString()})`
           : "",
-        "A watched FeeSnip wallet sold its whole position — exiting.",
+        "A watched FeeSnip wallet sold — exiting.",
       ].filter(Boolean),
       signature,
       { allowWhenFeePayerOnly: true },
     );
-  }
-
-  /** True when the wallet holds no tokens of the mint (sold all / transferred out). */
-  private async walletSoldAllOfMint(
-    wallet: string,
-    mint: string,
-  ): Promise<boolean> {
-    try {
-      const accounts = await this.gmgnClient.getParsedTokenAccountsForMint(
-        new PublicKey(wallet),
-        new PublicKey(mint),
-      );
-      let total = 0n;
-      for (const account of accounts) {
-        const parsed = account.account.data.parsed as {
-          info?: { tokenAmount?: { amount?: string } };
-        };
-        const raw = parsed.info?.tokenAmount?.amount;
-        if (raw && /^\d+$/.test(raw)) total += BigInt(raw);
-      }
-      return total <= 0n;
-    } catch (err) {
-      this.log.warn(
-        "FeeSnip sell-all balance check failed — treating as sold all",
-        {
-          mint,
-          wallet,
-          error: err instanceof Error ? err.message : String(err),
-        },
-      );
-      // Fail open: if we cannot read the balance, honor the sell signal.
-      return true;
-    }
   }
 
   /**
