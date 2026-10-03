@@ -157,7 +157,7 @@ const FEE_SNIP_START_DELAY_MS = 10 * 1_000;
 const FEE_SNIP_BUY_DEADLINE_MS = 10 * 60 * 1_000;
 /** FeeSnip: wallet first-buy USD band for the observer buy trigger. */
 const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 0.4;
-const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 10;
+const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 2;
 /** FeeSnip: collect up to this many qualifying wallets (the first 5). */
 const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 5;
 /** FeeSnip: max wallets held (pending) at once while finding the valid ones. */
