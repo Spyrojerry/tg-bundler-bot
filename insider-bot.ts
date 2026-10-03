@@ -150,9 +150,14 @@ const FOLLOW_TOKEN_SMALLEST_ROOT_IMMEDIATE_BUY_REMAINING = 40_000_000;
  */
 /** FeeSnip: wait this long after the token starts before the observer begins. */
 const FEE_SNIP_START_DELAY_MS = 10 * 1_000;
+/**
+ * FeeSnip: the buy must happen within this long after scanning goes live;
+ * otherwise skip the token and reset the flow.
+ */
+const FEE_SNIP_BUY_DEADLINE_MS = 10 * 60 * 1_000;
 /** FeeSnip: wallet first-buy USD band for the observer buy trigger. */
 const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 0.4;
-const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 2;
+const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 10;
 /** FeeSnip: collect up to this many qualifying wallets (the first 5). */
 const NORMAL_ROUTE_OBSERVER_MAX_WALLETS = 5;
 /** FeeSnip: max wallets held (pending) at once while finding the valid ones. */
@@ -1012,6 +1017,9 @@ export class InsiderBot extends EventEmitter {
     null;
   /** True once the 10s post-start delay has elapsed and the watch is live. */
   private normalRouteObserverDelayElapsed = false;
+  /** FeeSnip: timer that skips + resets if no buy happened within the deadline. */
+  private normalRouteObserverBuyDeadlineTimer: ReturnType<typeof setTimeout> | null =
+    null;
   /**
    * True while the active position was entered by the FeeSnip flow. FeeSnip
    * always keeps the +80% MC take-profit armed — the shared bundler/LI exit
@@ -5909,6 +5917,10 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverRejected.clear();
     this.normalRouteObserverExtraSellWallets.clear();
     this.normalRouteObserverDelayElapsed = false;
+    if (this.normalRouteObserverBuyDeadlineTimer !== null) {
+      clearTimeout(this.normalRouteObserverBuyDeadlineTimer);
+      this.normalRouteObserverBuyDeadlineTimer = null;
+    }
     this.normalRouteObserverWatchId = null;
 
     // FeeSnip: no buy scanning for the token's first 10 seconds. Compute the
@@ -5983,6 +5995,15 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverWatchId = this.enhancedWs.watch(mint, (tx) => {
       void this.observeNormalRouteFirstBuy(mint, tx);
     });
+    // FeeSnip: the buy must happen within 5 minutes of scanning; otherwise skip
+    // the token and reset the flow.
+    if (this.normalRouteObserverBuyDeadlineTimer !== null) {
+      clearTimeout(this.normalRouteObserverBuyDeadlineTimer);
+    }
+    this.normalRouteObserverBuyDeadlineTimer = setTimeout(() => {
+      this.normalRouteObserverBuyDeadlineTimer = null;
+      void this.skipNormalRouteObserverBuyDeadlineExpired(mint);
+    }, FEE_SNIP_BUY_DEADLINE_MS);
     // Keep qualified observer wallets' scrape watches healthy and re-scan their
     // sells so the ≥25% exit is reliably tracked on this route too.
     this.startValidWalletReconciliation();
@@ -5996,9 +6017,47 @@ export class InsiderBot extends EventEmitter {
         `Token: <code>${mint}</code>`,
         `Now tracking $${NORMAL_ROUTE_OBSERVER_MIN_BUY_USD}–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD} buys with tx fee above <b>$${NORMAL_ROUTE_OBSERVER_MIN_FEE_USD}</b> (up to ${NORMAL_ROUTE_OBSERVER_MAX_WALLETS}).`,
         `Buy on the first qualifying wallet; exit on a wallet selling all or <b>+${NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT}%</b> TP.`,
+        `Buy must happen within <b>${FEE_SNIP_BUY_DEADLINE_MS / 60_000} minutes</b> or the token is skipped and reset.`,
       ].join("\n"),
       "feesnip watch live",
     );
+  }
+
+  /**
+   * FeeSnip: no qualifying buy happened within the deadline after scanning began
+   * — skip the token and reset the flow.
+   */
+  private async skipNormalRouteObserverBuyDeadlineExpired(
+    mint: string,
+  ): Promise<void> {
+    if (
+      !this.normalRouteObserverActive ||
+      this.normalRouteObserverMint !== mint ||
+      this.buySubmitted ||
+      this.isBuyExecuting
+    ) {
+      return;
+    }
+    this.log.warn(
+      "FeeSnip skip — buy deadline expired with no qualifying wallet; resetting",
+      {
+        mint,
+        deadlineMs: FEE_SNIP_BUY_DEADLINE_MS,
+        collected: this.normalRouteObserverCollectedCount(),
+      },
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏭️ ${this.label} FeeSnip Skipped — Buy Deadline Expired</b>`,
+        `Token: <code>${mint}</code>`,
+        `No qualifying buy within <b>${FEE_SNIP_BUY_DEADLINE_MS / 60_000} minutes</b> of scanning.`,
+        "Token skipped and flow reset.",
+      ].join("\n"),
+      "feesnip buy deadline expired",
+    );
+    await this.resetForNewToken(true, {
+      reason: "feesnip_buy_deadline_expired",
+    });
   }
 
   /** Base fee for the normal-route observer: any insider wallet's sell fee. */
@@ -6330,6 +6389,11 @@ export class InsiderBot extends EventEmitter {
       return;
     }
     this.normalRouteObserverMcGraceConsumed = true;
+    // Buy is firing — cancel the buy deadline.
+    if (this.normalRouteObserverBuyDeadlineTimer !== null) {
+      clearTimeout(this.normalRouteObserverBuyDeadlineTimer);
+      this.normalRouteObserverBuyDeadlineTimer = null;
+    }
     const entryWallet =
       feeTriggerWallet ??
       ([...this.normalRouteObserverQualified.keys()].at(-1) ??
@@ -6586,6 +6650,10 @@ export class InsiderBot extends EventEmitter {
     if (this.normalRouteObserverStartDelayTimer !== null) {
       clearTimeout(this.normalRouteObserverStartDelayTimer);
       this.normalRouteObserverStartDelayTimer = null;
+    }
+    if (this.normalRouteObserverBuyDeadlineTimer !== null) {
+      clearTimeout(this.normalRouteObserverBuyDeadlineTimer);
+      this.normalRouteObserverBuyDeadlineTimer = null;
     }
     if (this.normalRouteObserverWatchId !== null) {
       const watchId = this.normalRouteObserverWatchId;
