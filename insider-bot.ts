@@ -6164,6 +6164,20 @@ export class InsiderBot extends EventEmitter {
       ].join("\n"),
       "feesnip ref-fee wallet tracked",
     );
+    // FeeSnip: the buy is held until the first >$500 ref-fee wallet appears. Now
+    // that one exists, re-attempt the buy with the earliest held $0–$2 wallet.
+    if (
+      !this.buySubmitted &&
+      !this.isBuyExecuting &&
+      !this.normalRouteObserverMcGraceConsumed
+    ) {
+      const entry =
+        [...this.normalRouteObserverQualified.entries()][0] ??
+        [...this.normalRouteObserverPending.entries()][0];
+      if (entry) {
+        void this.maybeTriggerNormalRouteObserverBuy(entry[0], entry[1].feeUsd);
+      }
+    }
   }
 
   private fromNewTokenStreamActive(): boolean {
@@ -6509,6 +6523,19 @@ export class InsiderBot extends EventEmitter {
     const feeTriggered =
       feeTriggerWallet !== undefined && feeUsd !== undefined;
     if (!feeTriggered) {
+      return;
+    }
+    // FeeSnip: hold the buy until at least one >$500 reference-fee wallet has
+    // been tracked. The buy is re-attempted when the first such wallet appears.
+    if (this.normalRouteObserverRefFeeWallets.size < 1) {
+      this.log.info(
+        "FeeSnip buy held — no >$500 reference-fee wallet tracked yet",
+        {
+          mint: this.normalRouteObserverMint,
+          heldCount,
+          refFeeWallets: this.normalRouteObserverRefFeeWallets.size,
+        },
+      );
       return;
     }
     if (this.normalRouteObserverMcGraceConsumed) {
