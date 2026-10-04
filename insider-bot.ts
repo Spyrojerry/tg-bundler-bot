@@ -187,9 +187,9 @@ const NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT = 80;
 const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
 /**
  * FeeSnip reference-fee sell path: alongside the normal logic, track wallets
- * that buy more than this many USD with a buy tx fee within
- * FEE_SNIP_REF_FEE_TOLERANCE_USD of the reference fee taken from an early
- * insider bundler sell tx. Any such wallet's sell (below the MC cap) exits.
+ * that buy $500 or more with a buy tx fee within FEE_SNIP_REF_FEE_TOLERANCE_USD
+ * of the reference fee taken from the first early insider bundler sell tx. Any
+ * such wallet's sell (below the MC cap) exits.
  */
 const FEE_SNIP_REF_BUY_MIN_USD = 500;
 /** FeeSnip reference-fee sell path: track up to this many qualifying wallets. */
@@ -325,6 +325,8 @@ interface FollowTokenEarlyBundlerExitState {
   smallestBundlerSellGateCompleted: boolean;
   smallestBundlerSellGateRootWallet: string | null;
   smallestBundlerSellFeeLamports: number | null;
+  /** First early-insider-bundler sell tx fee seen this token (FeeSnip ref fee). */
+  firstEarlyBundlerSellFeeLamports: number | null;
   fromNewTokenStream: boolean;
   initialSyncComplete: boolean;
   maxSingleSell60mCapExceeded: boolean;
@@ -5988,20 +5990,6 @@ export class InsiderBot extends EventEmitter {
       this.normalRouteObserverStartDelayTimer = null;
       this.beginNormalRouteObserverWatch(mint);
     }, remainingDelayMs);
-
-    // The reference fee is snapshotted into
-    // normalRouteObserverReferenceFeeLamports, so the early-bundler exit watch is
-    // no longer needed to supply it. Deferred to the next tick so we don't tear
-    // down the early-bundler exit state mid-evaluation.
-    setImmediate(() => {
-      if (this.normalRouteObserverActive && this.normalRouteObserverMint === mint) {
-        this.log.info(
-          "Reference fee snapshotted — stopping early-bundler exit watch (FeeSnip is the only path)",
-          { mint, referenceFeeLamports },
-        );
-        void this.stopFollowTokenEarlyBundlerExitMonitoring();
-      }
-    });
   }
 
   /** FeeSnip: install the enhanced-WS watch once the 10s token-start delay ends. */
@@ -6091,15 +6079,15 @@ export class InsiderBot extends EventEmitter {
   }
 
   /**
-   * FeeSnip reference-fee sell path: the reference fee (lamports) taken from an
-   * early insider bundler sell tx. Prefers the smallest-root sell reference, then
-   * any early-bundler exit watch's last sell fee.
+   * FeeSnip reference-fee sell path: the single reference fee (lamports) taken
+   * from the FIRST early-insider-bundler sell tx seen this token.
    */
   private resolveFeeSnipBundlerReferenceFeeLamports(): number | null {
     const ebState = this.followTokenEarlyBundlerExitState;
-    if (ebState?.smallestBundlerSellFeeLamports != null) {
-      return ebState.smallestBundlerSellFeeLamports;
+    if (ebState?.firstEarlyBundlerSellFeeLamports != null) {
+      return ebState.firstEarlyBundlerSellFeeLamports;
     }
+    // Fallback: the earliest early-bundler exit watch's last sell fee.
     const watches = ebState ? [...ebState.watches.values()] : [];
     const withFee = watches
       .filter((watch) => watch.lastSellFeeLamports != null)
@@ -6157,7 +6145,7 @@ export class InsiderBot extends EventEmitter {
         `<b>👀 ${this.label} FeeSnip Ref-Fee Wallet #${this.normalRouteObserverRefFeeWallets.size}</b>`,
         `Token: <code>${mint}</code>`,
         `Wallet: <code>${wallet}</code>`,
-        `Buy: <b>$${buyUsd.toFixed(2)}</b> (> $${FEE_SNIP_REF_BUY_MIN_USD})`,
+        `Buy: <b>$${buyUsd.toFixed(2)}</b> (>= $${FEE_SNIP_REF_BUY_MIN_USD})`,
         `Fee: <b>${feeLamports.toLocaleString()}</b> lamports (ref ${this.normalRouteObserverRefFeeLamports?.toLocaleString() ?? "?"} ± $${FEE_SNIP_REF_FEE_TOLERANCE_USD.toFixed(3)})`,
         `Watching for its sells below <b>$${FEE_SNIP_REF_SELL_SKIP_MC_USD.toLocaleString()}</b> MC.`,
         `Tracked: <b>${this.normalRouteObserverRefFeeWallets.size}/${FEE_SNIP_REF_WALLET_MAX}</b>`,
@@ -6275,7 +6263,7 @@ export class InsiderBot extends EventEmitter {
         const refBuySol = this.estimateEarlyBuySol(tx, wallet);
         if (refBuySol === null) continue;
         const refBuyUsd = refBuySol * solPriceUsd;
-        if (refBuyUsd <= FEE_SNIP_REF_BUY_MIN_USD) continue;
+        if (refBuyUsd < FEE_SNIP_REF_BUY_MIN_USD) continue;
         this.trackFeeSnipReferenceFeeWallet(
           mint,
           wallet,
@@ -10618,6 +10606,21 @@ export class InsiderBot extends EventEmitter {
       watch.soldAmount += amount;
       watch.lastSellFeeLamports = tx.fee ?? null;
       watch.lastSellTimestamp = tx.timestamp;
+      // FeeSnip reference-fee sell path: capture the FIRST early-insider-bundler
+      // sell tx fee as the reference the >$500 wallets are matched against.
+      if (
+        state &&
+        state.firstEarlyBundlerSellFeeLamports === null &&
+        tx.fee != null
+      ) {
+        state.firstEarlyBundlerSellFeeLamports = tx.fee;
+        this.log.warn("FeeSnip reference fee captured from early bundler sell", {
+          mint,
+          wallet,
+          signature: tx.signature,
+          referenceFeeLamports: tx.fee,
+        });
+      }
       // Normal-route observer is paused — the early fee-buy scan is the buy
       // trigger on the normal route, so no reference-fee observer is started.
       if (amount > watch.maxSingleSellTokenAmount) {
@@ -11586,6 +11589,7 @@ export class InsiderBot extends EventEmitter {
       smallestBundlerSellGateCompleted: false,
       smallestBundlerSellGateRootWallet: null,
       smallestBundlerSellFeeLamports: null,
+      firstEarlyBundlerSellFeeLamports: null,
       fromNewTokenStream,
       initialSyncComplete: false,
       maxSingleSell60mCapExceeded: false,
