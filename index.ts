@@ -2174,7 +2174,7 @@ async function main(): Promise<void> {
             if (positiveMcExitConfirmations.has(index)) return;
             positiveMcExitConfirmations.add(index);
             log.info(
-              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% ≥ 0 target reached; waiting 1 second for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% ≥ 0 target reached; waiting 2 seconds for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
             );
             setTimeout(() => {
               positiveMcExitConfirmations.delete(index);
@@ -2184,7 +2184,7 @@ async function main(): Promise<void> {
                 currentMc,
                 exitMc,
               });
-            }, 1_000);
+            }, 2_000);
             return;
           }
           if (pnlPct >= HOLD_PNL_FLOOR_PCT && pnlPct < 0) {
