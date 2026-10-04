@@ -186,6 +186,22 @@ const NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT = 80;
 /** FeeSnip: a sell within this window after a wallet's first buy disqualifies it. */
 const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
 /**
+ * FeeSnip reference-fee sell path: alongside the normal logic, track wallets
+ * that buy more than this many USD with a buy tx fee within
+ * FEE_SNIP_REF_FEE_TOLERANCE_USD of the reference fee taken from an early
+ * insider bundler sell tx. Any such wallet's sell (below the MC cap) exits.
+ */
+const FEE_SNIP_REF_BUY_MIN_USD = 500;
+/** FeeSnip reference-fee sell path: track up to this many qualifying wallets. */
+const FEE_SNIP_REF_WALLET_MAX = 5;
+/** FeeSnip reference-fee sell path: USD tolerance against the bundler sell fee. */
+const FEE_SNIP_REF_FEE_TOLERANCE_USD = 0.005;
+/**
+ * FeeSnip reference-fee sell path: only a watched wallet's sell while MC is
+ * below this triggers our exit. Sells at/above this MC are ignored.
+ */
+const FEE_SNIP_REF_SELL_SKIP_MC_USD = 100_000;
+/**
  * Normal follow-token route (paused observer replacement): buy trigger scans all
  * buys in the token's first 2 seconds and keeps those whose tx fee exceeds $1.
  * A non-empty wallet list triggers the buy.
@@ -1014,6 +1030,22 @@ export class InsiderBot extends EventEmitter {
    * machinery must not disable it.
    */
   private feesnipPosition = false;
+  /**
+   * FeeSnip reference-fee sell path: wallets that bought >$500 with a buy fee
+   * within tolerance of the insider bundler sell fee, watched for sells.
+   */
+  private normalRouteObserverRefFeeWallets = new Map<
+    string,
+    {
+      buyUsd: number;
+      feeLamports: number;
+      signature: string;
+      timestamp: number;
+      tx: HeliusTransaction;
+    }
+  >();
+  /** Reference fee (lamports) taken from an early insider bundler sell tx. */
+  private normalRouteObserverRefFeeLamports: number | null = null;
   /** Cumulative count of wallets ever held (past + currently held) this flow. */
   private normalRouteObserverTotalHeldCount = 0;
   /** Wall-clock ms when the current normal-route observer started, for rate math. */
@@ -5903,6 +5935,9 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverQualified.clear();
     this.normalRouteObserverRejected.clear();
     this.normalRouteObserverExtraSellWallets.clear();
+    this.normalRouteObserverRefFeeWallets.clear();
+    this.normalRouteObserverRefFeeLamports =
+      this.resolveFeeSnipBundlerReferenceFeeLamports();
     this.normalRouteObserverDelayElapsed = false;
     if (this.normalRouteObserverBuyDeadlineTimer !== null) {
       clearTimeout(this.normalRouteObserverBuyDeadlineTimer);
@@ -6055,6 +6090,82 @@ export class InsiderBot extends EventEmitter {
     return NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS;
   }
 
+  /**
+   * FeeSnip reference-fee sell path: the reference fee (lamports) taken from an
+   * early insider bundler sell tx. Prefers the smallest-root sell reference, then
+   * any early-bundler exit watch's last sell fee.
+   */
+  private resolveFeeSnipBundlerReferenceFeeLamports(): number | null {
+    const ebState = this.followTokenEarlyBundlerExitState;
+    if (ebState?.smallestBundlerSellFeeLamports != null) {
+      return ebState.smallestBundlerSellFeeLamports;
+    }
+    const watches = ebState ? [...ebState.watches.values()] : [];
+    const withFee = watches
+      .filter((watch) => watch.lastSellFeeLamports != null)
+      .sort(
+        (a, b) => (a.lastSellTimestamp ?? 0) - (b.lastSellTimestamp ?? 0),
+      );
+    return withFee[0]?.lastSellFeeLamports ?? null;
+  }
+
+  /**
+   * FeeSnip reference-fee sell path: track a wallet that bought >$500 with a buy
+   * tx fee within tolerance of the insider bundler sell fee. Up to 5 are tracked;
+   * each is registered so its sells are watched for our exit.
+   */
+  private trackFeeSnipReferenceFeeWallet(
+    mint: string,
+    wallet: string,
+    tx: HeliusTransaction,
+    buyUsd: number,
+    feeLamports: number,
+  ): void {
+    if (this.normalRouteObserverRefFeeWallets.has(wallet)) return;
+    if (this.normalRouteObserverRefFeeWallets.size >= FEE_SNIP_REF_WALLET_MAX) {
+      return;
+    }
+    this.normalRouteObserverRefFeeWallets.set(wallet, {
+      buyUsd,
+      feeLamports,
+      signature: tx.signature,
+      timestamp: tx.timestamp,
+      tx,
+    });
+    // Register the wallet so its sells are tracked (observer handoff guard also
+    // sees it via normalRouteObserverRefFeeWallets).
+    const li = this.followTokenLargeInsiderState;
+    if (li?.active) {
+      if (!li.validWallets.includes(wallet)) li.validWallets.push(wallet);
+      this.registerFollowTokenLargeInsiderValidWalletForExitMonitoring(wallet, {
+        tx,
+        signature: tx.signature,
+        timestamp: tx.timestamp,
+      });
+    }
+    this.log.warn("FeeSnip reference-fee wallet tracked for sells", {
+      mint,
+      wallet,
+      buyUsd,
+      feeLamports,
+      referenceFeeLamports: this.normalRouteObserverRefFeeLamports,
+      toleranceUsd: FEE_SNIP_REF_FEE_TOLERANCE_USD,
+      trackedCount: this.normalRouteObserverRefFeeWallets.size,
+    });
+    void this.sendTelegramSafe(
+      [
+        `<b>👀 ${this.label} FeeSnip Ref-Fee Wallet #${this.normalRouteObserverRefFeeWallets.size}</b>`,
+        `Token: <code>${mint}</code>`,
+        `Wallet: <code>${wallet}</code>`,
+        `Buy: <b>$${buyUsd.toFixed(2)}</b> (> $${FEE_SNIP_REF_BUY_MIN_USD})`,
+        `Fee: <b>${feeLamports.toLocaleString()}</b> lamports (ref ${this.normalRouteObserverRefFeeLamports?.toLocaleString() ?? "?"} ± $${FEE_SNIP_REF_FEE_TOLERANCE_USD.toFixed(3)})`,
+        `Watching for its sells below <b>$${FEE_SNIP_REF_SELL_SKIP_MC_USD.toLocaleString()}</b> MC.`,
+        `Tracked: <b>${this.normalRouteObserverRefFeeWallets.size}/${FEE_SNIP_REF_WALLET_MAX}</b>`,
+      ].join("\n"),
+      "feesnip ref-fee wallet tracked",
+    );
+  }
+
   private fromNewTokenStreamActive(): boolean {
     return this.followTokenEarlyBundlerExitState?.fromNewTokenStream ?? false;
   }
@@ -6091,7 +6202,8 @@ export class InsiderBot extends EventEmitter {
     if (
       this.normalRouteObserverPending.size > 0 ||
       this.normalRouteObserverQualified.size > 0 ||
-      this.normalRouteObserverExtraSellWallets.size > 0
+      this.normalRouteObserverExtraSellWallets.size > 0 ||
+      this.normalRouteObserverRefFeeWallets.size > 0
     ) {
       const touchedWallets = new Set<string>();
       for (const transfer of tx.tokenTransfers ?? []) {
@@ -6100,13 +6212,63 @@ export class InsiderBot extends EventEmitter {
         if (transfer.fromUserAccount) touchedWallets.add(transfer.fromUserAccount);
       }
       for (const wallet of touchedWallets) {
-        const isWatched =
+        const isNormal =
           this.normalRouteObserverPending.has(wallet) ||
           this.normalRouteObserverQualified.has(wallet) ||
           this.normalRouteObserverExtraSellWallets.has(wallet);
-        if (!isWatched) continue;
+        const isRefWallet = this.normalRouteObserverRefFeeWallets.has(wallet);
+        if (!isNormal && !isRefWallet) continue;
         if (this.classifyTx(tx, wallet, mint) !== "sell") continue;
-        void this.handleWatchedNormalRouteObserverSell(wallet, mint, tx);
+        if (isRefWallet) {
+          void this.handleFeeSnipReferenceFeeWalletSell(wallet, mint, tx);
+        }
+        if (isNormal) {
+          void this.handleWatchedNormalRouteObserverSell(wallet, mint, tx);
+        }
+      }
+    }
+    // FeeSnip reference-fee sell path (parallel to the normal logic): track
+    // wallets that bought >$500 with a buy fee within tolerance of the insider
+    // bundler sell fee, up to 5, so their sells can trigger our exit.
+    if (
+      this.normalRouteObserverRefFeeLamports === null &&
+      this.normalRouteObserverRefFeeWallets.size < FEE_SNIP_REF_WALLET_MAX
+    ) {
+      // Re-resolve lazily: the bundler sell fee may not have been seen yet when
+      // the observer started.
+      this.normalRouteObserverRefFeeLamports =
+        this.resolveFeeSnipBundlerReferenceFeeLamports();
+    }
+    if (
+      this.normalRouteObserverRefFeeLamports !== null &&
+      this.normalRouteObserverRefFeeWallets.size < FEE_SNIP_REF_WALLET_MAX
+    ) {
+      const refFee = this.normalRouteObserverRefFeeLamports;
+      for (const wallet of recipients) {
+        if (
+          wallet === "__pool__" ||
+          this.normalRouteObserverRefFeeWallets.has(wallet)
+        ) {
+          continue;
+        }
+        if (this.normalRouteObserverRefFeeWallets.size >= FEE_SNIP_REF_WALLET_MAX) {
+          break;
+        }
+        if (this.classifyTx(tx, wallet, mint) !== "buy") continue;
+        const refFeeDiffUsd =
+          (Math.abs(feeLamports - refFee) * solPriceUsd) / 1_000_000_000;
+        if (refFeeDiffUsd > FEE_SNIP_REF_FEE_TOLERANCE_USD) continue;
+        const refBuySol = this.estimateEarlyBuySol(tx, wallet);
+        if (refBuySol === null) continue;
+        const refBuyUsd = refBuySol * solPriceUsd;
+        if (refBuyUsd <= FEE_SNIP_REF_BUY_MIN_USD) continue;
+        this.trackFeeSnipReferenceFeeWallet(
+          mint,
+          wallet,
+          tx,
+          refBuyUsd,
+          feeLamports,
+        );
       }
     }
     for (const wallet of recipients) {
@@ -6471,6 +6633,90 @@ export class InsiderBot extends EventEmitter {
     );
   }
 
+  /**
+   * FeeSnip reference-fee sell path: a tracked >$500 ref-fee wallet sold.
+   * - Before our buy triggers → skip the token and reset.
+   * - While holding → exit only when the current MC is below the cap.
+   */
+  private async handleFeeSnipReferenceFeeWalletSell(
+    wallet: string,
+    mint: string,
+    tx: HeliusTransaction,
+  ): Promise<void> {
+    if (
+      !this.normalRouteObserverActive ||
+      this.normalRouteObserverMint !== mint
+    ) {
+      return;
+    }
+    if (!this.normalRouteObserverRefFeeWallets.has(wallet)) return;
+    this.normalRouteObserverRefFeeWallets.delete(wallet);
+
+    // Pre-buy: a tracked wallet sold before our own buy → skip + reset.
+    if (!this.buySubmitted && !this.activePosition) {
+      this.log.warn(
+        "FeeSnip ref-fee wallet sold before buy — skipping token and resetting",
+        { mint, wallet, signature: tx.signature },
+      );
+      void this.sendTelegramSafe(
+        [
+          `<b>⏭️ ${this.label} FeeSnip Skipped — Ref-Fee Wallet Sold Pre-Buy</b>`,
+          `Token: <code>${mint}</code>`,
+          `Wallet: <code>${wallet}</code>`,
+          "A tracked >$500 ref-fee wallet sold before our buy — token skipped and flow reset.",
+        ].join("\n"),
+        "feesnip ref-fee pre-buy sell skip",
+      );
+      await this.resetForNewToken(true, {
+        reason: "feesnip_ref_fee_wallet_sold_pre_buy",
+      });
+      return;
+    }
+
+    if (
+      !this.activePosition ||
+      this.positionSellTriggered ||
+      this.phase !== "holding"
+    ) {
+      return;
+    }
+
+    const currentMc = await this.gmgnClient
+      .fetchTokenMarketCapUsd(mint)
+      .catch(() => null);
+    if (currentMc !== null && currentMc >= FEE_SNIP_REF_SELL_SKIP_MC_USD) {
+      this.log.info(
+        "FeeSnip ref-fee wallet sold but MC is at/above the skip cap — not selling",
+        { mint, wallet, currentMc, skipMcUsd: FEE_SNIP_REF_SELL_SKIP_MC_USD },
+      );
+      return;
+    }
+
+    const entryMc = this.getEntryMc();
+    const pnlPct =
+      entryMc > 0 && currentMc !== null
+        ? ((currentMc - entryMc) / entryMc) * 100
+        : null;
+    await this.triggerPositionSell(
+      mint,
+      `feesnip ref-fee wallet sold (${wallet})`,
+      [
+        `<b>🚨 ${this.label} FeeSnip Ref-Fee Wallet Sold — Selling</b>`,
+        `Token: <code>${mint}</code>`,
+        `Wallet: <code>${wallet}</code>`,
+        currentMc !== null
+          ? `MC: <b>$${currentMc.toLocaleString()}</b> (below $${FEE_SNIP_REF_SELL_SKIP_MC_USD.toLocaleString()})`
+          : "",
+        pnlPct !== null
+          ? `P&L: <b>${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</b>`
+          : "",
+        "A tracked >$500 ref-fee wallet sold — exiting.",
+      ].filter(Boolean),
+      tx.signature,
+      { allowWhenFeePayerOnly: true },
+    );
+  }
+
   private rejectNormalRouteObserverWallet(
     wallet: string,
     reason: string,
@@ -6659,6 +6905,8 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverQualified.clear();
     this.normalRouteObserverRejected.clear();
     this.normalRouteObserverExtraSellWallets.clear();
+    this.normalRouteObserverRefFeeWallets.clear();
+    this.normalRouteObserverRefFeeLamports = null;
     this.normalRouteObserverTokenStartedAtSec = null;
     this.normalRouteObserverDelayElapsed = false;
   }
