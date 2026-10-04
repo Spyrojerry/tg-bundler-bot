@@ -154,7 +154,7 @@ const FEE_SNIP_START_DELAY_MS = 10 * 1_000;
  * FeeSnip: the buy must happen within this long after scanning goes live;
  * otherwise skip the token and reset the flow.
  */
-const FEE_SNIP_BUY_DEADLINE_MS = 5 * 60 * 1_000;
+const FEE_SNIP_BUY_DEADLINE_MS = 4 * 60 * 1_000;
 /** FeeSnip: wallet first-buy USD band for the observer buy trigger. */
 const NORMAL_ROUTE_OBSERVER_MIN_BUY_USD = 0.4;
 const NORMAL_ROUTE_OBSERVER_MAX_BUY_USD = 2;
