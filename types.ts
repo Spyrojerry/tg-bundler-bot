@@ -141,6 +141,8 @@ export interface ServiceConfig {
   jupiterPriceApiKey: string;
   pumpPortalApiKey: string | null;
   pumpPortalWalletAddress: string | null;
+  /** Base58 secret key for the trading wallet used by the Pump SDK direct engine. */
+  tradingWalletPrivateKey: string | null;
   rateLimitMinTime: number;
   rateLimitMaxConcurrent: number;
   dbPath: string;
@@ -199,6 +201,12 @@ export interface ServiceConfig {
   sellSlippage: number;
   sellAutoSlippage: boolean;
   sellPriorityFeeSol: number;
+  /** Direct Pump SDK engine: priority (network) fee in SOL for buys. */
+  buyPriorityFeeSol: number;
+  /** Direct Pump SDK engine: slippage percent for buys. */
+  buySlippage: number;
+  /** Direct Pump SDK engine: auto-slippage toggle for buys. */
+  buyAutoSlippage: boolean;
   port: number;
 }
 
@@ -253,9 +261,7 @@ export interface SellOptions {
   slippage: number;
   autoSlippage: boolean;
   priorityFeeSol: number;
-}
-
-export interface BuyOptions {
+}export interface BuyOptions {
   solAmount: number;
   slippage: number;
   autoSlippage: boolean;
@@ -273,6 +279,17 @@ export interface SellResult {
   filledOutputAmount: string | null;
   raw: Record<string, unknown>;
 }
+
+/** Trade venue resolved for a Pump.fun-family mint. */
+export type PumpTradeVenue = "bonding_curve" | "pump_swap" | "migrator" | "error";
+
+/** Where a trade actually executed: the resolved venue and which engine filled it. */
+export type PumpTradeRoute =
+  | "bonding_curve"
+  | "pump_swap"
+  | "pumpportal"
+  | "skipped"
+  | "error";
 
 export interface SellQuote {
   inputToken: string;

@@ -46,6 +46,7 @@ import {
   SellQuote,
   SellResult,
   ServiceConfig,
+  PumpTradeVenue,
 } from "./types";
 
 const execAsync = promisify(exec);
@@ -68,6 +69,11 @@ const PUMPPORTAL_STATUS_CHECKPOINTS_MS = [300, 800, 1_500, 3_000, 5_000];
 /** Retry transient "minimum context slot has not been reached" preflight errors. */
 const PUMPPORTAL_SLOT_RETRY_MAX_ATTEMPTS = 4;
 const PUMPPORTAL_SLOT_RETRY_BASE_DELAY_MS = 400;
+/** Direct Pump SDK engine: how many times we re-submit before falling back. */
+const DIRECT_SDK_MAX_ATTEMPTS = 3;
+const DIRECT_SDK_RETRY_DELAY_MS = 500;
+/** How many times the pumpportal fallback engine is submitted before we skip. */
+const PUMPPORTAL_FALLBACK_MAX_ATTEMPTS = 3;
 const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const TOKEN_PROGRAM_IDS = [
@@ -75,7 +81,6 @@ const TOKEN_PROGRAM_IDS = [
   new PublicKey(TOKEN_2022_PROGRAM_ID),
 ];
 
-type PumpTradeVenue = "bonding_curve" | "pump_swap" | "unknown";
 type PumpPortalTradeAction = "buy" | "sell";
 type PumpPortalSignatureState =
   | { status: "confirmed"; error: null }
@@ -105,7 +110,7 @@ export class GmgnClient {
   private readonly fetchMode: "auto" | "direct" | "cli";
   private readonly pumpSdk: OnlinePumpSdk;
   private readonly pumpAmmSdk: OnlinePumpAmmSdk;
-  private readonly tradingKeypair: Keypair | null = null;
+  private readonly tradingKeypair: Keypair | null;
 
   constructor(
     config: ServiceConfig,
@@ -123,13 +128,68 @@ export class GmgnClient {
     this.connection = new Connection(this.rpcEndpoint, "confirmed");
     this.pumpSdk = new OnlinePumpSdk(this.connection);
     this.pumpAmmSdk = new OnlinePumpAmmSdk(this.connection);
+    this.tradingKeypair = this.loadTradingKeypair(
+      config.tradingWalletPrivateKey,
+      config.tradingWalletAddress,
+    );
     this.limiter = limiter;
     this.baselineMinTime = config.rateLimitMinTime;
     this.fetchMode = config.gmgnFetchMode;
   }
 
-  // ── Public: fetch Market Cap (Primary: GMGN API, Secondary: Jupiter + RPC) ──
+  // ── Trading engine: direct Pump SDK (bonding curve → PumpSwap) ──────────────
 
+  /**
+   * Loads the trading keypair used by the direct Pump SDK engine. Accepts a
+   * base58 secret key (64-byte Keypair or 32-byte seed) or a JSON byte array.
+   * Returns null when unset so the client transparently falls back to
+   * pumpportal for every trade.
+   */
+  private loadTradingKeypair(
+    rawKey: string | null,
+    walletAddress: string | null,
+  ): Keypair | null {
+    if (!rawKey) return null;
+    const trimmed = rawKey.trim();
+    if (!trimmed) return null;
+
+    try {
+      let secretKey: Uint8Array | null = null;
+      if (trimmed.startsWith("[")) {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed) && parsed.every((n) => typeof n === "number")) {
+          secretKey = Uint8Array.from(parsed as number[]);
+        }
+      } else {
+        const decoded = Uint8Array.from(bs58.decode(trimmed));
+        if (decoded.length === 64) secretKey = decoded;
+        else if (decoded.length === 32) secretKey = decoded;
+      }
+      if (!secretKey) {
+        throw new Error("unsupported key format (expected base58 or JSON array)");
+      }
+
+      const keypair = Keypair.fromSecretKey(secretKey);
+      const derived = keypair.publicKey.toBase58();
+      if (walletAddress && walletAddress !== derived) {
+        throw new Error(
+          `TRADING_WALLET_PRIVATE_KEY derives ${derived} but TRADING_WALLET_ADDRESS is ${walletAddress}`,
+        );
+      }
+      log.info("Trading keypair loaded for direct Pump SDK engine", {
+        publicKey: derived,
+      });
+      return keypair;
+    } catch (err) {
+      log.error(
+        "Failed to load TRADING_WALLET_PRIVATE_KEY; direct Pump SDK engine disabled and pumpportal will be used as the only engine",
+        { error: err instanceof Error ? err.message : String(err) },
+      );
+      return null;
+    }
+  }
+
+  // ── Public: fetch Market Cap (Primary: GMGN API, Secondary: Jupiter + RPC) ──
   async fetchTokenMarketCapUsd(mint: string): Promise<number | null> {
     this.validateSolAddress(mint, "mint");
 
@@ -926,14 +986,19 @@ export class GmgnClient {
     mint: string,
     options: BuyOptions,
   ): Promise<SellResult> {
+    this.validateSolAddress(mint, "mint");
     const venue = await this.detectPumpTradeVenue(mint);
-    return this.executePumpPortalLightningTrade(
-      "buy",
-      walletAddress,
-      mint,
-      options,
-      venue,
-    );
+
+    // 1. Primary engine: direct Pump SDK (bonding curve → PumpSwap).
+    const direct = await this.tryDirectSdkEngine("buy", walletAddress, mint, options, venue);
+    if (direct) return direct;
+
+    // 2. Fallback engine: pumpportal (up to N submissions).
+    const fallback = await this.tryPumpPortalEngine("buy", walletAddress, mint, options, venue);
+    if (fallback) return fallback;
+
+    // 3. Skip: unconfirmed after retries on both engines.
+    return this.skippedTradeResult("buy", mint, options, venue, "both-engine-unconfirmed");
   }
 
   async sellTokenForSol(
@@ -941,54 +1006,418 @@ export class GmgnClient {
     mint: string,
     options: SellOptions & { preFetchedBalance?: bigint },
   ): Promise<SellResult> {
+    this.validateSolAddress(mint, "mint");
     const venue = await this.detectPumpTradeVenue(mint);
-    try {
-      return await this.executePumpPortalLightningTrade(
-        "sell",
-        walletAddress,
-        mint,
-        options,
-        venue,
-        options.preFetchedBalance,
+
+    // 1. Primary engine: direct Pump SDK (bonding curve → PumpSwap).
+    const direct = await this.tryDirectSdkEngine("sell", walletAddress, mint, options, venue);
+    if (direct) return direct;
+
+    // 2. Fallback engine: pumpportal (up to N submissions).
+    const fallback = await this.tryPumpPortalEngine("sell", walletAddress, mint, options, venue);
+    if (fallback) return fallback;
+
+    // 3. Skip: unconfirmed after retries on both engines.
+    return this.skippedTradeResult("sell", mint, options, venue, "both-engine-unconfirmed");
+  }
+
+  // ── Engine 1: direct Pump SDK (bonding curve → PumpSwap) ─────────────────────
+
+  /**
+   * Primary buy/sell engine. Routes by resolved venue:
+   *   bonding_curve → Pump.fun bonding curve SDK
+   *   pump_swap     → PumpSwap AMM SDK
+   *   migrator/error → no direct route
+   * Re-submits up to DIRECT_SDK_MAX_ATTEMPTS, verifying each attempt by wallet
+   * balance so a timeout that actually landed is not retried. Returns null when
+   * the direct engine cannot fill (caller then falls back to pumpportal).
+   */
+  private async tryDirectSdkEngine(
+    action: PumpPortalTradeAction,
+    walletAddress: string,
+    mint: string,
+    options: BuyOptions | SellOptions,
+    venue: PumpTradeVenue,
+  ): Promise<SellResult | null> {
+    if (!this.tradingKeypair) {
+      log.warn(
+        `Direct Pump SDK ${action} skipped — no TRADING_WALLET_PRIVATE_KEY; falling back to pumpportal`,
+        { mint, venue },
       );
-    } catch (err) {
-      const balanceAfterLightningFailure = await this.getTokenBalance(
-        walletAddress,
-        mint,
-      ).catch(() => null);
-      if (balanceAfterLightningFailure === 0n) {
+      return null;
+    }
+    if (venue === "migrator" || venue === "error") {
+      log.warn(
+        `Direct Pump SDK ${action} has no route for venue=${venue}; falling back to pumpportal`,
+        { mint, venue },
+      );
+      return null;
+    }
+
+    const balanceBefore = await this.getTokenBalance(walletAddress, mint).catch(
+      (err) => {
+        if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) return 0n;
+        throw err;
+      },
+    );
+
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= DIRECT_SDK_MAX_ATTEMPTS; attempt++) {
+      try {
+        const result =
+          action === "buy"
+            ? await this.buyWithDirectSdk(
+                walletAddress,
+                mint,
+                options as BuyOptions,
+                venue,
+                balanceBefore,
+                attempt,
+              )
+            : await this.sellWithDirectSdk(
+                walletAddress,
+                mint,
+                options as SellOptions,
+                venue,
+                balanceBefore,
+                attempt,
+              );
+        log.info(`Direct Pump SDK ${action} confirmed on attempt ${attempt}`, {
+          mint,
+          venue,
+          route: result.raw?.route,
+          signature: result.hash,
+        });
+        return result;
+      } catch (err) {
+        lastError = err;
+        const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
+          () => balanceBefore,
+        );
+        if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
+          log.warn(
+            `Direct Pump SDK ${action} errored on attempt ${attempt} but wallet balance proves completion`,
+            { mint, venue, error: this.errorText(err) },
+          );
+          return this.balancesToResult(
+            action,
+            mint,
+            options,
+            venue,
+            balanceBefore,
+            balanceAfter,
+            `direct-sdk-${venue}-balance-recovered`,
+            attempt,
+            null,
+            err,
+          );
+        }
         log.warn(
-          "PumpPortal Lightning sell failed but wallet token balance is zero; treating sell as completed",
+          `Direct Pump SDK ${action} attempt ${attempt}/${DIRECT_SDK_MAX_ATTEMPTS} failed`,
           {
             mint,
-            walletAddress,
             venue,
-            error: err instanceof Error ? err.message : String(err),
+            error: this.errorText(err),
+            balanceAfter: balanceAfter.toString(),
           },
         );
-        return this.pumpPortalResult(
-          "sell",
+        if (attempt < DIRECT_SDK_MAX_ATTEMPTS) {
+          await sleep(DIRECT_SDK_RETRY_DELAY_MS * attempt);
+        }
+      }
+    }
+
+    log.warn(
+      `Direct Pump SDK ${action} failed after ${DIRECT_SDK_MAX_ATTEMPTS} attempts; falling back to pumpportal`,
+      { mint, venue, error: this.errorText(lastError) },
+    );
+    return null;
+  }
+
+  /** Builds+submits a bonding-curve or PumpSwap buy via the SDK and verifies it. */
+  private async buyWithDirectSdk(
+    walletAddress: string,
+    mint: string,
+    options: BuyOptions,
+    venue: PumpTradeVenue,
+    balanceBefore: bigint,
+    attempt: number,
+  ): Promise<SellResult> {
+    if (venue === "bonding_curve") {
+      return this.buyTokenWithSolViaPump(walletAddress, mint, options);
+    }
+    return this.buyTokenWithSolViaPumpSwap(walletAddress, mint, options);
+  }
+
+  /** Builds+submits a bonding-curve or PumpSwap sell via the SDK and verifies it. */
+  private async sellWithDirectSdk(
+    walletAddress: string,
+    mint: string,
+    options: SellOptions,
+    venue: PumpTradeVenue,
+    balanceBefore: bigint,
+    attempt: number,
+  ): Promise<SellResult> {
+    if (venue === "bonding_curve") {
+      return this.sellTokenForSolViaPump(walletAddress, mint, balanceBefore, options);
+    }
+    return this.sellTokenForSolViaPumpSwap(walletAddress, mint, balanceBefore, options);
+  }
+
+  // ── Engine 2: pumpportal fallback ────────────────────────────────────────────
+
+  /**
+   * Fallback engine used only after the direct Pump SDK engine fails. Submits
+   * up to PUMPPORTAL_FALLBACK_MAX_ATTEMPTS times, verifying each by signature
+   * status and wallet balance. Returns null when unconfirmed after all attempts
+   * so the caller can skip the trade cleanly instead of throwing.
+   */
+  private async tryPumpPortalEngine(
+    action: PumpPortalTradeAction,
+    walletAddress: string,
+    mint: string,
+    options: BuyOptions | SellOptions,
+    venue: PumpTradeVenue,
+  ): Promise<SellResult | null> {
+    if (!this.canUsePumpPortalFallback(walletAddress)) {
+      log.warn(
+        `pumpportal fallback unavailable for ${action}; skipping trade`,
+        { mint, venue },
+      );
+      return null;
+    }
+
+    const balanceBefore = await this.getTokenBalance(walletAddress, mint).catch(
+      (err) => {
+        if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) return 0n;
+        throw err;
+      },
+    );
+
+    let lastSignature: string | null = null;
+    let lastState: PumpPortalSignatureState = { status: "unknown", error: null };
+
+    for (let attempt = 1; attempt <= PUMPPORTAL_FALLBACK_MAX_ATTEMPTS; attempt++) {
+      try {
+        lastSignature = await this.submitPumpPortalLightningTradeOnce(
+          action,
           mint,
-          null,
           options,
-          options.preFetchedBalance ?? 0n,
-          0n,
           venue,
-          0,
-          "lightning-error-balance-zero",
+          action === "buy"
+            ? (options as BuyOptions).solAmount
+            : `${Math.min(Math.max((options as SellOptions).percent, 0), 100)}%`,
+        );
+      } catch (submitError) {
+        const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
+          (err) => {
+            if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) return 0n;
+            throw err;
+          },
+        );
+        if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
+          log.warn(
+            `pumpportal ${action} request errored on attempt ${attempt} but wallet balance proves completion`,
+            { mint, error: this.errorText(submitError) },
+          );
+          return this.balancesToResult(
+            action,
+            mint,
+            options,
+            venue,
+            balanceBefore,
+            balanceAfter,
+            "pumpportal-request-error-balance-recovered",
+            attempt,
+            null,
+            submitError,
+          );
+        }
+        log.warn(
+          `pumpportal ${action} submit attempt ${attempt}/${PUMPPORTAL_FALLBACK_MAX_ATTEMPTS} errored`,
+          { mint, error: this.errorText(submitError) },
+        );
+        if (attempt < PUMPPORTAL_FALLBACK_MAX_ATTEMPTS) {
+          await sleep(DIRECT_SDK_RETRY_DELAY_MS * attempt);
+        }
+        continue;
+      }
+
+      lastState = await this.waitForPumpPortalSignature(lastSignature);
+      if (lastState.status === "confirmed") {
+        const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
+          () => balanceBefore,
+        );
+        log.info(`pumpportal ${action} confirmed on attempt ${attempt}`, {
+          mint,
+          signature: lastSignature,
+        });
+        return this.pumpPortalResult(
+          action,
+          mint,
+          lastSignature,
+          options,
+          balanceBefore,
+          balanceAfter,
+          venue,
+          attempt,
+          "signature-confirmed",
         );
       }
 
-      log.warn("PumpPortal Lightning sell failed", {
-        mint,
-        walletAddress,
-        venue,
-        balanceAfterLightningFailure:
-          balanceAfterLightningFailure?.toString() ?? null,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      throw err;
+      const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
+        (err) => {
+          if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) return 0n;
+          throw err;
+        },
+      );
+      if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
+        log.warn(
+          `pumpportal ${action} recovered from wallet balance on attempt ${attempt}`,
+          {
+            mint,
+            signature: lastSignature,
+            signatureStatus: lastState.status,
+          },
+        );
+        return this.pumpPortalResult(
+          action,
+          mint,
+          lastSignature,
+          options,
+          balanceBefore,
+          balanceAfter,
+          venue,
+          attempt,
+          "balance-recovered",
+        );
+      }
+
+      log.warn(
+        `pumpportal ${action} attempt ${attempt}/${PUMPPORTAL_FALLBACK_MAX_ATTEMPTS} not confirmed`,
+        {
+          mint,
+          signature: lastSignature,
+          signatureStatus: lastState.status,
+          mayhemError: lastState.error,
+          balanceAfter: balanceAfter.toString(),
+        },
+      );
+      if (attempt < PUMPPORTAL_FALLBACK_MAX_ATTEMPTS) {
+        await sleep(DIRECT_SDK_RETRY_DELAY_MS * attempt);
+      }
     }
+
+    log.error(
+      `pumpportal ${action} unconfirmed after ${PUMPPORTAL_FALLBACK_MAX_ATTEMPTS} attempts; skipping trade`,
+      { mint, venue, lastSignature, signatureStatus: lastState.status },
+    );
+    return null;
+  }
+
+  private canUsePumpPortalFallback(walletAddress: string): boolean {
+    if (!this.pumpPortalApiKey) return false;
+    if (this.pumpPortalWalletAddress && this.pumpPortalWalletAddress !== walletAddress) {
+      log.warn(
+        "pumpportal fallback wallet mismatch; refusing fallback to avoid trading the wrong account",
+        {
+          requestedWallet: walletAddress,
+          pumpPortalWalletAddress: this.pumpPortalWalletAddress,
+        },
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /** True when balance movement proves the trade actually executed on-chain. */
+  private balanceProvesCompletion(
+    action: PumpPortalTradeAction,
+    options: BuyOptions | SellOptions,
+    balanceBefore: bigint,
+    balanceAfter: bigint,
+  ): boolean {
+    if (action === "buy") return balanceAfter > 0n && balanceAfter > balanceBefore;
+    const percent = (options as SellOptions).percent;
+    return percent >= 100 ? balanceAfter < balanceBefore : balanceAfter < balanceBefore;
+  }
+
+  private balancesToResult(
+    action: PumpPortalTradeAction,
+    mint: string,
+    options: BuyOptions | SellOptions,
+    venue: PumpTradeVenue,
+    balanceBefore: bigint,
+    balanceAfter: bigint,
+    route: string,
+    attempt: number,
+    signature: string | null,
+    error: unknown,
+  ): SellResult {
+    const isBuy = action === "buy";
+    const filledTokenAmount = isBuy
+      ? balanceAfter > balanceBefore
+        ? balanceAfter - balanceBefore
+        : 0n
+      : balanceBefore > balanceAfter
+        ? balanceBefore - balanceAfter
+        : 0n;
+    return {
+      orderId: null,
+      hash: signature,
+      status: "confirmed",
+      inputToken: isBuy ? SOL_MINT : mint,
+      outputToken: isBuy ? mint : SOL_MINT,
+      soldPercent: isBuy ? 100 : (options as SellOptions).percent,
+      filledInputAmount: isBuy
+        ? String(Math.floor((options as BuyOptions).solAmount * 1e9))
+        : filledTokenAmount.toString(),
+      filledOutputAmount: isBuy ? filledTokenAmount.toString() : null,
+      raw: {
+        route,
+        venue,
+        attempt,
+        engine: route.startsWith("direct-sdk") ? "pump-sdk" : "pumpportal",
+        error: error === null ? null : this.errorText(error),
+        balanceBefore: balanceBefore.toString(),
+        balanceAfter: balanceAfter.toString(),
+      },
+    };
+  }
+
+  /** Terminal, non-throwing result when both engines failed to confirm. */
+  private skippedTradeResult(
+    action: PumpPortalTradeAction,
+    mint: string,
+    options: BuyOptions | SellOptions,
+    venue: PumpTradeVenue,
+    reason: string,
+  ): SellResult {
+    const isBuy = action === "buy";
+    log.error(`Trade skipped — no engine confirmed ${action}`, {
+      mint,
+      venue,
+      reason,
+    });
+    return {
+      orderId: null,
+      hash: null,
+      status: "skipped",
+      inputToken: isBuy ? SOL_MINT : mint,
+      outputToken: isBuy ? mint : SOL_MINT,
+      soldPercent: isBuy ? 100 : (options as SellOptions).percent,
+      filledInputAmount: null,
+      filledOutputAmount: null,
+      raw: {
+        route: "skipped",
+        venue,
+        reason,
+      },
+    };
+  }
+
+  private errorText(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
   }
 
   private async executePumpPortalLightningTrade(
@@ -1384,7 +1813,6 @@ export class GmgnClient {
     if (venue === "pump_swap") return "pump-amm";
     return "auto";
   }
-
   private extractPumpPortalSignature(data: unknown): string | null {
     if (typeof data === "string") {
       const trimmed = data.trim().replace(/^"|"$/g, "");
@@ -1507,7 +1935,7 @@ export class GmgnClient {
           user,
           sourceTokenAccount.account,
         );
-        const slippage = 100;
+        const slippage = this.toPumpSlippagePercent(options);
         const instructions = await PUMP_AMM_SDK.sellInstructions(
           swapState,
           new BN(amountRawForAccount.toString()),
@@ -2136,7 +2564,7 @@ private async sendRawTransactionAndAssertSuccess(
     return Math.min(Math.max(options.slippage, 0), 100);
   }
 
-  private async detectPumpTradeVenue(mint: string): Promise<PumpTradeVenue> {
+  async detectPumpTradeVenue(mint: string): Promise<PumpTradeVenue> {
     const mintPk = new PublicKey(mint);
     const bondingCurve = bondingCurvePda(mintPk);
     const pumpSwapPool = canonicalPumpPoolPda(mintPk, new PublicKey(SOL_MINT));
@@ -2150,9 +2578,15 @@ private async sendRawTransactionAndAssertSuccess(
 
       if (bondingCurveInfo) {
         const decoded = PUMP_SDK.decodeBondingCurve(bondingCurveInfo);
-        const venue: PumpTradeVenue = decoded.complete
-          ? "pump_swap"
-          : "bonding_curve";
+        let venue: PumpTradeVenue;
+        if (!decoded.complete) {
+          venue = "bonding_curve";
+        } else if (pumpSwapPoolInfo) {
+          venue = "pump_swap";
+        } else {
+          // Curve complete with no PumpSwap pool → migration in flight; retry.
+          venue = "migrator";
+        }
         log.info(`Pump trade venue detected for ${mint}`, {
           mint,
           venue,
@@ -2164,6 +2598,7 @@ private async sendRawTransactionAndAssertSuccess(
         return venue;
       }
 
+      // No bonding curve account: either graduated (PumpSwap) or already gone.
       if (pumpSwapPoolInfo) {
         log.info(`Pump trade venue detected for ${mint}`, {
           mint,
@@ -2181,16 +2616,16 @@ private async sendRawTransactionAndAssertSuccess(
         bondingCurve: bondingCurve.toBase58(),
         pumpSwapPool: pumpSwapPool.toBase58(),
       });
-      return "unknown";
+      return "migrator";
     } catch (err) {
       log.warn(
-        `Pump trade venue detection failed for ${mint}; using route fallback order`,
+        `Pump trade venue detection failed for ${mint}; deferring to pumpportal auto routing`,
         {
           mint,
           error: err instanceof Error ? err.message : String(err),
         },
       );
-      return "unknown";
+      return "error";
     }
   }
 
@@ -2756,7 +3191,7 @@ private async sendRawTransactionAndAssertSuccess(
     const pool = canonicalPumpPoolPda(mintPk, new PublicKey(SOL_MINT));
     const balanceBefore = await this.getTokenBalance(walletAddress, mint);
     const swapState = await this.pumpAmmSdk.swapSolanaState(pool, user);
-    const slippage = 100;
+    const slippage = this.toPumpSlippagePercent(options);
     const instructions = await PUMP_AMM_SDK.buyQuoteInput(
       swapState,
       new BN(amountLamports),

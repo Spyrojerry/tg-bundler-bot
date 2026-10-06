@@ -86,6 +86,7 @@ export function loadConfig(): ServiceConfig {
   const jupiterPriceApiKey = optional('JUPITER_PRICE_API_KEY', jupiterApiKey);
   const pumpPortalApiKey = optionalNullable('PUMPPORTAL_API_KEY');
   const pumpPortalWalletAddress = optionalNullable('PUMPPORTAL_WALLET_ADDRESS');
+  const tradingWalletPrivateKey = optionalNullable('TRADING_WALLET_PRIVATE_KEY');
   const heliusApiKey     = optional('HELIUS_API_KEY', '');
   const insiderHeliusApiKey = optional('INSIDER_HELIUS_API_KEY', '');
   const insiderHeliusApiKey2 = optional('INSIDER_HELIUS_API_KEY_2', '');
@@ -168,6 +169,9 @@ export function loadConfig(): ServiceConfig {
   const sellPercent            = optionalNumber('SELL_PERCENT', 100);
   const sellSlippage           = optionalNumber('SELL_SLIPPAGE', 50);
   const sellPriorityFeeSol     = optionalNumber('SELL_PRIORITY_FEE_SOL', 0.000012);
+  const buyPriorityFeeSol      = optionalNumber('BUY_PRIORITY_FEE_SOL', sellPriorityFeeSol);
+  const buySlippage            = optionalNumber('BUY_SLIPPAGE', sellSlippage);
+  const buyAutoSlippage        = optionalBoolean('BUY_AUTO_SLIPPAGE', sellAutoSlippage);
   const insiderBuySol          = optionalNumber('INSIDER_BUY_SOL', 0.01);
   const insiderNormalBuySol    = optionalNumber('INSIDER_NORMAL_BUY_SOL', insiderBuySol);
   const insiderLowFundingBuySol = optionalNumber('INSIDER_LOW_FUNDING_BUY_SOL', insiderBuySol);
@@ -200,6 +204,9 @@ export function loadConfig(): ServiceConfig {
   if (sellSlippage < 0 || sellSlippage > 100) {
     throw new Error('SELL_SLIPPAGE must be between 0 and 100');
   }
+  if (buySlippage < 0 || buySlippage > 100) {
+    throw new Error('BUY_SLIPPAGE must be between 0 and 100');
+  }
   return {
     tradingWalletAddress,
     solanaRpcUrl,
@@ -216,6 +223,7 @@ export function loadConfig(): ServiceConfig {
     jupiterPriceApiKey,
     pumpPortalApiKey,
     pumpPortalWalletAddress,
+    tradingWalletPrivateKey,
     rateLimitMinTime,
     rateLimitMaxConcurrent,
     dbPath,
@@ -265,6 +273,9 @@ export function loadConfig(): ServiceConfig {
     sellSlippage,
     sellAutoSlippage,
     sellPriorityFeeSol,
+    buyPriorityFeeSol,
+    buySlippage,
+    buyAutoSlippage,
     port,
   };
 }

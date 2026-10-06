@@ -1699,11 +1699,30 @@ async function main(): Promise<void> {
             trigger.mint,
             {
               solAmount: trigger.buySol,
-              slippage: config.sellSlippage,
-              autoSlippage: config.sellAutoSlippage,
-              priorityFeeSol: config.sellPriorityFeeSol,
+              slippage: config.buySlippage,
+              autoSlippage: config.buyAutoSlippage,
+              priorityFeeSol: config.buyPriorityFeeSol,
             },
           );
+
+          if (result.status === "skipped") {
+            bot.setBuyExecuting(false);
+            bot.resetBuyAttempt();
+            log.warn(
+              `[INSIDER ${botNumber}] Buy skipped — Pump SDK and pumpportal both unconfirmed`,
+              { mint: trigger.mint, route: result.raw?.route ?? null },
+            );
+            void telegramBot
+              ?.sendDefault(
+                [
+                  `<b>⏭️ Insider ${botNumber} Buy Skipped</b>`,
+                  `Token: <code>${html(trigger.mint)}</code>`,
+                  "Pump SDK and pumpportal both failed to confirm. Skipping this token.",
+                ].join("\n"),
+              )
+              .catch(() => undefined);
+            return;
+          }
 
           bot.markPositionBought(trigger);
           const confirmedBuyBalance = parseConfirmedBuyBalance(result);
@@ -2142,24 +2161,7 @@ async function main(): Promise<void> {
           );
           return;
         }
-        // Hard floor regardless of target: if P&L is below -80%, force-sell even
-        // when MC has not reached the exit target.
-        const hardFloorPnlPct =
-          bot.getEntryMc() > 0
-            ? ((currentMc - bot.getEntryMc()) / bot.getEntryMc()) * 100
-            : 0;
-        if (hardFloorPnlPct < -80) {
-          log.warn(
-            `[INSIDER ${botNumber} EXIT] PnL ${hardFloorPnlPct.toFixed(2)}% below -80% hard floor (MC $${currentMc.toLocaleString()} below target $${exitMc.toLocaleString()}) — selling.`,
-          );
-          bot.emit("sellTrigger", {
-            followedWallet: bot.getFollowedWallet()!,
-            positionMint: activePos.mint,
-            signature: "MC_HARD_FLOOR",
-            reason: `PnL ${hardFloorPnlPct.toFixed(2)}% below -80% hard floor (MC $${currentMc.toLocaleString()})`,
-          });
-          return;
-        }
+        // Profit exit is evaluated purely against the exit-MC target below.
         if (currentMc >= exitMc) {
           const pnlPct =
             bot.getEntryMc() > 0
@@ -2971,6 +2973,13 @@ async function main(): Promise<void> {
     sellPercent: number,
   ): boolean {
     if (result.status !== "confirmed") return false;
+    // New engine chain tags results with a route + engine; a skipped trade is
+    // terminal and must never be treated as confirmed.
+    const route = typeof result.raw?.route === "string" ? result.raw.route : "";
+    if (route === "skipped") return false;
+    if (route.startsWith("direct-sdk") || route === "pump.fun-custom" || route === "pump-swap-custom-direct") {
+      return Boolean(result.hash) || this_balanceProvesSell(result, sellPercent);
+    }
     const verification =
       typeof result.raw?.verification === "string"
         ? result.raw.verification
@@ -2984,17 +2993,22 @@ async function main(): Promise<void> {
     }
     if (result.hash) return true;
     if (verification !== "signature-confirmed") {
-      const balanceBefore = parseSellResultBalanceField(
-        result.raw?.balanceBefore,
-      );
-      const balanceAfter = parseSellResultBalanceField(result.raw?.balanceAfter);
-      if (balanceBefore === null || balanceAfter === null) return false;
-      if (sellPercent >= 100) {
-        return balanceAfter === 0n && balanceBefore > 0n;
-      }
-      return balanceAfter < balanceBefore;
+      return this_balanceProvesSell(result, sellPercent);
     }
     return true;
+  }
+
+  function this_balanceProvesSell(
+    result: SellResult,
+    sellPercent: number,
+  ): boolean {
+    const balanceBefore = parseSellResultBalanceField(result.raw?.balanceBefore);
+    const balanceAfter = parseSellResultBalanceField(result.raw?.balanceAfter);
+    if (balanceBefore === null || balanceAfter === null) return false;
+    if (sellPercent >= 100) {
+      return balanceAfter === 0n && balanceBefore > 0n;
+    }
+    return balanceAfter < balanceBefore;
   }
 
   async function getTokenRawBalance(
@@ -3096,6 +3110,30 @@ async function main(): Promise<void> {
                   : undefined,
             },
           );
+
+          if (lastResult.status === "skipped") {
+            log.warn(
+              `[SELL SKIP] Both engines unconfirmed for ${mint}; skipping token and moving on`,
+              { attempt, route: lastResult.raw?.route ?? null },
+            );
+            if (!failureNotified && chatId && telegramBot) {
+              failureNotified = true;
+              await telegramBot.sendChat(
+                chatId,
+                [
+                  "<b>⏭️ Sell Skipped</b>",
+                  `Token: <code>${html(mint)}</code>`,
+                  "Pump SDK and pumpportal both failed to confirm. Skipping this token.",
+                ].join("\n"),
+              );
+            }
+            if (pending.event.insiderBotIndex !== undefined) {
+              insiderBots[
+                pending.event.insiderBotIndex
+              ]?.skipAndResetAfterSellFailure(mint);
+            }
+            return;
+          }
 
           if (!isPumpPortalSellConfirmed(lastResult, config.sellPercent)) {
             log.warn(
