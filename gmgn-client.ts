@@ -1093,7 +1093,7 @@ export class GmgnClient {
           walletAddress,
           mint,
         );
-        if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
+        if (await this.confirmBalanceCompletion(action, options, walletAddress, mint, balanceBefore, balanceAfter)) {
           log.warn(
             `Direct Pump SDK ${action} errored on attempt ${attempt} but wallet balance proves completion`,
             { mint, venue, error: this.errorText(err) },
@@ -1204,7 +1204,7 @@ export class GmgnClient {
         );
       } catch (submitError) {
         const balanceAfter = await this.getTokenBalanceOrNull(walletAddress, mint);
-        if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
+        if (await this.confirmBalanceCompletion(action, options, walletAddress, mint, balanceBefore, balanceAfter)) {
           log.warn(
             `pumpportal ${action} request errored on attempt ${attempt} but wallet balance proves completion`,
             { mint, error: this.errorText(submitError) },
@@ -1253,7 +1253,7 @@ export class GmgnClient {
       }
 
       const balanceAfter = await this.getTokenBalanceOrNull(walletAddress, mint);
-      if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
+      if (await this.confirmBalanceCompletion(action, options, walletAddress, mint, balanceBefore, balanceAfter)) {
         log.warn(
           `pumpportal ${action} recovered from wallet balance on attempt ${attempt}`,
           {
@@ -1326,6 +1326,40 @@ export class GmgnClient {
     if (action === "buy") return balanceAfter > 0n && balanceAfter > balanceBefore;
     const percent = (options as SellOptions).percent;
     return percent >= 100 ? balanceAfter < balanceBefore : balanceAfter < balanceBefore;
+  }
+
+  /**
+   * Stronger form of balanceProvesCompletion used before declaring a trade
+   * filled off balance movement alone: the drop must be observed on a SECOND
+   * read too, so a transient zero (index lag, raced ATA) cannot be mistaken for
+   * a completed sell. Signature-confirmed fills never reach here.
+   */
+  private async confirmBalanceCompletion(
+    action: PumpPortalTradeAction,
+    options: BuyOptions | SellOptions,
+    walletAddress: string,
+    mint: string,
+    balanceBefore: bigint | null,
+    balanceAfter: bigint | null,
+  ): Promise<boolean> {
+    if (!this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
+      return false;
+    }
+    await sleep(600);
+    const recheck = await this.getTokenBalanceOrNull(walletAddress, mint);
+    if (!this.balanceProvesCompletion(action, options, balanceBefore, recheck)) {
+      log.warn(
+        `Balance-derived ${action} completion did not hold on recheck; treating as unconfirmed`,
+        {
+          mint,
+          balanceBefore: balanceBefore?.toString() ?? null,
+          firstRead: balanceAfter?.toString() ?? null,
+          recheck: recheck?.toString() ?? "unreliable",
+        },
+      );
+      return false;
+    }
+    return true;
   }
 
   private balancesToResult(
@@ -1895,9 +1929,13 @@ export class GmgnClient {
 
     const user = new PublicKey(walletAddress);
     const mintPk = new PublicKey(mint);
-    const tokenAccounts = (
-      await this.getTokenAccountsWithBalance(user, mintPk)
-    ).sort((a, b) =>
+    const resolved = await this.resolveTokenAccountsForSell(user, mintPk);
+    if (resolved === null) {
+      throw new Error(
+        `Token account lookup for PumpSwap sell failed after retries (RPC/index lag): ${mint}`,
+      );
+    }
+    const tokenAccounts = resolved.sort((a, b) =>
       a.balance === b.balance ? 0 : a.balance > b.balance ? -1 : 1,
     );
     if (tokenAccounts.length === 0) {
@@ -2136,9 +2174,13 @@ export class GmgnClient {
 
     const user = new PublicKey(walletAddress);
     const mintPk = new PublicKey(mint);
-    const tokenAccounts = (
-      await this.getTokenAccountsWithBalance(user, mintPk)
-    ).sort((a, b) =>
+    const resolved = await this.resolveTokenAccountsForSell(user, mintPk);
+    if (resolved === null) {
+      throw new Error(
+        `Token account lookup for Pump.fun sell failed after retries (RPC/index lag): ${mint}`,
+      );
+    }
+    const tokenAccounts = resolved.sort((a, b) =>
       a.balance === b.balance ? 0 : a.balance > b.balance ? -1 : 1,
     );
     if (tokenAccounts.length === 0) {
@@ -2798,12 +2840,56 @@ private async sendRawTransactionAndAssertSuccess(
    * DROP as proof a trade executed must use this and reject a null read: a
    * failed lookup collapses to 0, which is indistinguishable from "sold all"
    * and must never be accepted as a fill.
+   *
+   * ATA-first: the associated token account is derived for both token programs
+   * and read by exact address (index-independent). Only when no ATA read
+   * completes do we fall back to the owner-wide enumeration.
    */
   private async getTokenBalanceOrNull(
     wallet: string,
     mint: string,
   ): Promise<bigint | null> {
-    const pubkey = new PublicKey(wallet);
+    const owner = new PublicKey(wallet);
+    const mintPk = new PublicKey(mint);
+
+    const ataResults = await Promise.all(
+      TOKEN_PROGRAM_IDS.map((tokenProgram) =>
+        this.readTokenAccountByAddress(
+          getAssociatedTokenAddressSync(mintPk, owner, false, tokenProgram),
+          tokenProgram,
+          mintPk,
+        ),
+      ),
+    );
+
+    const ataTotal = ataResults.reduce(
+      (sum, entry) => sum + (entry?.balance ?? 0n),
+      0n,
+    );
+    if (ataTotal > 0n) return ataTotal;
+
+    // No positive ATA balance: confirm against the owner-wide query, which also
+    // catches tokens held in a non-ATA account.
+    const enumerated = await this.getTokenBalanceViaOwnerQuery(owner, mintPk);
+    if (enumerated !== null && enumerated > 0n) return enumerated;
+
+    // A failed ATA read (null entry) or a failed enumeration means we cannot
+    // trust the zero. Report unreliable rather than a false "sold all".
+    const anyAtaReadFailed = ataResults.some((entry) => entry === null);
+    if (anyAtaReadFailed || enumerated === null) return null;
+
+    return ataTotal;
+  }
+
+  /**
+   * Owner-wide balance query (all token accounts for the owner, filtered to the
+   * mint locally). Returns null when any program lookup failed, so callers can
+   * tell an unavailable read from a real zero.
+   */
+  private async getTokenBalanceViaOwnerQuery(
+    owner: PublicKey,
+    mint: PublicKey,
+  ): Promise<bigint | null> {
     let total = 0n;
     let reliable = true;
 
@@ -2812,10 +2898,10 @@ private async sendRawTransactionAndAssertSuccess(
         // getTokenAccountsByOwner accepts one filter only. Query by program and
         // filter the target mint locally so fresh/unindexed mints do not make
         // every balance lookup fail with "could not find mint".
-        const accounts = await this.connection.getParsedTokenAccountsByOwner(pubkey, {
+        const accounts = await this.connection.getParsedTokenAccountsByOwner(owner, {
           programId,
         });
-        total += this.sumParsedTokenAccountsForMint(accounts.value, mint);
+        total += this.sumParsedTokenAccountsForMint(accounts.value, mint.toBase58());
       } catch (err) {
         // A missing-mint lookup for a brand-new token is expected and means
         // zero holdings for that program; anything else makes the read
@@ -2823,8 +2909,8 @@ private async sendRawTransactionAndAssertSuccess(
         if (this.isMissingMintTokenAccountLookup(err)) continue;
         reliable = false;
         log.warn("Token balance lookup failed for owner/program; read marked unreliable", {
-          wallet,
-          mint,
+          owner: owner.toBase58(),
+          mint: mint.toBase58(),
           programId: programId.toBase58(),
           error: err instanceof Error ? err.message : String(err),
         });
@@ -2884,6 +2970,98 @@ private async sendRawTransactionAndAssertSuccess(
       }
     }
     return programs;
+  }
+
+  /**
+   * Resolves the accounts holding `mint` for `owner`, ATA-first.
+   *
+   * The associated token account is a pure function of (owner, mint, program),
+   * so we derive it directly for both token programs and read each by address.
+   * That avoids depending on the node's owner index (which lags right after a
+   * buy and caused "No token accounts with balance found"). Only if the ATA
+   * reads fail do we fall back to the owner-wide enumeration, which also
+   * catches tokens held in a non-ATA account.
+   *
+   * Returns null when every read failed (RPC/index lag) so the caller can retry
+   * or fall back instead of mistaking an unavailable read for an empty wallet.
+   */
+  private async resolveTokenAccountsForSell(
+    owner: PublicKey,
+    mint: PublicKey,
+  ): Promise<
+    Array<{ tokenProgram: PublicKey; account: PublicKey; balance: bigint }> | null
+  > {
+    const ataResults = await Promise.all(
+      TOKEN_PROGRAM_IDS.map((tokenProgram) =>
+        this.readTokenAccountByAddress(
+          getAssociatedTokenAddressSync(mint, owner, false, tokenProgram),
+          tokenProgram,
+          mint,
+        ),
+      ),
+    );
+
+    const ataAccounts = ataResults.filter(
+      (entry): entry is { tokenProgram: PublicKey; account: PublicKey; balance: bigint } =>
+        entry !== null && entry.balance > 0n,
+    );
+    if (ataAccounts.length > 0) return ataAccounts;
+
+    // No positive ATA balance. Distinguish "read failed" from "genuinely empty".
+    const anyReadFailed = ataResults.some((entry) => entry === null);
+    const enumerated = await this.getTokenAccountsWithBalance(owner, mint);
+    if (enumerated.length > 0) return enumerated;
+
+    // Nothing found. Any failed read means we cannot trust "empty" — the token
+    // may live in the program whose read did not complete.
+    return anyReadFailed ? null : [];
+  }
+
+  /**
+   * Reads one token account by its exact address with short retries, to ride
+   * out RPC/index lag. Returns null when the read could not be completed, or
+   * when the account does not exist / holds nothing for the mint (balance 0n
+   * with a successful read).
+   */
+  private async readTokenAccountByAddress(
+    account: PublicKey,
+    tokenProgram: PublicKey,
+    mint: PublicKey,
+  ): Promise<
+    { tokenProgram: PublicKey; account: PublicKey; balance: bigint } | null
+  > {
+    const attempts = 3;
+    let lastError: unknown = null;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const info = await this.connection.getAccountInfo(account, "confirmed");
+        // Account does not exist yet → no holding here (successful read).
+        if (!info || !info.owner.equals(tokenProgram)) {
+          return { tokenProgram, account, balance: 0n };
+        }
+        const parsed = await this.connection.getTokenAccountBalance(
+          account,
+          "confirmed",
+        );
+        const raw = parsed?.value?.amount;
+        if (typeof raw !== "string" || !/^\d+$/.test(raw)) {
+          return { tokenProgram, account, balance: 0n };
+        }
+        return { tokenProgram, account, balance: BigInt(raw) };
+      } catch (err) {
+        lastError = err;
+        if (attempt < attempts) await sleep(250 * attempt);
+      }
+    }
+
+    log.warn("Token account read failed after retries; read marked unreliable", {
+      account: account.toBase58(),
+      mint: mint.toBase58(),
+      tokenProgram: tokenProgram.toBase58(),
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+    return null;
   }
 
   private async getTokenAccountsWithBalance(
@@ -3139,11 +3317,11 @@ private async sendRawTransactionAndAssertSuccess(
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (errorMessage.includes("was not confirmed")) {
-        const recoveredBalance = await this.getTokenBalance(
+        const recoveredBalance = await this.getTokenBalanceOrNull(
           signerPublicKey,
           mint,
-        ).catch(() => 0n);
-        if (recoveredBalance > 0n) {
+        );
+        if (recoveredBalance !== null && recoveredBalance > 0n) {
           const signature =
             errorMessage.match(/Transaction ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ??
             null;
@@ -3276,11 +3454,11 @@ private async sendRawTransactionAndAssertSuccess(
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       if (errorMessage.includes("was not confirmed")) {
-        const recoveredBalance = await this.getTokenBalance(
+        const recoveredBalance = await this.getTokenBalanceOrNull(
           walletAddress,
           mint,
-        ).catch(() => balanceBefore);
-        if (recoveredBalance > balanceBefore) {
+        );
+        if (recoveredBalance !== null && recoveredBalance > balanceBefore) {
           const signature =
             errorMessage.match(/Transaction ([1-9A-HJ-NP-Za-km-z]+)/)?.[1] ??
             null;
