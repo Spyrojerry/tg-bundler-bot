@@ -18,6 +18,7 @@ import { TelegramBot } from "./telegram-bot";
 import { WalletMonitor } from "./wallet-monitor";
 import { HeliusEnhancedWsClient } from "./helius-enhanced-ws";
 import { isDevRugCloseAccountTx, UNKNOWN_COUNTERPARTY } from "./tx-normalizer";
+import { resolveJitoTip } from "./jito-tip-detector";
 import { extractFirstUniqueEarlyBundlerBuys } from "./wallet-swap-detector";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -200,7 +201,7 @@ const FEE_SNIP_REF_FEE_TOLERANCE_USD = 0.005;
  * FeeSnip reference-fee sell path: only a watched wallet's sell while MC is
  * below this triggers our exit. Sells at/above this MC are ignored.
  */
-const FEE_SNIP_REF_SELL_SKIP_MC_USD = 100_000;
+const FEE_SNIP_REF_SELL_SKIP_MC_USD = 150_000;
 /**
  * FeeSnip reference-fee sell path: a ref-fee wallet's sell only counts when the
  * sold amount is at least this fraction of its bought amount. Partial sells
@@ -6315,6 +6316,27 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
+      // FeeSnip: the below-$2 buy must pay a Jito tip (destination is a Jito
+      // tip account). A wallet whose buy does not tip is skipped entirely — it
+      // is not held or collected into the flow.
+      const jitoTip = resolveJitoTip(tx);
+      if (!jitoTip) {
+        this.log.info(
+          "FeeSnip below-$2 wallet skipped — buy tx pays no Jito tip",
+          {
+            mint,
+            wallet,
+            signature: tx.signature,
+            nativeTransfers: (tx.nativeTransfers ?? []).map((transfer) => ({
+              from: transfer.fromUserAccount,
+              to: transfer.toUserAccount,
+              amount: transfer.amount,
+            })),
+          },
+        );
+        this.normalRouteObserverSeenWallets.add(wallet);
+        continue;
+      }
       this.normalRouteObserverSeenWallets.add(wallet);
       const buySol = this.estimateEarlyBuySol(tx, wallet);
       if (buySol === null) continue;
@@ -6325,6 +6347,13 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
+      this.log.info("FeeSnip below-$2 wallet qualifies — buy tx pays a Jito tip", {
+        mint,
+        wallet,
+        signature: tx.signature,
+        jitoTipAccount: jitoTip?.tipAccount ?? null,
+        jitoTipLamports: jitoTip?.lamports ?? null,
+      });
       // FeeSnip: collect this qualifying wallet, and buy on the FIRST one seen.
       // Collection keeps running (up to 5) so later wallets are watched for
       // their own sell-all exits.

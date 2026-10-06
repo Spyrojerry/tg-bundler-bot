@@ -55,6 +55,8 @@ export interface HeliusTransaction {
       accounts?: string[];
     }>;
   }>;
+  /** Set when the tx pays a Jito tip (destination is a Jito tip account). */
+  jitoTip?: { tipAccount: string; lamports: number } | null;
 }
 
 export interface HeliusBalanceAtResponse {

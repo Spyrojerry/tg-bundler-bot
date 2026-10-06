@@ -49,6 +49,7 @@ import {
   SWAP_PROGRAM_IDS,
   transactionInvolvesWalletSwap,
 } from './wallet-swap-detector';
+import { detectJitoTipInInstructions } from './jito-tip-detector';
 
 const log = createLogger('TX-NORMALIZER');
 
@@ -305,6 +306,7 @@ export function normalizeEnhancedWsTransaction(
     const nativeTransfers = reconstructNativeTransfers(raw, accountKeys);
     const tokenTransfers = reconstructTokenTransfers(raw);
     const accountData = reconstructAccountData(raw, accountKeys);
+    const jitoTip = detectJitoTipInInstructions(instructions);
 
     const hasAnyTransfer =
       (nativeTransfers?.length ?? 0) > 0 || (tokenTransfers?.length ?? 0) > 0;
@@ -324,6 +326,7 @@ export function normalizeEnhancedWsTransaction(
       instructions: instructions
         .filter((ix): ix is ParsedInstructionLike & { programId: string } => Boolean(ix.programId))
         .map((ix) => ({ programId: ix.programId })),
+      jitoTip,
     };
     return tx;
   } catch (err) {
