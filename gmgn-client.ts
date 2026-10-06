@@ -1054,11 +1054,9 @@ export class GmgnClient {
       return null;
     }
 
-    const balanceBefore = await this.getTokenBalance(walletAddress, mint).catch(
-      (err) => {
-        if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) return 0n;
-        throw err;
-      },
+    const balanceBefore = await this.getTokenBalanceOrNull(
+      walletAddress,
+      mint,
     );
 
     let lastError: unknown = null;
@@ -1071,7 +1069,7 @@ export class GmgnClient {
                 mint,
                 options as BuyOptions,
                 venue,
-                balanceBefore,
+                balanceBefore ?? 0n,
                 attempt,
               )
             : await this.sellWithDirectSdk(
@@ -1079,7 +1077,7 @@ export class GmgnClient {
                 mint,
                 options as SellOptions,
                 venue,
-                balanceBefore,
+                balanceBefore ?? 0n,
                 attempt,
               );
         log.info(`Direct Pump SDK ${action} confirmed on attempt ${attempt}`, {
@@ -1091,8 +1089,9 @@ export class GmgnClient {
         return result;
       } catch (err) {
         lastError = err;
-        const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
-          () => balanceBefore,
+        const balanceAfter = await this.getTokenBalanceOrNull(
+          walletAddress,
+          mint,
         );
         if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
           log.warn(
@@ -1104,8 +1103,8 @@ export class GmgnClient {
             mint,
             options,
             venue,
-            balanceBefore,
-            balanceAfter,
+            balanceBefore!,
+            balanceAfter!,
             `direct-sdk-${venue}-balance-recovered`,
             attempt,
             null,
@@ -1118,7 +1117,7 @@ export class GmgnClient {
             mint,
             venue,
             error: this.errorText(err),
-            balanceAfter: balanceAfter.toString(),
+            balanceAfter: balanceAfter?.toString() ?? "unreliable",
           },
         );
         if (attempt < DIRECT_SDK_MAX_ATTEMPTS) {
@@ -1187,12 +1186,7 @@ export class GmgnClient {
       return null;
     }
 
-    const balanceBefore = await this.getTokenBalance(walletAddress, mint).catch(
-      (err) => {
-        if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) return 0n;
-        throw err;
-      },
-    );
+    const balanceBefore = await this.getTokenBalanceOrNull(walletAddress, mint);
 
     let lastSignature: string | null = null;
     let lastState: PumpPortalSignatureState = { status: "unknown", error: null };
@@ -1209,12 +1203,7 @@ export class GmgnClient {
             : `${Math.min(Math.max((options as SellOptions).percent, 0), 100)}%`,
         );
       } catch (submitError) {
-        const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
-          (err) => {
-            if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) return 0n;
-            throw err;
-          },
-        );
+        const balanceAfter = await this.getTokenBalanceOrNull(walletAddress, mint);
         if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
           log.warn(
             `pumpportal ${action} request errored on attempt ${attempt} but wallet balance proves completion`,
@@ -1225,8 +1214,8 @@ export class GmgnClient {
             mint,
             options,
             venue,
-            balanceBefore,
-            balanceAfter,
+            balanceBefore!,
+            balanceAfter!,
             "pumpportal-request-error-balance-recovered",
             attempt,
             null,
@@ -1245,9 +1234,7 @@ export class GmgnClient {
 
       lastState = await this.waitForPumpPortalSignature(lastSignature);
       if (lastState.status === "confirmed") {
-        const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
-          () => balanceBefore,
-        );
+        const balanceAfter = await this.getTokenBalanceOrNull(walletAddress, mint);
         log.info(`pumpportal ${action} confirmed on attempt ${attempt}`, {
           mint,
           signature: lastSignature,
@@ -1257,20 +1244,15 @@ export class GmgnClient {
           mint,
           lastSignature,
           options,
-          balanceBefore,
-          balanceAfter,
+          balanceBefore ?? 0n,
+          balanceAfter ?? balanceBefore ?? 0n,
           venue,
           attempt,
           "signature-confirmed",
         );
       }
 
-      const balanceAfter = await this.getTokenBalance(walletAddress, mint).catch(
-        (err) => {
-          if (action === "buy" && this.isMissingMintTokenAccountLookup(err)) return 0n;
-          throw err;
-        },
-      );
+      const balanceAfter = await this.getTokenBalanceOrNull(walletAddress, mint);
       if (this.balanceProvesCompletion(action, options, balanceBefore, balanceAfter)) {
         log.warn(
           `pumpportal ${action} recovered from wallet balance on attempt ${attempt}`,
@@ -1285,8 +1267,8 @@ export class GmgnClient {
           mint,
           lastSignature,
           options,
-          balanceBefore,
-          balanceAfter,
+          balanceBefore!,
+          balanceAfter!,
           venue,
           attempt,
           "balance-recovered",
@@ -1300,7 +1282,7 @@ export class GmgnClient {
           signature: lastSignature,
           signatureStatus: lastState.status,
           mayhemError: lastState.error,
-          balanceAfter: balanceAfter.toString(),
+          balanceAfter: balanceAfter?.toString() ?? "unreliable",
         },
       );
       if (attempt < PUMPPORTAL_FALLBACK_MAX_ATTEMPTS) {
@@ -1334,9 +1316,13 @@ export class GmgnClient {
   private balanceProvesCompletion(
     action: PumpPortalTradeAction,
     options: BuyOptions | SellOptions,
-    balanceBefore: bigint,
-    balanceAfter: bigint,
+    balanceBefore: bigint | null,
+    balanceAfter: bigint | null,
   ): boolean {
+    // Only a reliable read on BOTH sides can prove a fill. A null (unreliable)
+    // read — e.g. an RPC/program lookup failure that collapsed to 0 — is never
+    // accepted, so a transient zero is never mistaken for "sold everything".
+    if (balanceBefore === null || balanceAfter === null) return false;
     if (action === "buy") return balanceAfter > 0n && balanceAfter > balanceBefore;
     const percent = (options as SellOptions).percent;
     return percent >= 100 ? balanceAfter < balanceBefore : balanceAfter < balanceBefore;
@@ -2802,8 +2788,24 @@ private async sendRawTransactionAndAssertSuccess(
   }
 
   private async getTokenBalance(wallet: string, mint: string): Promise<bigint> {
+    const balance = await this.getTokenBalanceOrNull(wallet, mint);
+    return balance ?? 0n;
+  }
+
+  /**
+   * Reads the wallet's raw token balance, returning null when the read is
+   * unreliable (any RPC/program lookup failed). Callers that treat a balance
+   * DROP as proof a trade executed must use this and reject a null read: a
+   * failed lookup collapses to 0, which is indistinguishable from "sold all"
+   * and must never be accepted as a fill.
+   */
+  private async getTokenBalanceOrNull(
+    wallet: string,
+    mint: string,
+  ): Promise<bigint | null> {
     const pubkey = new PublicKey(wallet);
     let total = 0n;
+    let reliable = true;
 
     for (const programId of TOKEN_PROGRAM_IDS) {
       try {
@@ -2815,7 +2817,12 @@ private async sendRawTransactionAndAssertSuccess(
         });
         total += this.sumParsedTokenAccountsForMint(accounts.value, mint);
       } catch (err) {
-        log.warn("Token balance lookup failed for owner/program; continuing", {
+        // A missing-mint lookup for a brand-new token is expected and means
+        // zero holdings for that program; anything else makes the read
+        // unreliable and must not be reported as a real zero.
+        if (this.isMissingMintTokenAccountLookup(err)) continue;
+        reliable = false;
+        log.warn("Token balance lookup failed for owner/program; read marked unreliable", {
           wallet,
           mint,
           programId: programId.toBase58(),
@@ -2824,7 +2831,7 @@ private async sendRawTransactionAndAssertSuccess(
       }
     }
 
-    return total;
+    return reliable ? total : null;
   }
 
   private sumParsedTokenAccountsForMint(
