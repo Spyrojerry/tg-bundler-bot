@@ -2984,6 +2984,10 @@ async function main(): Promise<void> {
       typeof result.raw?.verification === "string"
         ? result.raw.verification
         : "";
+    // Terminal flat states: the wallet reported nothing left to sell. This is
+    // NOT proof the position is closed — a zero/sparse balance read can be
+    // transient or stale — so it is not treated as a confirmed sell. The caller
+    // decides how to reconcile.
     if (
       verification === "already-sold" ||
       verification === "lightning-error-balance-zero" ||
@@ -3087,7 +3091,7 @@ async function main(): Promise<void> {
 
         if (startingBalance !== null && startingBalance <= 0n) {
           log.warn(
-            `[SELL RETRY] Zero balance read for ${mint} on attempt ${attempt}; continuing until PumpPortal sell is confirmed`,
+            `[SELL RETRY] Zero balance read for ${mint} on attempt ${attempt}; continuing until sell is confirmed`,
           );
         } else {
           log.info(
