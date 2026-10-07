@@ -2174,15 +2174,16 @@ async function main(): Promise<void> {
               ? ((currentMc - bot.getEntryMc()) / bot.getEntryMc()) * 100
               : 0;
           // P&L bands at the exit-MC trigger:
-          //  - P&L >= 0  → 1-second MC confirmation, then sell if MC holds.
-          //  - -30% <= P&L < 0 → hold; never sell here, wait for P&L positive.
+          //  - P&L >= +5% → 2-second MC confirmation, then sell if MC holds.
+          //  - -30% <= P&L < +5% → hold; never sell here, wait for P&L to reach +5%.
           //  - P&L < -30% → sell normally (no confirmation gate).
           const HOLD_PNL_FLOOR_PCT = -30;
-          if (pnlPct >= 0 && !positiveExitConfirmation) {
+          const HOLD_PNL_TARGET_PCT = 5;
+          if (pnlPct >= HOLD_PNL_TARGET_PCT && !positiveExitConfirmation) {
             if (positiveMcExitConfirmations.has(index)) return;
             positiveMcExitConfirmations.add(index);
             log.info(
-              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% ≥ 0 target reached; waiting 2 seconds for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+              `[INSIDER ${botNumber} MC EXIT CONFIRM] PnL ${pnlPct.toFixed(2)}% ≥ ${HOLD_PNL_TARGET_PCT}% target reached; waiting 2 seconds for confirmation. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
             );
             setTimeout(() => {
               positiveMcExitConfirmations.delete(index);
@@ -2195,9 +2196,12 @@ async function main(): Promise<void> {
             }, 2_000);
             return;
           }
-          if (pnlPct >= HOLD_PNL_FLOOR_PCT && pnlPct < 0) {
+          if (
+            pnlPct >= HOLD_PNL_FLOOR_PCT &&
+            pnlPct < HOLD_PNL_TARGET_PCT
+          ) {
             log.info(
-              `[INSIDER ${botNumber} MC EXIT HOLD] PnL ${pnlPct.toFixed(2)}% is between ${HOLD_PNL_FLOOR_PCT}% and 0% — holding until P&L turns positive. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
+              `[INSIDER ${botNumber} MC EXIT HOLD] PnL ${pnlPct.toFixed(2)}% is between ${HOLD_PNL_FLOOR_PCT}% and ${HOLD_PNL_TARGET_PCT}% — holding until P&L reaches +${HOLD_PNL_TARGET_PCT}%. Current MC $${currentMc.toLocaleString()}, target $${exitMc.toLocaleString()}.`,
             );
             return;
           }
