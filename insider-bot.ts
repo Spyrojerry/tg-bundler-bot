@@ -6539,19 +6539,9 @@ export class InsiderBot extends EventEmitter {
     ) {
       return;
     }
-    // Sniper: buy on ANY token activity — any tx on this mint by any wallet,
-    // before any FeeSnip qualifying-wallet filtering. Sells also count as
-    // activity for the buy trigger (they are a different wallet's action).
-    if (
-      this.sniperMode &&
-      !this.sniperActivitySeen &&
-      !this.buySubmitted &&
-      !this.isBuyExecuting &&
-      !this.activePosition
-    ) {
-      const activityWallet = this.firstActivityWallet(tx, mint);
-      this.markSniperActivity(tx, activityWallet ?? undefined);
-    }
+    // Sniper buy-on-activity is scoped to the two qualifying wallet sets only —
+    // a >$500 ref-fee buy or a Jito-tipped $0–$2 buy — and fires from those
+    // paths below (markSniperActivity). A plain tx on the mint does NOT buy.
     const feeLamports = tx.fee;
     if (feeLamports === undefined) return;
     const solPriceUsd = await this.getCachedSolPriceUsd();
@@ -16892,30 +16882,6 @@ export class InsiderBot extends EventEmitter {
       });
       return null;
     }
-  }
-
-  /**
-   * Sniper: the first wallet touched by activity on `mint` in this tx, used only
-   * as a label for the buy-on-activity trigger. Returns null when no wallet can
-   * be identified (the buy still fires with a synthetic trigger wallet).
-   */
-  private firstActivityWallet(
-    tx: HeliusTransaction,
-    mint: string,
-  ): string | null {
-    for (const transfer of tx.tokenTransfers ?? []) {
-      if (transfer.mint !== mint) continue;
-      if (transfer.toUserAccount && transfer.toUserAccount !== "__pool__") {
-        return transfer.toUserAccount;
-      }
-      if (
-        transfer.fromUserAccount &&
-        transfer.fromUserAccount !== "__pool__"
-      ) {
-        return transfer.fromUserAccount;
-      }
-    }
-    return null;
   }
 
   private extractTokenAmountForWallet(
