@@ -184,6 +184,14 @@ const SNIPER_NO_ACTIVITY_SELL_MS = 2 * 60 * 1_000;
 /** Sniper: cadence for re-checking MC while waiting to clear the buy minimum. */
 const SNIPER_BUY_RECHECK_MS = 1_500;
 /**
+ * Sniper sell P&L hold: when a sniper sell is about to fire and P&L by MC is in
+ * [HOLD_PNL_FLOOR_PCT, 0), hold instead of selling and re-check, waiting for P&L
+ * to turn positive. Mirrors the exit-MC hold band in the MC monitor.
+ */
+const SNIPER_HOLD_PNL_FLOOR_PCT = -20;
+/** Sniper: cadence for re-checking P&L while holding a sniper sell. */
+const SNIPER_PNL_HOLD_RECHECK_MS = 3_000;
+/**
  * The only fee that qualifies a wallet exit on the normal route: an exact tx fee
  * of 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
  * the lamport count must match exactly.
@@ -5177,23 +5185,22 @@ export class InsiderBot extends EventEmitter {
     ) {
       return;
     }
-    this.sniperTimeoutSellTriggered = true;
     this.log.warn(
-      "Sniper: no qualifying snip wallet within 2 minutes — selling position",
+      "Sniper: no qualifying snip wallet within 2 minutes — evaluating sell",
       { mint, windowMs: SNIPER_NO_ACTIVITY_SELL_MS },
     );
-    await this.triggerPositionSell(
+    await this.attemptSniperSell({
       mint,
-      "sniper no-activity timeout (2 minutes)",
-      [
+      reason: "sniper no-activity timeout (2 minutes)",
+      telegramLines: [
         `<b>⏱️ ${this.label} Sniper — No Activity, Selling</b>`,
         `Token: <code>${mint}</code>`,
         `No qualifying snip wallet (≥ $${FEE_SNIP_REF_BUY_MIN_USD} or $0–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD} Jito-tipped) appeared within <b>2 minutes</b> of the fill.`,
         "Exiting the sniper position.",
       ],
-      `SNIPER_NO_ACTIVITY:${mint}`,
-      { allowWhenFeePayerOnly: true },
-    );
+      signature: `SNIPER_NO_ACTIVITY:${mint}`,
+      retry: () => this.runSniperNoActivitySell(mint),
+    });
   }
 
   /**
@@ -5210,22 +5217,109 @@ export class InsiderBot extends EventEmitter {
     }
     const mint = this.activePosition?.mint ?? null;
     this.log.warn(
-      "Sniper: qualifying snip wallet activity seen — selling into the buy",
+      "Sniper: qualifying snip wallet activity seen — evaluating sell into the buy",
       { mint },
     );
     if (!mint || this.positionSellTriggered || this.phase !== "holding") {
       return;
     }
-    this.sniperTimeoutSellTriggered = true;
-    void this.triggerPositionSell(
+    void this.attemptSniperSell({
       mint,
-      "sniper activity buy (qualifying snip wallet appeared)",
-      [
+      reason: "sniper activity buy (qualifying snip wallet appeared)",
+      telegramLines: [
         `<b>🚨 ${this.label} Sniper — Activity Detected, Selling</b>`,
         `Token: <code>${mint}</code>`,
         "A qualifying snip wallet appeared (activity is a buy) — exiting the sniper position.",
       ],
-      `SNIPER_ACTIVITY_BUY:${mint}`,
+      signature: `SNIPER_ACTIVITY_BUY:${mint}`,
+      retry: () => this.markSniperActivityRetry(mint),
+    });
+  }
+
+  private markSniperActivityRetry(mint: string): void {
+    if (
+      !this.sniperMode ||
+      !this.activePosition ||
+      this.activePosition.mint !== mint ||
+      this.positionSellTriggered ||
+      this.phase !== "holding"
+    ) {
+      return;
+    }
+    void this.attemptSniperSell({
+      mint,
+      reason: "sniper activity buy (qualifying snip wallet appeared)",
+      telegramLines: [
+        `<b>🚨 ${this.label} Sniper — Activity Detected, Selling</b>`,
+        `Token: <code>${mint}</code>`,
+        "A qualifying snip wallet appeared (activity is a buy) — exiting the sniper position.",
+      ],
+      signature: `SNIPER_ACTIVITY_BUY:${mint}`,
+      retry: () => this.markSniperActivityRetry(mint),
+    });
+  }
+
+  /**
+   * Sniper sell gate shared by both sniper exits. Applies the same
+   * hold-to-positive-P&L rule as the MC-monitor exit: when P&L by MC is in
+   * [SNIPER_HOLD_PNL_FLOOR_PCT, 0), hold instead of selling and re-check, so the
+   * sniper sell waits for P&L to turn positive. Sells when P&L ≥ 0 or below the
+   * floor (or when the entry MC is unknown).
+   */
+  private async attemptSniperSell(args: {
+    mint: string;
+    reason: string;
+    telegramLines: string[];
+    signature: string;
+    retry: () => void;
+  }): Promise<void> {
+    const { mint, reason, telegramLines, signature, retry } = args;
+    if (
+      !this.sniperMode ||
+      !this.activePosition ||
+      this.activePosition.mint !== mint ||
+      this.positionSellTriggered ||
+      this.phase !== "holding"
+    ) {
+      return;
+    }
+    const entryMc = this.getEntryMc();
+    if (entryMc > 0) {
+      const currentMc = await this.gmgnClient
+        .fetchTokenMarketCapUsd(mint)
+        .catch(() => null);
+      if (currentMc !== null) {
+        const pnlPct = ((currentMc - entryMc) / entryMc) * 100;
+        if (pnlPct >= SNIPER_HOLD_PNL_FLOOR_PCT && pnlPct < 0) {
+          this.log.info(
+            "Sniper sell held — P&L between floor and 0; waiting for positive P&L",
+            {
+              mint,
+              reason,
+              pnlPct,
+              currentMc,
+              entryMc,
+              holdFloorPct: SNIPER_HOLD_PNL_FLOOR_PCT,
+              retryMs: SNIPER_PNL_HOLD_RECHECK_MS,
+            },
+          );
+          if (this.sniperSellTimer !== null) {
+            clearTimeout(this.sniperSellTimer);
+          }
+          this.sniperSellTimer = setTimeout(() => {
+            this.sniperSellTimer = null;
+            retry();
+          }, SNIPER_PNL_HOLD_RECHECK_MS);
+          return;
+        }
+      }
+    }
+    this.sniperTimeoutSellTriggered = true;
+    await this.triggerPositionSell(
+      mint,
+      reason,
+      telegramLines,
+      signature,
       { allowWhenFeePayerOnly: true },
     );
   }
