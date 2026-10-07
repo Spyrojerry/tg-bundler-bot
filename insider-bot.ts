@@ -6788,6 +6788,32 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
+      // Sniper: buy on the FIRST buy that is either >$500 or in the $0–$2 band,
+      // regardless of the FeeSnip fee-tolerance/Jito-tip gates below. Those gates
+      // only decide whether we WATCH the wallet; sniper's trigger is the buy size
+      // itself. markSniperActivity is a no-op outside sniper mode.
+      if (this.sniperMode && this.classifyTx(tx, wallet, mint) === "buy") {
+        const sniperBuySol = this.estimateEarlyBuySol(tx, wallet);
+        if (sniperBuySol !== null) {
+          const sniperBuyUsd = sniperBuySol * solPriceUsd;
+          const isBigBuy = sniperBuyUsd >= FEE_SNIP_REF_BUY_MIN_USD;
+          const isSmallBuy =
+            sniperBuyUsd >= NORMAL_ROUTE_OBSERVER_MIN_BUY_USD &&
+            sniperBuyUsd <= NORMAL_ROUTE_OBSERVER_MAX_BUY_USD;
+          if (isBigBuy || isSmallBuy) {
+            this.log.warn(
+              "Sniper: qualifying buy activity seen — buying on activity",
+              {
+                mint,
+                wallet,
+                buyUsd: sniperBuyUsd,
+                reason: isBigBuy ? ">=$500 buy" : "$0–$2 buy",
+              },
+            );
+            this.markSniperActivity(tx, wallet);
+          }
+        }
+      }
       // FeeSnip: hard cap — stop searching the moment 5 qualifying wallets
       // (buy $0–$2 with tx fee above $0.1) have been collected; the buy happens
       // FeeSnip: stop searching for more wallets once 5 have been collected.
