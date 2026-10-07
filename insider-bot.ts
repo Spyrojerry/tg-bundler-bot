@@ -180,7 +180,7 @@ const FEE_SNIP_MIN_BUY_MC_USD = 40_000;
  * Sniper mode: once the token watch goes live, if NO token activity happens
  * within this window, skip the token and reset the flow (2 minutes).
  */
-const SNIPER_NO_ACTIVITY_SELL_MS = 2 * 60 * 1_000;
+const SNIPER_NO_ACTIVITY_SELL_MS = 1.7 * 60 * 1_000;
 /**
  * The only fee that qualifies a wallet exit on the normal route: an exact tx fee
  * of 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
