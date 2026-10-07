@@ -194,6 +194,15 @@ const NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT = 40;
 // MC is still below this cap. The watched wallets are the >$500 ref-fee set and
 // the Jito-tipped $0–$2 set.
 const SNIPER_WATCHED_SELL_MAX_MC_USD = 150_000;
+/**
+ * Sniper watched-wallet sell P&L hold: when the sell is about to fire and P&L by
+ * MC is in [SNIPER_HOLD_PNL_FLOOR_PCT, 0), hold instead of selling and re-check,
+ * waiting for P&L to turn positive. Mirrors the exit-MC hold band in the MC
+ * monitor (index.ts). P&L ≥ 0 or below the floor sells normally.
+ */
+const SNIPER_HOLD_PNL_FLOOR_PCT = -20;
+/** Sniper: cadence for re-checking P&L while holding a watched-wallet sell. */
+const SNIPER_PNL_HOLD_RECHECK_MS = 3_000;
 /** FeeSnip: a sell within this window after a wallet's first buy disqualifies it. */
 const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
 /**
@@ -1186,6 +1195,12 @@ export class InsiderBot extends EventEmitter {
   private sniperTimeoutSellTriggered = false;
   /** Sniper: true once any token activity has been seen (buy enqueued). */
   private sniperActivitySeen = false;
+  /**
+   * Sniper: retry timer for a watched-wallet sell that is being held while P&L
+   * is between the hold floor and 0. Re-checks until P&L turns positive.
+   */
+  private sniperWatchedSellHoldTimer: ReturnType<typeof setTimeout> | null =
+    null;
 
   constructor(
     config: ServiceConfig,
@@ -1681,6 +1696,10 @@ export class InsiderBot extends EventEmitter {
     if (this.sniperBuyDelayTimer !== null) {
       clearTimeout(this.sniperBuyDelayTimer);
       this.sniperBuyDelayTimer = null;
+    }
+    if (this.sniperWatchedSellHoldTimer !== null) {
+      clearTimeout(this.sniperWatchedSellHoldTimer);
+      this.sniperWatchedSellHoldTimer = null;
     }
   }
 
@@ -5228,6 +5247,11 @@ export class InsiderBot extends EventEmitter {
    * $0–$2 set. Only fires while MC is below SNIPER_WATCHED_SELL_MAX_MC_USD; a
    * wallet's sell above the cap is ignored. Outside sniper mode this is a
    * no-op. Buys never trigger a sniper sell.
+   *
+   * Hold-to-positive-P&L: when P&L by MC is in [SNIPER_HOLD_PNL_FLOOR_PCT, 0),
+   * hold instead of selling and re-check every SNIPER_PNL_HOLD_RECHECK_MS, so
+   * the exit waits for P&L to turn positive (same bands as the MC-monitor exit).
+   * P&L ≥ 0 or below the floor sells normally.
    */
   private maybeSniperWatchedWalletSell(): void {
     if (!this.sniperMode) return;
@@ -5238,7 +5262,12 @@ export class InsiderBot extends EventEmitter {
     ) {
       return;
     }
+    if (this.sniperWatchedSellHoldTimer !== null) {
+      clearTimeout(this.sniperWatchedSellHoldTimer);
+      this.sniperWatchedSellHoldTimer = null;
+    }
     const mint = this.activePosition.mint;
+    const entryMc = this.getEntryMc();
     void this.gmgnClient
       .fetchTokenMarketCapUsd(mint)
       .catch(() => null)
@@ -5262,9 +5291,41 @@ export class InsiderBot extends EventEmitter {
           );
           return;
         }
+        // Hold-to-positive-P&L band. Only when the entry MC is known; an unknown
+        // entry MC sells as before.
+        if (entryMc > 0) {
+          const pnlPct = ((currentMc - entryMc) / entryMc) * 100;
+          if (pnlPct >= SNIPER_HOLD_PNL_FLOOR_PCT && pnlPct < 0) {
+            this.log.info(
+              "Sniper watched-wallet sell held — P&L between floor and 0; waiting for positive P&L",
+              {
+                mint,
+                pnlPct,
+                currentMc,
+                entryMc,
+                holdFloorPct: SNIPER_HOLD_PNL_FLOOR_PCT,
+                retryMs: SNIPER_PNL_HOLD_RECHECK_MS,
+              },
+            );
+            void this.sendTelegramSafe(
+              [
+                `<b>⏳ ${this.label} Sniper — Sell Held</b>`,
+                `Token: <code>${mint}</code>`,
+                `A watched wallet sold, but P&L <b>${pnlPct.toFixed(2)}%</b> is between ${SNIPER_HOLD_PNL_FLOOR_PCT}% and 0% — holding until P&L turns positive.`,
+              ].join("\n"),
+              "sniper watched-wallet sell held",
+            );
+            this.sniperWatchedSellHoldTimer = setTimeout(() => {
+              this.sniperWatchedSellHoldTimer = null;
+              if (!this.sniperMode) return;
+              this.maybeSniperWatchedWalletSell();
+            }, SNIPER_PNL_HOLD_RECHECK_MS);
+            return;
+          }
+        }
         this.log.warn(
           "Sniper: watched wallet sold — exiting sniper position",
-          { mint, currentMc },
+          { mint, currentMc, entryMc, pnlPct: entryMc > 0 ? ((currentMc - entryMc) / entryMc) * 100 : null },
         );
         void this.sendTelegramSafe(
           [
@@ -7255,6 +7316,10 @@ export class InsiderBot extends EventEmitter {
     if (this.sniperBuyDelayTimer !== null) {
       clearTimeout(this.sniperBuyDelayTimer);
       this.sniperBuyDelayTimer = null;
+    }
+    if (this.sniperWatchedSellHoldTimer !== null) {
+      clearTimeout(this.sniperWatchedSellHoldTimer);
+      this.sniperWatchedSellHoldTimer = null;
     }
   }
 
