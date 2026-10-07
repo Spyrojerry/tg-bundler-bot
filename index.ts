@@ -2160,6 +2160,12 @@ async function main(): Promise<void> {
       }
 
       if (activePos) {
+        // In-position hard reset: MC at/below $35k force-sells regardless of the
+        // exit target or the P&L hold bands. Runs before the profit-exit-enabled
+        // guard so it fires even when the profit exit is disabled.
+        if (await bot.tryTriggerStopLossSell(currentMc)) {
+          return;
+        }
         const exitMc = bot.getExitMc();
         if (bot.isProfitExitDisabled()) {
           log.info(

@@ -34,6 +34,12 @@ const INSIDER_RUG_MARKET_CAP_USD = 5_000;
 const FOLLOW_TOKEN_MIN_BUY_MARKET_CAP_USD = 40_000;
 /** Live rug reset/sell when MC drops below this during pre-buy or in-position monitoring. */
 const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
+/**
+ * In-position hard reset: once we have bought, if the token's MC reaches this or
+ * below, force-sell immediately regardless of the exit target or the P&L hold
+ * bands. Replaces the old -80% P&L hard floor.
+ */
+const INSIDER_HOLD_HARD_RESET_MC_USD = 30_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
 const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
@@ -181,6 +187,12 @@ const FEE_SNIP_MIN_BUY_MC_USD = 40_000;
  * within this window, skip the token and reset the flow (2 minutes).
  */
 const SNIPER_NO_ACTIVITY_SELL_MS = 1.7 * 60 * 1_000;
+/**
+ * Sniper mode: after our buy, if no token activity happens in addition to the
+ * one that triggered the buy by this long after the token-start 10s delay
+ * (i.e. tokenStart + 10s + this), sell, skip and reset the flow (4 minutes).
+ */
+const SNIPER_POST_BUY_NO_ACTIVITY_MS = 3.2 * 60 * 1_000;
 /**
  * The only fee that qualifies a wallet exit on the normal route: an exact tx fee
  * of 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
@@ -1204,6 +1216,13 @@ export class InsiderBot extends EventEmitter {
    */
   private sniperWatchedSellHoldTimer: ReturnType<typeof setTimeout> | null =
     null;
+  /**
+   * Sniper: post-buy no-activity timer. After our buy, if no further token
+   * activity happens in the 4-minute window from the post-10s watch start, sell,
+   * skip and reset.
+   */
+  private sniperPostBuyNoActivityTimer: ReturnType<typeof setTimeout> | null =
+    null;
 
   constructor(
     config: ServiceConfig,
@@ -1489,8 +1508,49 @@ export class InsiderBot extends EventEmitter {
     return 0;
   }
 
-  async tryTriggerStopLossSell(_currentMc: number): Promise<boolean> {
-    return false;
+  /**
+   * In-position hard reset: once we have bought, if the token's MC reaches
+   * INSIDER_HOLD_HARD_RESET_MC_USD ($35k) or below, force-sell immediately,
+   * bypassing the exit target and the P&L hold bands. Returns true when it
+   * triggered a sell (so the caller stops evaluating other exits this tick).
+   * Never acts before the buy.
+   */
+  async tryTriggerStopLossSell(currentMc: number): Promise<boolean> {
+    if (!this.activePosition) return false;
+    if (this.positionSellTriggered) return false;
+    if (this.phase !== "holding") return false;
+    if (currentMc > INSIDER_HOLD_HARD_RESET_MC_USD) return false;
+    const mint = this.activePosition.mint;
+    const entryMc = this.getEntryMc();
+    const pnlPct =
+      entryMc > 0 ? ((currentMc - entryMc) / entryMc) * 100 : null;
+    this.log.warn(
+      "In-position hard reset — MC at/below floor; force-selling regardless of target",
+      {
+        mint,
+        currentMc,
+        hardResetMcUsd: INSIDER_HOLD_HARD_RESET_MC_USD,
+        entryMc,
+        pnlPct,
+      },
+    );
+    await this.triggerPositionSell(
+      mint,
+      `MC $${currentMc.toLocaleString()} at/below $${INSIDER_HOLD_HARD_RESET_MC_USD.toLocaleString()} hard reset floor`,
+      [
+        `<b>🛑 ${this.label} Hard Reset — Selling ASAP</b>`,
+        `Token: <code>${mint}</code>`,
+        `Current MC: <b>$${currentMc.toLocaleString()}</b>`,
+        `Hard reset floor: <b>$${INSIDER_HOLD_HARD_RESET_MC_USD.toLocaleString()}</b>`,
+        pnlPct !== null
+          ? `P&L: <b>${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%</b>`
+          : "",
+        "MC reached the hard reset floor after our buy — exiting.",
+      ].filter(Boolean),
+      "MC_HARD_RESET",
+      { allowWhenFeePayerOnly: true },
+    );
+    return true;
   }
 
   async tryTriggerRugMarketCapReset(currentMc: number): Promise<boolean> {
@@ -1662,9 +1722,10 @@ export class InsiderBot extends EventEmitter {
    * Toggles sniper mode. When ON, the normal FeeSnip observer buy path is
    * paused and the bot instead buys on the first token activity after the 10s
    * delay (MC ≥ $40k on execution); if NO activity happens within 2 minutes the
-   * token is skipped and reset. Exits are the +40% MC take-profit or a watched
-   * wallet selling below the sniper MC cap. When OFF, the normal FeeSnip flow
-   * runs unchanged.
+   * token is skipped and reset. Exits are the +40% MC take-profit, a watched
+   * wallet selling below the sniper MC cap, a post-buy 4-minute no-activity
+   * sell+reset, or the MC hard reset at/below $35k. When OFF, the normal FeeSnip
+   * flow runs unchanged.
    */
   setSniperMode(value: boolean): void {
     if (this.sniperMode === value) return;
@@ -1689,7 +1750,9 @@ export class InsiderBot extends EventEmitter {
         `Buys on the first token activity after the 10s delay if MC ≥ <b>$${FEE_SNIP_MIN_BUY_MC_USD.toLocaleString()}</b>.`,
         "Normal FeeSnip observer buy path is paused while sniper mode is on.",
         `If no token activity occurs within <b>${(SNIPER_NO_ACTIVITY_SELL_MS / 60_000).toFixed(0)} minutes</b> of the watch going live, the token is skipped and reset.`,
+        `After the buy, if no further activity occurs within <b>${(SNIPER_POST_BUY_NO_ACTIVITY_MS / 60_000).toFixed(0)} minutes</b> of the post-10s window, the position is sold, skipped and reset.`,
         `Exit: +${NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT}% MC take-profit, or a watched wallet selling below $${SNIPER_WATCHED_SELL_MAX_MC_USD.toLocaleString()} MC.`,
+        `Hard reset: MC at/below $${INSIDER_HOLD_HARD_RESET_MC_USD.toLocaleString()} after buy.`,
       ].join("\n"),
       "sniper mode on",
     );
@@ -1704,6 +1767,7 @@ export class InsiderBot extends EventEmitter {
       clearTimeout(this.sniperWatchedSellHoldTimer);
       this.sniperWatchedSellHoldTimer = null;
     }
+    this.cancelSniperPostBuyNoActivity();
   }
 
   getFollowedWallet() {
@@ -5160,8 +5224,82 @@ export class InsiderBot extends EventEmitter {
     }
 
     // Sniper mode: the sell side is the +40% MC take-profit (armed at buy) plus
-    // a watched-wallet sell. There is no post-buy timer.
+    // a watched-wallet sell, plus a 4-minute post-buy no-activity timer.
+    if (this.sniperMode) {
+      this.armSniperPostBuyNoActivity(trigger.mint);
+    }
     void this.executeFollowTokenEarlyBundlerPostBuyExitPlan();
+  }
+
+  /**
+   * Sniper: after our buy, arm a no-activity window ending at
+   * tokenStart + 10s + SNIPER_POST_BUY_NO_ACTIVITY_MS. If no further token
+   * activity happens by then, sell, skip and reset. Any further activity
+   * cancels the window.
+   */
+  private armSniperPostBuyNoActivity(mint: string): void {
+    if (!this.sniperMode) return;
+    if (this.sniperPostBuyNoActivityTimer !== null) {
+      clearTimeout(this.sniperPostBuyNoActivityTimer);
+      this.sniperPostBuyNoActivityTimer = null;
+    }
+    const tokenStartSec = this.normalRouteObserverTokenStartedAtSec;
+    const deadlineMs =
+      tokenStartSec !== null && tokenStartSec > 0
+        ? tokenStartSec * 1_000 + FEE_SNIP_START_DELAY_MS + SNIPER_POST_BUY_NO_ACTIVITY_MS
+        : Date.now() + SNIPER_POST_BUY_NO_ACTIVITY_MS;
+    const delayMs = Math.max(0, deadlineMs - Date.now());
+    this.log.warn("Sniper: arming post-buy no-activity sell/reset", {
+      mint,
+      windowMs: delayMs,
+      tokenStartSec,
+    });
+    this.sniperPostBuyNoActivityTimer = setTimeout(() => {
+      this.sniperPostBuyNoActivityTimer = null;
+      void this.runSniperPostBuyNoActivity(mint);
+    }, delayMs);
+  }
+
+  private async runSniperPostBuyNoActivity(mint: string): Promise<void> {
+    if (!this.sniperMode) return;
+    if (
+      !this.activePosition ||
+      this.activePosition.mint !== mint ||
+      this.positionSellTriggered ||
+      this.phase !== "holding"
+    ) {
+      return;
+    }
+    this.log.warn(
+      "Sniper: no further token activity within 4 minutes of the post-10s window — selling, skipping and resetting",
+      { mint, windowMs: SNIPER_POST_BUY_NO_ACTIVITY_MS },
+    );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏱️ ${this.label} Sniper — No Further Activity, Selling & Resetting</b>`,
+        `Token: <code>${mint}</code>`,
+        "No token activity beyond the buy trigger within <b>4 minutes</b> of the post-10s window — selling and resetting.",
+      ].join("\n"),
+      "sniper post-buy no-activity",
+    );
+    await this.triggerPositionSell(
+      mint,
+      "sniper post-buy no-activity (4 minutes)",
+      [],
+      `SNIPER_POST_BUY_NO_ACTIVITY:${mint}`,
+      { allowWhenFeePayerOnly: true },
+    );
+    await this.resetForNewToken(true, {
+      reason: "sniper_post_buy_no_activity_4m",
+    });
+  }
+
+  /** Cancels the sniper post-buy no-activity window when further activity is seen. */
+  private cancelSniperPostBuyNoActivity(): void {
+    if (this.sniperPostBuyNoActivityTimer !== null) {
+      clearTimeout(this.sniperPostBuyNoActivityTimer);
+      this.sniperPostBuyNoActivityTimer = null;
+    }
   }
 
   /**
@@ -6541,7 +6679,8 @@ export class InsiderBot extends EventEmitter {
     }
     // Sniper buy-on-activity is scoped to the two qualifying wallet sets only —
     // a >$500 ref-fee buy or a Jito-tipped $0–$2 buy — and fires from those
-    // paths below (markSniperActivity). A plain tx on the mint does NOT buy.
+    // paths below (markSniperActivity). A plain tx on the mint does NOT buy, and
+    // does NOT count as further activity for the post-buy no-activity window.
     const feeLamports = tx.fee;
     if (feeLamports === undefined) return;
     const solPriceUsd = await this.getCachedSolPriceUsd();
@@ -6621,6 +6760,15 @@ export class InsiderBot extends EventEmitter {
         if (refBuySol === null) continue;
         const refBuyUsd = refBuySol * solPriceUsd;
         if (refBuyUsd < FEE_SNIP_REF_BUY_MIN_USD) continue;
+        // Sniper: a qualifying >$500 ref-fee buy is further activity beyond the
+        // buy trigger — cancel the post-buy no-activity window.
+        if (
+          this.sniperMode &&
+          this.activePosition &&
+          this.activePosition.mint === mint
+        ) {
+          this.cancelSniperPostBuyNoActivity();
+        }
         this.trackFeeSnipReferenceFeeWallet(
           mint,
           wallet,
@@ -6697,6 +6845,15 @@ export class InsiderBot extends EventEmitter {
       });
       // Sniper: a qualifying Jito-tipped $0–$2 wallet is activity → buy on it.
       this.markSniperActivity(tx, wallet);
+      // Sniper: a qualifying Jito-tipped buy is further activity beyond the buy
+      // trigger — cancel the post-buy no-activity window.
+      if (
+        this.sniperMode &&
+        this.activePosition &&
+        this.activePosition.mint === mint
+      ) {
+        this.cancelSniperPostBuyNoActivity();
+      }
       // FeeSnip: collect this qualifying wallet, and buy on the FIRST one seen.
       // Collection keeps running (up to 5) so later wallets are watched for
       // their own sell-all exits.
@@ -7368,6 +7525,7 @@ export class InsiderBot extends EventEmitter {
       clearTimeout(this.sniperWatchedSellHoldTimer);
       this.sniperWatchedSellHoldTimer = null;
     }
+    this.cancelSniperPostBuyNoActivity();
   }
 
   private startNewTokenBuyClusterLogger(mint: string): void {
