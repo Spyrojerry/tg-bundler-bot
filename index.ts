@@ -1118,6 +1118,12 @@ async function main(): Promise<void> {
           bot.setBuyDisabled(!bot.isBuyDisabled());
           return homeReply(true);
         }
+        if (data === "insider:togglesniper") {
+          activeInsiderIndex = 0;
+          const bot = insiderBots[0];
+          bot.setSniperMode(!bot.isSniperMode());
+          return homeReply(true);
+        }
         if (data === "insider:stop") {
           activeInsiderIndex = 0;
           await insiderBots[0].stop();
@@ -2700,6 +2706,12 @@ async function main(): Promise<void> {
       callback_data: "insider:togglebuy",
     };
 
+    const sniperOn = bot.isSniperMode();
+    const sniperButton = {
+      text: sniperOn ? "🎯 Sniper Mode: ON" : "🎯 Sniper Mode: OFF",
+      callback_data: "insider:togglesniper",
+    };
+
     const monitoredWallet = bot.getMonitoredWallet();
     const funderAddress = funderFirstOrchestrator.getFunderAddress();
     const followTokenRunning = followTokenOrchestrator.isRunning();
@@ -2761,6 +2773,7 @@ async function main(): Promise<void> {
         `16M Fallback Buy SOL: <b>${html(String(bot.getFollowToken16mPostLiBuySol()))}</b>`,
         `Exit Strategy: <b>+${html(String(bot.getExitPercent()))}% Current MC from Entry</b>`,
         `Auto Buy: <b>${buyDisabled ? "Disabled ❌" : "Enabled ✅"}</b>`,
+        `Sniper Mode: <b>${sniperOn ? "ON 🎯" : "OFF"}</b>${sniperOn ? " (normal FeeSnip buy paused)" : ""}`,
         "",
         "<b>Flows (run in parallel)</b>",
         "<b>A) Follow-wallet</b> — backtrack feePayer from a followed wallet buy.",
@@ -2808,6 +2821,7 @@ async function main(): Promise<void> {
             { text: "Set Exit %", callback_data: "insider:exitpercent" },
           ],
           [disableBuyButton],
+          [sniperButton],
           [
             { text: "Status", callback_data: "menu:status" },
             { text: "Refresh", callback_data: "menu:refresh" },
