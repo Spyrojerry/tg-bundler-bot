@@ -177,20 +177,10 @@ const NORMAL_ROUTE_OBSERVER_MAX_FEE_SOL = 0.001005;
 /** FeeSnip: if the market cap at buy time is below this, skip the token and reset. */
 const FEE_SNIP_MIN_BUY_MC_USD = 40_000;
 /**
- * Sniper mode: after our buy fills, if no qualifying snip wallet appears within
- * this window, sell the position (2 minutes).
+ * Sniper mode: once the token watch goes live, if NO token activity happens
+ * within this window, skip the token and reset the flow (2 minutes).
  */
 const SNIPER_NO_ACTIVITY_SELL_MS = 2 * 60 * 1_000;
-/** Sniper: cadence for re-checking MC while waiting to clear the buy minimum. */
-const SNIPER_BUY_RECHECK_MS = 1_500;
-/**
- * Sniper sell P&L hold: when a sniper sell is about to fire and P&L by MC is in
- * [HOLD_PNL_FLOOR_PCT, 0), hold instead of selling and re-check, waiting for P&L
- * to turn positive. Mirrors the exit-MC hold band in the MC monitor.
- */
-const SNIPER_HOLD_PNL_FLOOR_PCT = -20;
-/** Sniper: cadence for re-checking P&L while holding a sniper sell. */
-const SNIPER_PNL_HOLD_RECHECK_MS = 3_000;
 /**
  * The only fee that qualifies a wallet exit on the normal route: an exact tx fee
  * of 5,000 lamports (the "$0 fee" insider wallet signature). No tolerance band —
@@ -198,7 +188,12 @@ const SNIPER_PNL_HOLD_RECHECK_MS = 3_000;
  */
 const NORMAL_ROUTE_OBSERVER_EXACT_FEE_LAMPORTS = 5_000;
 /** FeeSnip: fallback take-profit (%) when no 5,000-lamport sell fee is seen. */
-const NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT = 80;
+const NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT = 40;
+
+// Sniper mode: a watched wallet's sell triggers our exit only while the token's
+// MC is still below this cap. The watched wallets are the >$500 ref-fee set and
+// the Jito-tipped $0–$2 set.
+const SNIPER_WATCHED_SELL_MAX_MC_USD = 150_000;
 /** FeeSnip: a sell within this window after a wallet's first buy disqualifies it. */
 const NORMAL_ROUTE_OBSERVER_RECENT_SELL_WINDOW_MS = 4 * 60 * 1_000;
 /**
@@ -1180,18 +1175,17 @@ export class InsiderBot extends EventEmitter {
    * wallet. While this is on, the normal FeeSnip observer buy path is paused.
    */
   private sniperMode = false;
-  /** Sniper: timer that buys once the 10s post-start delay elapses. */
-  private sniperBuyDelayTimer: ReturnType<typeof setTimeout> | null = null;
   /**
-   * Sniper: 2-minute post-buy timer. If no qualifying snip wallet appears (no
-   * >$500 ref-fee wallet and no Jito-tipped $0–$2 wallet) before it fires, sell.
-   * Any qualifying snip wallet cancels it.
+   * Sniper: 2-minute no-activity skip window. Armed once the token watch goes
+   * live. If NO activity happens on the token before it fires, the token is
+   * skipped and the flow reset (no buy). Any token activity cancels it and
+   * triggers the buy.
    */
-  private sniperSellTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Sniper: true once a qualifying snip wallet appeared (activity seen). */
-  private sniperActivitySeen = false;
-  /** Sniper: guards the 2-minute sell so it only fires once per position. */
+  private sniperBuyDelayTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Sniper: guards the 2-minute no-activity skip so it only fires once. */
   private sniperTimeoutSellTriggered = false;
+  /** Sniper: true once any token activity has been seen (buy enqueued). */
+  private sniperActivitySeen = false;
 
   constructor(
     config: ServiceConfig,
@@ -1648,9 +1642,11 @@ export class InsiderBot extends EventEmitter {
 
   /**
    * Toggles sniper mode. When ON, the normal FeeSnip observer buy path is
-   * paused and the bot instead buys a viable token right after the 10s delay
-   * (MC ≥ $40k), then applies the 2-minute no-activity sell. When OFF, the
-   * normal FeeSnip flow runs unchanged.
+   * paused and the bot instead buys on the first token activity after the 10s
+   * delay (MC ≥ $40k on execution); if NO activity happens within 2 minutes the
+   * token is skipped and reset. Exits are the +40% MC take-profit or a watched
+   * wallet selling below the sniper MC cap. When OFF, the normal FeeSnip flow
+   * runs unchanged.
    */
   setSniperMode(value: boolean): void {
     if (this.sniperMode === value) return;
@@ -1672,9 +1668,10 @@ export class InsiderBot extends EventEmitter {
     void this.sendTelegramSafe(
       [
         `<b>🎯 ${this.label} Sniper Mode ON</b>`,
-        `Buys any viable token right after the 10s delay if MC ≥ <b>$${FEE_SNIP_MIN_BUY_MC_USD.toLocaleString()}</b>.`,
+        `Buys on the first token activity after the 10s delay if MC ≥ <b>$${FEE_SNIP_MIN_BUY_MC_USD.toLocaleString()}</b>.`,
         "Normal FeeSnip observer buy path is paused while sniper mode is on.",
-        `If no qualifying snip wallet appears within <b>${(SNIPER_NO_ACTIVITY_SELL_MS / 60_000).toFixed(0)} minutes</b> of the fill, the position is sold.`,
+        `If no token activity occurs within <b>${(SNIPER_NO_ACTIVITY_SELL_MS / 60_000).toFixed(0)} minutes</b> of the watch going live, the token is skipped and reset.`,
+        `Exit: +${NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT}% MC take-profit, or a watched wallet selling below $${SNIPER_WATCHED_SELL_MAX_MC_USD.toLocaleString()} MC.`,
       ].join("\n"),
       "sniper mode on",
     );
@@ -1684,10 +1681,6 @@ export class InsiderBot extends EventEmitter {
     if (this.sniperBuyDelayTimer !== null) {
       clearTimeout(this.sniperBuyDelayTimer);
       this.sniperBuyDelayTimer = null;
-    }
-    if (this.sniperSellTimer !== null) {
-      clearTimeout(this.sniperSellTimer);
-      this.sniperSellTimer = null;
     }
   }
 
@@ -4033,7 +4026,7 @@ export class InsiderBot extends EventEmitter {
         return;
       }
       this.setEntryMc(currentMc);
-      // Only exit on the normal route: +80% MC take-profit (unless a held
+      // Only exit on the normal route: +40% MC take-profit (unless a held
       // wallet's 5,000-lamport sell fee fires first, handled in the observer).
       this.setExitMc(
         this.flowSource === "follow-token"
@@ -4044,7 +4037,7 @@ export class InsiderBot extends EventEmitter {
       this.buySubmitted = true;
       this.preBuyStopped = true;
       if (options.allowOnlyNormalRoute) {
-        // FeeSnip is the only normal-route buy path: always keep +80% MC TP armed
+        // FeeSnip is the only normal-route buy path: always keep +40% MC TP armed
         // and don't let the shared bundler/LI exit machinery disable it.
         this.feesnipPosition = true;
         this.profitExitDisabled = false;
@@ -5144,184 +5137,151 @@ export class InsiderBot extends EventEmitter {
       this.registerNewTokenBuyClusterWalletsForExitMonitoring();
     }
 
-    // Sniper mode: arm the 2-minute no-activity sell now that the buy filled.
-    if (this.sniperMode) {
-      this.armSniperNoActivitySell(trigger.mint);
-    }
-
+    // Sniper mode: the sell side is the +40% MC take-profit (armed at buy) plus
+    // a watched-wallet sell. There is no post-buy timer.
     void this.executeFollowTokenEarlyBundlerPostBuyExitPlan();
   }
 
   /**
-   * Sniper: arms the post-buy 2-minute sell. If a qualifying snip wallet
-   * appears first (sniperActivitySeen), the timer is cancelled and the normal
-   * exit machinery takes over. Otherwise we sell at 2 minutes.
+   * Sniper: buys on the FIRST token activity after the 10s delay. The buy is
+   * enqueued (not made yet) so the normal FeeSnip path confirms the market cap
+   * ($40k minimum) and then executes. Outside sniper mode this is a no-op.
    */
-  private armSniperNoActivitySell(mint: string): void {
-    this.sniperActivitySeen = false;
-    this.sniperTimeoutSellTriggered = false;
-    if (this.sniperSellTimer !== null) {
-      clearTimeout(this.sniperSellTimer);
+  private markSniperActivity(_kind: "buy" | "sell" = "buy"): void {
+    if (!this.sniperMode) return;
+    if (this.sniperTimeoutSellTriggered) return;
+    if (this.buySubmitted || this.isBuyExecuting || this.activePosition) return;
+    const mint = this.normalRouteObserverMint;
+    if (!mint) return;
+    if (this.sniperActivitySeen) return;
+    this.sniperActivitySeen = true;
+    // Any activity cancels the 2-minute no-activity skip window.
+    if (this.sniperBuyDelayTimer !== null) {
+      clearTimeout(this.sniperBuyDelayTimer);
+      this.sniperBuyDelayTimer = null;
     }
-    this.log.warn("Sniper: arming 2-minute no-activity sell", {
+    this.log.warn(
+      "Sniper: token activity seen — enqueuing buy-on-activity (MC confirmed on execution)",
+      { mint, minBuyMcUsd: FEE_SNIP_MIN_BUY_MC_USD },
+    );
+    if (this.normalRouteObserverBuyDeadlineTimer !== null) {
+      clearTimeout(this.normalRouteObserverBuyDeadlineTimer);
+      this.normalRouteObserverBuyDeadlineTimer = null;
+    }
+    // Enqueue the buy (MC confirmed at execution by emitFollowTokenLargeInsiderBuy).
+    // Uses the latest held wallet as the trigger wallet; the normal path's own
+    // maybeTrigger was already called by the caller for this same tx.
+    void this.emitNormalRouteObserverBuy();
+  }
+
+  /**
+   * Sniper: arms the 2-minute no-activity skip once the token watch goes live.
+   * If NO activity happens before it fires, the token is skipped and the flow
+   * reset. Any token activity cancels it and triggers the buy.
+   */
+  private armSniperNoActivitySkip(mint: string): void {
+    if (!this.sniperMode) return;
+    if (this.sniperBuyDelayTimer !== null) {
+      clearTimeout(this.sniperBuyDelayTimer);
+    }
+    this.log.warn("Sniper: arming 2-minute no-activity skip", {
       mint,
       windowMs: SNIPER_NO_ACTIVITY_SELL_MS,
     });
-    this.sniperSellTimer = setTimeout(() => {
-      this.sniperSellTimer = null;
-      void this.runSniperNoActivitySell(mint);
+    this.sniperBuyDelayTimer = setTimeout(() => {
+      this.sniperBuyDelayTimer = null;
+      void this.runSniperNoActivitySkip(mint);
     }, SNIPER_NO_ACTIVITY_SELL_MS);
   }
 
-  private async runSniperNoActivitySell(mint: string): Promise<void> {
+  private async runSniperNoActivitySkip(mint: string): Promise<void> {
     if (
       !this.sniperMode ||
-      this.sniperActivitySeen ||
       this.sniperTimeoutSellTriggered ||
-      !this.activePosition ||
-      this.activePosition.mint !== mint ||
-      this.positionSellTriggered ||
-      this.phase !== "holding"
+      !this.normalRouteObserverActive ||
+      this.normalRouteObserverMint !== mint ||
+      this.buySubmitted ||
+      this.isBuyExecuting ||
+      this.activePosition
     ) {
       return;
-    }
-    this.log.warn(
-      "Sniper: no qualifying snip wallet within 2 minutes — evaluating sell",
-      { mint, windowMs: SNIPER_NO_ACTIVITY_SELL_MS },
-    );
-    await this.attemptSniperSell({
-      mint,
-      reason: "sniper no-activity timeout (2 minutes)",
-      telegramLines: [
-        `<b>⏱️ ${this.label} Sniper — No Activity, Selling</b>`,
-        `Token: <code>${mint}</code>`,
-        `No qualifying snip wallet (≥ $${FEE_SNIP_REF_BUY_MIN_USD} or $0–$${NORMAL_ROUTE_OBSERVER_MAX_BUY_USD} Jito-tipped) appeared within <b>2 minutes</b> of the fill.`,
-        "Exiting the sniper position.",
-      ],
-      signature: `SNIPER_NO_ACTIVITY:${mint}`,
-      retry: () => this.runSniperNoActivitySell(mint),
-    });
-  }
-
-  /**
-   * Sniper: a qualifying snip wallet appeared. That appearance is itself a buy
-   * by another wallet, so sniper mode sells into it (cancelling the 2-minute
-   * timer). Outside sniper mode this is a no-op.
-   */
-  private markSniperActivity(): void {
-    if (!this.sniperMode || this.sniperActivitySeen) return;
-    this.sniperActivitySeen = true;
-    if (this.sniperSellTimer !== null) {
-      clearTimeout(this.sniperSellTimer);
-      this.sniperSellTimer = null;
-    }
-    const mint = this.activePosition?.mint ?? null;
-    this.log.warn(
-      "Sniper: qualifying snip wallet activity seen — evaluating sell into the buy",
-      { mint },
-    );
-    if (!mint || this.positionSellTriggered || this.phase !== "holding") {
-      return;
-    }
-    void this.attemptSniperSell({
-      mint,
-      reason: "sniper activity buy (qualifying snip wallet appeared)",
-      telegramLines: [
-        `<b>🚨 ${this.label} Sniper — Activity Detected, Selling</b>`,
-        `Token: <code>${mint}</code>`,
-        "A qualifying snip wallet appeared (activity is a buy) — exiting the sniper position.",
-      ],
-      signature: `SNIPER_ACTIVITY_BUY:${mint}`,
-      retry: () => this.markSniperActivityRetry(mint),
-    });
-  }
-
-  private markSniperActivityRetry(mint: string): void {
-    if (
-      !this.sniperMode ||
-      !this.activePosition ||
-      this.activePosition.mint !== mint ||
-      this.positionSellTriggered ||
-      this.phase !== "holding"
-    ) {
-      return;
-    }
-    void this.attemptSniperSell({
-      mint,
-      reason: "sniper activity buy (qualifying snip wallet appeared)",
-      telegramLines: [
-        `<b>🚨 ${this.label} Sniper — Activity Detected, Selling</b>`,
-        `Token: <code>${mint}</code>`,
-        "A qualifying snip wallet appeared (activity is a buy) — exiting the sniper position.",
-      ],
-      signature: `SNIPER_ACTIVITY_BUY:${mint}`,
-      retry: () => this.markSniperActivityRetry(mint),
-    });
-  }
-
-  /**
-   * Sniper sell gate shared by both sniper exits. Applies the same
-   * hold-to-positive-P&L rule as the MC-monitor exit: when P&L by MC is in
-   * [SNIPER_HOLD_PNL_FLOOR_PCT, 0), hold instead of selling and re-check, so the
-   * sniper sell waits for P&L to turn positive. Sells when P&L ≥ 0 or below the
-   * floor (or when the entry MC is unknown).
-   */
-  private async attemptSniperSell(args: {
-    mint: string;
-    reason: string;
-    telegramLines: string[];
-    signature: string;
-    retry: () => void;
-  }): Promise<void> {
-    const { mint, reason, telegramLines, signature, retry } = args;
-    if (
-      !this.sniperMode ||
-      !this.activePosition ||
-      this.activePosition.mint !== mint ||
-      this.positionSellTriggered ||
-      this.phase !== "holding"
-    ) {
-      return;
-    }
-    const entryMc = this.getEntryMc();
-    if (entryMc > 0) {
-      const currentMc = await this.gmgnClient
-        .fetchTokenMarketCapUsd(mint)
-        .catch(() => null);
-      if (currentMc !== null) {
-        const pnlPct = ((currentMc - entryMc) / entryMc) * 100;
-        if (pnlPct >= SNIPER_HOLD_PNL_FLOOR_PCT && pnlPct < 0) {
-          this.log.info(
-            "Sniper sell held — P&L between floor and 0; waiting for positive P&L",
-            {
-              mint,
-              reason,
-              pnlPct,
-              currentMc,
-              entryMc,
-              holdFloorPct: SNIPER_HOLD_PNL_FLOOR_PCT,
-              retryMs: SNIPER_PNL_HOLD_RECHECK_MS,
-            },
-          );
-          if (this.sniperSellTimer !== null) {
-            clearTimeout(this.sniperSellTimer);
-          }
-          this.sniperSellTimer = setTimeout(() => {
-            this.sniperSellTimer = null;
-            retry();
-          }, SNIPER_PNL_HOLD_RECHECK_MS);
-          return;
-        }
-      }
     }
     this.sniperTimeoutSellTriggered = true;
-    await this.triggerPositionSell(
-      mint,
-      reason,
-      telegramLines,
-      signature,
-      { allowWhenFeePayerOnly: true },
+    this.log.warn(
+      "Sniper: no token activity within 2 minutes — skipping token and resetting",
+      { mint, windowMs: SNIPER_NO_ACTIVITY_SELL_MS },
     );
+    void this.sendTelegramSafe(
+      [
+        `<b>⏭️ ${this.label} Sniper — No Activity, Skipped</b>`,
+        `Token: <code>${mint}</code>`,
+        "No token activity within <b>2 minutes</b> — token skipped and flow reset.",
+      ].join("\n"),
+      "sniper no-activity skip",
+    );
+    await this.resetForNewToken(true, { reason: "sniper_no_activity_2m" });
+  }
+
+  /**
+   * Sniper: a watched wallet SOLD — the only trigger that can sell a sniper
+   * position. Watched wallets are the >$500 ref-fee set and the Jito-tipped
+   * $0–$2 set. Only fires while MC is below SNIPER_WATCHED_SELL_MAX_MC_USD; a
+   * wallet's sell above the cap is ignored. Outside sniper mode this is a
+   * no-op. Buys never trigger a sniper sell.
+   */
+  private maybeSniperWatchedWalletSell(): void {
+    if (!this.sniperMode) return;
+    if (
+      !this.activePosition ||
+      this.positionSellTriggered ||
+      this.phase !== "holding"
+    ) {
+      return;
+    }
+    const mint = this.activePosition.mint;
+    void this.gmgnClient
+      .fetchTokenMarketCapUsd(mint)
+      .catch(() => null)
+      .then((currentMc) => {
+        if (
+          !this.sniperMode ||
+          !this.activePosition ||
+          this.activePosition.mint !== mint ||
+          this.positionSellTriggered ||
+          this.phase !== "holding"
+        ) {
+          return;
+        }
+        if (
+          currentMc === null ||
+          currentMc >= SNIPER_WATCHED_SELL_MAX_MC_USD
+        ) {
+          this.log.info(
+            "Sniper: watched-wallet sell ignored — MC at/above sell cap or unknown",
+            { mint, currentMc, sellMaxMcUsd: SNIPER_WATCHED_SELL_MAX_MC_USD },
+          );
+          return;
+        }
+        this.log.warn(
+          "Sniper: watched wallet sold — exiting sniper position",
+          { mint, currentMc },
+        );
+        void this.sendTelegramSafe(
+          [
+            `<b>🚨 ${this.label} Sniper — Watched Wallet Sold</b>`,
+            `Token: <code>${mint}</code>`,
+            `MC: <b>$${Math.round(currentMc).toLocaleString()}</b> — a watched wallet sold; exiting.`,
+          ].join("\n"),
+          "sniper watched-wallet sell",
+        );
+        void this.triggerPositionSell(
+          mint,
+          "sniper watched-wallet sell",
+          [],
+          `SNIPER_WATCHED_SELL:${mint}`,
+          { allowWhenFeePayerOnly: true },
+        );
+      });
   }
 
   private async executeFollowTokenEarlyBundlerPostBuyExitPlan(): Promise<void> {
@@ -6159,7 +6119,7 @@ export class InsiderBot extends EventEmitter {
             `${index + 1}. <code>${wallet}</code> · fee <b>$${feeUsd.toFixed(4)}</b>`,
         ),
         "",
-        `Exit: sell once <b>any</b> of the ${qualifying.length} qualifying wallet(s) sell all · <b>+80%</b> MC TP also active.`,
+        `Exit: sell once <b>any</b> of the ${qualifying.length} qualifying wallet(s) sell all · <b>+${NORMAL_ROUTE_OBSERVER_FALLBACK_TP_PCT}%</b> MC TP also active.`,
         "Buying immediately.",
       ].join("\n"),
       "normal-route early fee-buy trigger",
@@ -6304,92 +6264,13 @@ export class InsiderBot extends EventEmitter {
       "feesnip watch live",
     );
 
-    // Sniper mode: buy immediately now that the 10s delay has elapsed, as soon
-    // as MC clears the $40k minimum — no qualifying snip wallet required.
+    // Sniper mode: arm the 2-minute no-activity window. If no token activity
+    // happens within it, skip the token and reset (no buy at all).
     if (this.sniperMode) {
-      this.scheduleSniperBuyCheck(mint);
+      this.armSniperNoActivitySkip(mint);
     }
   }
 
-  /**
-   * Sniper: attempts the immediate post-10s buy once MC clears $40k. Retries on
-   * a short cadence until it fires, the flow resets, or the buy deadline hits.
-   */
-  private scheduleSniperBuyCheck(mint: string): void {
-    if (!this.sniperMode) return;
-    if (this.sniperBuyDelayTimer !== null) {
-      clearTimeout(this.sniperBuyDelayTimer);
-    }
-    const attempt = async (): Promise<void> => {
-      this.sniperBuyDelayTimer = null;
-      if (
-        !this.sniperMode ||
-        !this.normalRouteObserverActive ||
-        this.normalRouteObserverMint !== mint ||
-        this.buySubmitted ||
-        this.isBuyExecuting ||
-        this.buyDisabled
-      ) {
-        return;
-      }
-      const funderState = this.bundlerFunderWatch;
-      if (!funderState || funderState.mint !== mint) return;
-
-      const currentMc = await this.gmgnClient
-        .fetchTokenMarketCapUsd(mint)
-        .catch(() => null);
-      if (currentMc === null) {
-        this.sniperBuyDelayTimer = setTimeout(() => {
-          void attempt();
-        }, SNIPER_BUY_RECHECK_MS);
-        return;
-      }
-      if (currentMc < FEE_SNIP_MIN_BUY_MC_USD) {
-        this.log.info("Sniper buy waiting — MC below minimum", {
-          mint,
-          currentMc,
-          minBuyMcUsd: FEE_SNIP_MIN_BUY_MC_USD,
-        });
-        this.sniperBuyDelayTimer = setTimeout(() => {
-          void attempt();
-        }, SNIPER_BUY_RECHECK_MS);
-        return;
-      }
-
-      this.log.warn("Sniper buy trigger — MC cleared minimum after 10s delay", {
-        mint,
-        currentMc,
-        minBuyMcUsd: FEE_SNIP_MIN_BUY_MC_USD,
-      });
-      void this.sendTelegramSafe(
-        [
-          `<b>🟢 ${this.label} Sniper Buy Triggered</b>`,
-          `Token: <code>${mint}</code>`,
-          `MC: <b>$${currentMc.toLocaleString()}</b> (≥ $${FEE_SNIP_MIN_BUY_MC_USD.toLocaleString()})`,
-          "Bought immediately after the 10s delay (no snip wallet required).",
-        ].join("\n"),
-        "sniper buy triggered",
-      );
-      // Mark consumed so the FeeSnip wallet path cannot double-buy.
-      this.normalRouteObserverMcGraceConsumed = true;
-      await this.emitFollowTokenLargeInsiderBuy(
-        funderState,
-        this.getFlowFollowWallet() ?? "sniper",
-        `SNIPER:${mint}`,
-        {
-          signature: `SNIPER:${mint}`,
-          timestamp: Math.floor(Date.now() / 1000),
-          type: "SWAP",
-        } as HeliusTransaction,
-        {
-          triggerSource: "smallest_bundler_sell_gate",
-          buySolOverride: this.getBuySolForFundingMode(false),
-          allowOnlyNormalRoute: true,
-        },
-      );
-    };
-    void attempt();
-  }
 
   /**
    * FeeSnip: no qualifying buy happened within the deadline after scanning began
@@ -7128,6 +7009,13 @@ export class InsiderBot extends EventEmitter {
       return;
     }
 
+    // Sniper: a watched (>$500 ref-fee) wallet sold — the only trigger that can
+    // sell a sniper position (buys never do). Uses the sniper MC cap.
+    if (this.sniperMode) {
+      this.maybeSniperWatchedWalletSell();
+      return;
+    }
+
     const currentMc = await this.gmgnClient
       .fetchTokenMarketCapUsd(mint)
       .catch(() => null);
@@ -7227,6 +7115,13 @@ export class InsiderBot extends EventEmitter {
       return;
     }
     const mint = this.activePosition.mint;
+    // Sniper: a watched wallet (buy wallet or collected $0–$2 Jito-tipped
+    // wallet) sold — the only trigger that can sell a sniper position. Uses the
+    // sniper MC cap; a sell above the cap is ignored.
+    if (this.sniperMode) {
+      this.maybeSniperWatchedWalletSell();
+      return;
+    }
     const entryMc = this.getEntryMc();
     const currentMc = await this.gmgnClient
       .fetchTokenMarketCapUsd(mint)
@@ -7360,10 +7255,6 @@ export class InsiderBot extends EventEmitter {
     if (this.sniperBuyDelayTimer !== null) {
       clearTimeout(this.sniperBuyDelayTimer);
       this.sniperBuyDelayTimer = null;
-    }
-    if (this.sniperSellTimer !== null) {
-      clearTimeout(this.sniperSellTimer);
-      this.sniperSellTimer = null;
     }
   }
 

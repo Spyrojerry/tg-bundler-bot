@@ -34,6 +34,7 @@ import {
 } from "@pump-fun/pump-swap-sdk";
 import {
   createAssociatedTokenAccountIdempotentInstruction,
+  createCloseAccountInstruction,
   createTransferInstruction,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
@@ -3003,5 +3004,108 @@ private async sendRawTransactionAndAssertSuccess(
   private parseNullableNumber(value: unknown): number | null {
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
+  }
+
+  // ── Public: reclaim token-account rent after a sell ─────────────────────────
+
+  /**
+   * Closes the wallet's token account(s) for `mint`, returning the ~0.00204 SOL
+   * rent-exempt lamports to the owner. Call after a full sell — a closed ATA
+   * frees the rent that would otherwise stay locked. Returns the transaction
+   * signatures that closed accounts (empty when there was nothing to close).
+   *
+   * Only closes accounts holding ZERO tokens; a non-empty account is left alone
+   * so we never burn unsold tokens.
+   */
+  async reclaimTokenRent(walletAddress: string, mint: string): Promise<string[]> {
+    if (!this.tradingKeypair) {
+      log.debug("Skipping rent reclaim — no trading keypair configured", { mint });
+      return [];
+    }
+    this.validateSolAddress(walletAddress, "rent reclaim wallet");
+    this.validateSolAddress(mint, "mint");
+
+    const owner = new PublicKey(walletAddress);
+    const mintPk = new PublicKey(mint);
+    const signer = this.tradingKeypair.publicKey;
+
+    // Derive the ATAs directly (both programs) and keep those that exist with a
+    // zero balance. Rent can only be reclaimed from an empty account.
+    const candidates = await Promise.all(
+      TOKEN_PROGRAM_IDS.map(async (tokenProgram) => {
+        const account = getAssociatedTokenAddressSync(
+          mintPk,
+          owner,
+          false,
+          tokenProgram,
+        );
+        const info = await this.connection
+          .getAccountInfo(account, "confirmed")
+          .catch(() => null);
+        if (!info) {
+          return { tokenProgram, account, exists: false, empty: false };
+        }
+        // Read THIS account's own balance — not the walletwide total — so a
+        // second non-empty account for the same mint is never closed.
+        const balance = await this.connection
+          .getTokenAccountBalance(account, "confirmed")
+          .then((resp) => resp?.value?.amount ?? null)
+          .catch(() => null);
+        const empty = balance === null ? false : BigInt(balance) === 0n;
+        return { tokenProgram, account, exists: true, empty };
+      }),
+    );
+
+    const closeable = candidates.filter((entry) => entry.exists && entry.empty);
+    if (closeable.length === 0) {
+      log.debug("Rent reclaim — no empty token account to close", { mint });
+      return [];
+    }
+
+    const signatures: string[] = [];
+    for (const entry of closeable) {
+      try {
+        const instructions = [
+          createCloseAccountInstruction(
+            entry.account,
+            owner,
+            signer,
+            [],
+            entry.tokenProgram,
+          ),
+        ];
+        const latestBlockhash =
+          await this.connection.getLatestBlockhash("confirmed");
+        const tx = new VersionedTransaction(
+          new TransactionMessage({
+            payerKey: signer,
+            recentBlockhash: latestBlockhash.blockhash,
+            instructions,
+          }).compileToV0Message(),
+        );
+        tx.sign([this.tradingKeypair]);
+        const signature = await this.sendRawTransactionAndAssertSuccess(
+          Buffer.from(tx.serialize()),
+          mint,
+          { maxRetries: 3, timeoutMs: 6_000 },
+        );
+        signatures.push(signature);
+        log.info("Reclaimed token-account rent after sell", {
+          mint,
+          wallet: walletAddress,
+          account: entry.account.toBase58(),
+          tokenProgram: entry.tokenProgram.toBase58(),
+          signature,
+        });
+      } catch (err) {
+        log.warn("Rent reclaim failed for token account; continuing", {
+          mint,
+          wallet: walletAddress,
+          account: entry.account.toBase58(),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return signatures;
   }
 }

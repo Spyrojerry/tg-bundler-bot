@@ -3193,6 +3193,16 @@ async function main(): Promise<void> {
                 orderId: lastResult.orderId,
               });
             }
+            // Reclaim the ~0.00204 SOL ATA rent now the position is flat. Fire
+            // and forget so it never blocks the sell flow.
+            void gmgnClients[
+              pending.event.insiderBotIndex ?? 0
+            ]?.reclaimTokenRent(pending.event.walletAddress, mint).catch((err) =>
+              log.warn("Rent reclaim after sell failed", {
+                mint,
+                error: err instanceof Error ? err.message : String(err),
+              }),
+            );
             return;
           }
         } catch (err) {
