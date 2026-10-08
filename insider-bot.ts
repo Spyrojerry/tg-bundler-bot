@@ -5314,11 +5314,39 @@ export class InsiderBot extends EventEmitter {
     wallet?: string,
   ): void {
     if (!this.sniperMode) return;
-    if (this.sniperTimeoutSellTriggered) return;
-    if (this.buySubmitted || this.isBuyExecuting || this.activePosition) return;
+    if (this.sniperTimeoutSellTriggered) {
+      this.log.info("Sniper: activity ignored — timeout sell already triggered", {
+        wallet: wallet ?? null,
+      });
+      return;
+    }
+    if (this.buySubmitted || this.isBuyExecuting || this.activePosition) {
+      this.log.info(
+        "Sniper: activity ignored — buy already submitted/in-flight or position held",
+        {
+          wallet: wallet ?? null,
+          buySubmitted: this.buySubmitted,
+          isBuyExecuting: this.isBuyExecuting,
+          hasActivePosition: !!this.activePosition,
+          activePositionMint: this.activePosition?.mint ?? null,
+        },
+      );
+      return;
+    }
     const mint = this.normalRouteObserverMint;
-    if (!mint) return;
-    if (this.sniperActivitySeen) return;
+    if (!mint) {
+      this.log.info("Sniper: activity ignored — no observer mint", {
+        wallet: wallet ?? null,
+      });
+      return;
+    }
+    if (this.sniperActivitySeen) {
+      this.log.info("Sniper: activity ignored — sniperActivitySeen already set", {
+        mint,
+        wallet: wallet ?? null,
+      });
+      return;
+    }
     this.sniperActivitySeen = true;
     // Any activity cancels the 2-minute no-activity skip window.
     if (this.sniperBuyDelayTimer !== null) {
@@ -6788,11 +6816,20 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
-      // Sniper: buy on the FIRST buy that is either >$500 or in the $0–$2 band,
-      // regardless of the FeeSnip fee-tolerance/Jito-tip gates below. Those gates
-      // only decide whether we WATCH the wallet; sniper's trigger is the buy size
-      // itself. markSniperActivity is a no-op outside sniper mode.
-      if (this.sniperMode && this.classifyTx(tx, wallet, mint) === "buy") {
+      // Sniper: buy on the FIRST buy that is either >$500 or in the $0–$2 band.
+      // The $0–$2 band still requires a Jito tip (same as FeeSnip collection);
+      // the >$500 band does NOT require the fee-tolerance match. Guards on the
+      // sniper state so a buy already in flight does not log a false "qualifying".
+      if (
+        this.sniperMode &&
+        !this.sniperActivitySeen &&
+        !this.buySubmitted &&
+        !this.isBuyExecuting &&
+        !this.activePosition &&
+        wallet !== "__pool__" &&
+        wallet !== this.devWallet &&
+        this.classifyTx(tx, wallet, mint) === "buy"
+      ) {
         const sniperBuySol = this.estimateEarlyBuySol(tx, wallet);
         if (sniperBuySol !== null) {
           const sniperBuyUsd = sniperBuySol * solPriceUsd;
@@ -6800,17 +6837,31 @@ export class InsiderBot extends EventEmitter {
           const isSmallBuy =
             sniperBuyUsd >= NORMAL_ROUTE_OBSERVER_MIN_BUY_USD &&
             sniperBuyUsd <= NORMAL_ROUTE_OBSERVER_MAX_BUY_USD;
-          if (isBigBuy || isSmallBuy) {
+          const jitoTip = resolveJitoTip(tx);
+          const qualifies =
+            isBigBuy || (isSmallBuy && jitoTip !== null && jitoTip !== undefined);
+          if (qualifies) {
             this.log.warn(
               "Sniper: qualifying buy activity seen — buying on activity",
               {
                 mint,
                 wallet,
                 buyUsd: sniperBuyUsd,
-                reason: isBigBuy ? ">=$500 buy" : "$0–$2 buy",
+                reason: isBigBuy ? ">=$500 buy" : "$0–$2 buy (Jito-tipped)",
+                jitoTipLamports: jitoTip?.lamports ?? null,
               },
             );
             this.markSniperActivity(tx, wallet);
+          } else if (isSmallBuy) {
+            this.log.info(
+              "Sniper: $0–$2 buy skipped — buy tx pays no Jito tip",
+              {
+                mint,
+                wallet,
+                buyUsd: sniperBuyUsd,
+                signature: tx.signature,
+              },
+            );
           }
         }
       }
