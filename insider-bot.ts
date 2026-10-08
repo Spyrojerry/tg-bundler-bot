@@ -39,7 +39,7 @@ const INSIDER_RUG_RESET_MARKET_CAP_USD = 3_000;
  * below, force-sell immediately regardless of the exit target or the P&L hold
  * bands. Replaces the old -80% P&L hard floor.
  */
-const INSIDER_HOLD_HARD_RESET_MC_USD = 30_000;
+const INSIDER_HOLD_HARD_RESET_MC_USD = 35_000;
 const MAX_FOLLOW_WALLET_START_MARKET_CAP_USD = 80_000;
 const BUNDLER_FUNDER_TRANSFER_LIMIT = 5;
 const BUNDLER_FUNDER_REQUIRED_COUNT = 4;
@@ -1206,6 +1206,13 @@ export class InsiderBot extends EventEmitter {
    * triggers the buy.
    */
   private sniperBuyDelayTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Sniper: dedicated timer for the 2-minute no-activity pre-buy skip. Kept
+   * separate from sniperBuyDelayTimer so the funder-retry / activity paths that
+   * reassign that field can't silently cancel the skip.
+   */
+  private sniperNoActivitySkipTimer: ReturnType<typeof setTimeout> | null =
+    null;
   /** Sniper: guards the 2-minute no-activity skip so it only fires once. */
   private sniperTimeoutSellTriggered = false;
   /** Sniper: true once any token activity has been seen (buy enqueued). */
@@ -1762,6 +1769,10 @@ export class InsiderBot extends EventEmitter {
     if (this.sniperBuyDelayTimer !== null) {
       clearTimeout(this.sniperBuyDelayTimer);
       this.sniperBuyDelayTimer = null;
+    }
+    if (this.sniperNoActivitySkipTimer !== null) {
+      clearTimeout(this.sniperNoActivitySkipTimer);
+      this.sniperNoActivitySkipTimer = null;
     }
     if (this.sniperWatchedSellHoldTimer !== null) {
       clearTimeout(this.sniperWatchedSellHoldTimer);
@@ -5407,29 +5418,46 @@ export class InsiderBot extends EventEmitter {
    */
   private armSniperNoActivitySkip(mint: string): void {
     if (!this.sniperMode) return;
-    if (this.sniperBuyDelayTimer !== null) {
-      clearTimeout(this.sniperBuyDelayTimer);
+    if (this.sniperNoActivitySkipTimer !== null) {
+      clearTimeout(this.sniperNoActivitySkipTimer);
     }
     this.log.warn("Sniper: arming 2-minute no-activity skip", {
       mint,
       windowMs: SNIPER_NO_ACTIVITY_SELL_MS,
     });
-    this.sniperBuyDelayTimer = setTimeout(() => {
-      this.sniperBuyDelayTimer = null;
+    this.sniperNoActivitySkipTimer = setTimeout(() => {
+      this.sniperNoActivitySkipTimer = null;
       void this.runSniperNoActivitySkip(mint);
     }, SNIPER_NO_ACTIVITY_SELL_MS);
   }
 
   private async runSniperNoActivitySkip(mint: string): Promise<void> {
-    if (
-      !this.sniperMode ||
-      this.sniperTimeoutSellTriggered ||
-      !this.normalRouteObserverActive ||
-      this.normalRouteObserverMint !== mint ||
-      this.buySubmitted ||
-      this.isBuyExecuting ||
-      this.activePosition
-    ) {
+    if (!this.sniperMode) {
+      this.log.info("Sniper skip ignored - sniper mode off", { mint });
+      return;
+    }
+    if (this.sniperTimeoutSellTriggered) {
+      this.log.info("Sniper skip ignored - already skipped", { mint });
+      return;
+    }
+    if (!this.normalRouteObserverActive) {
+      this.log.info("Sniper skip ignored - observer not active", { mint });
+      return;
+    }
+    if (this.normalRouteObserverMint !== mint) {
+      this.log.info("Sniper skip ignored - observer mint changed", {
+        mint,
+        observerMint: this.normalRouteObserverMint,
+      });
+      return;
+    }
+    if (this.buySubmitted || this.isBuyExecuting || this.activePosition) {
+      this.log.info("Sniper skip ignored - buy submitted/in-flight or holding", {
+        mint,
+        buySubmitted: this.buySubmitted,
+        isBuyExecuting: this.isBuyExecuting,
+        hasActivePosition: !!this.activePosition,
+      });
       return;
     }
     this.sniperTimeoutSellTriggered = true;
@@ -6816,55 +6844,6 @@ export class InsiderBot extends EventEmitter {
       ) {
         continue;
       }
-      // Sniper: buy on the FIRST buy that is either >$500 or in the $0–$2 band.
-      // The $0–$2 band still requires a Jito tip (same as FeeSnip collection);
-      // the >$500 band does NOT require the fee-tolerance match. Guards on the
-      // sniper state so a buy already in flight does not log a false "qualifying".
-      if (
-        this.sniperMode &&
-        !this.sniperActivitySeen &&
-        !this.buySubmitted &&
-        !this.isBuyExecuting &&
-        !this.activePosition &&
-        wallet !== "__pool__" &&
-        wallet !== this.devWallet &&
-        this.classifyTx(tx, wallet, mint) === "buy"
-      ) {
-        const sniperBuySol = this.estimateEarlyBuySol(tx, wallet);
-        if (sniperBuySol !== null) {
-          const sniperBuyUsd = sniperBuySol * solPriceUsd;
-          const isBigBuy = sniperBuyUsd >= FEE_SNIP_REF_BUY_MIN_USD;
-          const isSmallBuy =
-            sniperBuyUsd >= NORMAL_ROUTE_OBSERVER_MIN_BUY_USD &&
-            sniperBuyUsd <= NORMAL_ROUTE_OBSERVER_MAX_BUY_USD;
-          const jitoTip = resolveJitoTip(tx);
-          const qualifies =
-            isBigBuy || (isSmallBuy && jitoTip !== null && jitoTip !== undefined);
-          if (qualifies) {
-            this.log.warn(
-              "Sniper: qualifying buy activity seen — buying on activity",
-              {
-                mint,
-                wallet,
-                buyUsd: sniperBuyUsd,
-                reason: isBigBuy ? ">=$500 buy" : "$0–$2 buy (Jito-tipped)",
-                jitoTipLamports: jitoTip?.lamports ?? null,
-              },
-            );
-            this.markSniperActivity(tx, wallet);
-          } else if (isSmallBuy) {
-            this.log.info(
-              "Sniper: $0–$2 buy skipped — buy tx pays no Jito tip",
-              {
-                mint,
-                wallet,
-                buyUsd: sniperBuyUsd,
-                signature: tx.signature,
-              },
-            );
-          }
-        }
-      }
       // FeeSnip: hard cap — stop searching the moment 5 qualifying wallets
       // (buy $0–$2 with tx fee above $0.1) have been collected; the buy happens
       // FeeSnip: stop searching for more wallets once 5 have been collected.
@@ -7597,6 +7576,10 @@ export class InsiderBot extends EventEmitter {
     if (this.sniperBuyDelayTimer !== null) {
       clearTimeout(this.sniperBuyDelayTimer);
       this.sniperBuyDelayTimer = null;
+    }
+    if (this.sniperNoActivitySkipTimer !== null) {
+      clearTimeout(this.sniperNoActivitySkipTimer);
+      this.sniperNoActivitySkipTimer = null;
     }
     if (this.sniperWatchedSellHoldTimer !== null) {
       clearTimeout(this.sniperWatchedSellHoldTimer);
