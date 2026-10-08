@@ -6464,6 +6464,12 @@ export class InsiderBot extends EventEmitter {
     this.normalRouteObserverHeldPerMinute = [];
     this.normalRouteObserverMcGraceInFlight = false;
     this.normalRouteObserverMcGraceConsumed = false;
+    // Sniper per-token state: a fresh observer means a fresh token, so clear the
+    // one-shot skip/buy flags. Without this, a single no-activity skip on an
+    // earlier token leaves sniperTimeoutSellTriggered=true forever and every
+    // later token's qualifying activity is ignored (no buy ever fires).
+    this.sniperTimeoutSellTriggered = false;
+    this.sniperActivitySeen = false;
     this.normalRouteObserverSeenWallets.clear();
     this.normalRouteObserverPending.clear();
     this.normalRouteObserverQualified.clear();
